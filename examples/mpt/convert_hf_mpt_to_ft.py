@@ -120,7 +120,7 @@ def convert_weight_to_ft_each(out_dir: str, tensor_parallelism: int,
             config['d_model'], ), f'unexpected dim for {tensor_name}'
         split_vals = np.split(data, tensor_parallelism, axis=-1)
         for j in range(tensor_parallelism):
-            save_path = os.path.join(out_dir + f'model.{tensor_name}.{j}.bin')
+            save_path = os.path.join(out_dir, f'model.{tensor_name}.{j}.bin')
             split_vals[j].tofile(save_path)
 
     elif tensor_name.find('attention.query_key_value.bias') != -1:
