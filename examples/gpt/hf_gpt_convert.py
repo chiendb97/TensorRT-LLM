@@ -44,7 +44,7 @@ class ProgArgs:
     smoothquant: float = None
     model: str = "gpt"
     storage_type: str = "fp32"
-    dataset_cache_dir: str = None
+    dataset_file: str = None
     load_model_on_cpu: bool = False
     convert_model_on_cpu: bool = False
 
@@ -100,10 +100,10 @@ class ProgArgs:
                             type=str,
                             default="float32",
                             choices=["float32", "float16", "bfloat16"])
-        parser.add_argument("--dataset-cache-dir",
+        parser.add_argument("--dataset-file",
                             type=str,
                             default=None,
-                            help="cache dir to load the hugging face dataset")
+                            help="dataset file for quantize")
         parser.add_argument("--load-model-on-cpu", action="store_true")
         parser.add_argument("--convert-model-on-cpu", action="store_true")
         return ProgArgs(**vars(parser.parse_args(args)))
@@ -207,9 +207,7 @@ def hf_gpt_converter(args: ProgArgs):
         os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
             "TOKENIZERS_PARALLELISM", "false")
         from datasets import load_dataset
-        dataset = load_dataset("lambada",
-                               split="validation",
-                               cache_dir=args.dataset_cache_dir)
+        dataset = load_dataset("csv", data_files=args.dataset_file)
         act_range = capture_activation_range(
             model, AutoTokenizer.from_pretrained(args.in_file, use_fast=False), dataset)
         if args.smoothquant is not None:
