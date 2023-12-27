@@ -33,7 +33,7 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.profiler import check_gpt_mem_usage
 from tensorrt_llm.quantization import QuantMode
 
-from weight import load_from_ft, parse_ft_config, check_embedding_share  # isort:skip
+from weight import load_from_ft, parse_ft_config, check_embedding_share, get_scaling_factors  # isort:skip
 
 MODEL_NAME = "gpt"
 
@@ -311,6 +311,11 @@ def parse_arguments(args):
         'By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV'
     )
     parser.add_argument(
+        '--quantized_fp8_model_path',
+        type=str,
+        default=None,
+        help='Path of a quantized model checkpoint in .npz format')
+    parser.add_argument(
         '--max_num_tokens',
         type=int,
         default=None,
@@ -552,17 +557,9 @@ def build_rank_engine(builder: Builder,
         tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, args.quant_mode)
 
     if args.model_dir is not None:
-        gpt_dummy_fp8_scaling_factors = {
-            'fc_act': [0.5 for _ in range(args.n_layer)],
-            'fc_weights': [0.5 for _ in range(args.n_layer)],
-            'proj_act': [0.5 for _ in range(args.n_layer)],
-            'proj_weights': [0.5 for _ in range(args.n_layer)],
-            'qkv_act': [0.5 for _ in range(args.n_layer)],
-            'qkv_weights': [0.5 for _ in range(args.n_layer)],
-            'qkv_output': [0.5 for _ in range(args.n_layer)],
-            'dense_act': [0.5 for _ in range(args.n_layer)],
-            'dense_weights': [0.5 for _ in range(args.n_layer)],
-        }
+        quant_scales = get_scaling_factors(args.quantized_fp8_model_path,
+                                           num_layers=args.n_layer,
+                                           quant_mode=args.quant_mode)
 
         load_from_ft(tensorrt_llm_gpt,
                      args.model_dir,
@@ -572,7 +569,7 @@ def build_rank_engine(builder: Builder,
                      args.use_parallel_embedding,
                      args.embedding_sharding_dim,
                      share_embedding_table,
-                     scaling_factors=gpt_dummy_fp8_scaling_factors
+                     scaling_factors=quant_scales
                      if args.enable_fp8 else None)
 
     # Module -> Network
