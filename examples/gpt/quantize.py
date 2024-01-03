@@ -38,7 +38,7 @@ def get_calib_dataloader(dataset_file=None,
                          cache_dir=None):
     print("Loading calibration dataset")
     dataset = load_dataset("csv", data_files={'validation': dataset_file}, split='validation')
-
+    dataset = dataset["text"][:calib_size]
     dataset_input_ids = tokenizer(dataset,
                                   return_tensors="pt",
                                   padding=True,
