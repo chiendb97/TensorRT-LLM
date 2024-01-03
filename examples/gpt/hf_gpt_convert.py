@@ -209,7 +209,7 @@ def hf_gpt_converter(args: ProgArgs):
         from datasets import load_dataset
         dataset = load_dataset("csv", data_files={'validation': args.dataset_file}, split='validation')
         act_range = capture_activation_range(
-            model, AutoTokenizer.from_pretrained(args.in_file, use_fast=False), dataset)
+            model, AutoTokenizer.from_pretrained(args.in_file), dataset)
         if args.smoothquant is not None:
             smooth_gpt_model(model, act_range, args.smoothquant)
 
