@@ -41,7 +41,7 @@ def get_calib_dataloader(dataset_file=None,
     dataset = dataset["text"][:calib_size]
     dataset_input_ids = tokenizer(dataset,
                                   return_tensors="pt",
-                                  padding=True,
+                                  padding="max_length",
                                   truncation=True,
                                   max_length=block_size).input_ids.cuda()
 
@@ -96,6 +96,10 @@ def get_args():
                         type=int,
                         default=512,
                         help="Number of samples for calibration.")
+    parser.add_argument("--block_size",
+                        type=int,
+                        default=512,
+                        help="Number of token per sample for calibration.")
     parser.add_argument("--export_path", default="exported_model")
     parser.add_argument("--dataset_file",
                         type=str,
@@ -126,6 +130,7 @@ def main():
     calib_dataloader = get_calib_dataloader(dataset_file=args.dataset_file,
                                             tokenizer=tokenizer,
                                             calib_size=args.calib_size,
+                                            block_size=args.block_size,
                                             cache_dir=args.cache_dir)
     model = quantize_and_export(model,
                                 qformat=args.qformat,
