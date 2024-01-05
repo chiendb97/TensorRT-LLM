@@ -42,7 +42,7 @@ def get_scaling_factors(
     """ Get the scaling factors for GPT2 model
 
     Returns a dictionary of scaling factors for the selected layers of the
-    LLaMA model.
+    GPT2 model.
 
     Args:
         model_path (str): Path to the quantized GPT2 model
@@ -63,8 +63,6 @@ def get_scaling_factors(
             'dense_weights': dense_weights_scale,
             'fc_act': fc_act_scale,
             'fc_weights': fc_weights_scale,
-            'gate_act': gate_act_scale,
-            'gate_weights': gate_weights_scale,
             'proj_act': proj_act_scale,
             'proj_weights': proj_weights_scale,
         }
