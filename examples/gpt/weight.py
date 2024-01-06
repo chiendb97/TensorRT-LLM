@@ -83,8 +83,6 @@ def get_scaling_factors(
         'dense_weights': [],
         'fc_act': [],
         'fc_weights': [],
-        'gate_act': [],
-        'gate_weights': [],
         'proj_act': [],
         'proj_weights': [],
     }
@@ -109,8 +107,6 @@ def get_scaling_factors(
             weight_dict[f'_np:layers:{layer}:attention:dense:weights_scaling_factor'].item())
         scaling_factor['fc_act'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:activation_scaling_factor'].item())
         scaling_factor['fc_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:weights_scaling_factor'].item())
-        scaling_factor['gate_act'].append(weight_dict[f'_np:layers:{layer}:mlp:gate:activation_scaling_factor'].item())
-        scaling_factor['gate_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:gate:weights_scaling_factor'].item())
         scaling_factor['proj_act'].append(weight_dict[f'_np:layers:{layer}:mlp:proj:activation_scaling_factor'].item())
         scaling_factor['proj_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:proj:weights_scaling_factor'].item())
     # yapf: enable
