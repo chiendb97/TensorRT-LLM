@@ -26,6 +26,7 @@ from .modeling_utils import PretrainedConfig, PretrainedModel
 from .opt.model import OPTForCausalLM, OPTModel
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
+from .kilm.model import KiLMForCausalLM
 
 from .quantized.quant import quantize_model  # noqa # isort:skip
 
@@ -53,6 +54,7 @@ __all__ = [
     'ChatGLMModel',
     'BaichuanForCausalLM',
     'QWenForCausalLM',
+    'KiLMForCausalLM',
     'EncoderModel',
     'DecoderModel',
     'PretrainedConfig',

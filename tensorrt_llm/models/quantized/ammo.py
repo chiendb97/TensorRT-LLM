@@ -104,6 +104,7 @@ def quantize_and_export(
         ("gpt2", ): "gpt2",
         ("chatglm", ): "chatglm",
         ("qwen", ): "qwen",
+        ("kilm", ): "kilm",
     }
     for templates, model_type_target in model_lookup.items():
         if any(t in model_cls_name.lower() for t in templates):
@@ -120,7 +121,7 @@ def quantize_and_export(
 
     if export_path:
         with torch.inference_mode():
-            if qformat == "int4_awq" and model_type == "qwen" or \
+            if qformat == "int4_awq" and model_type in ["qwen", "kilm"] or \
                 model_type == "chatglm":
                 torch.save(model.state_dict(), export_path)
             else:
