@@ -187,13 +187,9 @@ def capture_activation_range(
                     functools.partial(stat_input_hook, name=name)))
     num_samples = min(num_samples, len(dataset))
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        line = dataset[i]["article"]
-        line = line + ' TL;DR: '
-        line = line.strip()
-        line = line.replace(" n't", "n't")
         # use make_content to generate prompt
         _, input_id_list = make_context(tokenizer=tokenizer,
-                                        query=line,
+                                        sample=dataset[i],
                                         history=[],
                                         system=system_prompt,
                                         chat_format=chat_format,

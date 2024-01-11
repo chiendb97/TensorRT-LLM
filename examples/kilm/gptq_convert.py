@@ -18,6 +18,14 @@ parser.add_argument(
     type=str,
     default=None,
 )
+parser.add_argument("--dataset_file",
+                    type=str,
+                    default=None,
+                    help="dataset file for quantize")
+parser.add_argument("--chat_format",
+                    type=str,
+                    default="raw",
+                    help="chat format")
 parser.add_argument('--tokenizer_dir',
                     type=str,
                     default=None,
@@ -46,20 +54,15 @@ tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_dir,
                                           use_fast=True,
                                           trust_remote_code=True)
 
-dataset_cnn = load_dataset("ccdv/cnn_dailymail", "3.0.0")
-dataset = dataset_cnn["test"]
+dataset = load_dataset("csv", data_files={'validation': args.dataset_file}, split='validation')
 
 num_samples = min(args.num_samples, len(dataset))
 examples = []
 for i in tqdm(range(num_samples), desc="tokenizing datasets"):
-    line = dataset[i]["article"]
-    line = line + ' TL;DR: '
-    line = line.strip()
-    line = line.replace(" n't", "n't")
     # use make_content to generate prompt
     raw_text, _ = make_context(
         tokenizer=tokenizer,
-        query=line,
+        sample=dataset[i],
         history=[],
     )
     example = tokenizer(raw_text)
