@@ -50,6 +50,7 @@ class ProgArgs:
     storage_type: str = "fp32"
     dataset_file: str = None
     chat_format: str = "raw"
+    calib_size: int = 32
     dataset_cache_dir: str = None
 
     @staticmethod
@@ -114,6 +115,10 @@ class ProgArgs:
                             type=str,
                             default=None,
                             help="dataset file for quantize")
+        parser.add_argument("--calib-size",
+                            type=int,
+                            default=32,
+                            help="Number of samples for calibration.")
         parser.add_argument("--chat-format",
                             type=str,
                             default="raw",
@@ -264,6 +269,7 @@ def hf_kilm_converter(args: ProgArgs):
             system_prompt=system_prompt,
             chat_format=chat_format,
             max_input_len=args.max_input_len,
+            num_samples=args.calib_size
         )
         if args.smoothquant is not None:
             smooth_kilm_model(model, act_range, args.smoothquant, kilm_smoother)

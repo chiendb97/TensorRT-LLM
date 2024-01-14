@@ -282,7 +282,7 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
         else:
             dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
 
-        dst = tensorrt_llm_kilm.layers[i].dense.qkv.bias
+        dst = tensorrt_llm_kilm.layers[i].attention.dense.bias
         t = fromfile(
             dir_path, 'model.layers.' + str(i) + '.attention.dense.bias.' +
                       str(mapping.tp_rank) + '.bin', [c_attn_out_dim])
