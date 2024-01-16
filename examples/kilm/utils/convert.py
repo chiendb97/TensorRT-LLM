@@ -187,18 +187,13 @@ def split_and_save_weight(tp_rank, saved_dir, split_factor, key, vals,
 
     if "ln_1.weight" in key or "ln_1.bias" in key or \
             "ln_2.weight" in key or "ln_2.bias" in key or \
-            "mlp.c_proj.bias" in key or "ln_f.weight" in key:
+            "mlp.c_proj.bias" in key or "ln_f.weight" in key or \
+            "attention.dense.bias" in key:
         # "final_layernorm.weight" in key or "final_layernorm.bias" in key:
 
         # shared weights, only need to convert the weights of rank 0
         if tp_rank == 0:
             save_val(vals[0], saved_dir, key)
-
-    elif "attention.dense.bias" in key:
-        cat_dim = 0
-        val = np.concatenate(vals, axis=cat_dim)
-        split_vals = np.split(val, split_factor, axis=cat_dim)
-        save_split(split_vals, saved_dir, key, tp_rank, split_factor)
 
     elif "attention.dense.weight" in key or "mlp.c_proj.weight" in key:
         cat_dim = 0
