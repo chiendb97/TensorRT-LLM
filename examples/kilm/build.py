@@ -326,6 +326,19 @@ def parse_arguments():
         action='store_true',
         help=
         'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
+    parser.add_argument(
+        '--gather_all_token_logits',
+        action='store_true',
+        default=False,
+        help='Enable both gather_context_logits and gather_generation_logits')
+    parser.add_argument('--gather_context_logits',
+                        action='store_true',
+                        default=False,
+                        help='Gather context logits')
+    parser.add_argument('--gather_generation_logits',
+                        action='store_true',
+                        default=False,
+                        help='Gather generation logits')
 
     args = parser.parse_args()
     assert not (
@@ -412,6 +425,10 @@ def parse_arguments():
     if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
         assert (args.tokens_per_block >=
                 128), "Context fMHA requires >= 128 tokens per block"
+
+    if args.gather_all_token_logits:
+        args.gather_context_logits = True
+        args.gather_generation_logits = True
 
     return args
 
@@ -570,6 +587,8 @@ def build_rank_engine(builder: Builder,
             use_cache=True,
             max_beam_width=args.max_beam_width,
             max_num_tokens=args.max_num_tokens,
+            gather_context_logits=args.gather_context_logits,
+            gather_generation_logits=args.gather_generation_logits,
         )
         tensorrt_llm_kilm(*inputs)
         if args.enable_debug_output:
@@ -639,6 +658,8 @@ def build(rank, args):
             fp8=args.quant_mode.has_fp8_qdq(),
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed,
+            gather_context_logits=args.gather_context_logits,
+            gather_generation_logits=args.gather_generation_logits,
             opt_level=args.builder_opt)
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)

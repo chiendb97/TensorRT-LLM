@@ -389,6 +389,8 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
         use_cache,
         max_beam_width: int = 1,
         max_num_tokens: int = None,
+        gather_context_logits: bool = False,
+        gather_generation_logits: bool = False,
     ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -426,6 +428,8 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
             num_heads=self.num_heads,
             mapping=self.mapping,
             max_num_tokens=max_num_tokens,
+            gather_context_logits=gather_context_logits,
+            gather_generation_logits=gather_generation_logits,
         )
 
         return (
