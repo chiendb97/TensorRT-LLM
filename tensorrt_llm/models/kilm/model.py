@@ -12,11 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
 
 import tensorrt as trt
-
-from tensorrt_llm.plugin.plugin import init_all_reduce_helper
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
@@ -24,7 +21,7 @@ from ...functional import (Tensor, gather_last_token_logits, partial, recv,
                            send, unary)
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
-                       PositionEmbeddingType, RmsNorm)
+                       PositionEmbeddingType, PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...quantization import QuantMode
@@ -32,6 +29,54 @@ from ..generation_mixin import GenerationMixin
 
 log = partial(unary, op=trt.UnaryOperation.LOG)
 ceil = partial(unary, op=trt.UnaryOperation.CEIL)
+
+
+class GPTEmbedding(Module):
+
+    def __init__(self,
+                 vocab_size,
+                 hidden_size,
+                 max_position_embeddings,
+                 position_embedding_type=PositionEmbeddingType.learned_absolute,
+                 dtype=None,
+                 use_prompt_tuning=False,
+                 tensor_parallel=1,
+                 tensor_parallel_group=None,
+                 sharding_dim=0,
+                 tp_rank=None):
+        super().__init__()
+        self.max_position_embeddings = max_position_embeddings
+        self.position_embedding_type = position_embedding_type
+        self.use_prompt_tuning = use_prompt_tuning
+
+        EmbeddingCls = PromptTuningEmbedding if use_prompt_tuning else Embedding
+        self.vocab_embedding = EmbeddingCls(vocab_size,
+                                            hidden_size,
+                                            dtype=dtype,
+                                            tp_size=tensor_parallel,
+                                            tp_group=tensor_parallel_group,
+                                            sharding_dim=sharding_dim,
+                                            tp_rank=tp_rank)
+
+        if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
+            self.position_embedding = Embedding(max_position_embeddings,
+                                                hidden_size,
+                                                dtype=dtype)
+
+    def forward(self,
+                input_ids,
+                position_ids,
+                prompt_embedding_table=None,
+                prompt_tasks=None,
+                prompt_vocab_size=None):
+        args = []
+        if self.use_prompt_tuning:
+            args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size]
+        x = self.vocab_embedding(input_ids, *args)
+        if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
+            x = x + self.position_embedding(position_ids)
+
+        return x
 
 
 class KiLMBlock(Module):
@@ -92,8 +137,7 @@ class KiLMBlock(Module):
             tp_group=self.tp_group,
             tp_size=self.tp_size,
             quant_mode=quant_mode,
-            dense_bias=bias
-        )
+            dense_bias=bias)
         if not mlp_hidden_size:
             mlp_hidden_size = hidden_size * 4
 
@@ -104,8 +148,7 @@ class KiLMBlock(Module):
                             bias=False,
                             tp_group=tp_group,
                             tp_size=tp_size,
-                            quant_mode=quant_mode,
-                            instance_id=2 * layer_id + 1)
+                            quant_mode=quant_mode)
         self.ln_2 = RmsNorm(normalized_shape=hidden_size,
                             eps=rms_norm_eps,
                             dtype=dtype)
@@ -157,7 +200,7 @@ class KiLMModel(Module):
         mlp_hidden_size=None,
         position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
         neox_rotary_style=True,
-        bias=False,
+        bias=True,
         rotary_base=10000.0,
         rotary_scaling=None,
         mapping=Mapping(),
@@ -165,16 +208,22 @@ class KiLMModel(Module):
         use_parallel_embedding=False,
         embedding_sharding_dim=0,
         rms_norm_eps=1e-06,
+        use_prompt_tuning=False,
     ):
         super().__init__()
         self.mapping = mapping
         if self.mapping.is_first_pp_rank():
-            self.vocab_embedding = Embedding(
-                num_embeddings=vocab_size,
-                embedding_dim=hidden_size,
+            self.embedding = GPTEmbedding(
+                vocab_size,
+                hidden_size,
+                max_position_embeddings,
+                position_embedding_type=PositionEmbeddingType.relative,
                 dtype=dtype,
-                tp_size=mapping.tp_size if use_parallel_embedding else 1,
-                tp_group=mapping.tp_group if use_parallel_embedding else None,
+                use_prompt_tuning=use_prompt_tuning,
+                tensor_parallel=mapping.tp_size
+                if use_parallel_embedding else 1,
+                tensor_parallel_group=mapping.tp_group
+                if use_parallel_embedding else None,
                 sharding_dim=embedding_sharding_dim,
                 tp_rank=mapping.tp_rank)
 
@@ -210,7 +259,10 @@ class KiLMModel(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None):
+                hidden_states=None,
+                prompt_embedding_table=None,
+                prompt_tasks=None,
+                prompt_vocab_size=None):
 
         if kv_cache_params.past_key_value is None:
             tuple([None] * len(self.layers))
@@ -221,7 +273,9 @@ class KiLMModel(Module):
             presents = []
 
         if self.mapping.is_first_pp_rank():
-            hidden_states = self.vocab_embedding(input_ids)
+            hidden_states = self.embedding(input_ids, position_ids,
+                                           prompt_embedding_table, prompt_tasks,
+                                           prompt_vocab_size)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
         self.register_network_output(f"embd", hidden_states)
@@ -283,8 +337,8 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
         use_parallel_embedding=False,
         embedding_sharding_dim=0,
         rms_norm_eps=1e-06,
+        use_prompt_tuning=False,
     ):
-        init_all_reduce_helper()
         self.mapping = mapping
         if isinstance(dtype, str):
             self.dtype = str_dtype_to_trt(dtype)
@@ -313,25 +367,28 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
         self.quant_mode = quant_mode
         self.use_parallel_embedding = use_parallel_embedding
         self.embedding_sharding_dim = embedding_sharding_dim
+        self._use_prompt_tuning = use_prompt_tuning
 
-        super().__init__(num_layers=num_layers,
-                         num_heads=num_heads,
-                         hidden_size=hidden_size,
-                         seq_length=seq_length,
-                         vocab_size=vocab_size,
-                         hidden_act=hidden_act,
-                         max_position_embeddings=max_position_embeddings,
-                         dtype=dtype,
-                         mlp_hidden_size=mlp_hidden_size,
-                         neox_rotary_style=neox_rotary_style,
-                         bias=True,
-                         rotary_base=rotary_base,
-                         rotary_scaling=rotary_scaling,
-                         mapping=mapping,
-                         quant_mode=quant_mode,
-                         use_parallel_embedding=use_parallel_embedding,
-                         embedding_sharding_dim=embedding_sharding_dim,
-                         rms_norm_eps=rms_norm_eps)
+        super().__init__(
+            num_layers=num_layers,
+            num_heads=num_heads,
+            hidden_size=hidden_size,
+            seq_length=seq_length,
+            vocab_size=vocab_size,
+            hidden_act=hidden_act,
+            max_position_embeddings=max_position_embeddings,
+            dtype=dtype,
+            mlp_hidden_size=mlp_hidden_size,
+            neox_rotary_style=neox_rotary_style,
+            rotary_base=rotary_base,
+            rotary_scaling=rotary_scaling,
+            mapping=mapping,
+            quant_mode=quant_mode,
+            use_parallel_embedding=use_parallel_embedding,
+            embedding_sharding_dim=embedding_sharding_dim,
+            rms_norm_eps=rms_norm_eps,
+            use_prompt_tuning=use_prompt_tuning,
+        )
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         if self.mapping.is_last_pp_rank():
             self.lm_head = ColumnLinear(hidden_size,
@@ -349,10 +406,14 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
                 last_token_ids=None,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None):
+                hidden_states=None,
+                prompt_embedding_table=None,
+                prompt_tasks=None,
+                prompt_vocab_size=None):
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         kv_cache_params, attention_params,
-                                        hidden_states)
+                                        hidden_states, prompt_embedding_table,
+                                        prompt_tasks, prompt_vocab_size)
         if use_cache:
             hidden_states, presents = hidden_states
 
@@ -383,12 +444,11 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
         self,
         max_batch_size,
         max_input_len,
-        max_new_tokens,
+        max_seq_len,
         use_cache,
         max_beam_width: int = 1,
         max_num_tokens: int = None,
-        gather_context_logits: bool = False,
-        gather_generation_logits: bool = False,
+        prompt_embedding_table_size=256,
     ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -408,14 +468,14 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
         ).plugin_config.use_custom_all_reduce
 
         model_inputs = self.prepare_basic_inputs(
-            max_batch_size,
-            max_beam_width,
-            max_input_len,
-            max_new_tokens,
-            self.num_kv_heads,
-            head_size,
-            self.num_layers,
-            self.kv_dtype,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
+            max_seq_len=max_seq_len,
+            num_kv_heads=self.num_kv_heads,
+            head_size=head_size,
+            num_layers=self.num_layers,
+            kv_dtype=self.kv_dtype,
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin,
@@ -426,14 +486,11 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
             num_heads=self.num_heads,
             mapping=self.mapping,
             max_num_tokens=max_num_tokens,
-            gather_context_logits=gather_context_logits,
-            gather_generation_logits=gather_generation_logits,
+            prompt_embedding_table_size=prompt_embedding_table_size,
         )
 
         return (
-            model_inputs['input_ids'],
-            model_inputs['position_ids'],
-            True,
+            model_inputs['input_ids'], model_inputs['position_ids'], True,
             model_inputs['last_token_ids'],
             KeyValueCacheParams(
                 past_key_value=model_inputs['past_key_value'],
@@ -454,4 +511,6 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
                 host_context_lengths=model_inputs['host_context_lengths'],
                 max_context_length=max_input_len,
                 host_request_types=model_inputs['host_request_types']),
-            model_inputs['hidden_states_input'])
+            model_inputs['hidden_states_input'],
+            model_inputs['prompt_embedding_table'], model_inputs['tasks'],
+            model_inputs['prompt_vocab_size'])
