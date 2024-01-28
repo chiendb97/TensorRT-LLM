@@ -442,14 +442,6 @@ def load_from_hf_kilm(tensorrt_llm_kilm: tensorrt_llm.models.KiLMForCausalLM,
         elif 'transformer.ln_f.weight' in k:
             tensorrt_llm_kilm.ln_f.weight.value = v
         elif 'lm_head.weight' in k:
-            [vocab_size, _] = v.shape
-            if vocab_size % mapping.tp_size != 0:
-                # padding
-                vocab_size_padded = tensorrt_llm_kilm.lm_head.out_features * mapping.tp_size
-                pad_width = vocab_size_padded - vocab_size
-                v = np.pad(v, ((0, pad_width), (0, 0)),
-                                        'constant',
-                                        constant_values=0)
             tensorrt_llm_kilm.lm_head.weight.value = np.ascontiguousarray(
                 split(v, mapping.tp_size, mapping.tp_rank))
         else:
@@ -665,7 +657,7 @@ def load_from_gptq_kilm(
     layer_ids = [
         extract_layer_idx(key) for key in model_params.keys()
         if 'visual' not in key
-    ]
+    ]  #exclude 'visual' for Qwen-VL case
     layer_ids = [
         int(layer_idx) for layer_idx in layer_ids if layer_idx is not None
     ]
@@ -685,7 +677,6 @@ def load_from_gptq_kilm(
                       desc="loading attention weight..."):
         prefix = f"transformer.h.{layer}.attn."
         split_qkv_suf = []
-
         for suf in suffixs:
             qkv_part = model_params[prefix + "c_attn." + suf].cpu()
             q_emb = qkv_part.shape[1] // 3
@@ -924,7 +915,7 @@ def load_from_awq_kilm(tensorrt_llm_kilm: KiLMForCausalLM,
         split_amax = split_amax.T.contiguous()
         pre_quant_scale = model_params[
             mPrefix + ".input_quantizer._pre_quant_scale"].reshape(
-            (1, model_emb)).to(torch_dtype)
+                (1, model_emb)).to(torch_dtype)
         split_scale = split_amax / 8.0
         mOp.weight.value = AWQ_quantize_pack_preprocess(split_v, split_scale)
         mOp.weights_scaling_factor.value = split_scale.cpu().numpy()
@@ -1001,7 +992,6 @@ def load_from_awq_kilm(tensorrt_llm_kilm: KiLMForCausalLM,
         mOp = tensorrt_llm_kilm.layers[layer_idx].attention.dense
         process_and_assign_weight(model_params, mPrefix, mOp, 0)
 
-        # Attention Dense (out_proj) Linear Bias
         th_bias = model_params[prefix + "attn.c_proj.bias"].cpu().to(
             torch_dtype).contiguous()
         tensorrt_llm_kilm.layers[

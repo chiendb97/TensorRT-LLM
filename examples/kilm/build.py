@@ -347,6 +347,7 @@ def parse_arguments():
         default=False,
         choices=['float16', 'float32', 'bfloat16'],
         help="Activates the lookup plugin which enables embedding sharing.")
+
     parser.add_argument(
         '--gather_all_token_logits',
         action='store_true',
@@ -423,6 +424,7 @@ def parse_arguments():
         args.hidden_act = "silu"
         args.kv_channels = hf_config.kv_channels
         args.rotary_emb_base = hf_config.rotary_emb_base
+
     if args.n_kv_head is not None and args.n_kv_head != args.n_head:
         assert (args.n_head % args.n_kv_head) == 0, \
             "MQA/GQA requires the number of heads to be divisible by the number of K/V heads."

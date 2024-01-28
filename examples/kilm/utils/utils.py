@@ -19,7 +19,7 @@ from transformers import PreTrainedTokenizer
 
 def make_context(
     tokenizer: PreTrainedTokenizer,
-    sample=None,
+    query: str,
     history: List[Tuple[str, str]] = None,
     system: str = "You are a helpful assistant.",
     max_input_length:
@@ -75,13 +75,13 @@ def make_context(
         context_tokens = system_tokens + context_tokens
         raw_text = f"{im_start}{system_text}{im_end}" + raw_text
         context_tokens += (nl_tokens + im_start_tokens +
-                           _tokenize_str("user", sample['user'])[1] + im_end_tokens +
+                           _tokenize_str("user", query)[1] + im_end_tokens +
                            nl_tokens + im_start_tokens +
                            tokenizer.encode("assistant") + nl_tokens)
-        raw_text += f"\n{im_start}user\n{sample['user']}{im_end}\n{im_start}assistant\n{sample['assistant']}{im_end}\n"
+        raw_text += f"\n{im_start}user\n{query}{im_end}\n{im_start}assistant\n"
 
     elif chat_format == "raw":
-        raw_text = sample['text']
+        raw_text = query
         context_tokens = tokenizer.encode(raw_text)
     else:
         raise NotImplementedError(f"Unknown chat format {chat_format!r}")

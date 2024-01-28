@@ -48,9 +48,6 @@ class ProgArgs:
     smoothquant: float = None
     model: str = "kilm"
     storage_type: str = "fp32"
-    dataset_file: str = None
-    chat_format: str = "raw"
-    calib_size: int = 32
     dataset_cache_dir: str = None
 
     @staticmethod
@@ -111,18 +108,10 @@ class ProgArgs:
                             type=str,
                             default="float16",
                             choices=["float32", "float16", "bfloat16"])
-        parser.add_argument("--dataset-file",
+        parser.add_argument("--dataset-cache-dir",
                             type=str,
                             default=None,
-                            help="dataset file for quantize")
-        parser.add_argument("--calib-size",
-                            type=int,
-                            default=32,
-                            help="Number of samples for calibration.")
-        parser.add_argument("--chat-format",
-                            type=str,
-                            default="raw",
-                            help="chat format")
+                            help="cache dir to load the hugging face dataset")
         return ProgArgs(**vars(parser.parse_args(args)))
 
 
@@ -250,18 +239,22 @@ def hf_kilm_converter(args: ProgArgs):
             "TOKENIZERS_PARALLELISM", "false")
         from datasets import load_dataset
 
-        dataset = load_dataset("csv", data_files={'validation': args.dataset_file}, split='validation')
+        # copy from summarize.py
+        dataset_cnn = load_dataset("ccdv/cnn_dailymail", '3.0.0')
+        dataset = dataset_cnn["test"]
         tokenizer = AutoTokenizer.from_pretrained(
             args.in_file,
             legacy=False,
             padding_side='left',
             trust_remote_code=True,
         )
-
-        chat_format = args.chat_format
+        gen_config_path = os.path.join(args.in_file, 'generation_config.json')
+        with open(gen_config_path, 'r') as f:
+            gen_config = json.load(f)
+        chat_format = gen_config['chat_format']
         tokenizer.pad_token_id = tokenizer.im_end_id
         # use this prompt to make chat model do summarize
-        system_prompt = "You are a helpful assistant."
+        system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
         act_range = capture_activation_range(
             model,
             tokenizer,
@@ -269,7 +262,6 @@ def hf_kilm_converter(args: ProgArgs):
             system_prompt=system_prompt,
             chat_format=chat_format,
             max_input_len=args.max_input_len,
-            num_samples=args.calib_size
         )
         if args.smoothquant is not None:
             smooth_kilm_model(model, act_range, args.smoothquant, kilm_smoother)
