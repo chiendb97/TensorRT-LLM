@@ -188,8 +188,7 @@ def split_and_save_weight(tp_rank, saved_dir, split_factor, key, vals,
     if "ln_1.weight" in key or "ln_1.bias" in key or \
             "attention.dense.bias" in key or \
             "ln_2.weight" in key or "ln_2.bias" in key or \
-            "mlp.c_proj.bias" in key or "ln_f.weight" in key or \
-            "attention.dense.bias" in key:
+            "mlp.c_proj.bias" in key or "ln_f.weight" in key:
         # "final_layernorm.weight" in key or "final_layernorm.bias" in key:
 
         # shared weights, only need to convert the weights of rank 0

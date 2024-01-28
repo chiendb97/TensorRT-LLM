@@ -19,11 +19,10 @@ from transformers import PreTrainedTokenizer
 
 def make_context(
     tokenizer: PreTrainedTokenizer,
-    query: str,
+    sample=None,
     history: List[Tuple[str, str]] = None,
     system: str = "You are a helpful assistant.",
-    max_input_length:
-    int = 2048,  # if you want to change this, you need to change the max_input_len in tensorrt_llm_july-release-v1/examples/kilm/build.py
+    max_input_length: int = 2048,
     max_window_size: int = 6144,
     chat_format: str = "chatml",
 ):
@@ -75,13 +74,13 @@ def make_context(
         context_tokens = system_tokens + context_tokens
         raw_text = f"{im_start}{system_text}{im_end}" + raw_text
         context_tokens += (nl_tokens + im_start_tokens +
-                           _tokenize_str("user", query)[1] + im_end_tokens +
+                           _tokenize_str("user", sample['user'])[1] + im_end_tokens +
                            nl_tokens + im_start_tokens +
                            tokenizer.encode("assistant") + nl_tokens)
-        raw_text += f"\n{im_start}user\n{query}{im_end}\n{im_start}assistant\n"
+        raw_text += f"\n{im_start}user\n{sample['user']}{im_end}\n{im_start}assistant\n{sample['assistant']}{im_end}\n"
 
     elif chat_format == "raw":
-        raw_text = query
+        raw_text = sample['text']
         context_tokens = tokenizer.encode(raw_text)
     else:
         raise NotImplementedError(f"Unknown chat format {chat_format!r}")

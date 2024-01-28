@@ -442,6 +442,14 @@ def load_from_hf_kilm(tensorrt_llm_kilm: tensorrt_llm.models.KiLMForCausalLM,
         elif 'transformer.ln_f.weight' in k:
             tensorrt_llm_kilm.ln_f.weight.value = v
         elif 'lm_head.weight' in k:
+            [vocab_size, _] = v.shape
+            if vocab_size % mapping.tp_size != 0:
+                # padding
+                vocab_size_padded = tensorrt_llm_kilm.lm_head.out_features * mapping.tp_size
+                pad_width = vocab_size_padded - vocab_size
+                v = np.pad(v, ((0, pad_width), (0, 0)),
+                           'constant',
+                           constant_values=0)
             tensorrt_llm_kilm.lm_head.weight.value = np.ascontiguousarray(
                 split(v, mapping.tp_size, mapping.tp_rank))
         else:
@@ -657,7 +665,7 @@ def load_from_gptq_kilm(
     layer_ids = [
         extract_layer_idx(key) for key in model_params.keys()
         if 'visual' not in key
-    ]  #exclude 'visual' for Qwen-VL case
+    ]
     layer_ids = [
         int(layer_idx) for layer_idx in layer_ids if layer_idx is not None
     ]
@@ -838,7 +846,7 @@ def load_from_awq_kilm(tensorrt_llm_kilm: KiLMForCausalLM,
                        mapping=Mapping(),
                        dtype="float16"):
     tensorrt_llm.logger.info(
-        'Loading weights from groupwise AWQ Qwen safetensors...')
+        'Loading weights from groupwise AWQ KiLM safetensors...')
     tik = time.time()
 
     if quant_ckpt_path.endswith(".safetensors"):
