@@ -318,7 +318,7 @@ def _smooth_quantize_kilm(model, quant_mode):
             num_layers=layer.num_layers,
             apply_query_key_layer_scaling=layer.apply_query_key_layer_scaling,
             attention_mask_type=layer.attention_mask_type,
-            bias=layer.bias,
+            bias=True,
             qkv_bias_only=False,
             dtype=layer.dtype,
             position_embedding_type=layer.position_embedding_type,
@@ -331,7 +331,7 @@ def _smooth_quantize_kilm(model, quant_mode):
                                         2,
                                         hidden_act=layer.hidden_act,
                                         dtype=layer.dtype,
-                                        bias=layer.bias,
+                                        bias=False,
                                         tp_group=layer.tp_group,
                                         tp_size=layer.tp_size,
                                         quant_mode=quant_mode)
