@@ -52,6 +52,8 @@ class ProgArgs:
     chat_format: str = "raw"
     calib_size: int = 32
     dataset_cache_dir: str = None
+    load_model_on_cpu: bool = False
+    convert_model_on_cpu: bool = False
 
     @staticmethod
     def parse(args=None) -> 'ProgArgs':
@@ -123,6 +125,8 @@ class ProgArgs:
                             type=str,
                             default="raw",
                             help="chat format")
+        parser.add_argument("--load-model-on-cpu", action="store_true")
+        parser.add_argument("--convert-model-on-cpu", action="store_true")
         return ProgArgs(**vars(parser.parse_args(args)))
 
 
@@ -234,13 +238,22 @@ def hf_kilm_converter(args: ProgArgs):
     saved_dir.mkdir(parents=True, exist_ok=True)
 
     # load position_embedding from rank 0
-    model = AutoModelForCausalLM.from_pretrained(
-        args.in_file,
-        device_map=
-        "auto",  # if you gpu memory is not enough, you can set device_map="cpu"
-        trust_remote_code=True,
-        torch_dtype=str_dtype_to_torch(args.storage_type),
-    ).half()  # if you gpu memory is not enough, you can set .half() to .float()
+    if args.load_model_on_cpu:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.in_file,
+            device_map=
+            "cpu",  # if you gpu memory is not enough, you can set device_map="cpu"
+            trust_remote_code=True,
+            torch_dtype=str_dtype_to_torch(args.storage_type),
+        ).double()  # if you gpu memory is not enough, you can set .half() to .float()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.in_file,
+            device_map=
+            "auto",  # if you gpu memory is not enough, you can set device_map="cpu"
+            trust_remote_code=True,
+            torch_dtype=str_dtype_to_torch(args.storage_type),
+        ).half()  # if you gpu memory is not enough, you can set .half() to .float()
     model.generation_config = GenerationConfig.from_pretrained(
         args.in_file, trust_remote_code=True)
     act_range = {}
@@ -304,6 +317,9 @@ def hf_kilm_converter(args: ProgArgs):
         if "weight" not in name and "bias" not in name:
             continue
         converted_name = convert_kilm_name(name)
+
+        if args.convert_model_on_cpu:
+            param = param.cpu()
         if name.replace(".weight", "") in kilm_smoother.keys():
             smoother = kilm_smoother[name.replace(".weight", "")]
             starmap_arg = (
