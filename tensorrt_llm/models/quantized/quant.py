@@ -347,8 +347,9 @@ def _smooth_quantize_kilm(model, quant_mode):
 def _smooth_quantize_chatglm(model, quant_mode):
     assert quant_mode.has_act_and_weight_quant()
     for layer in model.layers:
-        assert hasattr(layer, "pre_norm"), "The layer has no pre_norm"
-        layer.pre_norm = SmoothQuantRmsNorm(
+        assert hasattr(layer,
+                       "input_layernorm"), "The layer has no input_layernorm"
+        layer.input_layernorm = SmoothQuantRmsNorm(
             normalized_shape=layer.hidden_size,
             dtype=layer.dtype,
             quant_mode=quant_mode,
@@ -382,8 +383,9 @@ def _smooth_quantize_chatglm(model, quant_mode):
             quant_mode=quant_mode,
             bias=layer.dense_bias,
         )
-        assert hasattr(layer, "post_norm"), "The layer has no post_norm"
-        layer.post_norm = SmoothQuantRmsNorm(
+        assert hasattr(layer,
+                       "post_layernorm"), "The layer has no post_layernorm"
+        layer.post_layernorm = SmoothQuantRmsNorm(
             normalized_shape=layer.hidden_size,
             dtype=layer.dtype,
             quant_mode=quant_mode,
@@ -393,12 +395,12 @@ def _smooth_quantize_chatglm(model, quant_mode):
 
 def _smooth_quantize(model, quant_mode):
     from ...models import (BaichuanForCausalLM, BloomForCausalLM,
-                           ChatGLMHeadModel, GPTLMHeadModel, LLaMAForCausalLM,
+                           ChatGLMForCausalLM, GPTLMHeadModel, LLaMAForCausalLM,
                            QWenForCausalLM, KiLMForCausalLM)
     assert isinstance(model, GPTLMHeadModel) or isinstance(model, LLaMAForCausalLM) \
             or isinstance(model, BloomForCausalLM) or isinstance(model, BaichuanForCausalLM) \
             or isinstance(model, QWenForCausalLM) or isinstance(model, KiLMForCausalLM) \
-            or isinstance(model, ChatGLMHeadModel), \
+            or isinstance(model, ChatGLMForCausalLM), \
             "Only GPTLMHeadModel, LLaMAForCausalLM BloomForCausalLM and BaichuanForCausalLM are well tested now"
     if isinstance(model, GPTLMHeadModel):
         return _smooth_quantize_gpt(model, quant_mode)
@@ -412,7 +414,7 @@ def _smooth_quantize(model, quant_mode):
         return _smooth_quantize_qwen(model, quant_mode)
     elif isinstance(model, KiLMForCausalLM):
         return _smooth_quantize_kilm(model, quant_mode)
-    elif isinstance(model, ChatGLMHeadModel):
+    elif isinstance(model, ChatGLMForCausalLM):
         return _smooth_quantize_chatglm(model, quant_mode)
     else:
         assert False, f"Model {type(model).__name__} is not supported by SmoothQuant yet"
@@ -498,7 +500,7 @@ def get_dummy_quant_scales(num_layers):
         'proj_weights': [0.99 for _ in range(num_layers)],
         'qkv_act': [0.99 for _ in range(num_layers)],
         'qkv_weights': [0.99 for _ in range(num_layers)],
-        'qkv_output': [5.0 for _ in range(num_layers)],
+        'qkv_output': [1.0 for _ in range(num_layers)],
         'dense_act': [0.99 for _ in range(num_layers)],
         'dense_weights': [0.99 for _ in range(num_layers)],
     }

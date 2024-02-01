@@ -17,14 +17,8 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [2024/30/01] [ New **XQA-kernel** provides **2.4x more Llama-70B throughput** within the same latency budget](./docs/source/blogs/XQA-kernel.md)
 * [2023/12/04] [**Falcon-180B** on a **single H200** GPU with INT4 AWQ, and **6.7x faster Llama-70B** over A100](./docs/source/blogs/Falcon180B-H200.md)
-
-<img src="./docs/source/blogs/media/Falcon180B-H200_H200vA100.png" alt="H200 TPS" width="400" height="auto">
-
-H200 with INT4 AWQ, runs Falcon-180B on a _single_ GPU.
-
-H200 is now 2.4x faster on Llama-70B with recent improvements to TensorRT-LLM GQA; up to 6.7x faster than A100.
-
 * [2023/11/27] [SageMaker LMI now supports TensorRT-LLM - improves throughput by 60%, compared to previous version](https://aws.amazon.com/blogs/machine-learning/boost-inference-performance-for-llms-with-new-amazon-sagemaker-containers/)
 * [2023/11/13] [H200 achieves nearly 12,000 tok/sec on Llama2-13B](./docs/source/blogs/H200launch.md)
 * [2023/10/22] [🚀 RAG on Windows using TensorRT-LLM and LlamaIndex 🦙](https://github.com/NVIDIA/trt-llm-rag-windows#readme)
@@ -112,7 +106,8 @@ After installing the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacent
 please run the following commands to install TensorRT-LLM for x86_64 users.
 
 ```bash
-# Obtain and start the basic docker image environment
+# Please use the `nvidia-docker` application, using only `docker` may cause exceptions.
+# Obtain and start the basic docker image environment.
 nvidia-docker run --entrypoint /bin/bash -it nvidia/cuda:12.1.0-devel-ubuntu22.04
 
 # Install dependencies, TensorRT-LLM requires Python 3.10
@@ -124,7 +119,7 @@ apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenm
 pip3 install tensorrt_llm -U --pre --extra-index-url https://pypi.nvidia.com
 
 # Check installation
-python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
+python3 -c "import tensorrt_llm"
 ```
 
 For developers who have the best performance requirements, debugging needs, or use the aarch64 architecture,
@@ -173,8 +168,8 @@ python convert_checkpoint.py --model_dir ./bloom/560M/ \
                 --output_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/
 # May need to add trtllm-build to PATH, export PATH=/usr/local/bin:$PATH
 trtllm-build --checkpoint_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
+                --gpt_attention_plugin float16 \
                 --output_dir ./bloom/560M/trt_engines/fp16/1-gpu/
 ```
 
@@ -270,7 +265,7 @@ The list of supported models is:
 
 * [Baichuan](examples/baichuan)
 * [BART](examples/enc_dec)
-* [Bert](examples/bert)
+* [BERT](examples/bert)
 * [Blip2](examples/blip2)
 * [BLOOM](examples/bloom)
 * [ChatGLM](examples/chatglm)
@@ -292,6 +287,7 @@ The list of supported models is:
 * [Phi-1.5/Phi-2](examples/phi)
 * [Qwen](examples/qwen)
 * [Replit Code](examples/mpt)
+* [RoBERTa](examples/bert)
 * [SantaCoder](examples/gpt)
 * [StarCoder](examples/gpt)
 * [T5](examples/enc_dec)
