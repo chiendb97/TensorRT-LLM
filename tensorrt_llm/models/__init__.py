@@ -31,7 +31,6 @@ from .opt.model import OPTForCausalLM, OPTModel
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
 from .kilm.model import KiLMForCausalLM
-from .skywork.model import SkyworkForCausalLM
 
 from .quantized.quant import quantize_model  # noqa # isort:skip
 
@@ -89,5 +88,5 @@ MODEL_MAP = {
     'InternLMForCausalLM': LLaMAForCausalLM,
     'MedusaForCausalLM': MedusaForCausalLm,
     'BaichuanForCausalLM': BaichuanForCausalLM,
-    'SkyworkForCausalLM': SkyworkForCausalLM,
+    'SkyworkForCausalLM': LLaMAForCausalLM,
 }
