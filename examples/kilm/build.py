@@ -355,6 +355,19 @@ def parse_arguments():
                         action='store_true',
                         default=False,
                         help='Gather generation logits')
+    parser.add_argument(
+        '--max_draft_len',
+        type=int,
+        default=0,
+        help=
+        'Maximum lengths of draft tokens for speculative decoding target model.'
+    )
+    parser.add_argument(
+        '--use_paged_context_fmha',
+        action='store_true',
+        help=
+        'Activates paged context FMHA. This mode of the context FMHA is required for chunked context, speculative decoding and reuse of KV cache blocks. Context FMHA performance is worse when this mode is on.'
+    )
 
     args = parser.parse_args()
     assert not (
@@ -598,8 +611,13 @@ def build_rank_engine(builder: Builder,
 
     if args.paged_kv_cache:
         network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
+
     if args.use_lookup_plugin:
         network.plugin_config.set_lookup_plugin(dtype=args.dtype)
+
+    if args.use_paged_context_fmha or args.max_draft_len > 0:
+        assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc, "context fmha must be enabled"
+        network.plugin_config.set_paged_context_fmha()
 
     with net_guard(network):
         # Prepare
@@ -616,6 +634,7 @@ def build_rank_engine(builder: Builder,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
             gather_context_logits=args.gather_context_logits,
             gather_generation_logits=args.gather_generation_logits,
+            max_draft_len=args.max_draft_len,
         )
         tensorrt_llm_kilm(*inputs)
         if args.enable_debug_output:
@@ -682,6 +701,7 @@ def build(rank, args):
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
+            max_draft_len=args.max_draft_len,
             int8=int8_trt_flag,
             fp8=args.quant_mode.has_fp8_qdq(),
             quant_mode=args.quant_mode,
