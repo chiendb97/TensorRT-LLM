@@ -193,15 +193,23 @@ def hf_gpt_converter(args: ProgArgs):
     saved_dir = Path(args.out_dir) / f"{infer_tp}-gpu"
     saved_dir.mkdir(parents=True, exist_ok=True)
 
-    torch_dtype = torch.float16 if args.storage_type == 'float16' else torch.float32
     # load position_embedding from rank 0
-    model = AutoModelForCausalLM.from_pretrained(args.in_file,
-                                                 torch_dtype=torch_dtype,
-                                                 device_map="auto",
-                                                 trust_remote_code=True)
     if args.load_model_on_cpu:
-        model = model.cpu()
-        torch.cuda.empty_cache()
+        model = AutoModelForCausalLM.from_pretrained(
+            args.in_file,
+            device_map=
+            "cpu",  # if you gpu memory is not enough, you can set device_map="cpu"
+            trust_remote_code=True,
+            torch_dtype=str_dtype_to_torch(args.storage_type),
+        ).double()  # if you gpu memory is not enough, you can set .half() to .float()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.in_file,
+            device_map=
+            "auto",  # if you gpu memory is not enough, you can set device_map="cpu"
+            trust_remote_code=True,
+            torch_dtype=str_dtype_to_torch(args.storage_type),
+        ).half()  # if you gpu memory is not enough, you can set .half() to .float()
     act_range = {}
     if args.smoothquant is not None or args.calibrate_kv_cache:
         os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
