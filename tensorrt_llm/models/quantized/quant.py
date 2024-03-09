@@ -307,15 +307,16 @@ def _smooth_quantize_qwen(model, quant_mode):
 
 def _smooth_quantize_kilm(model, quant_mode):
     assert quant_mode.has_act_and_weight_quant()
-    for layer in model.layers:
+    for layer_idx, layer in enumerate(model.layers):
         assert hasattr(layer, "ln_1"), "The layer has no ln_1"
         layer.ln_1 = SmoothQuantRmsNorm(normalized_shape=layer.hidden_size,
                                         dtype=layer.dtype,
                                         quant_mode=quant_mode)
         assert hasattr(layer, "attention"), "The layer has no attention"
         layer.attention = SmoothQuantAttention(
-            layer.hidden_size,
-            layer.num_attention_heads,
+            layer_idx=layer_idx,
+            hidden_size=layer.hidden_size,
+            num_attention_heads=layer.num_attention_heads,
             max_position_embeddings=layer.max_position_embeddings,
             num_layers=layer.num_layers,
             apply_query_key_layer_scaling=layer.apply_query_key_layer_scaling,
@@ -330,7 +331,7 @@ def _smooth_quantize_kilm(model, quant_mode):
         assert hasattr(layer, "mlp"), "The layer has no mlp"
         layer.mlp = SmoothQuantGatedMLP(hidden_size=layer.hidden_size,
                                         ffn_hidden_size=layer.mlp_hidden_size //
-                                        2,
+                                                        2,
                                         hidden_act=layer.hidden_act,
                                         dtype=layer.dtype,
                                         bias=False,

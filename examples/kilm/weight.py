@@ -16,6 +16,7 @@ import configparser
 import time
 from operator import attrgetter
 from pathlib import Path
+from typing import Union
 
 import numpy as np
 import torch
@@ -49,16 +50,24 @@ def extract_layer_idx(name):
     return None
 
 
-def split(v, tp_size, idx, dim=0):
+def split(v: Union[np.ndarray, torch.Tensor],
+          tp_size: int,
+          tp_rank: int,
+          dim=0):
     if tp_size == 1:
         return v
-    if len(v.shape) == 1:
-        return np.ascontiguousarray(np.split(v, tp_size)[idx])
+    assert len(v.shape) > 1 or dim == 0
+    if isinstance(v, np.ndarray):
+        return np.ascontiguousarray(
+            np.split(v, tp_size, axis=dim)[tp_rank].copy())
     else:
-        return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx])
+        assert v.shape[dim] % tp_size == 0, \
+            'Unable to split: shape={v.shape} (dim={dim}) tp_size={tp_size}.'
+        split_size = v.shape[dim] // tp_size
+        return v.split(split_size, dim=dim)[tp_rank].clone().detach()
 
 
-def parse_ft_config(ini_file):
+def parse_bin_config(ini_file):
     kilm_config = configparser.ConfigParser()
     kilm_config.read(ini_file)
 
@@ -86,14 +95,11 @@ def parse_ft_config(ini_file):
             max_position_embeddings)
 
 
-def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
-                 dir_path,
-                 mapping=Mapping(),
-                 dtype='float16',
-                 share_embedding_table=False,
-                 parallel_embedding_table=False,
-                 multi_query_mode=False,
-                 use_gemm_woq_plugin=True):
+def load_from_binary(tensorrt_llm_kilm: KiLMForCausalLM,
+                     dir_path,
+                     mapping=Mapping(),
+                     dtype='float16',
+                     multi_query_mode=False):
     tensorrt_llm.logger.info('Loading weights from FT...')
     tik = time.time()
     quant_mode = getattr(tensorrt_llm_kilm, 'quant_mode', QuantMode(0))
@@ -103,7 +109,7 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
         plugin_weight_only_quant_type = torch.quint4x2
     (vocab_size, hidden_size, inter_size, num_hidden_layers, kv_channels,
      rotary_pct, rotary_emb_base, multi_query_mode,
-     max_position_embeddings) = parse_ft_config(Path(dir_path) / 'config.ini')
+     max_position_embeddings) = parse_bin_config(Path(dir_path) / 'config.ini')
     np_dtype = str_dtype_to_np(dtype)
 
     def fromfile(dir_path, name, shape=None, dtype=np.float16):
@@ -201,20 +207,18 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
         tensorrt_llm_kilm.lm_head.weight.value = np.ascontiguousarray(
             split(lm_head_weight, mapping.tp_size, mapping.tp_rank))
 
-    layers_range = list(
-        range(mapping.pp_rank * tensorrt_llm_kilm.num_layers,
-              (mapping.pp_rank + 1) * tensorrt_llm_kilm.num_layers, 1))
-
+    num_hidden_layers = tensorrt_llm_kilm.num_layers
+    layers_range = mapping.pp_layers(num_hidden_layers)
     for i in layers_range:
         c_attn_out_dim = (3 * hidden_size //
                           mapping.tp_size) if not multi_query_mode else (
                               hidden_size // mapping.tp_size +
                               (hidden_size // num_hidden_layers) * 2)
-
-        tensorrt_llm_kilm.layers[i].ln_1.weight.value = fromfile(
+        idx = i - layers_range[0]
+        tensorrt_llm_kilm.layers[idx].ln_1.weight.value = fromfile(
             dir_path, 'model.layers.' + str(i) + '.ln_1.weight.bin')
 
-        dst = tensorrt_llm_kilm.layers[i].ln_2.weight
+        dst = tensorrt_llm_kilm.layers[idx].ln_2.weight
         dst.value = fromfile(dir_path,
                              'model.layers.' + str(i) + '.ln_2.weight.bin')
 
@@ -223,12 +227,12 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
             'model.layers.' + str(i) + '.attention.qkv.weight.' + suffix,
             [hidden_size, c_attn_out_dim], w_type)
         if t is not None:
-            dst = tensorrt_llm_kilm.layers[i].attention.qkv.weight
+            dst = tensorrt_llm_kilm.layers[idx].attention.qkv.weight
             if use_smooth_quant:
                 dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
                 set_smoothquant_scale_factors(
-                    tensorrt_llm_kilm.layers[i].attention.qkv,
-                    tensorrt_llm_kilm.layers[i].ln_1.scale_to_int,
+                    tensorrt_llm_kilm.layers[idx].attention.qkv,
+                    tensorrt_llm_kilm.layers[idx].ln_1.scale_to_int,
                     dir_path,
                     'model.layers.' + str(i) + '.attention.qkv.',
                     [1, c_attn_out_dim],
@@ -239,34 +243,30 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
             elif use_weight_only:
                 processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(t), plugin_weight_only_quant_type)
-                if not use_gemm_woq_plugin:
-                    dst.value = torch.tensor(t).numpy().astype(
-                        str_dtype_to_np(dtype))
-                else:
-                    dst.value = processed_torch_weights.numpy()
+                dst.value = processed_torch_weights.numpy()
                 scales = tensorrt_llm_kilm.layers[
-                    i].attention.qkv.per_channel_scale
+                    idx].attention.qkv.per_channel_scale
                 scales.value = torch_weight_scales.numpy()
             else:
                 dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
 
-        dst = tensorrt_llm_kilm.layers[i].attention.qkv.bias
+        dst = tensorrt_llm_kilm.layers[idx].attention.qkv.bias
         t = fromfile(
             dir_path, 'model.layers.' + str(i) + '.attention.qkv.bias.' +
             str(mapping.tp_rank) + '.bin', [c_attn_out_dim])
         dst.value = np.ascontiguousarray(t)
 
-        dst = tensorrt_llm_kilm.layers[i].attention.dense.weight
+        dst = tensorrt_llm_kilm.layers[idx].attention.dense.weight
         t = fromfile(
             dir_path,
             'model.layers.' + str(i) + '.attention.dense.weight.' + suffix,
             [hidden_size // mapping.tp_size, hidden_size], w_type)
         if use_smooth_quant:
             dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
-            dense_scale = getattr(tensorrt_llm_kilm.layers[i].attention,
+            dense_scale = getattr(tensorrt_llm_kilm.layers[idx].attention,
                                   "quantization_scaling_factor", None)
             set_smoothquant_scale_factors(
-                tensorrt_llm_kilm.layers[i].attention.dense,
+                tensorrt_llm_kilm.layers[idx].attention.dense,
                 dense_scale,
                 dir_path,
                 'model.layers.' + str(i) + '.attention.dense.',
@@ -274,25 +274,22 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
                 quant_per_token_dyn,
                 quant_per_channel,
             )
-            set_smoother(tensorrt_llm_kilm.layers[i].attention.dense, dir_path,
+            set_smoother(tensorrt_llm_kilm.layers[idx].attention.dense,
+                         dir_path,
                          'model.layers.' + str(i) + '.attention.dense',
                          [1, hidden_size // mapping.tp_size], mapping.tp_rank)
 
         elif use_weight_only:
             processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            if not use_gemm_woq_plugin:
-                dst.value = torch.tensor(t).numpy().astype(
-                    str_dtype_to_np(dtype))
-            else:
-                dst.value = processed_torch_weights.numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_kilm.layers[
                 i].attention.dense.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
             dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
 
-        dst = tensorrt_llm_kilm.layers[i].attention.dense.bias
+        dst = tensorrt_llm_kilm.layers[idx].attention.dense.bias
         t = fromfile(
             dir_path, 'model.layers.' + str(i) + '.attention.dense.bias.bin')
         dst.value = np.ascontiguousarray(t)
@@ -302,11 +299,11 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
                      [hidden_size, inter_size // mapping.tp_size // 2], w_type)
         if use_smooth_quant:
             tensorrt_llm_kilm.layers[
-                i].mlp.gate.weight.value = np.ascontiguousarray(
+                idx].mlp.gate.weight.value = np.ascontiguousarray(
                     np.transpose(t, [1, 0]))
             set_smoothquant_scale_factors(
-                tensorrt_llm_kilm.layers[i].mlp.gate,
-                tensorrt_llm_kilm.layers[i].ln_2.scale_to_int,
+                tensorrt_llm_kilm.layers[idx].mlp.gate,
+                tensorrt_llm_kilm.layers[idx].ln_2.scale_to_int,
                 dir_path,
                 'model.layers.' + str(i) + '.mlp.w1.',
                 [1, inter_size // mapping.tp_size // 2],
@@ -314,19 +311,15 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
                 quant_per_channel,
                 rank=mapping.tp_rank)
         elif use_weight_only:
-            dst = tensorrt_llm_kilm.layers[i].mlp.gate.weight
+            dst = tensorrt_llm_kilm.layers[idx].mlp.gate.weight
             processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            if not use_gemm_woq_plugin:
-                dst.value = torch.tensor(t).numpy().astype(
-                    str_dtype_to_np(dtype))
-            else:
-                dst.value = processed_torch_weights.numpy()
-            scales = tensorrt_llm_kilm.layers[i].mlp.gate.per_channel_scale
+            dst.value = processed_torch_weights.numpy()
+            scales = tensorrt_llm_kilm.layers[idx].mlp.gate.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
             tensorrt_llm_kilm.layers[
-                i].mlp.gate.weight.value = np.ascontiguousarray(
+                idx].mlp.gate.weight.value = np.ascontiguousarray(
                     np.transpose(t, [1, 0]))
 
         t = fromfile(dir_path,
@@ -334,11 +327,11 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
                      [hidden_size, inter_size // mapping.tp_size // 2], w_type)
         if use_smooth_quant:
             tensorrt_llm_kilm.layers[
-                i].mlp.fc.weight.value = np.ascontiguousarray(
+                idx].mlp.fc.weight.value = np.ascontiguousarray(
                     np.transpose(t, [1, 0]))
             set_smoothquant_scale_factors(
-                tensorrt_llm_kilm.layers[i].mlp.fc,
-                tensorrt_llm_kilm.layers[i].ln_2.scale_to_int,
+                tensorrt_llm_kilm.layers[idx].mlp.fc,
+                tensorrt_llm_kilm.layers[idx].ln_2.scale_to_int,
                 dir_path,
                 'model.layers.' + str(i) + '.mlp.w2.',
                 [1, inter_size // mapping.tp_size // 2],
@@ -346,19 +339,15 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
                 quant_per_channel,
                 rank=mapping.tp_rank)
         elif use_weight_only:
-            dst = tensorrt_llm_kilm.layers[i].mlp.fc.weight
+            dst = tensorrt_llm_kilm.layers[idx].mlp.fc.weight
             processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            if not use_gemm_woq_plugin:
-                dst.value = torch.tensor(t).numpy().astype(
-                    str_dtype_to_np(dtype))
-            else:
-                dst.value = processed_torch_weights.numpy()
-            scales = tensorrt_llm_kilm.layers[i].mlp.fc.per_channel_scale
+            dst.value = processed_torch_weights.numpy()
+            scales = tensorrt_llm_kilm.layers[idx].mlp.fc.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
             tensorrt_llm_kilm.layers[
-                i].mlp.fc.weight.value = np.ascontiguousarray(
+                idx].mlp.fc.weight.value = np.ascontiguousarray(
                     np.transpose(t, [1, 0]))
 
         t = fromfile(dir_path,
@@ -366,32 +355,28 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
                      [inter_size // mapping.tp_size // 2, hidden_size], w_type)
         if use_smooth_quant:
             tensorrt_llm_kilm.layers[
-                i].mlp.proj.weight.value = np.ascontiguousarray(
+                idx].mlp.proj.weight.value = np.ascontiguousarray(
                     np.transpose(t, [1, 0]))
-            proj_scale = getattr(tensorrt_llm_kilm.layers[i].mlp,
+            proj_scale = getattr(tensorrt_llm_kilm.layers[idx].mlp,
                                  "quantization_scaling_factor", None)
             set_smoothquant_scale_factors(
-                tensorrt_llm_kilm.layers[i].mlp.proj, proj_scale, dir_path,
+                tensorrt_llm_kilm.layers[idx].mlp.proj, proj_scale, dir_path,
                 'model.layers.' + str(i) + '.mlp.c_proj.', [1, hidden_size],
                 quant_per_token_dyn, quant_per_channel)
-            set_smoother(tensorrt_llm_kilm.layers[i].mlp.proj, dir_path,
+            set_smoother(tensorrt_llm_kilm.layers[idx].mlp.proj, dir_path,
                          'model.layers.' + str(i) + '.mlp.c_proj',
                          [1, inter_size // mapping.tp_size // 2],
                          mapping.tp_rank)
         elif use_weight_only:
-            dst = tensorrt_llm_kilm.layers[i].mlp.proj.weight
+            dst = tensorrt_llm_kilm.layers[idx].mlp.proj.weight
             processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            if not use_gemm_woq_plugin:
-                dst.value = torch.tensor(t).numpy().astype(
-                    str_dtype_to_np(dtype))
-            else:
-                dst.value = processed_torch_weights.numpy()
-            scales = tensorrt_llm_kilm.layers[i].mlp.proj.per_channel_scale
+            dst.value = processed_torch_weights.numpy()
+            scales = tensorrt_llm_kilm.layers[idx].mlp.proj.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
             tensorrt_llm_kilm.layers[
-                i].mlp.proj.weight.value = np.ascontiguousarray(
+                idx].mlp.proj.weight.value = np.ascontiguousarray(
                     np.transpose(t, [1, 0]))
 
         if use_int8_kv_cache:
@@ -399,7 +384,7 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
                 dir_path, 'model.layers.' + str(i) +
                 '.attention.qkv.scale_y_quant_orig.bin', [1], np.float32)
             tensorrt_llm_kilm.layers[
-                i].attention.kv_cache_scaling_factor.value = t
+                idx].attention.kv_cache_scaling_factor.value = t
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -409,12 +394,8 @@ def load_from_ft(tensorrt_llm_kilm: KiLMForCausalLM,
 def load_from_hf_kilm(tensorrt_llm_kilm: tensorrt_llm.models.KiLMForCausalLM,
                       hf_kilm,
                       mapping=Mapping(),
-                      max_position_embeddings=8192,
-                      rotary_emb_base=10000,
-                      kv_channels=128,
                       dtype="float32",
-                      multi_query_mode=False,
-                      use_gemm_woq_plugin=True):
+                      multi_query_mode=False):
     tensorrt_llm.logger.info('Loading weights from HF KiLM...')
     tik = time.time()
 
@@ -427,6 +408,10 @@ def load_from_hf_kilm(tensorrt_llm_kilm: tensorrt_llm.models.KiLMForCausalLM,
 
     model_params = dict(hf_kilm.named_parameters())
     torch_dtype = str_dtype_to_torch(dtype)
+
+    num_hidden_layers = hf_kilm.config.num_hidden_layers
+    layers_range = mapping.pp_layers(num_hidden_layers)
+
     for k, v in tqdm(model_params.items(),
                      total=len(model_params),
                      ncols=80,
@@ -438,25 +423,23 @@ def load_from_hf_kilm(tensorrt_llm_kilm: tensorrt_llm.models.KiLMForCausalLM,
         else:
             v = torch_to_numpy(v.to(torch_dtype).detach().cpu())
         if 'transformer.wte.weight' in k:
-            tensorrt_llm_kilm.embedding.vocab_embedding.weight.value = v
+            if tensorrt_llm_kilm.use_parallel_embedding:
+                v = split(v, mapping.tp_size, mapping.tp_rank,
+                          tensorrt_llm_kilm.embedding_sharding_dim)
+            if mapping.is_first_pp_rank():
+                tensorrt_llm_kilm.embedding.vocab_embedding.weight.value = v
         elif 'transformer.ln_f.weight' in k:
-            tensorrt_llm_kilm.ln_f.weight.value = v
+            if mapping.is_last_pp_rank():
+                tensorrt_llm_kilm.ln_f.weight.value = v
         elif 'lm_head.weight' in k:
-            [vocab_size, _] = v.shape
-            if vocab_size % mapping.tp_size != 0:
-                # padding
-                vocab_size_padded = tensorrt_llm_kilm.lm_head.out_features * mapping.tp_size
-                pad_width = vocab_size_padded - vocab_size
-                v = np.pad(v, ((0, pad_width), (0, 0)),
-                           'constant',
-                           constant_values=0)
-            tensorrt_llm_kilm.lm_head.weight.value = np.ascontiguousarray(
-                split(v, mapping.tp_size, mapping.tp_rank))
+            if mapping.is_last_pp_rank():
+                tensorrt_llm_kilm.lm_head.weight.value = np.ascontiguousarray(
+                    split(v, mapping.tp_size, mapping.tp_rank))
         else:
             layer_idx = extract_layer_idx(k)
-            if layer_idx is None:
+            if layer_idx is None or int(layer_idx) not in layers_range:
                 continue
-            idx = int(layer_idx)
+            idx = int(layer_idx) - layers_range[0]
             if idx >= tensorrt_llm_kilm.num_layers:
                 continue
             if 'ln_1.weight' in k:
@@ -482,11 +465,7 @@ def load_from_hf_kilm(tensorrt_llm_kilm: tensorrt_llm.models.KiLMForCausalLM,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    if not use_gemm_woq_plugin:
-                        dst.value = torch.tensor(v).numpy().astype(
-                            str_dtype_to_np(dtype))
-                    else:
-                        dst.value = processed_torch_weights.numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_kilm.layers[
                         idx].attention.qkv.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -513,11 +492,7 @@ def load_from_hf_kilm(tensorrt_llm_kilm: tensorrt_llm.models.KiLMForCausalLM,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    if not use_gemm_woq_plugin:
-                        dst.value = torch.tensor(v).numpy().astype(
-                            str_dtype_to_np(dtype))
-                    else:
-                        dst.value = processed_torch_weights.numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_kilm.layers[
                         idx].attention.dense.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -533,11 +508,7 @@ def load_from_hf_kilm(tensorrt_llm_kilm: tensorrt_llm.models.KiLMForCausalLM,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    if not use_gemm_woq_plugin:
-                        dst.value = torch.tensor(v).numpy().astype(
-                            str_dtype_to_np(dtype))
-                    else:
-                        dst.value = processed_torch_weights.numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_kilm.layers[
                         idx].mlp.gate.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -550,11 +521,7 @@ def load_from_hf_kilm(tensorrt_llm_kilm: tensorrt_llm.models.KiLMForCausalLM,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    if not use_gemm_woq_plugin:
-                        dst.value = torch.tensor(v).numpy().astype(
-                            str_dtype_to_np(dtype))
-                    else:
-                        dst.value = processed_torch_weights.numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_kilm.layers[
                         idx].mlp.fc.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -567,11 +534,7 @@ def load_from_hf_kilm(tensorrt_llm_kilm: tensorrt_llm.models.KiLMForCausalLM,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    if not use_gemm_woq_plugin:
-                        dst.value = torch.tensor(v).numpy().astype(
-                            str_dtype_to_np(dtype))
-                    else:
-                        dst.value = processed_torch_weights.numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_kilm.layers[
                         idx].mlp.proj.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -665,20 +628,14 @@ def load_from_gptq_kilm(
     layer_ids = [
         extract_layer_idx(key) for key in model_params.keys()
         if 'visual' not in key
-    ]
+    ]  #exclude 'visual' for KiLM-VL case
     layer_ids = [
         int(layer_idx) for layer_idx in layer_ids if layer_idx is not None
     ]
     num_hidden_layers = max(layer_ids) + 1
     suffixs = ["qweight", "qzeros", "scales"]
 
-    layers_per_pipeline_stage = num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(
-            mapping.pp_rank * layers_per_pipeline_stage,
-            (mapping.pp_rank + 1) * layers_per_pipeline_stage,
-            1,
-        ))
+    layers_range = mapping.pp_layers(num_hidden_layers)
     torch_dtype = str_dtype_to_torch(dtype)
     for layer in tqdm(layers_range,
                       ncols=80,
@@ -693,12 +650,10 @@ def load_from_gptq_kilm(
             split_qkv = split(qkv_part, mapping.tp_size, mapping.rank, dim=2)
             split_qkv = split_qkv.reshape(model_emb,
                                           3 * (q_emb // mapping.tp_size))
-            if isinstance(split_qkv, np.ndarray):
-                split_qkv = torch.from_numpy(split_qkv)
-            # dype: int32, int32, float16
+            # dtype: int32, int32, float16
             split_qkv_suf.append(split_qkv)
 
-        idx = layer - mapping.pp_rank * layers_per_pipeline_stage
+        idx = layer - layers_range[0]
         th_bias = model_params[prefix + "c_attn.bias"].to(
             torch_dtype).cpu().contiguous()
 
@@ -742,8 +697,9 @@ def load_from_gptq_kilm(
             if mapping.is_last_pp_rank():
                 tensorrt_llm_kilm.ln_f.weight.value = v
         elif "lm_head.weight" in k:
-            tensorrt_llm_kilm.lm_head.weight.value = np.ascontiguousarray(
-                split(v, mapping.tp_size, mapping.rank))
+            if mapping.is_last_pp_rank():
+                tensorrt_llm_kilm.lm_head.weight.value = np.ascontiguousarray(
+                    split(v, mapping.tp_size, mapping.rank))
         else:
             layer_idx = extract_layer_idx(k)
             if layer_idx is None:
@@ -751,7 +707,7 @@ def load_from_gptq_kilm(
             idx = int(layer_idx)
             if idx not in layers_range:
                 continue
-            idx = idx - mapping.pp_rank * layers_per_pipeline_stage
+            idx = idx - layers_range[0]
 
             if "ln_1.weight" in k:
                 tensorrt_llm_kilm.layers[idx].ln_1.weight.value = v
@@ -778,7 +734,7 @@ def load_from_gptq_kilm(
                         torch_dtype).numpy()
             elif "attn.c_proj.bias" in k:
                 tensorrt_llm_kilm.layers[
-                    idx].attention.qkv.bias.value = np.ascontiguousarray(v)
+                    idx].attention.dense.bias.value = np.ascontiguousarray(v)
             elif "mlp.w1.qweight" in k:
                 split_v_suf = []
                 for suf in suffixs:
@@ -836,7 +792,7 @@ def load_from_gptq_kilm(
                 dst.value = np.ascontiguousarray(split_v)
 
     tok = time.time()
-    t = time.strftime("%h:%m:%s", time.gmtime(tok - tik))
+    t = time.strftime("%H:%M:%S", time.gmtime(tok - tik))
     tensorrt_llm.logger.info(f"weights loaded. total time: {t}")
 
 
@@ -915,10 +871,6 @@ def load_from_awq_kilm(tensorrt_llm_kilm: KiLMForCausalLM,
         split_amax = split(amax, mapping.tp_size, mapping.rank, dim=tp_dim)
         split_amax = split_amax.reshape(3 * (q_emb // mapping.tp_size),
                                         model_emb // group_size)
-        if isinstance(split_v, np.ndarray):
-            split_v = torch.from_numpy(split_v)
-        if isinstance(split_amax, np.ndarray):
-            split_amax = torch.from_numpy(split_amax)
         split_v = split_v.T.contiguous()
         split_amax = split_amax.T.contiguous()
         pre_quant_scale = model_params[
@@ -968,11 +920,7 @@ def load_from_awq_kilm(tensorrt_llm_kilm: KiLMForCausalLM,
     ]
 
     num_hidden_layers = max(layer_ids) + 1
-    layers_per_pipeline_stage = num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
-
+    layers_range = mapping.pp_layers(num_hidden_layers)
     for layer_idx in tqdm(layers_range, "Loading weights..."):
         prefix = "transformer.h." + str(layer_idx) + "."
         for idx, awq_attr in enumerate(awq_block_names):
@@ -1037,26 +985,30 @@ def load_from_awq_kilm(tensorrt_llm_kilm: KiLMForCausalLM,
         new_amax[:vocab_size, :] = amax
         new_amax = new_amax.T.contiguous()
         new_scale = new_amax / 8
-        tensorrt_llm_kilm.lm_head.weight.value = AWQ_quantize_pack_preprocess(
-            new_weight, new_scale)
-        tensorrt_llm_kilm.lm_head.weights_scaling_factor.value = new_scale.to(
-            torch_dtype).cpu().numpy()
-        tensorrt_llm_kilm.lm_head.prequant_scaling_factor.value = model_params[
-            'lm_head.input_quantizer._pre_quant_scale'].to(
+        if mapping.is_last_pp_rank():
+            tensorrt_llm_kilm.lm_head.weight.value = AWQ_quantize_pack_preprocess(
+                new_weight, new_scale)
+            tensorrt_llm_kilm.lm_head.weights_scaling_factor.value = new_scale.to(
                 torch_dtype).cpu().numpy()
+            tensorrt_llm_kilm.lm_head.prequant_scaling_factor.value = model_params[
+                'lm_head.input_quantizer._pre_quant_scale'].to(
+                    torch_dtype).cpu().numpy()
     elif quantize_lm_head:
         mPrefix = "lm_head"
         mOp = tensorrt_llm_kilm.lm_head
         if mapping.is_last_pp_rank():
             process_and_assign_weight(model_params, mPrefix, mOp, 1)
     else:
-        tensorrt_llm_kilm.lm_head.weight.value = torch_split(
-            model_params['lm_head.weight'], 0).to(torch_dtype).cpu().numpy()
+        if mapping.is_last_pp_rank():
+            tensorrt_llm_kilm.lm_head.weight.value = torch_split(
+                model_params['lm_head.weight'],
+                0).to(torch_dtype).cpu().numpy()
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     tensorrt_llm.logger.info(f'Weights loaded. Total time: {t}')
-    del groupwise_qweight_safetensors
+    if quant_ckpt_path.endswith(".safetensors"):
+        del groupwise_qweight_safetensors
     del model_params
     import gc
     gc.collect()
