@@ -22,6 +22,7 @@ import dataclasses
 import json
 import os
 from pathlib import Path
+from typing import List
 
 import torch
 import torch.multiprocessing as multiprocessing
@@ -33,11 +34,38 @@ from transformers import AutoTokenizer, GenerationConfig
 from utils.convert import split_and_save_weight
 
 from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
+from tensorrt_llm.runtime.lora_manager import LoraConfig
 
 now_dir = os.path.dirname(os.path.abspath(__file__))
 
 
-@dataclasses.dataclass(frozen=True)
+def create_lora_config(args: argparse.Namespace):
+    '''update args based on lora dir
+    '''
+    hf_modules_to_trtllm_modules = {
+        "c_attn": "attn_qkv",
+        "c_proj": "attn_dense",
+        "w1": "mlp_h_to_4h",
+        "c_proj": "mlp_4h_to_h",
+        "w2": "mlp_gate"
+    }  # lora modules on kilm
+
+    trtllm_modules_to_hf_modules = {
+        "attn_qkv": "c_attn",
+        "attn_dense": "c_proj",
+        "mlp_h_to_4h": "w1",
+        "mlp_4h_to_h": "c_proj",
+        "mlp_gate": "w2",
+    }
+
+    lora_config = LoraConfig.from_hf(args.hf_lora_dir,
+                                     hf_modules_to_trtllm_modules,
+                                     trtllm_modules_to_hf_modules)
+
+    return lora_config
+
+
+@dataclasses.dataclass(frozen=False)
 class ProgArgs:
     out_dir: str
     in_file: str
@@ -47,6 +75,8 @@ class ProgArgs:
     calibrate_kv_cache: bool = False
     smoothquant: float = None
     model: str = "kilm"
+    hf_lora_dir: str = None
+    max_lora_rank: int = 0
     storage_type: str = "fp32"
     dataset_file: str = None
     chat_format: str = "raw"
@@ -108,6 +138,13 @@ class ProgArgs:
             type=str,
             help="Specify GPT variants to convert checkpoints correctly",
             choices=["kilm", "gpt2", "santacoder", "starcoder"])
+        parser.add_argument('--hf-lora-dir', type=str, default=None)
+        parser.add_argument(
+            '--max-lora-rank',
+            type=int,
+            default=64,
+            help='maximum lora rank for different lora modules. '
+                 'It is used to compute the workspace size of lora plugin.')
         parser.add_argument("--storage-type",
                             "-t",
                             type=str,
@@ -231,6 +268,8 @@ def convert_kilm_name(orig_name):
 
 @torch.no_grad()
 def hf_kilm_converter(args: ProgArgs):
+    lora_config = create_lora_config(args)
+
     infer_tp = args.tensor_parallelism
     multi_query_mode = True if args.model in ["santacoder", "starcoder"
                                               ] else False
@@ -343,6 +382,16 @@ def hf_kilm_converter(args: ProgArgs):
 
         param = transpose_weights(name, param)
         if converted_name in global_weights:
+            if converted_name == "vocab_embedding.weight":
+                if lora_config.is_valid and lora_config.embedding_weight is not None:
+                    print("set embedding weight from lora to kilm")
+                    param = lora_config.embedding_weight
+
+            if converted_name == "lm_head.weight":
+                if lora_config.is_valid and lora_config.lm_head_weight is not None:
+                    print("set lm head weight from lora to kilm")
+                    param = lora_config.lm_head_weight
+
             torch_to_numpy(param.to(storage_type).cpu()).tofile(
                 saved_dir / f"{converted_name}.bin")
         else:

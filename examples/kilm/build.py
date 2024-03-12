@@ -375,6 +375,36 @@ def parse_arguments():
         help=
         'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
     parser.add_argument(
+        '--use_lora_plugin',
+        nargs='?',
+        const=None,
+        default=False,
+        choices=['float16', 'float32', 'bfloat16'],
+        help="Activates the lora plugin which enables embedding sharing.")
+    parser.add_argument(
+        '--lora_target_modules',
+        nargs='+',
+        default=None,
+        choices=[
+            "attn_qkv",
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_dense",
+            "mlp_h_to_4h",
+            "mlp_gate",
+            "mlp_4h_to_h",
+        ],
+        help=
+        "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
+    )
+    parser.add_argument(
+        '--max_lora_rank',
+        type=int,
+        default=64,
+        help='maximum lora rank for different lora modules. '
+             'It is used to compute the workspace size of lora plugin.')
+    parser.add_argument(
         '--max_prompt_embedding_table_size',
         type=int,
         default=0,
@@ -548,7 +578,8 @@ def get_model_object(args, mapping, trt_dtype=None):
         rms_norm_eps=args.rms_norm_eps,
         use_fused_mlp=args.use_fused_mlp,
         use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
-        dense_context_fmha=args.dense_context_fmha)
+        dense_context_fmha=args.dense_context_fmha,
+        max_lora_rank=args.max_lora_rank)
     quantize_kwargs = {}
     if args.use_smooth_quant or args.use_weight_only:
         if args.weight_only_precision == 'int4_awq':
@@ -658,6 +689,8 @@ def update_plugin_configs(args, network):
     if args.use_paged_context_fmha or args.max_draft_len > 0:
         assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc, "context fmha must be enabled"
         network.plugin_config.set_paged_context_fmha()
+    if args.use_lora_plugin:
+        network.plugin_config.set_lora_plugin(dtype=args.use_lora_plugin)
     return
 
 
@@ -704,7 +737,8 @@ def build_rank_engine(builder: Builder,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
             gather_context_logits=args.gather_context_logits,
             gather_generation_logits=args.gather_generation_logits,
-            max_draft_len=args.max_draft_len)
+            max_draft_len=args.max_draft_len,
+            lora_target_modules=args.lora_target_modules)
         tensorrt_llm_kilm(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -766,6 +800,8 @@ def get_builder_config_namespace(args, cache):
         gather_generation_logits=args.gather_generation_logits,
         max_draft_len=args.max_draft_len,
         mlp_hidden_size=args.inter_size,
+        lora_target_modules=args.lora_target_modules,
+        max_lora_rank=args.max_lora_rank,
     )
     return config
 

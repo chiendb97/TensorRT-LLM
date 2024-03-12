@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import Optional, List
 
 import tensorrt as trt
 
@@ -23,7 +23,7 @@ from ...functional import (Tensor, gather_last_token_logits, partial, recv,
                            send, unary)
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, FusedGatedMLP, GatedMLP,
-                       KeyValueCacheParams, PositionEmbeddingType,
+                       KeyValueCacheParams, LoraParams, PositionEmbeddingType,
                        PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
@@ -106,7 +106,8 @@ class KiLMBlock(Module):
                  tp_rank=0,
                  rms_norm_eps=1e-06,
                  use_fused_mlp=False,
-                 dense_context_fmha=False):
+                 dense_context_fmha=False,
+                 max_lora_rank=None):
         super().__init__()
         self.layer_idx = local_layer_idx
         self.hidden_size = hidden_size
@@ -143,7 +144,8 @@ class KiLMBlock(Module):
             tp_size=self.tp_size,
             quant_mode=quant_mode,
             dense_bias=bias,
-            dense_context_fmha=dense_context_fmha)
+            dense_context_fmha=dense_context_fmha,
+            max_lora_rank=max_lora_rank)
         if not mlp_hidden_size:
             mlp_hidden_size = hidden_size * 4
 
@@ -156,7 +158,8 @@ class KiLMBlock(Module):
                           bias=False,
                           tp_group=tp_group,
                           tp_size=tp_size,
-                          quant_mode=quant_mode)
+                          quant_mode=quant_mode,
+                          max_lora_rank=max_lora_rank)
         self.ln_2 = RmsNorm(normalized_shape=hidden_size,
                             eps=rms_norm_eps,
                             dtype=dtype)
@@ -167,6 +170,7 @@ class KiLMBlock(Module):
         use_cache=False,
         kv_cache_params=None,
         attention_params=None,
+        lora_layer_params=None,
     ):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
@@ -175,6 +179,7 @@ class KiLMBlock(Module):
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
+            lora_layer_params=lora_layer_params,
         )
         if use_cache:
             attention_output, presents = attention_output
@@ -185,7 +190,7 @@ class KiLMBlock(Module):
 
         hidden_states = self.ln_2(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, lora_layer_params=lora_layer_params)
 
         hidden_states = residual + hidden_states
         if use_cache:
@@ -216,7 +221,8 @@ class KiLMModel(Module):
                  rms_norm_eps=1e-06,
                  use_prompt_tuning=False,
                  use_fused_mlp=False,
-                 dense_context_fmha=False):
+                 dense_context_fmha=False,
+                 max_lora_rank=None):
         super().__init__()
         self.mapping = mapping
         if self.mapping.is_first_pp_rank():
@@ -255,7 +261,8 @@ class KiLMModel(Module):
                       tp_rank=mapping.tp_rank,
                       rms_norm_eps=rms_norm_eps,
                       use_fused_mlp=use_fused_mlp,
-                      dense_context_fmha=dense_context_fmha)
+                      dense_context_fmha=dense_context_fmha,
+                      max_lora_rank=max_lora_rank)
             for layer_idx in layers_range
         ])
 
@@ -273,7 +280,8 @@ class KiLMModel(Module):
                 hidden_states=None,
                 prompt_embedding_table=None,
                 prompt_tasks=None,
-                prompt_vocab_size=None):
+                prompt_vocab_size=None,
+                lora_params=None):
 
         if kv_cache_params.past_key_value is None:
             tuple([None] * len(self.layers))
@@ -291,7 +299,10 @@ class KiLMModel(Module):
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
         self.register_network_output(f"embd", hidden_states)
 
-        for layer, past in zip(self.layers, kv_cache_params.past_key_value):
+        for layer_idx, (layer, past) in enumerate(zip(self.layers, kv_cache_params.past_key_value)):
+            lora_layer_params = None
+            if lora_params is not None and lora_params.lora_ranks is not None:
+                lora_layer_params = lora_params.get_layer_params(layer_idx)
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -308,7 +319,8 @@ class KiLMModel(Module):
                     host_kv_cache_block_pointers=kv_cache_params.
                     host_kv_cache_block_pointers,
                     cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params)
+                attention_params=attention_params,
+                lora_layer_params=lora_layer_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -348,7 +360,8 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
                  rms_norm_eps=1e-06,
                  use_prompt_tuning=False,
                  use_fused_mlp=False,
-                 dense_context_fmha=False):
+                 dense_context_fmha=False,
+                 max_lora_rank=None):
         self.mapping = mapping
         if isinstance(dtype, str):
             self.dtype = str_dtype_to_trt(dtype)
@@ -398,7 +411,8 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
                          rms_norm_eps=rms_norm_eps,
                          use_prompt_tuning=use_prompt_tuning,
                          use_fused_mlp=use_fused_mlp,
-                         dense_context_fmha=dense_context_fmha)
+                         dense_context_fmha=dense_context_fmha,
+                         max_lora_rank=max_lora_rank)
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         if self.mapping.is_last_pp_rank():
             self.lm_head = ColumnLinear(hidden_size,
@@ -419,11 +433,12 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
                 hidden_states=None,
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
-                prompt_vocab_size: Optional[Tensor] = None):
+                prompt_vocab_size: Optional[Tensor] = None,
+                lora_params=None):
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         kv_cache_params, attention_params,
                                         hidden_states, prompt_embedding_table,
-                                        prompt_tasks, prompt_vocab_size)
+                                        prompt_tasks, prompt_vocab_size, lora_params)
         if use_cache:
             hidden_states, presents = hidden_states
 
@@ -462,6 +477,7 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
         gather_context_logits: bool = False,
         gather_generation_logits: bool = False,
         max_draft_len: int = 0,
+        lora_target_modules: List[str] = None,
     ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -479,6 +495,7 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
         tokens_per_block = default_net().plugin_config.tokens_per_block
         use_custom_all_reduce = default_net(
         ).plugin_config.use_custom_all_reduce
+        use_lora_plugin = default_net().plugin_config.lora_plugin
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size=max_batch_size,
@@ -502,7 +519,9 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
             prompt_embedding_table_size=prompt_embedding_table_size,
             gather_context_logits=gather_context_logits,
             gather_generation_logits=gather_generation_logits,
-            max_draft_len=max_draft_len)
+            use_lora_plugin=use_lora_plugin,
+            max_draft_len=max_draft_len,
+            lora_target_modules=lora_target_modules)
 
         return (
             model_inputs['input_ids'], model_inputs['position_ids'], True,
@@ -527,4 +546,11 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
                 host_request_types=model_inputs['host_request_types']),
             model_inputs['hidden_states_input'],
             model_inputs['prompt_embedding_table'], model_inputs['tasks'],
-            model_inputs['prompt_vocab_size'])
+            model_inputs['prompt_vocab_size'],
+            LoraParams(
+                model_inputs['lora_ranks'],
+                model_inputs['lora_weights_pointers'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types']),
+        )
