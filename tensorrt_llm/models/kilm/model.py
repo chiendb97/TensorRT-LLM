@@ -106,7 +106,6 @@ class KiLMBlock(Module):
                  tp_rank=0,
                  rms_norm_eps=1e-06,
                  use_fused_mlp=False,
-                 dense_context_fmha=False,
                  max_lora_rank=None):
         super().__init__()
         self.layer_idx = local_layer_idx
@@ -144,7 +143,6 @@ class KiLMBlock(Module):
             tp_size=self.tp_size,
             quant_mode=quant_mode,
             dense_bias=bias,
-            dense_context_fmha=dense_context_fmha,
             max_lora_rank=max_lora_rank)
         if not mlp_hidden_size:
             mlp_hidden_size = hidden_size * 4
@@ -221,7 +219,6 @@ class KiLMModel(Module):
                  rms_norm_eps=1e-06,
                  use_prompt_tuning=False,
                  use_fused_mlp=False,
-                 dense_context_fmha=False,
                  max_lora_rank=None):
         super().__init__()
         self.mapping = mapping
@@ -261,7 +258,6 @@ class KiLMModel(Module):
                       tp_rank=mapping.tp_rank,
                       rms_norm_eps=rms_norm_eps,
                       use_fused_mlp=use_fused_mlp,
-                      dense_context_fmha=dense_context_fmha,
                       max_lora_rank=max_lora_rank)
             for layer_idx in layers_range
         ])
@@ -360,7 +356,6 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
                  rms_norm_eps=1e-06,
                  use_prompt_tuning=False,
                  use_fused_mlp=False,
-                 dense_context_fmha=False,
                  max_lora_rank=None):
         self.mapping = mapping
         if isinstance(dtype, str):
@@ -411,7 +406,6 @@ class KiLMForCausalLM(KiLMModel, GenerationMixin):
                          rms_norm_eps=rms_norm_eps,
                          use_prompt_tuning=use_prompt_tuning,
                          use_fused_mlp=use_fused_mlp,
-                         dense_context_fmha=dense_context_fmha,
                          max_lora_rank=max_lora_rank)
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         if self.mapping.is_last_pp_rank():

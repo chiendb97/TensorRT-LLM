@@ -34,7 +34,7 @@ from transformers import AutoTokenizer, GenerationConfig
 from utils.convert import split_and_save_weight
 
 from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
-from tensorrt_llm.runtime.lora_manager import LoraConfig
+from tensorrt_llm.lora_manager import LoraConfig
 
 now_dir = os.path.dirname(os.path.abspath(__file__))
 
