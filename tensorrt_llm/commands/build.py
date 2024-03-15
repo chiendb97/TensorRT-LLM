@@ -367,6 +367,14 @@ def preprocess_weights(
                                                       'bias') not in weights:
                 update_dict[name.replace('weight',
                                          'bias')] = torch.zeros_like(param)
+            if 'transformer.vocab_embedding.weight' in name and name.replace(
+                    'weight', 'bias') not in weights:
+                update_dict[name.replace('weight',
+                                         'bias')] = torch.zeros([param.shape[0]])
+            if 'lm_head.weight' in name and name.replace(
+                    'weight', 'bias') not in weights:
+                update_dict[name.replace('weight',
+                                         'bias')] = torch.zeros([param.shape[0]])
         weights.update(update_dict)
 
     # Parallel block rowlinear should not have duplicate bias.

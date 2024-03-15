@@ -29,7 +29,7 @@ import torch
 from safetensors.torch import load_file
 
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.runtime.lora_manager import LoraConfig
+from tensorrt_llm.lora_manager import LoraConfig
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)
@@ -56,18 +56,18 @@ def get_all_lora_weights(lora_weights):
             print(f"no match {key}")
             continue
         layer_idx = int(m.group(1))
-        hf_module = m.group(3)
+        hf_module = m.group(2) + "." + m.group(3)
         inout = "in" if m.group(4) == "A" else "out"
         all_weights[layer_idx][hf_module][inout] = weights
     return all_weights
 
 
 hf_modules_to_trtllm_modules = {
-    "c_attn": "attn_qkv",
-    "c_proj": "attn_dense",
-    "w1": "mlp_h_to_4h",
-    "c_proj": "mlp_4h_to_h",
-    "w2": "mlp_gate"
+    "attn.c_attn": "attn_qkv",
+    "attn.c_proj": "attn_dense",
+    "mlp.w1": "mlp_h_to_4h",
+    "mlp.c_proj": "mlp_4h_to_h",
+    "mlp.w2": "mlp_gate"
 }  # lora modules on kilm
 
 hf_modules_to_module_id = {

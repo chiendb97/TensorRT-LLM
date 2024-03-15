@@ -876,15 +876,15 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
         prefix = f'transformer.blocks.{l}'
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
         # Attention QKV (no bias)
-        qkv_w = get_weight(model_params, f'{prefix}.attn.Wqkv', dtype)
+        qkv_w, qkv_b = get_weight_and_bias(model_params, f'{prefix}.attn.Wqkv', dtype)
         qkv_w = split_qkv_tp(qkv_w, num_head, num_kv_heads, hidden_size,
                              mapping.tp_size, mapping.tp_rank)
         weights.update(
-            get_tllm_linear_weight(qkv_w, f'{tllm_prex}.attention.qkv', None,
+            get_tllm_linear_weight(qkv_w, f'{tllm_prex}.attention.qkv', qkv_b,
                                    use_weight_only,
                                    plugin_weight_only_quant_type))
         # Attention dense (no bias)
-        attn_dense_weight = get_weight(model_params, f'{prefix}.attn.out_proj',
+        attn_dense_weight, attn_dense_bias = get_weight_and_bias(model_params, f'{prefix}.attn.out_proj',
                                        dtype)
         attn_dense_w = split_matrix(attn_dense_weight,
                                     mapping.tp_size,
@@ -892,36 +892,38 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
                                     dim=1)
         weights.update(
             get_tllm_linear_weight(attn_dense_w, f'{tllm_prex}.attention.dense',
-                                   None, use_weight_only,
+                                   attn_dense_bias, use_weight_only,
                                    plugin_weight_only_quant_type))
         # MLP fc_in (no bias)
-        mlp_fc_weight = get_weight(model_params, f'{prefix}.ffn.up_proj', dtype)
+        mlp_fc_weight, mlp_fc_bias = get_weight_and_bias(model_params, f'{prefix}.ffn.up_proj', dtype)
         mlp_fc_w = split_matrix(mlp_fc_weight,
                                 mapping.tp_size,
                                 mapping.tp_rank,
                                 dim=0)
         weights.update(
-            get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.fc', None,
+            get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.fc', mlp_fc_bias,
                                    use_weight_only,
                                    plugin_weight_only_quant_type))
         # MLP fc_out (no bias)
-        mlp_proj_weight = get_weight(model_params, f'{prefix}.ffn.down_proj',
+        mlp_proj_weight, mlp_proj_bias = get_weight_and_bias(model_params, f'{prefix}.ffn.down_proj',
                                      dtype)
         mlp_proj_w = split_matrix(mlp_proj_weight,
                                   mapping.tp_size,
                                   mapping.tp_rank,
                                   dim=1)
         weights.update(
-            get_tllm_linear_weight(mlp_proj_w, f'{tllm_prex}.mlp.proj', None,
+            get_tllm_linear_weight(mlp_proj_w, f'{tllm_prex}.mlp.proj', mlp_proj_bias,
                                    use_weight_only,
                                    plugin_weight_only_quant_type))
         # input layer_norm
-        input_ln_weight = get_weight(model_params, f'{prefix}.norm_1', dtype)
+        input_ln_weight, input_ln_bias = get_weight_and_bias(model_params, f'{prefix}.norm_1', dtype)
         weights[f'{tllm_prex}.input_layernorm.weight'] = input_ln_weight
+        weights[f'{tllm_prex}.input_layernorm.bias'] = input_ln_bias
 
         # post layer_norm
-        post_ln_weight = get_weight(model_params, f'{prefix}.norm_2', dtype)
+        post_ln_weight, post_ln_bias = get_weight_and_bias(model_params, f'{prefix}.norm_2', dtype)
         weights[f'{tllm_prex}.post_layernorm.weight'] = post_ln_weight
+        weights[f'{tllm_prex}.post_layernorm.bias'] = post_ln_bias
 
     embed_w = get_weight(model_params, 'transformer.wte', dtype)
     if mapping.is_first_pp_rank():
@@ -942,9 +944,10 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
                                                      mapping.tp_size,
                                                      mapping.tp_rank,
                                                      dim=0)
-        ln_f_w = get_weight(model_params, 'transformer.norm_f', dtype)
+        ln_f_w, ln_f_b = get_weight_and_bias(model_params, 'transformer.norm_f', dtype)
         # ln_f weight and bias
         weights['transformer.ln_f.weight'] = ln_f_w
+        weights['transformer.ln_f.bias'] = ln_f_b
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

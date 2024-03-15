@@ -377,7 +377,13 @@ def parse_arguments():
     parser.add_argument(
         '--lora_target_modules',
         nargs='+',
-        default=None,
+        default=[
+            "attn_qkv",
+            "attn_dense",
+            "mlp_h_to_4h",
+            "mlp_gate",
+            "mlp_4h_to_h",
+        ],
         choices=[
             "attn_qkv",
             "attn_q",
