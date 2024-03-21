@@ -94,4 +94,5 @@ MODEL_MAP = {
     'SkyworkForCausalLM': LLaMAForCausalLM,
     'GemmaForCausalLM': GemmaForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
+    'KiLMForCausalLM': KiLMForCausalLM,
 }

@@ -171,6 +171,10 @@ def parse_arguments():
         type=int,
         default=1,
         help='The number of workers for converting checkpoint in parallel')
+    parser.add_argument("--dataset_file",
+                        type=str,
+                        default=None,
+                        help="dataset file for quantize")
     parser.add_argument('--log_level', type=str, default='info')
     args = parser.parse_args()
 
@@ -1953,9 +1957,7 @@ if __name__ == '__main__':
         if args.smoothquant is not None or args.int8_kv_cache:
             os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
                 "TOKENIZERS_PARALLELISM", "false")
-            dataset = load_dataset("lambada",
-                                   split="validation",
-                                   cache_dir=args.dataset_cache_dir)
+            dataset = load_dataset("csv", data_files={'validation': args.dataset_file}, split='validation')
             tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
             act_range = capture_activation_range(hf_model, tokenizer, dataset)
             if args.smoothquant is not None:
