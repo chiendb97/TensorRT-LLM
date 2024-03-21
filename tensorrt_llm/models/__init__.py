@@ -20,7 +20,7 @@ from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.model import FalconForCausalLM, FalconModel
 from .gemma.model import GemmaForCausalLM
-from .gpt.model import GPTLMHeadModel, GPTModel
+from .gpt.model import GPTForCausalLM, GPTModel
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .llama.model import LLaMAForCausalLM, LLaMAModel
@@ -44,7 +44,7 @@ __all__ = [
     'FalconForCausalLM',
     'FalconModel',
     'GPTModel',
-    'GPTLMHeadModel',
+    'GPTForCausalLM',
     'OPTForCausalLM',
     'OPTModel',
     'LLaMAForCausalLM',
@@ -75,6 +75,7 @@ __all__ = [
 ]
 
 MODEL_MAP = {
+    'GPTForCausalLM': GPTForCausalLM,
     'OPTForCausalLM': OPTForCausalLM,
     'BloomForCausalLM': BloomForCausalLM,
     'FalconForCausalLM': FalconForCausalLM,
@@ -92,4 +93,5 @@ MODEL_MAP = {
     'BaichuanForCausalLM': BaichuanForCausalLM,
     'SkyworkForCausalLM': LLaMAForCausalLM,
     'GemmaForCausalLM': GemmaForCausalLM,
+    'QWenForCausalLM': QWenForCausalLM,
 }
