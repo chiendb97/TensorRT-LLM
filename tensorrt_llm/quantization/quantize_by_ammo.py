@@ -114,6 +114,7 @@ MODEL_NAME_PATTERN_MAP = {
     "Bloom": "bloom",
     "ChatGLM": "chatglm",
     "QWen": "qwen",
+    "KiLM": "kilm",
     "Gemma": "gemma",
 }
 
@@ -126,7 +127,7 @@ def get_tokenizer(ckpt_path, max_seq_length, model_type=None):
         padding_side="left",
         trust_remote_code=True,
     )
-    if model_type and model_type == "qwen":
+    if model_type and model_type in ["qwen", "kilm"]:
         # qwen use token id 151643 as pad and eos tokens
         tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
         tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
@@ -318,7 +319,7 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
 
         export_npz = (model_type not in [
             'gpt2', 'gptj', 'falcon', 'chatglm', 'mpt', 'llama', 'baichuan',
-            'gemma', 'qwen'
+            'gemma', 'qwen', 'kilm'
         ])
         export_model_config(model,
                             model_type,
