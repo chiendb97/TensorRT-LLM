@@ -578,7 +578,7 @@ def convert_hf_qwen(hf_model,
                     per_token=per_token,
                     per_channel=per_channel,
                     last_prefix=tllm_prex + 'input_layernorm.scale_to_int',
-                    bias=qkv_bias,
+                    bias=qkv_b,
                     smoother_value=None,
                     smoother_shape=None,
                     rank=mapping.tp_rank,
@@ -832,7 +832,7 @@ def create_config_from_hugging_face(hf_model,
     # TODO: directly assign the hf_config fields to the config dict w/o creating these local vars
     # same for from_meta and from_cli_args
     n_head = hf_config.num_attention_heads
-    inter_size = hf_config.intermediate_size
+    inter_size = hf_config.intermediate_size // 2
     n_layer = hf_config.num_hidden_layers
     n_embd = hf_config.hidden_size
     n_kv_head = getattr(hf_config, "num_key_value_heads", n_head)

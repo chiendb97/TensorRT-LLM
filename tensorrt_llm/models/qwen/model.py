@@ -58,7 +58,7 @@ class QWenDecoderLayer(Module):
             dense_bias=False)
 
         self.mlp = GatedMLP(hidden_size=config.hidden_size,
-                            ffn_hidden_size=config.intermediate_size // 2,
+                            ffn_hidden_size=config.intermediate_size,
                             hidden_act=config.hidden_act,
                             dtype=dtype,
                             bias=False,

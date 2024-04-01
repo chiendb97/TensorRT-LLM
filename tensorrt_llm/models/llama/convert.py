@@ -674,10 +674,16 @@ def convert_hf_llama(hf_model,
             q_bias = get_bias(model_params, prefix + 'self_attn.q_proj', dtype)
             k_bias = get_bias(model_params, prefix + 'self_attn.k_proj', dtype)
             v_bias = get_bias(model_params, prefix + 'self_attn.v_proj', dtype)
-            qkv_bias = torch.cat((q_bias, k_bias, v_bias))
-            split_bias_v = split_qkv_bias_tp(qkv_bias, num_attention_heads,
-                                             hidden_size, tensor_parallel,
-                                             mapping.tp_rank)
+            if not mha_mode:
+                bq = split(q_bias, mapping.tp_size, mapping.tp_rank)
+                bk = split(k_bias, mapping.tp_size, mapping.tp_rank)
+                bv = split(v_bias, mapping.tp_size, mapping.tp_rank)
+                split_bias_v = torch.concat((bq, bk, bv))
+            else:
+                qkv_bias = torch.cat((q_bias, k_bias, v_bias))
+                split_bias_v = split_qkv_bias_tp(qkv_bias, num_attention_heads,
+                                                 hidden_size, tensor_parallel,
+                                                 mapping.tp_rank)
         else:
             split_bias_v = None
 
