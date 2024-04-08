@@ -33,8 +33,6 @@ from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
 from .kilm.model import KiLMForCausalLM
 
-from .quantized.quant import quantize_model  # noqa # isort:skip
-
 __all__ = [
     'BertModel',
     'BertForQuestionAnswering',
@@ -56,7 +54,6 @@ __all__ = [
     'GPTNeoXForCausalLM',
     'PhiModel',
     'PhiForCausalLM',
-    'quantize_model',
     'ChatGLMForCausalLM',
     'ChatGLMModel',
     'BaichuanForCausalLM',

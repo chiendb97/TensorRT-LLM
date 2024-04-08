@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import LlamaConfig, LlamaForCausalLM, LlamaTokenizer
+from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.pytorch_utils import Conv1D
 
@@ -24,6 +24,7 @@ from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama.weight import load_from_hf_checkpoint
+from tensorrt_llm.models.llama.utils import iterate_shard_files, load_state_dict, retrieved_layer_index_from_name
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -759,6 +760,25 @@ def convert_hf_llama(hf_model,
 
             split_v = split_qkv_tp(qkv_weight, num_attention_heads, hidden_size,
                                    tensor_parallel, mapping.tp_rank)
+
+        if prefix + 'self_attn.q_proj.bias' in model_params:
+            # only used in Internlm 7B models
+            q_bias = get_bias(model_params, prefix + 'self_attn.q_proj', dtype)
+            k_bias = get_bias(model_params, prefix + 'self_attn.k_proj', dtype)
+            v_bias = get_bias(model_params, prefix + 'self_attn.v_proj', dtype)
+            if not mha_mode:
+                bq = split(q_bias, mapping.tp_size, mapping.tp_rank)
+                bk = split(k_bias, mapping.tp_size, mapping.tp_rank)
+                bv = split(v_bias, mapping.tp_size, mapping.tp_rank)
+                split_bias_v = torch.concat((bq, bk, bv))
+            else:
+                qkv_bias = torch.cat((q_bias, k_bias, v_bias))
+                split_bias_v = split_qkv_bias_tp(qkv_bias, num_attention_heads,
+                                                 hidden_size, tensor_parallel,
+                                                 mapping.tp_rank)
+        else:
+            split_bias_v = None
+
         if use_smooth_quant:
             qkv_weight = qkv_para[prefix + 'self_attn.qkv_proj']
 
@@ -788,6 +808,7 @@ def convert_hf_llama(hf_model,
                     ],
                     tensor_parallel,
                     is_qkv=True,
+                    bias=split_bias_v,
                     per_token=per_token,
                     per_channel=per_channel,
                     last_prefix=tllm_prex + 'input_layernorm.scale_to_int',
@@ -799,7 +820,7 @@ def convert_hf_llama(hf_model,
         else:
             weights.update(
                 get_tllm_linear_weight(split_v, tllm_prex + 'attention.qkv.',
-                                       None, use_weight_only,
+                                       split_bias_v, use_weight_only,
                                        plugin_weight_only_quant_type))
 
         if int8_kv_cache:
@@ -825,6 +846,13 @@ def convert_hf_llama(hf_model,
                                   tensor_parallel,
                                   mapping.tp_rank,
                                   dim=1)
+
+        if prefix + 'self_attn.o_proj.bias' in model_params:
+            attn_dense_bias = get_bias(model_params,
+                                       prefix + 'self_attn.o_proj', dtype)
+        else:
+            attn_dense_bias = None
+
         if use_smooth_quant:
             attn_dense_weight = attn_dense_weight.t()
             int8_weights = generate_int8(
@@ -835,6 +863,7 @@ def convert_hf_llama(hf_model,
                     tllm_prex + 'attention.dense.', [1, hidden_size],
                     tensor_parallel,
                     is_qkv=False,
+                    bias=attn_dense_bias,
                     per_token=per_token,
                     per_channel=per_channel,
                     last_prefix=tllm_prex +
@@ -846,7 +875,7 @@ def convert_hf_llama(hf_model,
         else:
             weights.update(
                 get_tllm_linear_weight(split_v, tllm_prex + 'attention.dense.',
-                                       None, use_weight_only,
+                                       attn_dense_bias, use_weight_only,
                                        plugin_weight_only_quant_type))
 
         mlp_gate_weight = get_weight(model_params, prefix + 'mlp.up_proj',
@@ -1010,6 +1039,8 @@ if __name__ == '__main__':
         args.rms_norm_eps = hf_config.rms_norm_eps
         args.vocab_size = hf_config.vocab_size
         args.n_positions = hf_config.max_position_embeddings
+        args.attn_bias = getattr(hf_config, 'bias', False) or getattr(
+            hf_config, 'attention_bias', False)
 
     elif args.meta_ckpt_dir is not None:
 
@@ -1030,6 +1061,7 @@ if __name__ == '__main__':
                 (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1)
                 // args.multiple_of)
         args.rms_norm_eps = meta_config["norm_eps"]
+        attn_bias = meta_config.get("bias", False) or meta_config.get("attention_bias", False)
 
     if args.rotary_scaling is not None:
         # assert args.use_gpt_attention_plugin, "RoPE scaling is only supported through GPT attention plugin."
@@ -1057,6 +1089,7 @@ if __name__ == '__main__':
         'rotary_base': args.rotary_base,
         'rotary_scaling': args.rotary_scaling,
         'norm_epsilon': args.rms_norm_eps,
+        'attn_bias': args.attn_bias,
         'quantization': {
             'quant_algo': None,
             'kv_cache_quant_algo': None,
@@ -1071,7 +1104,7 @@ if __name__ == '__main__':
         'share_embedding_table': args.use_embedding_sharing,
         'max_draft_len': args.max_medusa_token_len,
         'num_medusa_heads': args.num_medusa_heads,
-        'num_medusa_layers': args.num_medusa_layers
+        'num_medusa_layers': args.num_medusa_layers,
     }
 
     if args.use_weight_only:
@@ -1123,7 +1156,7 @@ if __name__ == '__main__':
         hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
 
         model = hf_model.from_pretrained(args.model_dir,
-                                         torch_dtype='auto',
+                                         torch_dtype=torch.float16,
                                          device_map="auto",
                                          trust_remote_code=True)
 
@@ -1140,8 +1173,9 @@ if __name__ == '__main__':
 
             act_range = capture_activation_range(
                 model,
-                LlamaTokenizer.from_pretrained(args.model_dir,
-                                               padding_side='left'), dataset)
+                AutoTokenizer.from_pretrained(args.model_dir,
+                                              trust_remote_code=True,
+                                              padding_side='left'), dataset)
             if args.smoothquant is not None:
                 smooth_llama_model(model, act_range, args.smoothquant,
                                    llama_qkv_para, llama_smoother)
@@ -1188,9 +1222,23 @@ if __name__ == '__main__':
                                    mapping=Mapping(),
                                    dtype='float32'):
                     logger.info("Loading Medusa heads' weights ...")
-                    ckpt_file = Path(medusa_path) / "medusa_lm_head.pt"
-                    state_dict = torch.load(ckpt_file, map_location="cpu")
+                    # ckpt_file = Path(medusa_path) / "medusa_lm_head.pt"
+                    # state_dict = torch.load(ckpt_file, map_location="cpu")
+
                     torch_dtype = str_dtype_to_torch(dtype)
+                    state_dict = {}
+                    for model_file in iterate_shard_files(medusa_path,
+                                                          rank=mapping.tp_rank,
+                                                          progress_bar=False):
+                        logger.debug(f'Loading file {str(model_file)}...')
+                        model_params = load_state_dict(model_file, dtype=torch_dtype)
+                        for name, param in model_params.items():
+                            logger.debug(f'Converting weight {name}...')
+
+                            if name.startswith("medusa_head"):
+                                name = name.replace("medusa_head.", "")
+                                state_dict[name] = param
+
                     weights = {}
 
                     for h in range(args.num_medusa_heads):
