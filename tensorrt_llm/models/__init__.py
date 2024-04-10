@@ -17,6 +17,7 @@ from .bert.model import (BertForQuestionAnswering,
                          BertForSequenceClassification, BertModel)
 from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
+from .dbrx.model import DbrxForCausalLM
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.model import FalconForCausalLM, FalconModel
 from .gemma.model import GemmaForCausalLM
@@ -69,6 +70,7 @@ __all__ = [
     'MPTModel',
     'SkyworkForCausalLM',
     'GemmaForCausalLM',
+    'DbrxForCausalLM',
 ]
 
 MODEL_MAP = {
@@ -92,4 +94,5 @@ MODEL_MAP = {
     'GemmaForCausalLM': GemmaForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
     'KiLMForCausalLM': KiLMForCausalLM,
+    'DbrxForCausalLM': DbrxForCausalLM,
 }

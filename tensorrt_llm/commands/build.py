@@ -85,8 +85,8 @@ def parse_arguments():
         type=int,
         default=None,
         help='It equals to max_batch_size*max_beam_width by default, set this '
-        'value as close as possible to the actual number of tokens on your workload. '
-        'Note that this argument might be removed in the future.')
+             'value as close as possible to the actual number of tokens on your workload. '
+             'Note that this argument might be removed in the future.')
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument(
@@ -421,7 +421,8 @@ def main():
                     'gpus_per_node':
                         args.gpus_per_node,
                     'cluster_key':
-                        args.cluster_key or infer_cluster_key(),
+                        args.cluster_key
+                        or infer_cluster_key(allow_fallback=args.auto_parallel > 1),
                     'sharded_io_allowlist': [
                         'past_key_value_\\d+',
                         'present_key_value_\\d*',
