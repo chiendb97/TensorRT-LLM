@@ -127,10 +127,6 @@ def get_tokenizer(ckpt_path, max_seq_length, model_type=None):
         padding_side="left",
         trust_remote_code=True,
     )
-    if model_type and model_type in ["qwen", "kilm"]:
-        # qwen use token id 151643 as pad and eos tokens
-        tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
-        tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
 
     # can't set attribute 'pad_token' for "<unk>"
     if tokenizer.pad_token != "<unk>":  # nosec B105
