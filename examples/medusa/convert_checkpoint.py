@@ -24,7 +24,6 @@ from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama.weight import load_from_hf_checkpoint
-from tensorrt_llm.models.llama.utils import iterate_shard_files, load_state_dict, retrieved_layer_index_from_name
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -1222,23 +1221,9 @@ if __name__ == '__main__':
                                    mapping=Mapping(),
                                    dtype='float32'):
                     logger.info("Loading Medusa heads' weights ...")
-                    # ckpt_file = Path(medusa_path) / "medusa_lm_head.pt"
-                    # state_dict = torch.load(ckpt_file, map_location="cpu")
-
+                    ckpt_file = Path(medusa_path) / "medusa_lm_head.pt"
+                    state_dict = torch.load(ckpt_file, map_location="cpu")
                     torch_dtype = str_dtype_to_torch(dtype)
-                    state_dict = {}
-                    for model_file in iterate_shard_files(medusa_path,
-                                                          rank=mapping.tp_rank,
-                                                          progress_bar=False):
-                        logger.debug(f'Loading file {str(model_file)}...')
-                        model_params = load_state_dict(model_file, dtype=torch_dtype)
-                        for name, param in model_params.items():
-                            logger.debug(f'Converting weight {name}...')
-
-                            if name.startswith("medusa_head"):
-                                name = name.replace("medusa_head.", "")
-                                state_dict[name] = param
-
                     weights = {}
 
                     for h in range(args.num_medusa_heads):
@@ -1261,7 +1246,7 @@ if __name__ == '__main__':
 
                         lm = state_dict[
                             f"{h}.{args.num_medusa_layers}.weight"].clone().to(
-                                torch_dtype)  # LM Head
+                            torch_dtype)  # LM Head
 
                         weights['medusa_heads.{}.lm_head.weight'.format(
                             h)] = split(lm, mapping.tp_size, mapping.tp_rank)
