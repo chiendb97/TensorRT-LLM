@@ -94,5 +94,7 @@ MODEL_MAP = {
     'GemmaForCausalLM': GemmaForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
     'KiLMForCausalLM': KiLMForCausalLM,
+    'EncoderModel': EncoderModel,
+    'DecoderModel': DecoderModel,
     'DbrxForCausalLM': DbrxForCausalLM,
 }
