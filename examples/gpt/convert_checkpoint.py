@@ -862,7 +862,8 @@ def convert_hf_gpt_legacy(hf_model: AutoModelForCausalLM,
                           per_channel=False,
                           per_token=False,
                           int8_kv_cache=False,
-                          act_range=None):
+                          act_range=None,
+                          rank=None):
     weights = {}
     tik = time.time()
 
@@ -1808,6 +1809,7 @@ if __name__ == '__main__':
                     per_token=args.per_token,
                     int8_kv_cache=args.int8_kv_cache,
                     act_range=act_range,
+                    rank=rank,
                 )
             else:
                 weights = convert_hf_gpt(
