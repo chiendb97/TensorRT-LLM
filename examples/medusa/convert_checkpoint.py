@@ -24,6 +24,7 @@ from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama.weight import load_from_hf_checkpoint
+# from tensorrt_llm.models.llama.convert import convert_hf_llama
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -1102,7 +1103,7 @@ if __name__ == '__main__':
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
         'max_draft_len': args.max_medusa_token_len,
-        'num_medusa_heads': args.num_medusa_heads,
+        'num_medusa_heads': args.num_medusa_heads if args.fixed_num_medusa_heads is None else args.fixed_num_medusa_heads,
         'num_medusa_layers': args.num_medusa_layers,
     }
 
