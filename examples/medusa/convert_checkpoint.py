@@ -139,8 +139,8 @@ def parse_arguments():
                         type=str,
                         default=None,
                         help="cache dir to load the hugging face dataset")
-    parser.add_argument("--load-model-on-cpu", action="store_true")
-    parser.add_argument("--convert-model-on-cpu", action="store_true")
+    parser.add_argument("--load_model_on_cpu", action="store_true")
+    parser.add_argument("--convert_model_on_cpu", action="store_true")
     parser.add_argument(
         '--use_parallel_embedding',
         action="store_true",

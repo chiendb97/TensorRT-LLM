@@ -1003,7 +1003,7 @@ def create_config_from_hugging_face(hf_model,
     # TODO: directly assign the hf_config fields to the config dict w/o creating these local vars
     # same for from_meta and from_cli_args
     n_head = hf_config.num_attention_heads
-    inter_size = hf_config.intermediate_size // 2
+    inter_size = hf_config.intermediate_size
     n_layer = hf_config.num_hidden_layers
     n_embd = hf_config.hidden_size
     n_kv_head = getattr(hf_config, "num_key_value_heads", n_head)
