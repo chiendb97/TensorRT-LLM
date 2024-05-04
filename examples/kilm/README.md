@@ -1,24 +1,24 @@
 # KiLM
 
-This document shows how to build and run a KiLM model in TensorRT-LLM on both single GPU, single node multi-GPU.
+This document shows how to build and run a [KiLM](https://huggingface.co/KiLM) model in TensorRT-LLM on both single GPU, single node multi-GPU.
 
 - [KiLM](#kilm)
-   - [Overview](#overview)
-   - [Support Matrix](#support-matrix)
-   - [Usage](#usage)
-      - [Download model weights](#download-model-weights)
-      - [Build TensorRT engine(s)](#build-tensorrt-engines)
-         - [INT8 KV cache](#int8-kv-cache)
-         - [SmoothQuant](#smoothquant)
-         - [INT4-GPTQ](#int4-gptq)
-         - [INT4-AWQ](#int4-awq)
-      - [Run](#run)
-      - [Summarization using the KiLM model](#summarization-using-the-kilm-model)
-   - [Credits](#credits)
+    - [Overview](#overview)
+    - [Support Matrix](#support-matrix)
+    - [Usage](#usage)
+        - [Download model weights](#download-model-weights)
+        - [Build TensorRT engine(s)](#build-tensorrt-engines)
+            - [INT8 KV cache](#int8-kv-cache)
+            - [SmoothQuant](#smoothquant)
+            - [INT4-GPTQ](#int4-gptq)
+            - [INT4-AWQ](#int4-awq)
+        - [Run](#run)
+        - [Summarization using the KiLM model](#summarization-using-the-kilm-model)
+    - [Credits](#credits)
 
 ## Overview
 
-The TensorRT-LLM KiLM implementation can be found in [model.py](../../tensorrt_llm/models/kilm/model.py). The TensorRT-LLM KiLM example code is located in [`examples/kilm`](./). There is one main file:
+The TensorRT-LLM KiLM implementation can be found in [models/kilm](../../tensorrt_llm/models/kilm/). The TensorRT-LLM KiLM example code is located in [`examples/kilm`](./). There is one main file:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the KiLM model.
 
@@ -28,23 +28,29 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
-|   Model Name    | FP16  | FMHA  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  ST   | C++ Runtime | benchmark |  IFB  |  Arch   |
-| :-------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---------: | :-------: | :---: | :-----: |
-| KiLM-7B(-Chat)  |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
-| KiLM-14B(-Chat) |   Y   |   Y   |   Y   |  Y*   |   Y   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
-| KiLM-72B(-Chat) |   Y   |   Y   |   Y   |   -   |   Y   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
+|   Model Name       | FP16/BF16  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  Arch   |
+| :-------------:    |   :---:    | :---: | :---: | :---: | :---: | :---: | :---: | :-----: |
+| KiLM-1_8B(-Chat)   |     Y      |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM-7B(-Chat)     |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM-14B(-Chat)    |     Y      |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM-72B(-Chat)    |     Y      |   Y   |   -   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-7B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-14B(-Chat) |     Y      |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-32B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-72B(-Chat) |     Y      |   Y   |   -   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 
-*Please note that KiLM-14B-Chat model supports AWQ only with single GPU.
+*Please note that these models supports AWQ only with single GPU.
+
 * Model Name: the name of the model, the same as the name on HuggingFace
-* FMHA: Fused MultiHead Attention
 * WO: Weight Only Quantization (int8 / int4)
 * AWQ: Activation Aware Weight Quantization (int4)
 * GPTQ: Generative Pretrained Transformer Quantization (int4)
-* SQ: Smooth Quantization
+* SQ: Smooth Quantization (int8)
 * TP: Tensor Parallel
 * PP: Pipeline Parallel
-* ST: Strongly Typed
-* IFB: In-flight Batching
 
 *Currently KiLM models does not support dynamic NTK and logn attention. Therefore, accuracy on long sequence input for the 7B and 14B model is not promised.
 
