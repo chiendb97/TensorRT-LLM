@@ -57,8 +57,11 @@ class KiLMDecoderLayer(Module):
             quant_mode=config.quant_mode,
             dense_bias=True)
 
+        # KiLM's real inter_size is one half of what's in the config while KiLM2 is aligned with the config
+        intermediate_size = config.intermediate_size // 2 if self.config.kilm_type == 'kilm' else config.intermediate_size
+
         self.mlp = GatedMLP(hidden_size=config.hidden_size,
-                            ffn_hidden_size=config.intermediate_size,
+                            ffn_hidden_size=intermediate_size,
                             hidden_act=config.hidden_act,
                             dtype=dtype,
                             bias=False,

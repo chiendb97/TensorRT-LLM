@@ -83,3 +83,34 @@ def make_context(
         raise NotImplementedError(f"Unknown chat format {chat_format!r}")
     # truncate to max_input_length, truncate from the front
     return raw_text, context_tokens[-max_input_length:]
+
+
+def get_kilm_key_list(kilm_type):
+    kilm_key_list = [
+        "attn.c_attn",  # attention.qkv
+        "attn.c_proj",  # attention.dense
+        "mlp.w1",  # mlp.gate
+        "mlp.w2",  # mlp.fc
+        "mlp.c_proj",  # mlp.proj
+        "ln_1",  # input_layernorm
+        "ln_2",  # post_layernorm
+        "transformer.wte",  # vocabulary embedding
+        "transformer.ln_f",  # final layer norm
+    ]
+    kilm2_key_list = [
+        "self_attn.",  # attention.qkv
+        "self_attn.o_proj",  # attention.dense
+        "mlp.up_proj",  # mlp.gate
+        "mlp.gate_proj",  # mlp.fc
+        "mlp.down_proj",  # mlp.proj
+        "input_layernorm",  # input_layernorm
+        "post_attention_layernorm",  # post_layernorm
+        "model.embed_tokens",  # vocabulary embedding
+        "model.norm",  # final layer norm
+    ]
+    key_list = []
+    if kilm_type == 'kilm':
+        key_list.extend(kilm_key_list)
+    else:
+        key_list.extend(kilm2_key_list)
+    return key_list

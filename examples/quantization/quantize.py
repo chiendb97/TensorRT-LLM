@@ -47,6 +47,7 @@ if __name__ == "__main__":
                         help="KV Cache dtype.",
                         default=None,
                         choices=["int8", "fp8", None])
+    parser.add_argument('--max_draft_len', type=int, default=63)
     args = parser.parse_args()
 
     quantize_and_export(model_dir=args.model_dir,
@@ -61,4 +62,5 @@ if __name__ == "__main__":
                         batch_size=args.batch_size,
                         awq_block_size=args.awq_block_size,
                         seed=args.seed,
-                        max_seq_length=args.max_seq_length)
+                        max_seq_length=args.max_seq_length,
+                        max_draft_len=args.max_draft_len)
