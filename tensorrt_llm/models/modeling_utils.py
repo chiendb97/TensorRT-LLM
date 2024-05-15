@@ -1031,12 +1031,12 @@ def preprocess_weights(
         for name, param in weights.items():
             if name.endswith('weight') and param.dtype == torch.int8:
                 weights[name] = param.view(torch.float8_e4m3fn)
-        # lm_head is not quantized to FP8
-        if "lm_head.weight" in weights:
-            assert weights['lm_head.weight'].dtype == str_dtype_to_torch(
-                model_config.dtype)
-            weights.pop('lm_head.weights_scaling_factor', None)
-            weights.pop('lm_head.activation_scaling_factor', None)
+        # # lm_head is not quantized to FP8
+        # if "lm_head.weight" in weights:
+        #     assert weights['lm_head.weight'].dtype == str_dtype_to_torch(
+        #         model_config.dtype)
+        #     weights.pop('lm_head.weights_scaling_factor', None)
+        #     weights.pop('lm_head.activation_scaling_factor', None)
 
     elif quant_algo in [QuantAlgo.W4A16, QuantAlgo.W8A16]:
         weights = weight_only_quantize_dict(weights=weights,
