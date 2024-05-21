@@ -398,6 +398,18 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
+        # Workaround for kilm version
+        if model_type == 'kilm':
+            with open(f"{export_path}/config.json", "r") as f:
+                tensorrt_llm_config = json.load(f)
+            kilm_config = AutoConfig.from_pretrained(model_dir,
+                                                     trust_remote_code=True)
+            tensorrt_llm_config["kilm_type"] = kilm_config.model_type
+            tensorrt_llm_config[
+                "intermediate_size"] = kilm_config.intermediate_size
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
+
         # Workaround for medusa version
         if type(model).__name__ == "MedusaForCausalLM":
             with open(f"{export_path}/config.json", "r") as f:
