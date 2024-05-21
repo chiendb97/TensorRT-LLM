@@ -123,7 +123,7 @@ MODEL_NAME_PATTERN_MAP = {
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
     "ArcticForCausalLM": "llama",
-    "MedusaForCausalLM": "medusa",
+    "MedusaForCausalLM": "llama",
 }
 
 
@@ -398,11 +398,12 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
                 json.dump(tensorrt_llm_config, f, indent=4)
 
         # Workaround for medusa version
-        if model_type == 'medusa':
+        if type(model).__name__ == "MedusaForCausalLM":
             with open(f"{export_path}/config.json", "r") as f:
                 tensorrt_llm_config = json.load(f)
             medusa_config = AutoConfig.from_pretrained(model_dir,
                                                        trust_remote_code=True)
+            tensorrt_llm_config["architecture"] = "MedusaForCausalLM"
             tensorrt_llm_config["num_medusa_heads"] = medusa_config.medusa_num_heads
             tensorrt_llm_config["num_medusa_layers"] = medusa_config.medusa_num_layers
             tensorrt_llm_config["max_draft_len"] = max_draft_len
