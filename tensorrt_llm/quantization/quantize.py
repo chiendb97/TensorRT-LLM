@@ -254,10 +254,14 @@ def smooth_quantize(model, quant_config: QuantConfig):
 
 
 def fp8_quantize(model, quant_config: QuantConfig, current_key_name=None):
+    import os
     assert quant_config.quant_mode.has_fp8_qdq()
+    enable_quantize_lm_head = os.getenv("ENABLE_QUANTIZE_LM_HEAD", 'False').lower() in ('true', '1', 't')
+    if enable_quantize_lm_head:
+        exclude_modules = quant_config.exclude_modules or ['router']
+    else:
+        exclude_modules = quant_config.exclude_modules or ['lm_head', 'router']
 
-    # exclude_modules = quant_config.exclude_modules or ['lm_head', 'router']
-    exclude_modules = quant_config.exclude_modules or ['router']
     for name, module in model.named_children():
         if current_key_name is None:
             current_key_name = []
