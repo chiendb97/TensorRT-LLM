@@ -15,6 +15,8 @@
 
 from typing import Optional
 
+from tensorrt_llm.lora_manager import LoraConfig, use_lora
+
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, recv, send
 from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
@@ -57,8 +59,11 @@ class KiLMDecoderLayer(Module):
             quant_mode=config.quant_mode,
             dense_bias=True)
 
+        # KiLM's real inter_size is one half of what's in the config while KiLM2 is aligned with the config
+        intermediate_size = config.intermediate_size // 2 if self.config.kilm_type == 'kilm' else config.intermediate_size
+
         self.mlp = GatedMLP(hidden_size=config.hidden_size,
-                            ffn_hidden_size=config.intermediate_size,
+                            ffn_hidden_size=intermediate_size,
                             hidden_act=config.hidden_act,
                             dtype=dtype,
                             bias=False,
@@ -76,6 +81,7 @@ class KiLMDecoderLayer(Module):
             use_cache=False,
             kv_cache_params=None,
             attention_params=None,
+            lora_layer_params=None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -85,6 +91,7 @@ class KiLMDecoderLayer(Module):
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
+            lora_layer_params=lora_layer_params,
         )
         if use_cache:
             attention_output, presents = attention_output
@@ -95,7 +102,8 @@ class KiLMDecoderLayer(Module):
 
         hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states,
+                                 lora_layer_params=lora_layer_params)
 
         hidden_states = residual + hidden_states
         if use_cache:
@@ -109,16 +117,9 @@ class KiLMModel(Module):
         super().__init__()
         self.mapping = config.mapping
         if self.mapping.is_first_pp_rank():
-            self.vocab_embedding = Embedding(
-                config.vocab_size,
-                config.hidden_size,
-                dtype=config.dtype,
-                tp_size=self.mapping.tp_size
-                if config.use_parallel_embedding else 1,
-                tp_group=self.mapping.tp_group
-                if config.use_parallel_embedding else None,
-                sharding_dim=config.embedding_sharding_dim,
-                tp_rank=self.mapping.tp_rank)
+            self.vocab_embedding = Embedding(config.vocab_size,
+                                             config.hidden_size,
+                                             dtype=config.dtype)
 
         self.layers = DecoderLayerList(KiLMDecoderLayer, config)
 
@@ -137,12 +138,8 @@ class KiLMModel(Module):
                 hidden_states=None,
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
-                prompt_vocab_size: Optional[Tensor] = None):
-
-        kv_cache_params.fill_none_tensor_list(len(self.layers))
-
-        if use_cache:
-            presents = []
+                prompt_vocab_size: Optional[Tensor] = None,
+                lora_params=None):
 
         ptuning_args = [
             prompt_embedding_table, prompt_tasks, prompt_vocab_size
@@ -157,7 +154,8 @@ class KiLMModel(Module):
                                             use_cache=use_cache,
                                             attention_mask=attention_mask,
                                             kv_cache_params=kv_cache_params,
-                                            attention_params=attention_params)
+                                            attention_params=attention_params,
+                                            lora_params=lora_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -192,8 +190,18 @@ class KiLMForCausalLM(DecoderModelForCausalLM):
             lm_head = None
         self.quant_mode = config.quant_mode
         self.mapping = config.mapping
+        self.trtllm_modules_to_hf_modules = {
+            "attn_qkv": "c_attn",
+            "attn_dense": "attn.c_proj",
+            "mlp_h_to_4h": "w2",
+            "mlp_4h_to_h": "mlp.c_proj",
+            "mlp_gate": "w1",
+        }
         super().__init__(config, transformer, lm_head)
 
     def check_config(self, config):
         config.set_if_not_exist('rotary_base', 10000.0)
         config.set_if_not_exist('rotary_scaling', None)
+
+    def use_lora(self, lora_config: LoraConfig):
+        use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)

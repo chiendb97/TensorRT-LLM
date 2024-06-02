@@ -12,22 +12,26 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/loraCache.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/workerPool.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
-#include <NvInferRuntimeBase.h>
+
+#include <NvInferRuntime.h>
+
 #include <future>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager
 {
 
-using runtime::SizeType;
+using runtime::SizeType32;
 
 /**
  * BasePeftCacheManager
@@ -39,7 +43,7 @@ class BasePeftCacheManager
 {
 public:
     using LlmRequestPtr = std::shared_ptr<LlmRequest>;
-    using RequestTable = std::map<uint64_t, LlmRequestPtr>;
+    using RequestVector = std::vector<LlmRequestPtr>;
     using PeftTable = std::map<uint64_t, std::shared_ptr<std::vector<runtime::LoraCache::TaskLayerModuleConfig>>>;
 
     /**
@@ -50,13 +54,14 @@ public:
     virtual void addRequestPeft(LlmRequestPtr llmRequest, bool tryGpuCache = true) = 0;
 
     /**
-     * \brief ensures device cache has all the weights needed to execute batch as specified by requestTable.
+     * \brief ensures device cache has all the weights needed to execute batch as specified by requests.
      * This acts as sync for the copy tasks started by addRequestPeft
-     * \param[in] requestTable: current request table
+     * \param[in] contextRequests: current context requests
+     * \param[in] genRequests: current generation requests
      * \param[in] resetGpuCache: reset (make all tasks evictable)
      * \returns -- a PeftTable
      */
-    virtual PeftTable ensureBatch(RequestTable const& requestTable, bool resetGpuCache = false) = 0;
+    virtual PeftTable ensureBatch(ScheduledRequests const& scheduledRequests, bool resetGpuCache = false) = 0;
 
     /**
      * \brief mark all the tasks in device cache as done
@@ -65,11 +70,11 @@ public:
 
     virtual void markRequestDone(LlmRequestPtr const& llmReq, bool pause = false) = 0;
 
-    [[nodiscard]] virtual SizeType getMaxDevicePages() const = 0;
+    [[nodiscard]] virtual SizeType32 getMaxDevicePages() const = 0;
 
-    [[nodiscard]] virtual SizeType getMaxHostPages() const = 0;
+    [[nodiscard]] virtual SizeType32 getMaxHostPages() const = 0;
 
-    [[nodiscard]] virtual SizeType determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const = 0;
+    [[nodiscard]] virtual SizeType32 determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const = 0;
 
     [[nodiscard]] virtual bool enabled() const = 0;
 };
@@ -77,12 +82,12 @@ public:
 class PeftCacheManager : public BasePeftCacheManager
 {
 public:
-    PeftCacheManager(PeftCacheManagerConfig const& config, runtime::GptModelConfig const& modelConfig,
+    PeftCacheManager(PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager);
 
     void addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bool tryGpuCache = true) override;
 
-    PeftTable ensureBatch(RequestTable const& requestTable, bool resetGpuCache = false) override;
+    PeftTable ensureBatch(ScheduledRequests const& scheduledRequests, bool resetGpuCache = false) override;
 
     [[nodiscard]] bool isTaskCached(uint64_t taskId) const;
 
@@ -94,11 +99,11 @@ public:
 
     void markRequestDone(std::shared_ptr<LlmRequest> const& llmReq, bool pause = false) override;
 
-    [[nodiscard]] SizeType getMaxDevicePages() const override;
+    [[nodiscard]] SizeType32 getMaxDevicePages() const override;
 
-    [[nodiscard]] SizeType getMaxHostPages() const override;
+    [[nodiscard]] SizeType32 getMaxHostPages() const override;
 
-    [[nodiscard]] SizeType determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const override;
+    [[nodiscard]] SizeType32 determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const override;
 
     inline bool enabled() const override
     {
@@ -116,7 +121,7 @@ public:
         runtime::BufferManager const& bufferManager);
 
     static std::pair<runtime::LoraCachePageManagerConfig, runtime::LoraCachePageManagerConfig> getPageManagerConfig(
-        PeftCacheManagerConfig const& config, runtime::GptModelConfig const& modelConfig,
+        PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager);
 
 private:
@@ -133,9 +138,9 @@ private:
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> mTaskIdToPausedReqIds;
 
     std::tuple<std::map<uint64_t, std::future<void>>, std::map<uint64_t, std::vector<uint64_t>>> getTaskMaps(
-        RequestTable const& requestTable);
+        ScheduledRequests const& scheduledRequests);
 
-    runtime::GptModelConfig mModelConfig;
+    runtime::ModelConfig mModelConfig;
     runtime::WorldConfig mWorldConfig;
 
     int mDevice{-1};
@@ -145,17 +150,17 @@ class NoOpPeftCacheManager : public BasePeftCacheManager
 {
     void addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bool tryGpuCache = true) override;
 
-    PeftTable ensureBatch(RequestTable const& requestTable, bool resetGpuCache = false) override;
+    PeftTable ensureBatch(ScheduledRequests const& scheduledRequests, bool resetGpuCache = false) override;
 
     void resetDeviceCache() override;
 
     void markRequestDone(std::shared_ptr<LlmRequest> const& llmReq, bool pause = false) override;
 
-    [[nodiscard]] SizeType getMaxDevicePages() const override;
+    [[nodiscard]] SizeType32 getMaxDevicePages() const override;
 
-    [[nodiscard]] SizeType getMaxHostPages() const override;
+    [[nodiscard]] SizeType32 getMaxHostPages() const override;
 
-    [[nodiscard]] SizeType determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const override;
+    [[nodiscard]] SizeType32 determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const override;
 
     inline bool enabled() const override
     {

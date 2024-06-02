@@ -85,7 +85,6 @@ setup(
     # TODO Add windows support for python bindings.
     classifiers=[
         "Development Status :: 4 - Beta",
-        "License :: Apache License 2.0",
         "Intended Audience :: Developers",
         "Programming Language :: Python :: 3.10",
     ],
@@ -95,17 +94,25 @@ setup(
     package_data={
         'tensorrt_llm': ([
             'libs/th_common.dll', 'libs/tensorrt_llm.dll',
-            'libs/nvinfer_plugin_tensorrt_llm.dll', 'bindings.*.pyd'
+            'libs/nvinfer_plugin_tensorrt_llm.dll',
+            'libs/tensorrt_llm_nvrtc_wrapper.dll', 'bindings.*.pyd'
         ] if on_windows else [
+            'bin/executorWorker',
             'libs/libtensorrt_llm.so',
             'libs/libth_common.so',
             'libs/libnvinfer_plugin_tensorrt_llm.so',
+            'libs/libtensorrt_llm_nvrtc_wrapper.so',
             'bindings.*.so',
         ]) + ['bindings/*.pyi', 'tools/plugin_gen/templates/*'],
     },
     entry_points={
-        'console_scripts': ['trtllm-build=tensorrt_llm.commands.build:main'],
+        'console_scripts': [
+            'trtllm-build=tensorrt_llm.commands.build:main',
+            'trtllm-prune=tensorrt_llm.commands.prune:main',
+            'trtllm-refit=tensorrt_llm.commands.refit:main',
+        ],
     },
+    scripts=['tensorrt_llm/hlapi/trtllm-hlapi-launch'],
     extras_require={
         "devel": devel_deps,
         "benchmarking": [

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <NvInferRuntime.h>
 
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -57,11 +58,17 @@ public:
 
     static auto constexpr kBYTE_TYPE = nvinfer1::DataType::kUINT8;
 
-    //! \brief Allocates an `IBuffer` of the given size on the GPU.
+    //! \brief Allocates an `IBuffer` of the given size on the GPU, using cudaMallocAsync.
     [[nodiscard]] IBufferPtr gpu(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE) const;
 
-    //! \brief Allocates an `ITensor` of the given dimensions on the GPU.
+    //! \brief Allocates an `ITensor` of the given dimensions on the GPU, using cudaMallocAsync.
     [[nodiscard]] ITensorPtr gpu(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE) const;
+
+    //! \brief Allocates an `IBuffer` of the given size on the GPU, using cudaMalloc.
+    [[nodiscard]] static IBufferPtr gpuSync(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
+
+    //! \brief Allocates an `ITensor` of the given dimensions on the GPU, using cudaMalloc.
+    [[nodiscard]] static ITensorPtr gpuSync(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `IBuffer` of the given size on the CPU.
     [[nodiscard]] static IBufferPtr cpu(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
@@ -106,6 +113,9 @@ public:
     {
         return allocate(memoryType, ITensor::makeShape({}), type);
     }
+
+    //! \brief Set the contents of the given `buffer` to value.
+    void setMem(IBuffer& buffer, int32_t value) const;
 
     //! \brief Set the contents of the given `buffer` to zero.
     void setZero(IBuffer& buffer) const;

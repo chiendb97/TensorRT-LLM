@@ -12,8 +12,8 @@ from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.models.llama.weight import load_from_gptq_llama
-from tensorrt_llm.models.modeling_utils import QuantizationConfig
-from tensorrt_llm.quantization import mode as quant_algo
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -99,7 +99,7 @@ def parse_arguments():
         'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
     parser.add_argument(
-        '--ammo_quant_ckpt_path',
+        '--modelopt_quant_ckpt_path',
         type=str,
         default=None,
         help='Path of a quantized model checkpoint in .npz format')
@@ -190,31 +190,6 @@ def parse_arguments():
         help=
         'Controls renormalization after gate logits. Check layers/moe.py for accepted values',
     )
-
-    parser.add_argument('--hf_lora_dir', type=str, default=None)
-    parser.add_argument(
-        '--lora_target_modules',
-        nargs='+',
-        default=None,
-        choices=[
-            "attn_qkv",
-            "attn_q",
-            "attn_k",
-            "attn_v",
-            "attn_dense",
-            "mlp_h_to_4h",
-            "mlp_gate",
-            "mlp_4h_to_h",
-        ],
-        help=
-        "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
-    )
-    parser.add_argument(
-        '--max_lora_rank',
-        type=int,
-        default=64,
-        help='maximum lora rank for different lora modules. '
-        'It is used to compute the workspace size of lora plugin.')
     parser.add_argument(
         '--save_config_only',
         action="store_true",
@@ -230,43 +205,42 @@ def parse_arguments():
     return args
 
 
-def args_to_quantization(args: argparse.Namespace) -> QuantizationConfig:
+def args_to_quantization(args: argparse.Namespace) -> QuantConfig:
     '''return config dict with quantization info based on the command line args
     '''
-    quant_config = QuantizationConfig()
-    quant_config.exclude_modules = ['lm_head']
+    quant_config = QuantConfig()
+    quant_config.exclude_modules = [
+        'lm_head', 'router', 'vocab_embedding', 'position_embedding',
+        'block_embedding'
+    ]
     if args.use_weight_only:
         if args.weight_only_precision == 'int8':
-            quant_config.quant_algo = quant_algo.W8A16
+            quant_config.quant_algo = QuantAlgo.W8A16
         elif args.weight_only_precision == 'int4':
-            quant_config.quant_algo = quant_algo.W4A16
+            quant_config.quant_algo = QuantAlgo.W4A16
     elif args.smoothquant:
+        quant_config.smoothquant_val = args.smoothquant
         if args.per_channel:
             if args.per_token:
-                quant_config.quant_algo = quant_algo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+                quant_config.quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
             else:
-                quant_config.quant_algo = quant_algo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN
+                quant_config.quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN
         else:
             if args.per_token:
-                quant_config.quant_algo = quant_algo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
+                quant_config.quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
             else:
-                quant_config.quant_algo = quant_algo.W8A8_SQ_PER_TENSOR_PLUGIN
+                quant_config.quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
 
     if args.int8_kv_cache:
-        quant_config.kv_cache_quant_algo = quant_algo.INT8
+        quant_config.kv_cache_quant_algo = QuantAlgo.INT8
 
     if args.weight_only_precision == 'int4_gptq':
         quant_config.group_size = args.group_size
         quant_config.has_zero_point = True
         quant_config.pre_quant_scale = False
-        quant_config.quant_algo = quant_algo.W4A16_GPTQ
+        quant_config.quant_algo = QuantAlgo.W4A16_GPTQ
 
     return quant_config
-
-
-def has_any_quant(args):
-    quant_config = args_to_quantization(args)
-    return quant_config.quant_algo is not None or quant_config.kv_cache_quant_algo is not None
 
 
 def convert_and_save_meta(args, rank):
@@ -274,9 +248,8 @@ def convert_and_save_meta(args, rank):
                       tp_size=args.tp_size,
                       pp_size=args.pp_size,
                       rank=rank)
-    assert not has_any_quant(args), \
+    assert not args_to_quantization(args).quant_mode.has_any_quant(), \
         "quantization from meta checkpoint or empty model were never supported"
-    assert not args.hf_lora_dir, "lora is only supported when loading from hf model dir for now"
     llama = LLaMAForCausalLM.from_meta_ckpt(
         args.meta_ckpt_dir,
         args.dtype,
@@ -328,27 +301,35 @@ def from_cli_args(args):
     return config
 
 
-def preload_model(model_dir):
+def preload_model(model_dir, load_model_on_cpu):
+    use_safetensors = True
     from transformers import AutoConfig, AutoModelForCausalLM
     if "vila" in model_dir:
+        use_safetensors = False
         sys.path.append(model_dir + "/../VILA")
         from llava.model import LlavaConfig, LlavaLlamaForCausalLM
         AutoConfig.register("llava_llama", LlavaConfig)
         AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
 
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    model_cls = AutoModelForCausalLM
     if hf_config.model_type == "llava":
+        use_safetensors = False
         from transformers import LlavaForConditionalGeneration
-        hf_llava = LlavaForConditionalGeneration.from_pretrained(
-            model_dir, torch_dtype="auto")
-        model = hf_llava.language_model
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            device_map='auto',
-            torch_dtype='auto',
-            trust_remote_code=True,
-        )
+        model_cls = LlavaForConditionalGeneration
+    use_safetensors = any(
+        [f.endswith(".safetensors")
+         for f in os.listdir(model_dir)]) and use_safetensors
+    if use_safetensors:
+        return None
+    model = model_cls.from_pretrained(
+        model_dir,
+        device_map='auto' if not load_model_on_cpu else 'cpu',
+        torch_dtype='auto',
+        trust_remote_code=True,
+    )
+    if hf_config.model_type == "llava":
+        model = model.language_model
     return model
 
 
@@ -378,15 +359,12 @@ def convert_and_save_hf(args):
                                   dtype=args.dtype,
                                   mapping=mapping,
                                   override_fields=override_fields,
-                                  dataset_cache_dir=args.dataset_cache_dir,
-                                  smoothquant_val=args.smoothquant,
-                                  hf_lora_dir=args.hf_lora_dir,
-                                  lora_target_modules=args.lora_target_modules,
-                                  max_lora_rank=args.max_lora_rank)
+                                  dataset_cache_dir=args.dataset_cache_dir)
     else:
         # When not loading by shard, preload one complete model and then slice per rank weights from this
         # this saves the disk reloading time
-        hf_model = preload_model(model_dir) if not args.load_by_shard else None
+        hf_model = preload_model(
+            model_dir, load_model_on_cpu) if not args.load_by_shard else None
 
         def convert_and_save_rank(args, rank):
             mapping = Mapping(world_size=world_size,
@@ -401,15 +379,13 @@ def convert_and_save_hf(args):
                 load_by_shard=load_by_shard,
                 load_model_on_cpu=load_model_on_cpu,
                 override_fields=override_fields,
-                hf_lora_dir=args.hf_lora_dir,
-                lora_target_modules=args.lora_target_modules,
-                max_lora_rank=args.max_lora_rank,
-                preloaded_model=hf_model)
+                preloaded_model=hf_model,
+            )
             llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del llama
-            release_gc()
 
         execute(args.workers, [convert_and_save_rank] * world_size, args)
+        release_gc()
 
 
 def convert_and_save_gptq(args, rank):
@@ -423,7 +399,7 @@ def convert_and_save_gptq(args, rank):
         mapping=mapping,
         quantization=args_to_quantization(args),
         skip_loading_weights=True)
-    weights = load_from_gptq_llama(llama.config, args.ammo_quant_ckpt_path)
+    weights = load_from_gptq_llama(llama.config, args.modelopt_quant_ckpt_path)
     llama.load(weights)
     llama.save_checkpoint(args.output_dir, rank == 0)
 
@@ -467,11 +443,11 @@ def main():
         execute(args.workers, [convert_and_save_meta] * world_size, args)
     elif args.weight_only_precision == 'int4_gptq':
         assert args.model_dir is not None
-        assert args.ammo_quant_ckpt_path is not None
+        assert args.modelopt_quant_ckpt_path is not None
         execute(args.workers, [convert_and_save_gptq] * world_size, args)
     else:  # all other non-gptq paths from hf model
         assert args.model_dir is not None
-        assert args.ammo_quant_ckpt_path is None, "only gptq weights only needs this option"
+        assert args.modelopt_quant_ckpt_path is None, "only gptq weights only needs this option"
         convert_and_save_hf(args)
 
     tok = time.time()

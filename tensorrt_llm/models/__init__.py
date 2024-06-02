@@ -17,6 +17,8 @@ from .bert.model import (BertForQuestionAnswering,
                          BertForSequenceClassification, BertModel)
 from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
+from .cogvlm.model import CogVLMForCausalLM
+from .dbrx.model import DbrxForCausalLM
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.model import FalconForCausalLM, FalconModel
 from .gemma.model import GemmaForCausalLM
@@ -24,16 +26,17 @@ from .gpt.model import GPTForCausalLM, GPTModel
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .llama.model import LLaMAForCausalLM, LLaMAModel
-from .mamba.model import MambaLMHeadModel
+from .mamba.model import MambaForCausalLM
 from .medusa.model import MedusaForCausalLm
-from .modeling_utils import PretrainedConfig, PretrainedModel
+from .modeling_utils import (PretrainedConfig, PretrainedModel,
+                             SpeculativeDecodingMode)
 from .mpt.model import MPTForCausalLM, MPTModel
 from .opt.model import OPTForCausalLM, OPTModel
+from .phi3.model import Phi3ForCausalLM, Phi3Model
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
 from .kilm.model import KiLMForCausalLM
-
-from .quantized.quant import quantize_model  # noqa # isort:skip
+from .recurrentgemma.model import RecurrentGemmaForCausalLM
 
 __all__ = [
     'BertModel',
@@ -55,8 +58,9 @@ __all__ = [
     'GPTNeoXModel',
     'GPTNeoXForCausalLM',
     'PhiModel',
+    'Phi3Model',
     'PhiForCausalLM',
-    'quantize_model',
+    'Phi3ForCausalLM',
     'ChatGLMForCausalLM',
     'ChatGLMModel',
     'BaichuanForCausalLM',
@@ -67,11 +71,15 @@ __all__ = [
     'PretrainedConfig',
     'PretrainedModel',
     'WhisperEncoder',
-    'MambaLMHeadModel',
+    'MambaForCausalLM',
     'MPTForCausalLM',
     'MPTModel',
     'SkyworkForCausalLM',
     'GemmaForCausalLM',
+    'DbrxForCausalLM',
+    'RecurrentGemmaForCausalLM',
+    'CogVLMForCausalLM',
+    'SpeculativeDecodingMode',
 ]
 
 MODEL_MAP = {
@@ -80,7 +88,8 @@ MODEL_MAP = {
     'BloomForCausalLM': BloomForCausalLM,
     'FalconForCausalLM': FalconForCausalLM,
     'PhiForCausalLM': PhiForCausalLM,
-    'MambaLMHeadModel': MambaLMHeadModel,
+    'Phi3ForCausalLM': Phi3ForCausalLM,
+    'MambaForCausalLM': MambaForCausalLM,
     'GPTNeoXForCausalLM': GPTNeoXForCausalLM,
     'GPTJForCausalLM': GPTJForCausalLM,
     'MPTForCausalLM': MPTForCausalLM,
@@ -88,6 +97,7 @@ MODEL_MAP = {
     'LlamaForCausalLM': LLaMAForCausalLM,
     'MistralForCausalLM': LLaMAForCausalLM,
     'MixtralForCausalLM': LLaMAForCausalLM,
+    'ArcticForCausalLM': LLaMAForCausalLM,
     'InternLMForCausalLM': LLaMAForCausalLM,
     'MedusaForCausalLM': MedusaForCausalLm,
     'BaichuanForCausalLM': BaichuanForCausalLM,
@@ -95,4 +105,9 @@ MODEL_MAP = {
     'GemmaForCausalLM': GemmaForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
     'KiLMForCausalLM': KiLMForCausalLM,
+    'EncoderModel': EncoderModel,
+    'DecoderModel': DecoderModel,
+    'DbrxForCausalLM': DbrxForCausalLM,
+    'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
+    'CogVLMForCausalLM': CogVLMForCausalLM,
 }

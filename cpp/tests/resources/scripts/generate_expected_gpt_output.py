@@ -110,21 +110,16 @@ def generate_outputs(num_beams):
                     num_beams=num_beams,
                     input_name='input_tokens',
                     output_name='output_tokens_fp16_plugin_packed_paged_gather',
-                    output_logits=True)
-    generate_output(
-        engine='fp16-plugin-packed-paged-context-fmha-for-gen',
-        num_beams=num_beams,
-        input_name='input_tokens',
-        output_name=
-        'output_tokens_fp16_plugin_packed_paged_context_fmha_for_gen',
-        output_logits=False)
+                    output_logits=True,
+                    output_log_probs=True,
+                    output_cum_log_probs=True)
     generate_output(engine='fp16-plugin-packed-paged',
                     num_beams=num_beams,
                     input_name='input_tokens',
                     output_name='output_tokens_fp16_plugin_packed_paged',
                     output_logits=False,
-                    output_log_probs=(num_beams == 1),
-                    output_cum_log_probs=(num_beams == 1))
+                    output_log_probs=True,
+                    output_cum_log_probs=True)
     generate_output(engine='fp16-plugin-packed-paged',
                     num_beams=num_beams,
                     input_name='input_tokens',

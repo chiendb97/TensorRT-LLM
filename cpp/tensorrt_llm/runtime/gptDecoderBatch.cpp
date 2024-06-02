@@ -32,7 +32,7 @@ namespace tk = tensorrt_llm::kernels;
 
 namespace
 {
-SamplingConfig extractSamplingConfig(SamplingConfig const& batchSamplingConfig, SizeType batchIdx)
+SamplingConfig extractSamplingConfig(SamplingConfig const& batchSamplingConfig, SizeType32 batchIdx)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     SamplingConfig samplingConfig{batchSamplingConfig.beamWidth};
@@ -83,7 +83,7 @@ GptDecoderBatch::GptDecoderBatch(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
-    auto constexpr nvSizeType = TRTDataType<SizeType>::value;
+    auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
     auto constexpr nvFloatType = TRTDataType<float>::value;
 
     auto& dInput = mJointDecodingInput;
@@ -104,13 +104,13 @@ GptDecoderBatch::GptDecoderBatch(
         = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<tk::FinishedState::UnderlyingType>::value);
     mDraftProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     mTargetProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
-    mBatchSlotsSetup = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
-    mBatchSlotsDecoder = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
-    mBatchSlotsAcceptTokens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
-    mBatchSlotsAcceptLogits = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
+    mBatchSlotsSetup = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
+    mBatchSlotsDecoder = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
+    mBatchSlotsAcceptTokens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
+    mBatchSlotsAcceptLogits = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
     // use batchSize many entries instead of the usual 1
     dOutput->finishedSum = mBufferManager.emptyTensor(MemoryType::kPINNED, nvSizeType);
-    mFinishedSum = mBufferManager.pinned(ITensor::makeShape({1}), nvSizeType);
+    mFinishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvSizeType);
     // we don't need dOutput->lengths because lengths are passed from outside
     dOutput->cumLogProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dOutput->logProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
@@ -123,39 +123,64 @@ GptDecoderBatch::GptDecoderBatch(
     mTargetLogitsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<float*>::value);
 
     dInput->stopWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
-    dInput->stopWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
+    dInput->stopWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
     dInput->badWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
-    dInput->badWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
+    dInput->badWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
     dInput->embeddingBias = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
 
-    mNextDraftTokens = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
-    mNextDraftTokenLengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    allocateMedusaBuffers();
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth,
-    SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep,
-    bool fusedDecoder, nvinfer1::DataType dtype)
+void GptDecoderBatch::allocateMedusaBuffers()
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
+
+    auto& dInput = mJointDecodingInput;
+    auto& dOutput = mJointDecodingOutput;
+
+    DecodingInput::MedusaInputs medusaInputs;
+    medusaInputs.medusaPaths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
+    medusaInputs.medusaTreeIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
+    medusaInputs.medusaCurTokensPerStep = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
+    medusaInputs.medusaTargetTokensPerStep = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
+    dInput->medusaInputs = medusaInputs;
+
+    DecodingOutput::MedusaOutputs medusaOutputs;
+    medusaOutputs.medusaNextDraftTokens = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    medusaOutputs.medusaAcceptedTokensLen = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    medusaOutputs.medusaAcceptedLengthsCumSum
+        = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    medusaOutputs.medusaPathsOffsets = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    dOutput->medusaOutputs = medusaOutputs;
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void GptDecoderBatch::setup(DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+    SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
+    SizeType32 maxTokensPerEngineStep, bool fusedDecoder, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxBatchSize > 0);
     TLLM_CHECK(maxBeamWidth > 0);
-    TLLM_CHECK(maxTokensPerStep > 0);
+    TLLM_CHECK(maxTokensPerEngineStep > 0);
     TLLM_CHECK(maxSequenceLength > 0);
     mActualBatchSize = maxBatchSize;
-    mGeneratedTokensPerStep.resize(maxBatchSize);
+    mGeneratedTokensPerEngineStep.resize(maxBatchSize);
     mMaxSequenceLength = maxSequenceLength;
     mMaxAttentionWindow = maxAttentionWindow;
     mSinkTokenLength = sinkTokenLength;
-    mMaxTokensPerStep = maxTokensPerStep;
+    mMaxTokensPerEngineStep = maxTokensPerEngineStep;
     mFusedDecoder = fusedDecoder;
+    mUseMedusa = modelConfig.useMedusa();
 
     auto const maxBatchSizeShape = ITensor::makeShape({maxBatchSize});
     auto const maxBatchSizeXmaxBeamWidth = ITensor::makeShape({maxBatchSize, maxBeamWidth});
     auto const maxTokensPerStepXmaxBatchSizeXmaxBeamWidth
-        = ITensor::makeShape({maxTokensPerStep, maxBatchSize, maxBeamWidth});
-    auto const maxBatchSizeXmaxTokensPerStep = ITensor::makeShape({maxBatchSize, maxTokensPerStep});
+        = ITensor::makeShape({maxTokensPerEngineStep, maxBatchSize, maxBeamWidth});
+    auto const maxBatchSizeXmaxTokensPerStep = ITensor::makeShape({maxBatchSize, maxTokensPerEngineStep});
 
     auto& dInput = *mJointDecodingInput;
     dInput.maxLength = mMaxSequenceLength;
@@ -174,7 +199,6 @@ void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, Siz
     auto& dOutput = *mJointDecodingOutput;
     dOutput.ids->reshape(jointOutputIdsShape);
 
-    dOutput.newTokensSteps->reshape(maxTokensPerStepXmaxBatchSizeXmaxBeamWidth);
     mBufferManager.setZero(*dOutput.newTokensSteps);
     mFinishedSteps->reshape(maxTokensPerStepXmaxBatchSizeXmaxBeamWidth);
     mBufferManager.setZero(*mFinishedSteps);
@@ -182,23 +206,25 @@ void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, Siz
     if (mFusedDecoder)
     {
         mBatchSlotsSetup->reshape(ITensor::makeShape({maxBatchSize}));
-        mBatchSlotsDecoder->reshape(ITensor::makeShape({maxTokensPerStep, maxBatchSize}));
-        mBatchSlotsAcceptTokens->reshape(ITensor::makeShape({maxTokensPerStep, maxBatchSize}));
-        mBatchSlotsAcceptLogits->reshape(ITensor::makeShape({maxTokensPerStep, maxBatchSize}));
+        mBatchSlotsDecoder->reshape(ITensor::makeShape({maxTokensPerEngineStep, maxBatchSize}));
+        mBatchSlotsAcceptTokens->reshape(ITensor::makeShape({maxTokensPerEngineStep, maxBatchSize}));
+        mBatchSlotsAcceptLogits->reshape(ITensor::makeShape({maxTokensPerEngineStep, maxBatchSize}));
     }
 
-    if (mMaxTokensPerStep > 1)
+    if (maxTokensPerEngineStep > 1 && !mUseMedusa)
     {
         mDraftProbs->reshape(ITensor::makeShape(
-            {maxBatchSize, maxTokensPerStep, maxBeamWidth, static_cast<SizeType>(mVocabSizePadded)}));
+            {maxBatchSize, maxTokensPerEngineStep, maxBeamWidth, static_cast<SizeType32>(mVocabSizePadded)}));
         mTargetProbs->reshape(ITensor::makeShape(
-            {maxBatchSize, maxTokensPerStep, maxBeamWidth, static_cast<SizeType>(mVocabSizePadded)}));
+            {maxBatchSize, maxTokensPerEngineStep, maxBeamWidth, static_cast<SizeType32>(mVocabSizePadded)}));
     }
 
     dOutput.parentIds->reshape(jointOutputIdsShape);
     // use batchSize many entries instead of the usual 1
     dOutput.finishedSum->reshape(maxBatchSizeShape);
     mBufferManager.setZero(*dOutput.finishedSum);
+
+    dOutput.newTokensSteps->reshape(ITensor::makeShape({maxTokensPerEngineStep, maxBatchSize, maxBeamWidth}));
 
     dOutput.cumLogProbs->reshape(maxBatchSizeXmaxBeamWidth);
     mBufferManager.setZero(*dOutput.cumLogProbs);
@@ -218,22 +244,33 @@ void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, Siz
     // speculative decoding only works for beam width == 1
     mDraftTokenIds->reshape(maxBatchSizeXmaxTokensPerStep);
     mDraftLogits->reshape(
-        ITensor::makeShape({maxBatchSize, maxTokensPerStep, static_cast<SizeType>(mVocabSizePadded)}));
+        ITensor::makeShape({maxBatchSize, maxTokensPerEngineStep, static_cast<SizeType32>(mVocabSizePadded)}));
     mAcceptByLogits.resize(maxBatchSize);
     mNumDraftTokens->reshape(ITensor::makeShape({maxBatchSize, 1}));
     mCurandStates->reshape(ITensor::makeShape({maxBatchSize, sizeof(curandState_t)}));
-    mTargetLogitsPtrs->reshape(ITensor::makeShape({maxTokensPerStep, maxBatchSize}));
+    mTargetLogitsPtrs->reshape(ITensor::makeShape({maxTokensPerEngineStep, maxBatchSize}));
 
     const_cast<ITensor&>(*dInput.embeddingBias)
-        .reshape(ITensor::makeShape({maxBatchSize, static_cast<SizeType>(mVocabSizePadded)}));
+        .reshape(ITensor::makeShape({maxBatchSize, static_cast<SizeType32>(mVocabSizePadded)}));
     const_cast<ITensor&>(*dInput.badWordsPtrs).reshape(ITensor::makeShape({maxBatchSize}));
     const_cast<ITensor&>(*dInput.badWordsLens).reshape(ITensor::makeShape({maxBatchSize}));
     const_cast<ITensor&>(*dInput.stopWordsPtrs).reshape(ITensor::makeShape({maxBatchSize}));
     const_cast<ITensor&>(*dInput.stopWordsLens).reshape(ITensor::makeShape({maxBatchSize}));
 
+    std::optional<SizeType32> tokensPerStepOpt = std::nullopt;
+    std::optional<SizeType32> numMedusaHeadsOpt = std::nullopt;
+    if (modelConfig.useMedusa())
+    {
+        tokensPerStepOpt = modelConfig.getMedusaModule()->tokensPerStep();
+        numMedusaHeadsOpt = modelConfig.getMedusaModule()->medusaHeads();
+        setupMedusa(modelConfig);
+    }
+    else
+    {
+        mMaxTokensPerDecoderStep = 1;
+    }
+
     auto const numOfDecoders = fusedDecoder ? 1 : maxBatchSize;
-    mNextDraftTokens->reshape(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep - 1}));
-    mNextDraftTokenLengths->reshape(ITensor::makeShape({maxBatchSize}));
 
     mStreams.resize(maxBatchSize);
     mDecoders.resize(numOfDecoders);
@@ -244,7 +281,7 @@ void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, Siz
     mMaxNewTokens.resize(maxBatchSize);
     mBeamWidths.resize(maxBatchSize);
     auto const device = mStream->getDevice();
-    for (SizeType i = 0; i < maxBatchSize; ++i)
+    for (SizeType32 i = 0; i < maxBatchSize; ++i)
     {
         mStreams[i] = std::make_shared<CudaStream>();
         TLLM_CHECK(mStreams[i]->getDevice() == device);
@@ -252,7 +289,7 @@ void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, Siz
         {
             auto maxBatchSizePerDecoder = fusedDecoder ? maxBatchSize : 1;
             mDecoders[i] = IGptDecoder::create(mode, dtype, maxBatchSizePerDecoder, maxBeamWidth, mVocabSize,
-                mVocabSizePadded, mMaxSequenceLength, mStreams[i]);
+                mVocabSizePadded, mMaxSequenceLength, mStreams[i], tokensPerStepOpt, numMedusaHeadsOpt);
         }
         mDecodingInputs[i].reset();
         mDecodingOutputs[i].reset();
@@ -260,13 +297,51 @@ void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, Siz
         mFinished[i] = true;
         mMaxNewTokens[i] = 0;
         mBeamWidths[i] = 0;
-        mGeneratedTokensPerStep[i] = 0;
+        mGeneratedTokensPerEngineStep[i] = 0;
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void GptDecoderBatch::setupMedusa(ModelConfig const& modelConfig)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto& dInput = *mJointDecodingInput;
+    auto& dOutput = *mJointDecodingOutput;
+
+    auto const medusaModule = modelConfig.getMedusaModule();
+    auto const medusaHeads = medusaModule->medusaHeads();
+    auto const maxAcceptedTokensPerDecoderStep = medusaHeads + 1;
+
+    auto& medusaPaths = const_cast<ITensor&>(*dInput.medusaInputs->medusaPaths);
+    medusaPaths.reshape(
+        ITensor::makeShape({mActualBatchSize, medusaModule->tokensPerStep(), maxAcceptedTokensPerDecoderStep}));
+    mBufferManager.setMem(medusaPaths, -1);
+
+    auto& medusaTreeIds = const_cast<ITensor&>(*dInput.medusaInputs->medusaTreeIds);
+    medusaTreeIds.reshape(ITensor::makeShape({mActualBatchSize, medusaModule->maxMedusaTokens()}));
+    mBufferManager.setZero(medusaTreeIds);
+
+    auto& curTokensPerStep = const_cast<ITensor&>(*dInput.medusaInputs->medusaCurTokensPerStep);
+    auto& targetTokensPerStep = const_cast<ITensor&>(*dInput.medusaInputs->medusaTargetTokensPerStep);
+    curTokensPerStep.reshape(ITensor::makeShape({mActualBatchSize}));
+    targetTokensPerStep.reshape(ITensor::makeShape({mActualBatchSize}));
+    mBufferManager.setZero(curTokensPerStep);
+    mBufferManager.setZero(targetTokensPerStep);
+
+    dOutput.medusaOutputs->medusaNextDraftTokens->reshape(
+        ITensor::makeShape({mActualBatchSize, mMaxTokensPerEngineStep - 1}));
+    dOutput.medusaOutputs->medusaAcceptedTokensLen->reshape(ITensor::makeShape({mActualBatchSize}));
+    dOutput.medusaOutputs->medusaAcceptedLengthsCumSum->reshape(ITensor::makeShape({mActualBatchSize + 1}));
+    dOutput.medusaOutputs->medusaPathsOffsets->reshape(ITensor::makeShape({mActualBatchSize * medusaHeads}));
+
+    mMaxTokensPerDecoderStep = mMaxTokensPerEngineStep;
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void GptDecoderBatch::newRequest(
-    SizeType batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig)
+    SizeType32 batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(batchIdx >= 0);
@@ -276,14 +351,19 @@ void GptDecoderBatch::newRequest(
     auto const maxBeamWidth = jointOutputIdsShape.d[1];
     auto const beamWidth = samplingConfig.beamWidth;
     TLLM_CHECK_WITH_INFO(beamWidth <= maxBeamWidth,
-        tc::fmtstr("Beam width (%d) must be smaller than maxBeamWidth (%d) passed to decoder setup function.",
+        tc::fmtstr("Beam width (%d) must be smaller than maxBeamWidth (" FMT_DIM ") passed to decoder setup function.",
             beamWidth, maxBeamWidth));
     auto const& requestIds = request.ids;
     auto const inputLength = request.inputLen;
-    auto const maxNewTokens = request.maxNewTokens.value_or(mMaxSequenceLength - inputLength);
-    TLLM_CHECK_WITH_INFO(inputLength + maxNewTokens <= mMaxSequenceLength,
-        tc::fmtstr("Input length (%d) + max new tokens (%d) must be less than max sequence length (%d).", inputLength,
-            maxNewTokens, mMaxSequenceLength));
+    auto const generatedTokensPerEngineStep = request.generatedTokensPerEngineStep;
+    auto const draftTokensPerEngineStep = generatedTokensPerEngineStep - 1;
+    auto const maxNewTokens
+        = request.maxNewTokens.value_or(mMaxSequenceLength - inputLength - draftTokensPerEngineStep);
+
+    TLLM_CHECK_WITH_INFO(inputLength + maxNewTokens + draftTokensPerEngineStep <= mMaxSequenceLength,
+        tc::fmtstr(
+            "Input length (%d) + max new tokens (%d) + draft tokens (%d) must be less than max sequence length (%d).",
+            inputLength, maxNewTokens, draftTokensPerEngineStep, mMaxSequenceLength));
     TLLM_CHECK(requestIds->getDataType() == TRTDataType<TokenIdType>::value);
     auto const endId = request.endId.value_or(-1);
 
@@ -308,7 +388,7 @@ void GptDecoderBatch::newRequest(
     {
         TLLM_CHECK(request.embeddingBias->getShape().nbDims == 2);
         TLLM_CHECK(request.embeddingBias->getShape().d[0] == 1);
-        TLLM_CHECK_WITH_INFO(request.embeddingBias->getShape().d[1] == static_cast<SizeType>(mVocabSize),
+        TLLM_CHECK_WITH_INFO(request.embeddingBias->getShape().d[1] == static_cast<SizeType32>(mVocabSize),
             "The embedding bias shape is not as expected. Expected last dimension to be same as vocab size: %lu.",
             mVocabSize);
 
@@ -322,17 +402,17 @@ void GptDecoderBatch::newRequest(
 
     auto setupWords = [fusedDecoder = mFusedDecoder](SharedConstPtr& inputWordsList, TensorPtr const& requestWordsList,
                           SharedConstPtr& jointWordsPtrs, SharedConstPtr& jointWordsLens, SharedConstPtr& wordsPtrs,
-                          SharedConstPtr& wordsLens, SizeType& inputMaxStopWordsLen, SizeType& maxWordsLen,
-                          SizeType localBatchSize, SizeType batchIdx)
+                          SharedConstPtr& wordsLens, SizeType32& inputMaxStopWordsLen, SizeType32& maxWordsLen,
+                          SizeType32 localBatchSize, SizeType32 batchIdx)
     {
         if (requestWordsList)
         {
             auto const wordsLen = requestWordsList->getShape().d[1];
             BufferRange<int32_t*>(*constPointerCast(jointWordsPtrs))[batchIdx]
-                = bufferCast<SizeType>(*requestWordsList);
-            bufferCast<SizeType>(*constPointerCast(jointWordsLens))[batchIdx] = wordsLen;
+                = bufferCast<TokenIdType>(*requestWordsList);
+            bufferCast<SizeType32>(*constPointerCast(jointWordsLens))[batchIdx] = wordsLen;
             // FIXME(nkorobov): this is monotonically growing size
-            maxWordsLen = std::max(wordsLen, maxWordsLen);
+            maxWordsLen = std::max(static_cast<SizeType32>(wordsLen), maxWordsLen);
             if (!fusedDecoder)
             {
                 wordsPtrs = ITensor::slice(jointWordsPtrs, batchIdx, localBatchSize);
@@ -345,7 +425,7 @@ void GptDecoderBatch::newRequest(
         }
         else
         {
-            bufferCast<SizeType>(*constPointerCast(jointWordsLens))[batchIdx] = 0;
+            bufferCast<SizeType32>(*constPointerCast(jointWordsLens))[batchIdx] = 0;
             inputMaxStopWordsLen = 0;
         }
     };
@@ -379,17 +459,17 @@ void GptDecoderBatch::newRequest(
     dOutput->finishedSum = ITensor::slice(dJointOutput.finishedSum, batchIdx, localBatchSize);
     manager.setZero(*dOutput->finishedSum);
 
-    dOutput->newTokensVec.resize(mMaxTokensPerStep);
-    for (SizeType ti = 0; ti < mMaxTokensPerStep; ++ti)
+    dOutput->newTokensVec.resize(mMaxTokensPerEngineStep);
+    for (SizeType32 ti = 0; ti < mMaxTokensPerEngineStep; ++ti)
     {
-        TensorPtr newTokensStepView = ITensor::slice(dJointOutput.newTokensSteps, ti, localBatchSize);
+        TensorPtr newTokensStepView = ITensor::slice(dJointOutput.newTokensSteps, ti, 1);
         newTokensStepView->squeeze(0);
         dOutput->newTokensVec[ti] = ITensor::slice(newTokensStepView, batchIdx, localBatchSize);
         manager.setZero(*dOutput->newTokensVec[ti]);
     }
 
-    // FIXME(nkorobov): we call setZero mMaxTokensPerStep times for only 1 element
-    for (SizeType ti = 0; ti < mMaxTokensPerStep; ++ti)
+    // FIXME(nkorobov): we call setZero mMaxTokensPerEngineStep times for only 1 element
+    for (SizeType32 ti = 0; ti < mMaxTokensPerEngineStep; ++ti)
     {
         TensorPtr finishedStepsView = std::move(ITensor::slice(mFinishedSteps, ti, 1));
         finishedStepsView->squeeze(0);
@@ -423,53 +503,19 @@ void GptDecoderBatch::newRequest(
         dOutput->beamHypotheses.init(manager, endId);
     }
 
-    auto generatedTokensPerStep = request.generatedTokensPerStep;
-    if (generatedTokensPerStep > 1)
+    // Speculative execution
+    if (generatedTokensPerEngineStep > 1)
     {
         TLLM_CHECK(beamWidth == 1);
         mAcceptByLogits[batchIdx] = false;
-        auto const numDraftTokens = generatedTokensPerStep - 1;
         // If draft tokens are given with context at decoder setup it is target model in speculative decoding
         if (request.draftTokens)
         {
-            if (request.draftLogits.has_value())
-            {
-                TensorPtr draftLogitsView = ITensor::view(request.draftLogits.value());
-                mAcceptByLogits[batchIdx] = true;
-
-                TensorPtr draftLogitsReqBatchSlice = std::move(ITensor::slice(mDraftLogits, batchIdx, 1));
-                draftLogitsReqBatchSlice->squeeze(0);
-                TensorPtr draftLogitsReqTokensSlice = ITensor::slice(draftLogitsReqBatchSlice, 0, numDraftTokens);
-                manager.copy(*draftLogitsView, *draftLogitsReqTokensSlice);
-            }
-            TensorPtr draftTokensReqBatchSlice = std::move(ITensor::slice(mDraftTokenIds, batchIdx, 1));
-            draftTokensReqBatchSlice->squeeze(0);
-            TensorPtr draftTokensReqTokensSlice = ITensor::slice(draftTokensReqBatchSlice, 0, numDraftTokens);
-            TensorPtr draftTokensView = ITensor::view(request.draftTokens, ITensor::makeShape({numDraftTokens}));
-            manager.copy(*draftTokensView, *draftTokensReqTokensSlice);
-
-            auto const curandStatesView = ITensor::slice(mCurandStates, batchIdx, localBatchSize);
-            auto curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*curandStatesView));
-            if (samplingConfig.randomSeed.has_value())
-            {
-                tk::invokeCurandInitialize(
-                    curandState, nullptr, localBatchSize, samplingConfig.randomSeed.value()[0], stream->get());
-            }
-            else
-            {
-                tk::invokeCurandInitialize(curandState, nullptr, localBatchSize, 0, stream->get());
-            }
-            auto numDraftTokensView = ITensor::slice(mNumDraftTokens, batchIdx, localBatchSize);
-            kernels::invokeFill(*numDraftTokensView, numDraftTokens, *stream);
+            newRequestSpeculativeDecoding(batchIdx, request, samplingConfig);
         }
         else // Medusa
         {
-            auto nextDraftTokenLengthsView = ITensor::slice(mNextDraftTokenLengths, batchIdx, localBatchSize);
-            kernels::invokeFill(*nextDraftTokenLengthsView, numDraftTokens, *stream);
-            TensorPtr nextDraftTokens = ITensor::slice(mNextDraftTokens, batchIdx, localBatchSize);
-            manager.setZero(*nextDraftTokens);
-            // FIXME(nkorobov): skip decoding draft tokens at medusa for now
-            generatedTokensPerStep = 1;
+            newRequestMedusa(batchIdx, request);
         }
     }
 
@@ -483,7 +529,7 @@ void GptDecoderBatch::newRequest(
     mNbSteps[batchIdx] = 0;
     mFinished[batchIdx] = false;
     mMaxNewTokens[batchIdx] = maxNewTokens;
-    mGeneratedTokensPerStep[batchIdx] = generatedTokensPerStep;
+    mGeneratedTokensPerEngineStep[batchIdx] = generatedTokensPerEngineStep;
 
     // copy the request ids into outputIds
     auto const requestIdsShape = requestIds->getShape();
@@ -494,14 +540,101 @@ void GptDecoderBatch::newRequest(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatch::newRequests(std::vector<SizeType> const& seqSlots,
+void GptDecoderBatch::newRequestSpeculativeDecoding(
+    SizeType32 batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    TLLM_CHECK_WITH_INFO(mFusedDecoder, "Speculative decoding requires fused decoder");
+    auto constexpr decoderIdx = 0;
+    auto& stream = mStreams[decoderIdx];
+    BufferManager manager{stream};
+
+    auto constexpr localBatchSize = 1;
+
+    auto const numDraftTokens = request.generatedTokensPerEngineStep - 1;
+    if (request.draftLogits.has_value())
+    {
+        TensorPtr draftLogitsView = ITensor::view(request.draftLogits.value());
+        mAcceptByLogits[batchIdx] = true;
+
+        TensorPtr draftLogitsReqBatchSlice = std::move(ITensor::slice(mDraftLogits, batchIdx, localBatchSize));
+        draftLogitsReqBatchSlice->squeeze(0);
+        TensorPtr draftLogitsReqTokensSlice = ITensor::slice(draftLogitsReqBatchSlice, 0, numDraftTokens);
+        manager.copy(*draftLogitsView, *draftLogitsReqTokensSlice);
+    }
+    TensorPtr draftTokensReqBatchSlice = std::move(ITensor::slice(mDraftTokenIds, batchIdx, localBatchSize));
+    draftTokensReqBatchSlice->squeeze(0);
+    TensorPtr draftTokensReqTokensSlice = ITensor::slice(draftTokensReqBatchSlice, 0, numDraftTokens);
+    TensorPtr draftTokensView = ITensor::view(request.draftTokens, ITensor::makeShape({numDraftTokens}));
+    manager.copy(*draftTokensView, *draftTokensReqTokensSlice);
+
+    auto const curandStatesView = ITensor::slice(mCurandStates, batchIdx, localBatchSize);
+    auto curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*curandStatesView));
+    if (samplingConfig.randomSeed.has_value())
+    {
+        tk::invokeCurandInitialize(
+            curandState, nullptr, localBatchSize, samplingConfig.randomSeed.value()[0], stream->get());
+    }
+    else
+    {
+        tk::invokeCurandInitialize(curandState, nullptr, localBatchSize, 0, stream->get());
+    }
+    auto numDraftTokensView = ITensor::slice(mNumDraftTokens, batchIdx, localBatchSize);
+    kernels::invokeFill(*numDraftTokensView, numDraftTokens, *stream);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void GptDecoderBatch::newRequestMedusa(SizeType32 batchIdx, decoder_batch::Request const& request)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    TLLM_CHECK_WITH_INFO(mFusedDecoder, "Medusa requires fused decoder");
+    auto constexpr decoderIdx = 0;
+    auto& stream = mStreams[decoderIdx];
+    BufferManager manager{stream};
+
+    auto& dJointInput = *mJointDecodingInput;
+    auto& dJointOutput = *mJointDecodingOutput;
+
+    auto constexpr localBatchSize = 1;
+    TensorPtr nextDraftTokens
+        = ITensor::slice(dJointOutput.medusaOutputs->medusaNextDraftTokens, batchIdx, localBatchSize);
+    manager.setZero(*nextDraftTokens);
+
+    TensorPtr curTokensPerStepSlice
+        = ITensor::slice(constPointerCast(dJointInput.medusaInputs->medusaCurTokensPerStep), batchIdx, localBatchSize);
+    // Context phase Medusa processes 1 token only, new value from targetTokensPerStep will be filled at the end
+    // of first decoder
+    kernels::invokeFill(*curTokensPerStepSlice, 1, *stream);
+    TensorPtr targetTokensPerStepSlice = ITensor::slice(
+        constPointerCast(dJointInput.medusaInputs->medusaTargetTokensPerStep), batchIdx, localBatchSize);
+    auto const generatedTokensPerEngineStep = request.generatedTokensPerEngineStep;
+    TLLM_CHECK_WITH_INFO(generatedTokensPerEngineStep <= mMaxTokensPerEngineStep,
+        "Tokens per step for (%d) is larger than maximum tokens per step (%d)", generatedTokensPerEngineStep,
+        mMaxTokensPerEngineStep);
+    kernels::invokeFill(*targetTokensPerStepSlice, generatedTokensPerEngineStep, *stream);
+
+    TensorPtr pathsSlice
+        = ITensor::slice(constPointerCast(dJointInput.medusaInputs->medusaPaths), batchIdx, localBatchSize);
+    manager.copy(*request.medusaPaths, *pathsSlice);
+
+    TensorPtr treeIdsSlice
+        = ITensor::slice(constPointerCast(dJointInput.medusaInputs->medusaTreeIds), batchIdx, localBatchSize);
+    manager.copy(*request.medusaTreeIds, *treeIdsSlice);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void GptDecoderBatch::newRequests(std::vector<SizeType32> const& seqSlots,
     std::vector<decoder_batch::Request> const& requests, std::vector<SamplingConfig> const& samplingConfigs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto batchSlotsPtr = bufferCast<SizeType>(*mBatchSlotsSetup);
-    SizeType const localBatchSize = seqSlots.size();
-    for (SizeType bi = 0; bi < localBatchSize; ++bi)
+    auto batchSlotsPtr = bufferCast<SizeType32>(*mBatchSlotsSetup);
+    SizeType32 const localBatchSize = seqSlots.size();
+    for (SizeType32 bi = 0; bi < localBatchSize; ++bi)
     {
         newRequest(seqSlots[bi], requests[bi], samplingConfigs[bi]);
         if (mFusedDecoder)
@@ -523,235 +656,22 @@ GptDecoderBatch::TokenPtr GptDecoderBatch::forwardAsync(
     decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto& allTargetLogits = input.logits;
-
-    // TODO(nkorobov): check logits shape considering draft tokens
-    auto const& jointOutputIdsShape = mJointDecodingOutput->ids->getShape();
-    auto const maxBeamWidth = jointOutputIdsShape.d[1];
-
-    auto& srcCacheIndirection = input.cacheIndirection;
-    auto& tgtCacheIndirection = output.cacheIndirection;
-    TLLM_CHECK_WITH_INFO((srcCacheIndirection && tgtCacheIndirection) || (!srcCacheIndirection && !tgtCacheIndirection),
-        "Specify both srcCacheIndirection and tgtCacheIndirection or neither.");
-    TLLM_CHECK(!srcCacheIndirection || srcCacheIndirection->getDataType() == TRTDataType<SizeType>::value);
-    TLLM_CHECK(!tgtCacheIndirection || tgtCacheIndirection->getDataType() == TRTDataType<SizeType>::value);
-
-    TLLM_CHECK(static_cast<SizeType>(output.sequenceLengths->getSize()) == mActualBatchSize * maxBeamWidth);
-    // TODO should remove this reshape and set shape to [batch_size, beam_width] outside
-    TensorPtr sequenceLengths
-        = ITensor::view(output.sequenceLengths, ITensor::makeShape({mActualBatchSize, maxBeamWidth}));
-    auto batchSlotsDecoderPtr = bufferCast<SizeType>(*mBatchSlotsDecoder);
-    auto batchSlotsAcceptTokensPtr = bufferCast<SizeType>(*mBatchSlotsAcceptTokens);
-    auto batchSlotsAcceptLogitsPtr = bufferCast<SizeType>(*mBatchSlotsAcceptLogits);
-    TLLM_CHECK(sequenceLengths);
-    auto constexpr singleRequest = 1;
 
     CudaEvent eventStart{};
     mStream->record(eventStart);
 
-    auto const maxGeneratedTokensPerStep
-        = *std::max_element(std::begin(mGeneratedTokensPerStep), std::end(mGeneratedTokensPerStep));
+    auto const maxGeneratedTokensPerEngineStep
+        = *std::max_element(std::begin(mGeneratedTokensPerEngineStep), std::end(mGeneratedTokensPerEngineStep));
 
-    for (SizeType si = 0; si < maxGeneratedTokensPerStep; ++si)
+    for (SizeType32 si = 0; si < maxGeneratedTokensPerEngineStep; si += mMaxTokensPerDecoderStep)
     {
-        SizeType localBatchDecoderIdx = 0;
-        SizeType localBatchAcceptTokensIdx = 0;
-        SizeType localBatchAcceptLogitsIdx = 0;
-        for (SizeType bi = 0; bi < mActualBatchSize; ++bi)
-        {
-            if (mFinished[bi] || !input.active.at(bi) || si >= mGeneratedTokensPerStep[bi])
-            {
-                continue;
-            }
-
-            if (mFusedDecoder)
-            {
-                if (!mAcceptByLogits[bi] && mGeneratedTokensPerStep[bi] > 1 && si == mGeneratedTokensPerStep[bi] - 1)
-                {
-                    batchSlotsAcceptTokensPtr[si * mActualBatchSize + localBatchAcceptTokensIdx] = bi;
-                    localBatchAcceptTokensIdx++;
-                }
-                else if (mAcceptByLogits[bi] && mGeneratedTokensPerStep[bi] > 1 && si == 0)
-                {
-                    batchSlotsAcceptLogitsPtr[si * mActualBatchSize + localBatchAcceptLogitsIdx] = bi;
-                    localBatchAcceptLogitsIdx++;
-                }
-                batchSlotsDecoderPtr[si * mActualBatchSize + localBatchDecoderIdx] = bi;
-                localBatchDecoderIdx++;
-            }
-        }
-
         if (!mFusedDecoder)
         {
-            for (SizeType bi = 0; bi < mActualBatchSize; ++bi)
-            {
-                if (mFinished[bi] || !input.active.at(bi) || si >= mGeneratedTokensPerStep[bi])
-                {
-                    continue;
-                }
-
-                auto& stream = mStreams[bi];
-                stream->wait(eventStart.get());
-
-                auto& targetLogits = allTargetLogits[bi];
-                auto& dInput = *mDecodingInputs[bi];
-                auto& dOutput = *mDecodingOutputs[bi];
-                auto& decoder = *mDecoders[bi];
-
-                TensorPtr finishedStepsInput = ITensor::slice(mFinishedSteps, si, 1);
-                TensorPtr finishedStepsOutput
-                    = ITensor::slice(mFinishedSteps, std::min(si + 1, mGeneratedTokensPerStep[bi] - 1), 1);
-                finishedStepsInput->squeeze(0);
-                finishedStepsOutput->squeeze(0);
-
-                if (srcCacheIndirection && tgtCacheIndirection)
-                {
-                    auto srcView = std::shared_ptr(ITensor::slice(srcCacheIndirection, bi, singleRequest));
-                    auto tgtView = std::shared_ptr(ITensor::slice(tgtCacheIndirection, bi, singleRequest));
-                    dInput.cacheIndirection = ITensor::view(
-                        srcView, ITensor::makeShape({singleRequest, mBeamWidths[bi], srcView->getShape().d[2]}));
-                    dOutput.cacheIndirection = ITensor::view(
-                        tgtView, ITensor::makeShape({singleRequest, mBeamWidths[bi], tgtView->getShape().d[2]}));
-                }
-
-                auto sequenceLengthsView = std::shared_ptr(ITensor::slice(sequenceLengths, bi, singleRequest));
-                dOutput.lengths
-                    = ITensor::view(sequenceLengthsView, ITensor::makeShape({singleRequest, mBeamWidths[bi]}));
-
-                {
-                    dInput.logits = ITensor::slice(targetLogits, si, singleRequest);
-                    dOutput.newTokens = ITensor::view(dOutput.newTokensVec[si]);
-                    dInput.finished = ITensor::slice(finishedStepsInput, bi, singleRequest);
-                    dOutput.finished = ITensor::slice(finishedStepsOutput, bi, singleRequest);
-
-                    decoder.forwardAsync(dOutput, dInput);
-
-                    mNbSteps[bi] += 1;
-                    mFinished[bi] = mNbSteps[bi] >= mMaxNewTokens[bi];
-                    dInput.step += 1;
-                }
-
-                if (si == mGeneratedTokensPerStep[bi] - 1)
-                {
-                    auto& stream = mStreams[bi];
-                    CudaEvent event{};
-                    stream->record(event);
-                    mStream->wait(event);
-                }
-            }
+            forwardAsyncUnfusedDecoder(si, output, input, eventStart);
         }
         else
         {
-            auto& dInput = *mJointDecodingInput;
-            auto& dOutput = *mJointDecodingOutput;
-            auto& decoder = *mDecoders[0];
-            auto& stream = mStreams[0];
-
-            stream->wait(eventStart.get());
-
-            BufferManager manager{stream};
-
-            std::vector<SharedConstPtr> logitsVec;
-            auto targetLogitsPtrsSlice = ITensor::slice(mTargetLogitsPtrs, si, 1);
-            auto targetLogitsPtrsSlicePtr = reinterpret_cast<void const**>(bufferCast<int64_t>(*targetLogitsPtrsSlice));
-            SizeType targetLogitsIdx = 0;
-            for (SizeType bi = 0; bi < mActualBatchSize; ++bi)
-            {
-                if (mFinished[bi] || !input.active.at(bi) || si >= mGeneratedTokensPerStep[bi])
-                {
-                    continue;
-                }
-                auto& targetLogits = allTargetLogits[bi];
-                SharedConstPtr logitsSlice = std::move(ITensor::slice(targetLogits, si, singleRequest));
-                logitsVec.push_back(logitsSlice);
-                targetLogitsPtrsSlicePtr[targetLogitsIdx++] = logitsSlice->data();
-            }
-
-            if (localBatchAcceptLogitsIdx > 0)
-            {
-                // These params are only used for testing. Thus, can be per batch instead of per request
-                auto const& samplingConfig = decoder.getSamplingConfig();
-                bool const useRandomAcceptanceThreshold = !samplingConfig.draftAcceptanceThreshold.has_value();
-                float const randomAcceptanceThreshold
-                    = useRandomAcceptanceThreshold ? 0 : samplingConfig.draftAcceptanceThreshold.value()[0];
-
-                TensorPtr batchSlotsAcceptLogitsStepSlice = std::move(ITensor::slice(mBatchSlotsAcceptLogits, si, 1));
-                batchSlotsAcceptLogitsStepSlice->squeeze(0);
-                TensorPtr batchSlotsAcceptLogitsSlice
-                    = std::move(ITensor::slice(batchSlotsAcceptLogitsStepSlice, 0, localBatchAcceptLogitsIdx));
-
-                IGptDecoder::acceptDraftTokensByLogits(
-                    /* [max_bs, max_tokens_per_step, vocabPadded] */ *mDraftLogits,
-                    /* [max_bs][max_tokens_per_step, vocabPadded] */ *targetLogitsPtrsSlice,
-                    /* [max_bs, max_tokens_per_step, vocabPadded] */ *mDraftProbs,
-                    /* [max_bs, max_tokens_per_step, vocabPadded] */ *mTargetProbs,
-                    /* [max_bs] */ *mNumDraftTokens,
-                    /* [max_tokens_per_step, max_bs] */ *mFinishedSteps,
-                    /* [bs] */ *batchSlotsAcceptLogitsSlice, static_cast<SizeType>(mVocabSize),
-                    static_cast<SizeType>(mVocabSizePadded), useRandomAcceptanceThreshold, randomAcceptanceThreshold,
-                    reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStates)), stream);
-            }
-
-            TensorPtr finishedStepsInput = ITensor::slice(mFinishedSteps, si, 1);
-            TensorPtr finishedStepsOutput
-                = ITensor::slice(mFinishedSteps, std::min(maxGeneratedTokensPerStep - 1, si + 1), 1);
-            finishedStepsInput->squeeze(0);
-            finishedStepsOutput->squeeze(0);
-            TensorPtr newTokensStepView = std::move(ITensor::slice(dOutput.newTokensSteps, si, 1));
-            newTokensStepView->squeeze(0);
-
-            dInput.logitsVec = logitsVec;
-            dInput.finished = finishedStepsInput;
-            TensorPtr batchSlotsDecoderSlice = std::move(ITensor::slice(mBatchSlotsDecoder, si, 1));
-            batchSlotsDecoderSlice->squeeze(0);
-            dInput.batchSlots = batchSlotsDecoderSlice;
-            dInput.maxBatchSize = localBatchDecoderIdx;
-
-            dOutput.newTokens = newTokensStepView;
-            dOutput.finished = finishedStepsOutput;
-            dOutput.lengths = sequenceLengths;
-
-            if (localBatchDecoderIdx > 0)
-            {
-                decoder.forwardAsync(dOutput, dInput);
-            }
-
-            for (SizeType bi = 0; bi < mActualBatchSize; ++bi)
-            {
-                if (mFinished[bi] || !input.active.at(bi) || si >= mGeneratedTokensPerStep[bi])
-                {
-                    continue;
-                }
-                mNbSteps[bi] += 1;
-                mFinished[bi] = mNbSteps[bi] >= mMaxNewTokens[bi];
-            }
-            if (localBatchAcceptTokensIdx > 0)
-            {
-                TensorPtr batchSlotsAcceptTokensStepSlice = std::move(ITensor::slice(mBatchSlotsAcceptTokens, si, 1));
-                batchSlotsAcceptTokensStepSlice->squeeze(0);
-                auto batchSlotsAcceptTokensSlice
-                    = ITensor::slice(batchSlotsAcceptTokensStepSlice, 0, localBatchAcceptTokensIdx);
-
-                // Update finished state for 0th step
-                auto finishedFinal = ITensor::slice(mFinishedSteps, si, 1);
-                IGptDecoder::acceptDraftTokensByIds(
-                    /* [max_bs, max_seq_len] */ *dOutput.ids,
-                    /* [max_bs, max_draft_tokens] */ *mDraftTokenIds,
-                    /* [max_bs] */ *dInput.lengths,
-                    /* [max_bs] */ *mNumDraftTokens,
-                    /* [max_bs] */ *dOutput.lengths,
-                    /* [max_tokens_per_step, max_bs] */ *mFinishedSteps,
-                    /* [max_bs] */ *finishedFinal,
-                    /* [max_bs] */ *dOutput.finishedSum,
-                    /* [bs] */ *batchSlotsAcceptTokensSlice, stream);
-            }
-
-            if (si == maxGeneratedTokensPerStep - 1)
-            {
-                CudaEvent event{};
-                stream->record(event);
-                mStream->wait(event);
-            }
+            forwardAsyncFusedDecoder(si, output, input, eventStart);
         }
     }
 
@@ -759,6 +679,258 @@ GptDecoderBatch::TokenPtr GptDecoderBatch::forwardAsync(
     mStream->record(eventStop);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return std::make_unique<decoder_batch::Token>(std::move(eventStop), input.active);
+}
+
+void GptDecoderBatch::forwardAsyncUnfusedDecoder(
+    SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input, CudaEvent const& eventStart)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto& allTargetLogits = input.logits;
+    auto const& jointOutputIdsShape = mJointDecodingOutput->ids->getShape();
+    auto const maxBeamWidth = jointOutputIdsShape.d[1];
+
+    auto& srcCacheIndirection = input.cacheIndirection;
+    auto& tgtCacheIndirection = output.cacheIndirection;
+    TLLM_CHECK_WITH_INFO((srcCacheIndirection && tgtCacheIndirection) || (!srcCacheIndirection && !tgtCacheIndirection),
+        "Specify both srcCacheIndirection and tgtCacheIndirection or neither.");
+    TLLM_CHECK(!srcCacheIndirection || srcCacheIndirection->getDataType() == TRTDataType<SizeType32>::value);
+    TLLM_CHECK(!tgtCacheIndirection || tgtCacheIndirection->getDataType() == TRTDataType<SizeType32>::value);
+
+    TLLM_CHECK(static_cast<SizeType32>(output.sequenceLengths->getSize()) == mActualBatchSize * maxBeamWidth);
+    // TODO should remove this reshape and set shape to [batch_size, beam_width] outside
+    TensorPtr sequenceLengths
+        = ITensor::view(output.sequenceLengths, ITensor::makeShape({mActualBatchSize, maxBeamWidth}));
+    TLLM_CHECK(sequenceLengths);
+
+    auto constexpr singleRequest = 1;
+
+    for (SizeType32 bi = 0; bi < mActualBatchSize; ++bi)
+    {
+        if (mFinished[bi] || !input.active.at(bi) || step >= mGeneratedTokensPerEngineStep[bi])
+        {
+            continue;
+        }
+
+        auto& stream = mStreams[bi];
+        stream->wait(eventStart.get());
+
+        auto& targetLogits = allTargetLogits[bi];
+        auto& dInput = *mDecodingInputs[bi];
+        auto& dOutput = *mDecodingOutputs[bi];
+        auto& decoder = *mDecoders[bi];
+
+        TensorPtr finishedStepsInput = ITensor::slice(mFinishedSteps, step, 1);
+        TensorPtr finishedStepsOutput
+            = ITensor::slice(mFinishedSteps, std::min(step + 1, mGeneratedTokensPerEngineStep[bi] - 1), 1);
+        finishedStepsInput->squeeze(0);
+        finishedStepsOutput->squeeze(0);
+
+        if (srcCacheIndirection && tgtCacheIndirection)
+        {
+            auto srcView = std::shared_ptr(ITensor::slice(srcCacheIndirection, bi, singleRequest));
+            auto tgtView = std::shared_ptr(ITensor::slice(tgtCacheIndirection, bi, singleRequest));
+            dInput.cacheIndirection = ITensor::view(
+                srcView, ITensor::makeShape({singleRequest, mBeamWidths[bi], srcView->getShape().d[2]}));
+            dOutput.cacheIndirection = ITensor::view(
+                tgtView, ITensor::makeShape({singleRequest, mBeamWidths[bi], tgtView->getShape().d[2]}));
+        }
+
+        auto sequenceLengthsView = std::shared_ptr(ITensor::slice(sequenceLengths, bi, singleRequest));
+        dOutput.lengths = ITensor::view(sequenceLengthsView, ITensor::makeShape({singleRequest, mBeamWidths[bi]}));
+
+        {
+            dInput.logits = ITensor::slice(targetLogits, step, singleRequest);
+            dOutput.newTokens = ITensor::view(dOutput.newTokensVec[step]);
+            dInput.finished = ITensor::slice(finishedStepsInput, bi, singleRequest);
+            dOutput.finished = ITensor::slice(finishedStepsOutput, bi, singleRequest);
+
+            decoder.forwardAsync(dOutput, dInput);
+
+            mNbSteps[bi] += 1;
+            mFinished[bi] = mNbSteps[bi] >= mMaxNewTokens[bi];
+            dInput.step += 1;
+        }
+
+        if (step == mGeneratedTokensPerEngineStep[bi] - 1)
+        {
+            auto& stream = mStreams[bi];
+            CudaEvent event{};
+            stream->record(event);
+            mStream->wait(event);
+        }
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void GptDecoderBatch::forwardAsyncFusedDecoder(
+    SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input, CudaEvent const& eventStart)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto& allTargetLogits = input.logits;
+    auto const& jointOutputIdsShape = mJointDecodingOutput->ids->getShape();
+    auto const maxBeamWidth = jointOutputIdsShape.d[1];
+
+    TLLM_CHECK_WITH_INFO(maxBeamWidth == 1, "Fused decoder does not support beam search");
+
+    auto constexpr singleRequest = 1;
+
+    TLLM_CHECK(static_cast<SizeType32>(output.sequenceLengths->getSize()) == mActualBatchSize * maxBeamWidth);
+    // TODO should remove this reshape and set shape to [batch_size, beam_width] outside
+    TensorPtr sequenceLengths
+        = ITensor::view(output.sequenceLengths, ITensor::makeShape({mActualBatchSize, maxBeamWidth}));
+    TLLM_CHECK(sequenceLengths);
+
+    auto batchSlotsDecoderPtr = bufferCast<SizeType32>(*mBatchSlotsDecoder);
+    auto batchSlotsAcceptTokensPtr = bufferCast<SizeType32>(*mBatchSlotsAcceptTokens);
+    auto batchSlotsAcceptLogitsPtr = bufferCast<SizeType32>(*mBatchSlotsAcceptLogits);
+
+    auto& dInput = *mJointDecodingInput;
+    auto& dOutput = *mJointDecodingOutput;
+    auto& decoder = *mDecoders[0];
+    auto& stream = mStreams[0];
+
+    stream->wait(eventStart.get());
+
+    BufferManager manager{stream};
+
+    SizeType32 localBatchDecoderIdx = 0;
+    SizeType32 localBatchAcceptTokensIdx = 0;
+    SizeType32 localBatchAcceptLogitsIdx = 0;
+    for (SizeType32 bi = 0; bi < mActualBatchSize; ++bi)
+    {
+        if (mFinished[bi] || !input.active.at(bi) || step >= mGeneratedTokensPerEngineStep[bi])
+        {
+            continue;
+        }
+
+        if (mFusedDecoder)
+        {
+            if (!mAcceptByLogits[bi] && mMaxTokensPerDecoderStep == 1 && mGeneratedTokensPerEngineStep[bi] > 1
+                && step == mGeneratedTokensPerEngineStep[bi] - 1)
+            {
+                batchSlotsAcceptTokensPtr[step * mActualBatchSize + localBatchAcceptTokensIdx] = bi;
+                localBatchAcceptTokensIdx++;
+            }
+            else if (mAcceptByLogits[bi] && mMaxTokensPerDecoderStep == 1 && mGeneratedTokensPerEngineStep[bi] > 1
+                && step == 0)
+            {
+                batchSlotsAcceptLogitsPtr[step * mActualBatchSize + localBatchAcceptLogitsIdx] = bi;
+                localBatchAcceptLogitsIdx++;
+            }
+            batchSlotsDecoderPtr[step * mActualBatchSize + localBatchDecoderIdx] = bi;
+            localBatchDecoderIdx++;
+        }
+    }
+
+    auto const maxGeneratedTokensPerEngineStep
+        = *std::max_element(std::begin(mGeneratedTokensPerEngineStep), std::end(mGeneratedTokensPerEngineStep));
+
+    std::vector<SharedConstPtr> logitsVec;
+    auto targetLogitsPtrsSlice = ITensor::slice(mTargetLogitsPtrs, step, 1);
+    auto targetLogitsPtrsSlicePtr = reinterpret_cast<void const**>(bufferCast<int64_t>(*targetLogitsPtrsSlice));
+    SizeType32 targetLogitsIdx = 0;
+    for (SizeType32 bi = 0; bi < mActualBatchSize; ++bi)
+    {
+        if (mFinished[bi] || !input.active.at(bi) || step >= mGeneratedTokensPerEngineStep[bi])
+        {
+            continue;
+        }
+        auto& targetLogits = allTargetLogits[bi];
+        SharedConstPtr logitsSlice = std::move(ITensor::slice(targetLogits, step, singleRequest));
+        logitsVec.push_back(logitsSlice);
+        targetLogitsPtrsSlicePtr[targetLogitsIdx++] = logitsSlice->data();
+    }
+
+    if (localBatchAcceptLogitsIdx > 0)
+    {
+        // These params are only used for testing. Thus, can be per batch instead of per request
+        auto const& samplingConfig = decoder.getSamplingConfig();
+        bool const useRandomAcceptanceThreshold = !samplingConfig.draftAcceptanceThreshold.has_value();
+        float const randomAcceptanceThreshold
+            = useRandomAcceptanceThreshold ? 0 : samplingConfig.draftAcceptanceThreshold.value()[0];
+
+        TensorPtr batchSlotsAcceptLogitsStepSlice = std::move(ITensor::slice(mBatchSlotsAcceptLogits, step, 1));
+        batchSlotsAcceptLogitsStepSlice->squeeze(0);
+        TensorPtr batchSlotsAcceptLogitsSlice
+            = std::move(ITensor::slice(batchSlotsAcceptLogitsStepSlice, 0, localBatchAcceptLogitsIdx));
+
+        IGptDecoder::acceptDraftTokensByLogits(
+            /* [max_bs, max_tokens_per_step, vocabPadded] */ *mDraftLogits,
+            /* [max_bs][max_tokens_per_step, vocabPadded] */ *targetLogitsPtrsSlice,
+            /* [max_bs, max_tokens_per_step, vocabPadded] */ *mDraftProbs,
+            /* [max_bs, max_tokens_per_step, vocabPadded] */ *mTargetProbs,
+            /* [max_bs] */ *mNumDraftTokens,
+            /* [max_tokens_per_step, max_bs] */ *mFinishedSteps,
+            /* [bs] */ *batchSlotsAcceptLogitsSlice, static_cast<SizeType32>(mVocabSize),
+            static_cast<SizeType32>(mVocabSizePadded), useRandomAcceptanceThreshold, randomAcceptanceThreshold,
+            reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStates)), stream);
+    }
+
+    TensorPtr finishedStepsInput = ITensor::slice(mFinishedSteps, step, 1);
+    TensorPtr finishedStepsOutput
+        = ITensor::slice(mFinishedSteps, std::min(maxGeneratedTokensPerEngineStep - 1, step + 1), 1);
+    finishedStepsInput->squeeze(0);
+    finishedStepsOutput->squeeze(0);
+    TensorPtr newTokensStepView = std::move(ITensor::slice(dOutput.newTokensSteps, step, mMaxTokensPerDecoderStep));
+
+    dInput.logitsVec = logitsVec;
+    dInput.finished = finishedStepsInput;
+    TensorPtr batchSlotsDecoderSlice = std::move(ITensor::slice(mBatchSlotsDecoder, step, 1));
+    batchSlotsDecoderSlice->squeeze(0);
+    dInput.batchSlots = batchSlotsDecoderSlice;
+    dInput.maxBatchSize = localBatchDecoderIdx;
+    dInput.medusaInputs->medusaLogits = input.medusaLogits;
+
+    dOutput.newTokens = newTokensStepView;
+    dOutput.finished = finishedStepsOutput;
+    dOutput.lengths = sequenceLengths;
+
+    if (localBatchDecoderIdx > 0)
+    {
+        decoder.forwardAsync(dOutput, dInput);
+    }
+
+    for (SizeType32 bi = 0; bi < mActualBatchSize; ++bi)
+    {
+        if (mFinished[bi] || !input.active.at(bi) || step >= mGeneratedTokensPerEngineStep[bi])
+        {
+            continue;
+        }
+        mNbSteps[bi] += 1;
+        mFinished[bi] = mNbSteps[bi] >= mMaxNewTokens[bi];
+    }
+    if (localBatchAcceptTokensIdx > 0)
+    {
+        TensorPtr batchSlotsAcceptTokensStepSlice = std::move(ITensor::slice(mBatchSlotsAcceptTokens, step, 1));
+        batchSlotsAcceptTokensStepSlice->squeeze(0);
+        auto batchSlotsAcceptTokensSlice
+            = ITensor::slice(batchSlotsAcceptTokensStepSlice, 0, localBatchAcceptTokensIdx);
+
+        // Update finished state for 0th step
+        auto finishedFinal = ITensor::slice(mFinishedSteps, step, 1);
+        IGptDecoder::acceptDraftTokensByIds(
+            /* [max_bs, max_seq_len] */ *dOutput.ids,
+            /* [max_bs, max_draft_tokens] */ *mDraftTokenIds,
+            /* [max_bs] */ *dInput.lengths,
+            /* [max_bs] */ *mNumDraftTokens,
+            /* [max_bs] */ *dOutput.lengths,
+            /* [max_tokens_per_step, max_bs] */ *mFinishedSteps,
+            /* [max_bs] */ *finishedFinal,
+            /* [max_bs] */ *dOutput.finishedSum,
+            /* [bs] */ *batchSlotsAcceptTokensSlice, stream);
+    }
+
+    if (step == maxGeneratedTokensPerEngineStep - mMaxTokensPerDecoderStep)
+    {
+        CudaEvent event{};
+        stream->record(event);
+        mStream->wait(event);
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void GptDecoderBatch::forwardSync(decoder_batch::Token const& token)
@@ -773,14 +945,14 @@ void GptDecoderBatch::forwardSync(decoder_batch::Token const& token)
             auto& dOutput = *mDecodingOutputs[i];
             mFinished[i] = mFinished[i]
                 // This condition requires the synchronization above
-                || bufferCast<SizeType>(*dOutput.finishedSum)[0] == static_cast<SizeType>(mBeamWidths[i]);
+                || bufferCast<SizeType32>(*dOutput.finishedSum)[0] == static_cast<SizeType32>(mBeamWidths[i]);
         }
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 // TODO call this at the end of forward if mFinished[i] changes from false to true?
-CudaEvent GptDecoderBatch::postProcessRequest(SizeType batchIdx) const
+CudaEvent GptDecoderBatch::postProcessRequest(SizeType32 batchIdx) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& stream = mStreams[batchIdx];
@@ -810,7 +982,7 @@ void GptDecoderBatch::newBatch(
     // split batch into single requests
     auto const& inputLengths = inputs.lengths;
     mActualBatchSize = inputLengths->getShape().d[0];
-    mGeneratedTokensPerStep.resize(mActualBatchSize);
+    mGeneratedTokensPerEngineStep.resize(mActualBatchSize);
 
     auto const& jointOutputIdsShape = mJointDecodingOutput->ids->getShape();
     auto const maxBatchSize = jointOutputIdsShape.d[0];
@@ -825,11 +997,11 @@ void GptDecoderBatch::newBatch(
         inputIdsFlatView->squeeze(0);
     }
     auto inputLengthsHost = mBufferManager.copyFrom(*inputLengths, MemoryType::kCPU);
-    auto inputLengthsPtr = bufferCast<SizeType>(*inputLengthsHost);
+    auto inputLengthsPtr = bufferCast<SizeType32>(*inputLengthsHost);
     auto inputOffset = 0;
     for (auto batchIdx = 0; batchIdx < mActualBatchSize; ++batchIdx)
     {
-        mGeneratedTokensPerStep[batchIdx] = 1;
+        mGeneratedTokensPerEngineStep[batchIdx] = 1;
         auto const inputLength = inputLengthsPtr[batchIdx];
         auto const inputShape = ITensor::makeShape({inputLength});
         TensorPtr inputView;
@@ -921,14 +1093,14 @@ void GptDecoderBatch::forwardSync()
 void GptDecoderBatch::finalize() const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    for (SizeType batchIdx = 0; batchIdx < mActualBatchSize; ++batchIdx)
+    for (SizeType32 batchIdx = 0; batchIdx < mActualBatchSize; ++batchIdx)
     {
         auto event = postProcessRequest(batchIdx);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-CudaEvent GptDecoderBatch::finalize(SizeType batchIdx) const
+CudaEvent GptDecoderBatch::finalize(SizeType32 batchIdx) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto event = postProcessRequest(batchIdx);

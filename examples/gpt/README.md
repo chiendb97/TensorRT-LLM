@@ -2,6 +2,38 @@
 
 This document explains how to build the [GPT](https://huggingface.co/gpt2) model using TensorRT-LLM and run on a single GPU, a single node with multiple GPUs or multiple nodes with multiple GPUs.
 
+- [GPT](#gpt)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [1. Download weights from HuggingFace Transformers](#1-download-weights-from-huggingface-transformers)
+    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
+      - [Fused MultiHead Attention (FMHA)](#fused-multihead-attention-fmha)
+      - [In-flight batching and paged KV cache](#in-flight-batching-and-paged-kv-cache)
+    - [4. Build TensorRT engine(s) with Random Weights](#4-build-tensorrt-engines-with-random-weights)
+    - [5. Run inference](#5-run-inference)
+      - [Single node, single GPU](#single-node-single-gpu)
+      - [Single node, multiple GPUs](#single-node-multiple-gpus)
+      - [Multiple nodes, multiple GPUs using Slurm](#multiple-nodes-multiple-gpus-using-slurm)
+  - [Quantization](#quantization)
+    - [SmoothQuant](#smoothquant)
+      - [Model Transformation](#model-transformation)
+      - [INT8 inference](#int8-inference)
+      - [Usage](#usage-1)
+    - [INT8 KV Cache](#int8-kv-cache)
+    - [Weight Only Quantization](#weight-only-quantization)
+    - [FP8 Quantization](#fp8-quantization)
+  - [Embedding Parallelism and Sharing](#embedding-parallelism-and-sharing)
+    - [1. Embedding parallelism](#1-embedding-parallelism)
+    - [2. The sharding dimension for embedding parallelism](#2-the-sharding-dimension-for-embedding-parallelism)
+    - [3. Embedding sharing](#3-embedding-sharing)
+  - [GPT Variant - SantaCoder](#gpt-variant---santacoder)
+  - [GPT Variant - StarCoder (v1 and v2)](#gpt-variant---starcoder-v1-and-v2)
+  - [GPT-Next](#gpt-next)
+    - [Prompt-tuning](#prompt-tuning)
+    - [MultiLoRA with the Nemo checkpoint](#multilora-with-the-nemo-checkpoint)
+
 ## Overview
 
 The TensorRT-LLM GPT implementation can be found in [`tensorrt_llm/models/gpt/model.py`](../../tensorrt_llm/models/gpt/model.py). The TensorRT-LLM GPT example code is located in [`examples/gpt`](./). There is one main file:
@@ -20,7 +52,11 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * PAGED_KV_CACHE
   * FP8 KV CACHE
   * Tensor Parallel
+  * Pipeline Parallel
   * STRONGLY TYPED
+  * INT8 SmoothQuant
+  * INT8 weight only
+  * INT4 weight only
 
 ## Usage
 
@@ -28,6 +64,12 @@ The next two sections describe how to convert the weights from the [HuggingFace 
 format to the TensorRT-LLM format.
 
 ### 1. Download weights from HuggingFace Transformers
+
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
 
 ```bash
 # Download hf gpt2 model
@@ -49,6 +91,13 @@ python3 convert_checkpoint.py --model_dir gpt2 \
         --dtype float16 \
         --tp_size 2 \
         --output_dir gpt2/trt_ckpt/fp16/2-gpu
+
+# 2-way tensor parallelism and 2-way pipeline parallelism
+python3 convert_checkpoint.py --model_dir gpt2 \
+        --dtype float16 \
+        --tp_size 2 \
+        --pp_size 2 \
+        --output_dir gpt2/trt_ckpt/fp16/4-gpu
 ```
 
 ### 3. Build TensorRT engine(s)
@@ -70,6 +119,12 @@ trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
         --gpt_attention_plugin float16 \
         --remove_input_padding enable \
         --output_dir gpt2/trt_engines/fp16/2-gpu
+
+# Build 2-way tensor parallelism and 2-way pipeline parallelism engines from TensorRT-LLM checkpoint.
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/4-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --output_dir gpt2/trt_engines/fp16/4-gpu
 ```
 
 If the engines are built successfully, you will see output like:

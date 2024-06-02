@@ -123,7 +123,11 @@ struct Multihead_attention_params_base
     float rotary_embedding_base = 0.0f;
     RotaryScalingType rotary_embedding_scale_type = RotaryScalingType::kNONE;
     float rotary_embedding_scale = 0.0f;
+    float rotary_embedding_m_scale = 0.0f;
+    float const* rotary_embedding_scaling_factors = nullptr;
     int rotary_embedding_max_positions = 0;
+    int rotary_cogvlm_vision_start = -1;
+    int rotary_cogvlm_vision_length = -1;
     // Position shift for streamingllm
     bool position_shift_enabled = false;
     // The current timestep. TODO Check that do we only this param in cross attention?
@@ -148,6 +152,7 @@ struct Multihead_attention_params_base
     float const* qkv_scale_quant_orig = nullptr;
     float const* attention_out_scale_orig_quant = nullptr;
 
+    // 8 bits kv cache scales.
     float const* kv_scale_orig_quant = nullptr;
     float const* kv_scale_quant_orig = nullptr;
 

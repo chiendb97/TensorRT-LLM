@@ -4,21 +4,21 @@ import tempfile
 from pathlib import Path
 
 import tensorrt_llm
-import tensorrt_llm.quantization.mode as quant_algo
 from tensorrt_llm.builder import BuildConfig, build
-from tensorrt_llm.executor import GenerationExecutor
+from tensorrt_llm.executor import GenerationExecutor, SamplingConfig
 from tensorrt_llm.models import LLaMAForCausalLM
-from tensorrt_llm.models.modeling_utils import QuantizationConfig
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
-from utils.util import force_ampere, skip_no_ammo, skip_pre_ada
+from utils.util import force_ampere, skip_no_modelopt, skip_pre_ada
 
 tensorrt_llm.logger.set_level('info')
 
 
 @force_ampere
-@skip_no_ammo
+@skip_no_modelopt
 def test_int4_awq_quantization():
     input_text = [
         'Born in north-east France, Soyer trained as a',
@@ -28,7 +28,7 @@ def test_int4_awq_quantization():
     hf_model_dir = llm_models_root() / "llama-models/llama-7b-hf"
     tokenizer_dir = hf_model_dir
     checkpoint_dir = tempfile.TemporaryDirectory("llama-checkpoint").name
-    quant_config = QuantizationConfig(quant_algo.W4A16_AWQ)
+    quant_config = QuantConfig(QuantAlgo.W4A16_AWQ)
     LLaMAForCausalLM.quantize(hf_model_dir,
                               checkpoint_dir,
                               quant_config=quant_config,
@@ -47,14 +47,16 @@ def test_int4_awq_quantization():
     engine.save(engine_dir)
     with GenerationExecutor.create(Path(engine_dir), tokenizer_dir) as executor:
         for idx, output in enumerate(
-                executor.generate(input_text, max_new_tokens=10)):
+                executor.generate(
+                    input_text,
+                    sampling_config=SamplingConfig(max_new_tokens=10))):
             print(f"Input: {input_text[idx]}")
             print(f'Output: {output.text}')
             # TODO: TRTLLM-185, check the score when the test infra is ready, hard coded value is not stable, cause flaky tests in L0
 
 
 @skip_pre_ada
-@skip_no_ammo
+@skip_no_modelopt
 def test_fp8_quantization():
     input_text = [
         'Born in north-east France, Soyer trained as a',
@@ -65,7 +67,11 @@ def test_fp8_quantization():
     tokenizer_dir = hf_model_dir
 
     checkpoint_dir = tempfile.TemporaryDirectory("llama-checkpoint").name
-    quant_config = QuantizationConfig(quant_algo.FP8)
+    quant_config = QuantConfig(QuantAlgo.FP8,
+                               exclude_modules=[
+                                   'lm_head', 'vocab_embedding',
+                                   'position_embedding', 'block_embedding'
+                               ])
     LLaMAForCausalLM.quantize(hf_model_dir,
                               checkpoint_dir,
                               quant_config=quant_config,
@@ -84,7 +90,9 @@ def test_fp8_quantization():
     engine.save(engine_dir)
     with GenerationExecutor.create(Path(engine_dir), tokenizer_dir) as executor:
         for idx, output in enumerate(
-                executor.generate(input_text, max_new_tokens=10)):
+                executor.generate(
+                    input_text,
+                    sampling_config=SamplingConfig(max_new_tokens=10))):
             print(f"Input: {input_text[idx]}")
             print(f'Output: {output.text}')
             # TODO: TRTLLM-185, check the score when the test infra is ready, hard coded value is not stable, cause flaky tests in L0

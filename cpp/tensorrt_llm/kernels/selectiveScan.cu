@@ -65,6 +65,8 @@ __device__ void convertAndStore(__nv_bfloat16* output, float input)
 }
 #endif
 
+#pragma nv_diag_suppress static_var_with_dynamic_init
+
 template <typename input_t, typename weight_t, int DSTATE = 16, int CHANNELS_PER_BLOCK = 128, int STAGES = 12,
     int SEQ_UNROLL = 6>
 __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBase params)
@@ -74,16 +76,13 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
     input_t* x = reinterpret_cast<input_t*>(params.u_ptr);
     input_t* dt = reinterpret_cast<input_t*>(params.delta_ptr);
     weight_t* A = reinterpret_cast<weight_t*>(params.A_ptr);
-    input_t* B = reinterpret_cast<input_t*>(params.B_ptr);
-    input_t* C = reinterpret_cast<input_t*>(params.C_ptr);
+    input_t* B = reinterpret_cast<input_t*>(params.BC_ptr);
+    input_t* C = reinterpret_cast<input_t*>(params.BC_ptr);
     weight_t* D = reinterpret_cast<weight_t*>(params.D_ptr);
     input_t* z = reinterpret_cast<input_t*>(params.z_ptr);
     weight_t* dt_bias = reinterpret_cast<weight_t*>(params.delta_bias_ptr);
     bool dt_softplus = params.delta_softplus;
     int num_channels = params.dim;
-
-    // static const int STAGES = 12;
-    // static const int SEQ_UNROLL = 6;
 
     __shared__ cuda::pipeline_shared_state<cuda::thread_scope::thread_scope_block, STAGES / SEQ_UNROLL> pipeline_state;
     auto block = cooperative_groups::this_thread_block();
@@ -95,31 +94,33 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
     __shared__ input_t sh_x[STAGES][CHANNELS_PER_BLOCK];
     __shared__ input_t sh_z[STAGES][CHANNELS_PER_BLOCK];
 
-    __shared__ weight_t sh_D[CHANNELS_PER_BLOCK];
-    __shared__ weight_t sh_dt_bias[CHANNELS_PER_BLOCK];
-
     int const channel = blockIdx.x * blockDim.x + threadIdx.x;
     int const sample = blockIdx.y; // batch id
 
+    int const slot_idx = params.slot_mapping_ptr == nullptr ? sample : params.slot_mapping_ptr[sample];
+    int const bc_cols = DSTATE * 2 + params.dt_rank;
+    int const b_offset = params.dt_rank;
+    int const c_offset = params.dt_rank + DSTATE;
+
     int num_tokens;
     int start_token_idx;
-    start_token_idx = sample * params.seqlen;
-    num_tokens = params.last_token_ids_ptr[sample];
-
+    if (params.remove_padding)
+    {
+        start_token_idx = sample == 0 ? 0 : params.last_token_ids_ptr[sample - 1];
+        int end_token_idx = params.last_token_ids_ptr[sample];
+        num_tokens = end_token_idx - start_token_idx;
+    }
+    else
+    {
+        start_token_idx = sample * params.max_seqlen;
+        num_tokens = params.last_token_ids_ptr[sample];
+    }
     int const seq_loops = (num_tokens + SEQ_UNROLL - 1) / SEQ_UNROLL;
 
     int const input_matrix_row_id = start_token_idx;
 
     if (threadIdx.y == 1)
     {
-        // Data loading warps
-
-        // Bias is independent of token
-        sh_dt_bias[threadIdx.x] = dt_bias[channel];
-        // D is independent of token
-        if (D)
-            sh_D[threadIdx.x] = D[channel];
-
         cuda::pipeline pipeline = cuda::make_pipeline(block, &pipeline_state, cuda::pipeline_role::producer);
 
         int stage = 0;
@@ -132,8 +133,8 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
             for (int token_id = si * SEQ_UNROLL; token_id < num_tokens && token_id < (si + 1) * SEQ_UNROLL; token_id++)
             {
 
-                input_t* my_B = &B[input_matrix_row_id * DSTATE + token_id * DSTATE];
-                input_t* my_C = &C[input_matrix_row_id * DSTATE + token_id * DSTATE];
+                input_t* my_B = &B[(input_matrix_row_id + token_id) * bc_cols + b_offset];
+                input_t* my_C = &C[(input_matrix_row_id + token_id) * bc_cols + c_offset];
 
                 int block_channel_per_token = blockIdx.x * blockDim.x;
                 int block_channel
@@ -205,10 +206,11 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
         float A_reg[DSTATE];
         for (int i = 0; i < DSTATE; i++)
         {
-            // state_reg[i] = toFloat(state[sample*num_channels*DSTATE + i*num_channels + channel]);
             state_reg[i] = 0.f;
             A_reg[i] = toFloat(A[i * num_channels + channel]);
         }
+        float dt_bias_reg = dt_bias[channel];
+        float D_reg = D ? D[channel] : 0.f;
 
         cuda::pipeline pipeline = cuda::make_pipeline(block, &pipeline_state, cuda::pipeline_role::consumer);
         int stage = 0;
@@ -221,14 +223,14 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
             for (int token_id = si * SEQ_UNROLL; token_id < num_tokens && token_id < (si + 1) * SEQ_UNROLL; token_id++)
             {
 
-                float dt_b = toFloat(sh_dt[stage][threadIdx.x]) + toFloat(sh_dt_bias[threadIdx.x]);
+                float dt_b = toFloat(sh_dt[stage][threadIdx.x]) + dt_bias_reg;
                 float dt_b_sp;
                 if (dt_softplus)
                 {
-                    dt_b_sp = dt_b <= 20.f ? log1pf(__expf(dt_b)) : dt_b; // softplus
+                    dt_b_sp = dt_b <= 20.f ? __logf(1.f + __expf(dt_b)) : dt_b; // softplus
                 }
                 float my_x = toFloat(sh_x[stage][threadIdx.x]);
-                float Dx = my_x * (D ? toFloat(sh_D[threadIdx.x]) : 0.f);
+                float Dx = my_x * D_reg;
                 float dtx = dt_b_sp * my_x;
                 float my_z = z ? toFloat(sh_z[stage][threadIdx.x]) : 0.f;
 
@@ -288,7 +290,7 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
                 {
                     float enz = __expf(0.f - my_z);
                     enz += 1.0;
-                    float sig_z = 1.0 / enz;
+                    float sig_z = __fdividef(1.f, enz);
                     float silu_z = my_z * sig_z;
                     out *= silu_z;
                 }
@@ -304,7 +306,7 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
         // Write the new state back out to the cache
         for (int i = 0; i < DSTATE; i++)
         {
-            input_t* my_state = &state[sample * num_channels * DSTATE];
+            input_t* my_state = &state[slot_idx * num_channels * DSTATE];
             int offset = i * num_channels + channel;
             convertAndStore(&my_state[offset], state_reg[i]);
         }
@@ -317,16 +319,15 @@ void invokeSelectiveScan(SSMParamsBase& params, cudaStream_t stream)
     int samples = params.batch;
     int channels = params.dim;
 
+    TLLM_CHECK(params.is_variable_B);
+    TLLM_CHECK(params.is_variable_C);
+    TLLM_CHECK(params.dstate == 16);
+
     int const threads = 128;
     int const blocks = (channels + threads - 1) / threads;
     dim3 block(threads, 2);
     dim3 grid(blocks, samples);
     TLLM_CHECK((channels % block.x) == 0);
-
-    TLLM_CHECK(params.is_variable_B);
-    TLLM_CHECK(params.is_variable_C);
-    TLLM_CHECK(params.dstate == 16);
-
     selective_scan_loop_kernel<input_t, weight_t><<<grid, block, 0, stream>>>(params);
 }
 
@@ -351,8 +352,8 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     input_t* x = reinterpret_cast<input_t*>(params.u_ptr);
     input_t* dt = reinterpret_cast<input_t*>(params.delta_ptr);
     weight_t* A = reinterpret_cast<weight_t*>(params.A_ptr);
-    input_t* B = reinterpret_cast<input_t*>(params.B_ptr);
-    input_t* C = reinterpret_cast<input_t*>(params.C_ptr);
+    input_t* B = reinterpret_cast<input_t*>(params.BC_ptr);
+    input_t* C = reinterpret_cast<input_t*>(params.BC_ptr);
     weight_t* D = reinterpret_cast<weight_t*>(params.D_ptr);
     input_t* z = reinterpret_cast<input_t*>(params.z_ptr);
     weight_t* dt_bias = reinterpret_cast<weight_t*>(params.delta_bias_ptr);
@@ -363,8 +364,12 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     if (channel >= num_channels)
         return;
     int const sample = blockIdx.y;
+    int const slot_idx = params.slot_mapping_ptr == nullptr ? sample : params.slot_mapping_ptr[sample];
+    int const bc_cols = DSTATE * 2 + params.dt_rank;
+    int const b_offset = params.dt_rank;
+    int const c_offset = params.dt_rank + DSTATE;
 
-    input_t* my_state = &state[sample * num_channels * DSTATE];
+    input_t* my_state = &state[slot_idx * num_channels * DSTATE];
     input_t* my_output = &output[sample * num_channels];
 
     float rA[DSTATE];
@@ -377,8 +382,8 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     for (int i = 0; i < DSTATE; i++)
     {
         rA[i] = toFloat(A[i * num_channels + channel]);
-        rB[i] = toFloat(B[sample * DSTATE + i]);
-        rC[i] = toFloat(C[sample * DSTATE + i]);
+        rB[i] = toFloat(B[sample * bc_cols + b_offset + i]);
+        rC[i] = toFloat(C[sample * bc_cols + c_offset + i]);
         rState[i] = toFloat(my_state[i * num_channels + channel]);
     }
 
@@ -393,15 +398,17 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     float dt_b_sp;
     if (dt_softplus)
     {
-        dt_b_sp = dt_b <= 20.f ? logf(1.f + expf(dt_b)) : dt_b; // softplus
+        // dt_b_sp = dt_b <= 20.f ? logf(1.f + expf(dt_b)) : dt_b; // softplus
+        dt_b_sp = dt_b <= 20.f ? __logf(1.f + __expf(dt_b)) : dt_b; // softplus
     }
 
-    float out = 0.f;
+    float out = D ? my_D * my_x : 0.f;
 
 #pragma unroll
     for (int i = 0; i < DSTATE; i++)
     {
-        float dA = expf(rA[i] * dt_b_sp);
+        // float dA = expf(rA[i] * dt_b_sp);
+        float dA = __expf(rA[i] * dt_b_sp);
         float dB = rB[i] * dt_b_sp;
         float sdA = rState[i] * dA;
         float dBx = dB * my_x;
@@ -410,11 +417,10 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
         out += newState * rC[i];
     }
 
-    if (D)
-        out += my_D * my_x;
     if (z)
     {
-        float sig_z = 1.0 / (1.0 + exp(0.f - my_z));
+        // float sig_z = 1.0 / (1.0 + exp(0.f - my_z));
+        float sig_z = __fdividef(1.f, (1.f + __expf(0.f - my_z)));
         float silu_z = my_z * sig_z;
         out *= silu_z;
     }

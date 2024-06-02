@@ -1,5 +1,4 @@
 import argparse
-import configparser
 import functools
 import json
 import logging
@@ -8,10 +7,10 @@ import shutil
 import tarfile
 import time
 import traceback
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import safetensors
@@ -20,15 +19,16 @@ import torch.nn as nn
 import yaml
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
-                          GPT2Config, GPT2Tokenizer, T5Tokenizer)
+from transformers import (AutoConfig, AutoModelForCausalLM,
+                          AutoModelForVision2Seq, AutoTokenizer, GPT2Config)
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
 from tensorrt_llm._utils import pad_vocab_size, str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.llama.utils import retrieved_layer_index_from_name
+from tensorrt_llm.models.convert_utils import retrieved_layer_index_from_name
+from tensorrt_llm.quantization import QuantAlgo
 
 LOGGER = logging.getLogger(__name__)
 
@@ -44,7 +44,10 @@ def parse_arguments():
     parser.add_argument(
         '--gpt_variant',
         default=None,
-        choices=[None, 'gpt2', 'santacoder', 'starcoder', 'starcoder2'],
+        choices=[
+            None, 'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon',
+            'kosmos-2'
+        ],
         help=
         "By default the script will try to infer the gpt_variant from model_dir. "
         "Or users may overwrite gpt_variant by explicitly passing the variant.")
@@ -138,30 +141,6 @@ def parse_arguments():
                         type=str,
                         default=None,
                         help="cache dir to load the hugging face dataset")
-
-    parser.add_argument(
-        '--lora_target_modules',
-        nargs='+',
-        default=None,
-        choices=[
-            "attn_qkv",
-            "attn_q",
-            "attn_k",
-            "attn_v",
-            "attn_dense",
-            "mlp_h_to_4h",
-            "mlp_gate",
-            "mlp_4h_to_h",
-        ],
-        help=
-        "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
-    )
-    parser.add_argument(
-        '--max_lora_rank',
-        type=int,
-        default=64,
-        help='maximum lora rank for different lora modules. '
-        'It is used to compute the workspace size of lora plugin.')
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
@@ -176,10 +155,33 @@ def parse_arguments():
                         default=None,
                         help="dataset file for quantize")
     parser.add_argument('--log_level', type=str, default='info')
+    parser.add_argument(
+        '--nemo_rename_key',
+        type=str,
+        nargs='+',
+        default=[],
+        help=
+        "Change a layer name when loading a NeMo checkpoint. Should follow <old_name_pattern>:<new_name_pattern>"
+    )
+
     args = parser.parse_args()
 
     tensorrt_llm.logger.set_level(args.log_level)
     return args
+
+
+def rename_keys(model_state, layer_rename_config: Dict[str, str]):
+    if not layer_rename_config:
+        return model_state
+
+    new_state_dict = {}
+    for key, value in model_state.items():
+        for old, new in layer_rename_config.items():
+            key = key.replace(old, new)
+        assert key not in new_state_dict, f"Key already exists: {key}"
+        new_state_dict[key] = value
+
+    return new_state_dict
 
 
 def load_gpt_config(model_dir: str,
@@ -188,26 +190,44 @@ def load_gpt_config(model_dir: str,
 
     if gpt_variant is None:
         print("Inferring gpt variant from path...")
-        for v in ['starcoder2', 'starcoder', 'santacoder', 'gpt2']:
-            if v in config._name_or_path:
+        for v in [
+                'starcoder2', 'starcoder', 'santacoder', 'gpt2', 'persimmon',
+                'kosmos-2'
+        ]:
+            if v in config._name_or_path or ('fuyu' in config._name_or_path
+                                             and v == 'persimmon'):
                 gpt_variant = v
                 break
-    assert gpt_variant in ['gpt2', 'santacoder', 'starcoder', 'starcoder2']
+    assert gpt_variant in [
+        'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon', 'kosmos-2'
+    ]
     print(f"Gpt variant: {gpt_variant}")
 
-    if gpt_variant == 'starcoder2':
+    if gpt_variant in ['starcoder2', 'persimmon']:
         config.n_embd = config.hidden_size
         config.n_inner = config.intermediate_size
         config.n_head = config.num_attention_heads
-        config.n_kv_head = config.num_key_value_heads
+        config.n_kv_head = config.num_key_value_heads if hasattr(
+            config, 'num_key_value_heads') else config.n_head
         config.n_layer = config.num_hidden_layers
         config.n_positions = config.max_position_embeddings
-        config.activation_function = 'gelu'
-        config.layer_norm_epsilon = config.norm_epsilon
-        config.bias = config.use_bias
+        config.activation_function = 'gelu' if gpt_variant == 'starcoder2' else 'squared-relu'
+        config.layer_norm_epsilon = config.norm_epsilon if gpt_variant == 'starcoder2' else config.layer_norm_eps
+        config.bias = config.use_bias if gpt_variant == 'starcoder2' else True
         config.position_embedding_type = 'rope_gpt_neox'
         config.rotary_base = config.rope_theta
-        config.rotary_pct = 1.0
+        config.rotary_pct = getattr(config, 'partial_rotary_factor', 1.0)
+    elif gpt_variant == "kosmos-2":
+        config.n_embd = config.text_config.embed_dim
+        config.n_inner = config.text_config.ffn_dim
+        config.n_head = config.text_config.attention_heads
+        config.n_kv_head = config.n_head
+        config.n_layer = config.text_config.layers
+        config.n_positions = config.text_config.max_position_embeddings
+        config.activation_function = config.text_config.activation_function
+        config.layer_norm_epsilon = config.text_config.layer_norm_eps
+        config.bias = True
+        config.vocab_size = config.text_config.vocab_size
     else:
         if config.n_inner is None:
             config.n_inner = config.n_embd * 4
@@ -281,6 +301,30 @@ def split_qkv(
     return torch.cat([q_param, k_param, v_param], dim=0)
 
 
+def split_embedding(
+    param: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+    use_parallel_embedding: bool = False,
+    sharding_dim: int = 0,
+) -> torch.Tensor:
+    if param is None:
+        return None
+    if not use_parallel_embedding:
+        return param
+
+    vocab_size, hidden_size = param.size()
+    if sharding_dim == 0:
+        if vocab_size % tp_size != 0:
+            vocab_size_padded = pad_vocab_size(vocab_size, tp_size)
+            pad_width = vocab_size_padded - vocab_size
+            param = torch.nn.functional.pad(param, (0, 0, 0, pad_width),
+                                            value=0)
+        else:
+            assert hidden_size % tp_size == 0
+    return split(param, tp_rank, tp_size, is_column=(sharding_dim == 0))
+
+
 def get_weight(params: Dict[str, torch.Tensor], prefix: str,
                dtype: torch.dtype) -> torch.Tensor:
     if f'{prefix}.weight' not in params:
@@ -349,6 +393,11 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
     for l in layers_range:
         if gpt_variant == 'starcoder2':
             prefix = f'model.layers.{l}'
+        elif gpt_variant == 'persimmon':
+            is_fuyu = f'language_model.model.embed_tokens.weight' in model_params
+            prefix = f'language_model.model.layers.{l}' if is_fuyu else f'model.layers.{l}'
+        elif gpt_variant == 'kosmos-2':
+            prefix = f'text_model.model.layers.{l}'
         else:
             prefix = f'transformer.h.{l}'
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
@@ -359,7 +408,7 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                              f'{prefix}.attn.kv_attn', dtype)
             qkv_w = torch.cat([q_w, kv_w], dim=-1)
             qkv_b = torch.cat([q_b, kv_b], dim=-1)
-        elif gpt_variant == 'starcoder2':
+        elif gpt_variant in ['starcoder2', 'kosmos-2']:
             q_w, q_b = get_weight_and_bias(model_params,
                                            f'{prefix}.self_attn.q_proj', dtype)
             k_w, k_b = get_weight_and_bias(model_params,
@@ -368,15 +417,30 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                            f'{prefix}.self_attn.v_proj', dtype)
             qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
             qkv_b = torch.cat([q_b, k_b, v_b], dim=0)
+        elif gpt_variant == 'persimmon':
+            qkv_w, qkv_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.query_key_value', dtype)
         else:
             qkv_w, qkv_b = get_weight_and_bias(model_params,
                                                f'{prefix}.attn.c_attn', dtype)
         if gpt_variant in ['gpt2', 'santacoder']:
             qkv_w = qkv_w.t().contiguous()  # transpose for Conv1D
-        qkv_w = split_qkv(qkv_w, mapping.tp_rank, mapping.tp_size, hidden_size,
-                          num_attention_heads, num_kv_heads)
-        qkv_b = split_qkv(qkv_b, mapping.tp_rank, mapping.tp_size, hidden_size,
-                          num_attention_heads, num_kv_heads)
+
+        if gpt_variant == 'persimmon':
+            qkv_w = split(qkv_w,
+                          mapping.tp_rank,
+                          mapping.tp_size,
+                          is_column=True)
+
+            qkv_b = split(qkv_b,
+                          mapping.tp_rank,
+                          mapping.tp_size,
+                          is_column=True)
+        else:
+            qkv_w = split_qkv(qkv_w, mapping.tp_rank, mapping.tp_size,
+                              hidden_size, num_attention_heads, num_kv_heads)
+            qkv_b = split_qkv(qkv_b, mapping.tp_rank, mapping.tp_size,
+                              hidden_size, num_attention_heads, num_kv_heads)
 
         weights.update(
             get_tllm_linear_weight(qkv_w, f'{tllm_prex}.attention.qkv', qkv_b,
@@ -386,6 +450,12 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if gpt_variant == 'starcoder2':
             attn_dense_w, attn_dense_b = get_weight_and_bias(
                 model_params, f'{prefix}.self_attn.o_proj', dtype)
+        elif gpt_variant == 'persimmon':
+            attn_dense_w, attn_dense_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.dense', dtype)
+        elif gpt_variant == 'kosmos-2':
+            attn_dense_w, attn_dense_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.out_proj', dtype)
         else:
             attn_dense_w, attn_dense_b = get_weight_and_bias(
                 model_params, f'{prefix}.attn.c_proj', dtype)
@@ -400,8 +470,16 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                    attn_dense_b, use_weight_only,
                                    plugin_weight_only_quant_type))
 
-        mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
-                                                 f'{prefix}.mlp.c_fc', dtype)
+        if gpt_variant == 'persimmon':
+            mlp_fc_w, mlp_fc_b = get_weight_and_bias(
+                model_params, f'{prefix}.mlp.dense_h_to_4h', dtype)
+        elif gpt_variant == 'kosmos-2':
+            mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
+                                                     f'{prefix}.ffn.fc1', dtype)
+        else:
+            mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
+                                                     f'{prefix}.mlp.c_fc',
+                                                     dtype)
         if gpt_variant in ['gpt2', 'santacoder']:
             mlp_fc_w = mlp_fc_w.t().contiguous()  # transpose for Conv1D
         mlp_fc_w = split(mlp_fc_w,
@@ -417,9 +495,15 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                    use_weight_only,
                                    plugin_weight_only_quant_type))
 
-        mlp_proj_w, mlp_proj_b = get_weight_and_bias(model_params,
-                                                     f'{prefix}.mlp.c_proj',
-                                                     dtype)
+        if gpt_variant == 'persimmon':
+            mlp_proj_w, mlp_proj_b = get_weight_and_bias(
+                model_params, f'{prefix}.mlp.dense_4h_to_h', dtype)
+        elif gpt_variant == 'kosmos-2':
+            mlp_proj_w, mlp_proj_b = get_weight_and_bias(
+                model_params, f'{prefix}.ffn.fc2', dtype)
+        else:
+            mlp_proj_w, mlp_proj_b = get_weight_and_bias(
+                model_params, f'{prefix}.mlp.c_proj', dtype)
         if gpt_variant in ['gpt2', 'santacoder']:
             mlp_proj_w = mlp_proj_w.t().contiguous()  # transpose for Conv1D
         mlp_proj_w = split(mlp_proj_w,
@@ -431,9 +515,12 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                    mlp_proj_b, use_weight_only,
                                    plugin_weight_only_quant_type))
 
-        if gpt_variant == 'starcoder2':
+        if gpt_variant in ['starcoder2', 'persimmon']:
             input_ln_w, input_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.input_layernorm', dtype)
+        elif gpt_variant == 'kosmos-2':
+            input_ln_w, input_ln_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn_layer_norm', dtype)
         else:
             input_ln_w, input_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.ln_1', dtype)
@@ -441,9 +528,12 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if input_ln_b is not None:
             weights[f'{tllm_prex}.input_layernorm.bias'] = input_ln_b
 
-        if gpt_variant == 'starcoder2':
+        if gpt_variant in ['starcoder2', 'persimmon']:
             post_ln_w, post_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.post_attention_layernorm', dtype)
+        elif gpt_variant == 'kosmos-2':
+            post_ln_w, post_ln_b = get_weight_and_bias(
+                model_params, f'{prefix}.final_layer_norm', dtype)
         else:
             post_ln_w, post_ln_b = get_weight_and_bias(model_params,
                                                        f'{prefix}.ln_2', dtype)
@@ -451,39 +541,82 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if post_ln_b is not None:
             weights[f'{tllm_prex}.post_layernorm.bias'] = post_ln_b
 
+        if gpt_variant == 'persimmon':
+            q_layernorm_w, q_layernorm_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.q_layernorm', dtype)
+
+            weights[f'{tllm_prex}.attention.q_layernorm.weight'] = q_layernorm_w
+            weights[f'{tllm_prex}.attention.q_layernorm.bias'] = q_layernorm_b
+
+            k_layernorm_w, k_layernorm_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.k_layernorm', dtype)
+
+            weights[f'{tllm_prex}.attention.k_layernorm.weight'] = k_layernorm_w
+            weights[f'{tllm_prex}.attention.k_layernorm.bias'] = k_layernorm_b
+
+        if gpt_variant == 'kosmos-2':
+            q_layernorm_w, q_layernorm_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.inner_attn_ln', dtype)
+
+            weights[
+                f'{tllm_prex}.attention.inner_layernorm.weight'] = q_layernorm_w
+            weights[
+                f'{tllm_prex}.attention.inner_layernorm.bias'] = q_layernorm_b
+
+            k_layernorm_w, k_layernorm_b = get_weight_and_bias(
+                model_params, f'{prefix}.ffn.ffn_layernorm', dtype)
+
+            weights[f'{tllm_prex}.mlp.inner_layernorm.weight'] = k_layernorm_w
+            weights[f'{tllm_prex}.mlp.inner_layernorm.bias'] = k_layernorm_b
+
     if mapping.is_first_pp_rank():
         if gpt_variant == 'starcoder2':
             embed_w = get_weight(model_params, 'model.embed_tokens', dtype)
+        elif gpt_variant == 'kosmos-2':
+            embed_w = get_weight(model_params, 'text_model.model.embed_tokens',
+                                 dtype)
+        elif gpt_variant == 'persimmon':
+            embed_w = get_weight(model_params,
+                                 ('language_model.' if is_fuyu else '') +
+                                 'model.embed_tokens', dtype)
         else:
             embed_w = get_weight(model_params, 'transformer.wte', dtype)
-        if not use_parallel_embedding:
-            weights['transformer.vocab_embedding.weight'] = embed_w
+        weights['transformer.vocab_embedding.weight'] = split_embedding(
+            embed_w,
+            mapping.tp_rank,
+            mapping.tp_size,
+            use_parallel_embedding=use_parallel_embedding,
+            sharding_dim=sharding_dim)
+
+        if gpt_variant == 'kosmos-2':
+            padding_idx = hf_config.text_config.pad_token_id
+            sin_pos_embedding = hf_model.text_model.model.embed_positions.get_embedding(
+                padding_idx + 1 + hf_config.text_config.max_position_embeddings,
+                hf_config.text_config.embed_dim,
+                padding_idx=padding_idx)  # [2 + num_embeddings, embed_dim]
+            pos_embed_w = sin_pos_embedding[2:].to(dtype).detach().cpu()
         else:
-            if sharding_dim == 0:
-                if vocab_size % mapping.tp_size != 0:
-                    vocab_size_padded = pad_vocab_size(vocab_size,
-                                                       mapping.tp_size)
-                    pad_width = vocab_size_padded - vocab_size
-                    embed_w = torch.nn.functional.pad(embed_w,
-                                                      (0, 0, 0, pad_width),
-                                                      value=0)
-            else:
-                assert hidden_size % mapping.tp_size == 0
-            weights['transformer.vocab_embedding.weight'] = split(
-                embed_w,
+            pos_embed_w = get_weight(model_params, 'transformer.wpe', dtype)
+        if pos_embed_w is not None:
+            weights['transformer.position_embedding.weight'] = split_embedding(
+                pos_embed_w,
                 mapping.tp_rank,
                 mapping.tp_size,
-                is_column=(sharding_dim == 0))
-
-        pos_embed_w = get_weight(model_params, 'transformer.wpe', dtype)
-        if pos_embed_w is not None:
-            weights['transformer.position_embedding.weight'] = pos_embed_w
+                use_parallel_embedding=use_parallel_embedding,
+                sharding_dim=sharding_dim)
 
     if mapping.is_last_pp_rank():
         if gpt_variant == 'starcoder2':
             embed_w = get_weight(model_params, 'lm_head', dtype)
             if embed_w is None:
                 embed_w = get_weight(model_params, 'model.embed_tokens', dtype)
+        elif gpt_variant == 'persimmon':
+            embed_w = get_weight(model_params,
+                                 ('language_model.' if is_fuyu else '') +
+                                 'lm_head', dtype)
+        elif gpt_variant == 'kosmos-2':
+            embed_w = get_weight(model_params, 'text_model.model.embed_tokens',
+                                 dtype)
         else:
             embed_w = get_weight(model_params, 'transformer.wte', dtype)
         if not share_embedding_table:
@@ -498,6 +631,14 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                               is_column=True)
         if gpt_variant == 'starcoder2':
             ln_f_w, ln_f_b = get_weight_and_bias(model_params, 'model.norm',
+                                                 dtype)
+        elif gpt_variant == 'persimmon':
+            ln_f_w, ln_f_b = get_weight_and_bias(
+                model_params, ('language_model.' if is_fuyu else '') +
+                'model.final_layernorm', dtype)
+        elif gpt_variant == 'kosmos-2':
+            ln_f_w, ln_f_b = get_weight_and_bias(model_params,
+                                                 'text_model.model.layer_norm',
                                                  dtype)
         else:
             ln_f_w, ln_f_b = get_weight_and_bias(model_params,
@@ -869,7 +1010,8 @@ def convert_hf_gpt_legacy(hf_model: AutoModelForCausalLM,
                           per_channel=False,
                           per_token=False,
                           int8_kv_cache=False,
-                          act_range=None):
+                          act_range=None,
+                          rank=None):
     weights = {}
     tik = time.time()
 
@@ -1075,28 +1217,21 @@ def convert_hf_gpt_legacy(hf_model: AutoModelForCausalLM,
 
     if mapping.is_first_pp_rank():
         embed_w = get_weight(model_params, 'transformer.wte', dtype)
-        if not use_parallel_embedding:
-            weights['transformer.vocab_embedding.weight'] = embed_w
-        else:
-            if sharding_dim == 0:
-                if vocab_size % mapping.tp_size != 0:
-                    vocab_size_padded = pad_vocab_size(vocab_size,
-                                                       mapping.tp_size)
-                    pad_width = vocab_size_padded - vocab_size
-                    embed_w = torch.nn.functional.pad(embed_w,
-                                                      (0, 0, 0, pad_width),
-                                                      value=0)
-            else:
-                assert hidden_size % mapping.tp_size == 0
-            weights['transformer.vocab_embedding.weight'] = split(
-                embed_w,
-                mapping.tp_rank,
-                mapping.tp_size,
-                is_column=(sharding_dim == 0))
+        weights['transformer.vocab_embedding.weight'] = split_embedding(
+            embed_w,
+            mapping.tp_rank,
+            mapping.tp_size,
+            use_parallel_embedding=use_parallel_embedding,
+            sharding_dim=sharding_dim)
 
         pos_embed_w = get_weight(model_params, 'transformer.wpe', dtype)
         if pos_embed_w is not None:
-            weights['transformer.position_embedding.weight'] = pos_embed_w
+            weights['transformer.position_embedding.weight'] = split_embedding(
+                pos_embed_w,
+                mapping.tp_rank,
+                mapping.tp_size,
+                use_parallel_embedding=use_parallel_embedding,
+                sharding_dim=sharding_dim)
 
     if mapping.is_last_pp_rank():
         embed_w = get_weight(model_params, 'transformer.wte', dtype)
@@ -1137,78 +1272,6 @@ def gpu_map_location(storage, loc):
         raise ValueError(f"Not handled {loc}")
 
 
-# The field names are the same as in .nemo config file
-# Defaults and their locations in NeMo code are given for commit 9c7926db4ae375b77dae7eb57656213de1dd76a5 in main branch
-# The commit from main is used instead of a release because there are `rotary_base` commit was introduced recently.
-NemoRotaryEmbeddingParameters = namedtuple(
-    "NemoRotaryEmbeddingParameters",
-    [
-        "position_embedding_type", "rotary_percentage",
-        "seq_len_interpolation_factor", "rotary_base"
-    ],
-    defaults=[
-        # "position_embedding_type", the default is taken from
-        # https://github.com/NVIDIA/NeMo/blob/9c7926db4ae375b77dae7eb57656213de1dd76a5/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L370
-        "learned_absolute",
-        # "rotary_percentage", the default is taken from
-        # https://github.com/NVIDIA/NeMo/blob/9c7926db4ae375b77dae7eb57656213de1dd76a5/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L370
-        1.0,
-        # "seq_len_interpolation_factor", the default is take from
-        # https://github.com/NVIDIA/NeMo/blob/9c7926db4ae375b77dae7eb57656213de1dd76a5/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L388
-        None,
-        # "rotary_base", the default is taken from
-        # https://github.com/NVIDIA/NeMo/blob/9c7926db4ae375b77dae7eb57656213de1dd76a5/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L389
-        10000,
-    ])
-
-
-def set_parameter_from_config(params: Dict[str, Any], nemo_config: Dict[str,
-                                                                        Any],
-                              param_name: str) -> None:
-    if param_name in nemo_config:
-        params[param_name] = nemo_config[param_name]
-    else:
-        LOGGER.debug(
-            f"A parameter '{param_name}' is missing in nemo checkpoint. "
-            f"The default value {repr(NemoRotaryEmbeddingParameters._field_defaults[param_name])} will be used."
-        )
-
-
-def extract_rotary_parameters_from_nemo_config(
-        nemo_config: Dict[str, Any]) -> NemoRotaryEmbeddingParameters:
-    params = {}
-    set_parameter_from_config(params, nemo_config, "position_embedding_type")
-    set_parameter_from_config(params, nemo_config, "rotary_percentage")
-    set_parameter_from_config(params, nemo_config,
-                              "seq_len_interpolation_factor")
-    set_parameter_from_config(params, nemo_config, "rotary_base")
-    return NemoRotaryEmbeddingParameters(**params)
-
-
-def nemo_to_gpt_config(nemo_model_config, vocab_size, eos_id, bos_id):
-    convertion_dict = {
-        "activation_function": "activation",
-        "layer_norm_epsilon": "layernorm_epsilon",
-        "n_embd": "hidden_size",
-        "n_head": "num_attention_heads",
-        "n_layer": "num_layers",
-        "n_positions": "max_position_embeddings",
-        "rotary_pct": "rotary_percentage",
-        "bias": "bias",
-        "intermediate_size": "ffn_hidden_size",
-    }
-
-    kwargs = {
-        key: nemo_model_config[value]
-        for key, value in convertion_dict.items() if value in nemo_model_config
-    }
-    kwargs["vocab_size"] = vocab_size
-    kwargs["eos_token_id"] = eos_id
-    kwargs["bos_token_id"] = bos_id
-
-    return GPT2Config(**kwargs)
-
-
 def copy_tokenizer_files(config, out_dir):
     basenames = {
         "model": "tokenizer",
@@ -1229,30 +1292,6 @@ def copy_tokenizer_files(config, out_dir):
         shutil.copy(path.as_posix(), dst_path.as_posix())
 
 
-def add_rotary_parameters_to_ini_config(
-        config: configparser.ConfigParser,
-        rotary_parameters: NemoRotaryEmbeddingParameters) -> None:
-    if rotary_parameters.position_embedding_type == "rope":
-        if rotary_parameters.rotary_percentage > 1.0 or rotary_parameters.rotary_percentage <= 0.0:
-            raise ValueError(
-                f"Rotary percentage has to suffice 0.0 < rotary_percentage <= 1.0, whereas "
-                f"rotary_percentage={rotary_parameters.rotary_percentage}")
-        config["gpt"]["rotary_pct"] = str(rotary_parameters.rotary_percentage)
-        config["gpt"]["rotary_base"] = str(rotary_parameters.rotary_base)
-        if rotary_parameters.seq_len_interpolation_factor is not None:
-            if rotary_parameters.seq_len_interpolation_factor <= 1.0:
-                raise ValueError(
-                    f"Rotary scaling is supported only for seq_len_interpolation_factor > 1.0. "
-                    f"Got seq_len_interpolation_factor={rotary_parameters.seq_len_interpolation_factor}"
-                )
-            config["gpt"]["rotary_scaling_type"] = "linear"
-            config["gpt"]["rotary_scaling_factor"] = str(
-                float(rotary_parameters.seq_len_interpolation_factor))
-    else:
-        # As in HF rotary_pct > 0.0 triggers RoPE. Dislabe RoPE if different embedding type is used
-        config["gpt"]["rotary_pct"] = "0.0"
-
-
 def update_tokenizer_paths(tokenizer_config: Dict,
                            tokenizer_file_paths: Dict[str, Optional[str]]):
     for key, new_path in tokenizer_file_paths.items():
@@ -1269,90 +1308,6 @@ def update_tokenizer_paths(tokenizer_config: Dict,
             )
             tokenizer_config[key] = None
     return tokenizer_config
-
-
-def build_tokenizer(tokenizer_config: Dict):
-    if tokenizer_config["library"] == "sentencepiece":
-        tokenizer = T5Tokenizer(tokenizer_config["model"], extra_ids=0)
-    elif "GPT2" in tokenizer_config["type"]:
-        tokenizer = GPT2Tokenizer(tokenizer_config["vocab_file"],
-                                  tokenizer_config["merge_file"])
-    else:
-        raise ValueError(
-            f'Tokenizer type {tokenizer_config["library"]} not handled')
-
-    if tokenizer.bos_token_id is None:
-        tokenizer.add_special_tokens({"bos_token": "<s>"})
-    if tokenizer.eos_token_id is None:
-        tokenizer.add_special_tokens({"eos_token": "</s>"})
-
-    return tokenizer
-
-
-def get_eos_bos_ids_from_tokenizer_config(
-        tokenizer_config: Dict[str, Any]) -> Tuple[int, int]:
-    tokenizer = build_tokenizer(tokenizer_config)
-    return tokenizer.eos_token_id, tokenizer.bos_token_id
-
-
-def nemo_config_to_ini_config(
-    nemo_model_config: Dict[str, Any],
-    eos_id: int,
-    bos_id: int,
-    vocab_size: int,
-    storage_type: str,
-) -> configparser.ConfigParser:
-    gpt_model_config = nemo_to_gpt_config(nemo_model_config, vocab_size, eos_id,
-                                          bos_id)
-    config = configparser.ConfigParser()
-    config["gpt"] = {k: str(v) for k, v in vars(gpt_model_config).items()}
-    config["gpt"]["storage_dtype"] = storage_type
-    add_rotary_parameters_to_ini_config(
-        config, extract_rotary_parameters_from_nemo_config(nemo_model_config))
-    return config
-
-
-def add_special_tokens_to_tokenizer(tokenizer):
-
-    # Need to add cls, sep, mask tokens to the tokenizer if they don't exist.
-    # If cls, sep and mask are not attributes of the tokenizer, add it.
-    if not hasattr(tokenizer, 'cls_token'):
-        tokenizer.add_special_tokens({'cls_token': '<cls>'})
-    if not hasattr(tokenizer.tokenizer, 'sep_id'):
-        tokenizer.add_special_tokens({'sep_token': '<sep>'})
-    if not hasattr(tokenizer.tokenizer, 'mask_id'):
-        tokenizer.add_special_tokens({'mask_token': '<mask>'})
-
-    # bos, eos, pad and unk may be present in the provided spm .model file, if they are, use it.
-    if not hasattr(tokenizer, 'pad_token'):
-        if hasattr(tokenizer.tokenizer,
-                   'pad_id') and tokenizer.tokenizer.pad_id() > 0:
-            tokenizer.pad_token = tokenizer.tokenizer.id_to_piece(
-                tokenizer.tokenizer.pad_id())
-        else:
-            tokenizer.add_special_tokens({'pad_token': '<pad>'})
-    else:
-        tokenizer.add_special_tokens({'pad_token': '<pad>'})
-
-    if not hasattr(tokenizer, 'bos_token'):
-        if hasattr(tokenizer.tokenizer,
-                   'bos_id') and tokenizer.tokenizer.bos_id() > 0:
-            tokenizer.bos_token = tokenizer.tokenizer.id_to_piece(
-                tokenizer.tokenizer.bos_id())
-        else:
-            tokenizer.add_special_tokens({'bos_token': '<bos>'})
-    else:
-        tokenizer.add_special_tokens({'bos_token': '<s>'})
-
-    if not hasattr(tokenizer, 'eos_token'):
-        if hasattr(tokenizer.tokenizer,
-                   'eos_id') and tokenizer.tokenizer.eos_id() > 0:
-            tokenizer.eos_token = tokenizer.tokenizer.id_to_piece(
-                tokenizer.tokenizer.eos_id())
-        else:
-            tokenizer.add_special_tokens({'eos_token': '<eos>'})
-    else:
-        tokenizer.add_special_tokens({'eos_token': '</s>'})
 
 
 def unpack_nemo_ckpt(nemo_archive_path: Union[str, Path],
@@ -1565,7 +1520,8 @@ class UnpackedNemoCheckpointDir:
 
 
 def load_nemo_gpt_config(
-        unpacked_checkpoints_dir: UnpackedNemoCheckpointDir) -> GPT2Config:
+        unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
+        layer_rename_config: Dict[str, str] = None) -> GPT2Config:
     nemo_model_config = unpacked_checkpoints_dir.model_config
 
     training_tp_size = nemo_model_config.get("tensor_model_parallel_size", 1)
@@ -1580,6 +1536,7 @@ def load_nemo_gpt_config(
     else:
         map_location_fn = gpu_map_location
     model_00 = torch.load(checkpoints_paths[0][0], map_location=map_location_fn)
+    model_00 = rename_keys(model_00, layer_rename_config)
     vocab_size = model_00[
         "model.language_model.embedding.word_embeddings.weight"].shape[
             0] * training_tp_size
@@ -1599,8 +1556,25 @@ def load_nemo_gpt_config(
     hf_config.bias = nemo_model_config['bias']
     # hf_config.apply_query_key_layer_scaling = nemo_model_config['apply_query_key_layer_scaling']
     hf_config.apply_query_key_layer_scaling = False
-    hf_config.position_embedding_type = 'rope_gpt_neox'
-    hf_config.rotary_pct = nemo_model_config['rotary_percentage']
+
+    hf_config.position_embedding_type = nemo_model_config.get(
+        'position_embedding_type', 'learned_absolute')
+    if hf_config.position_embedding_type == 'rope':
+        hf_config.position_embedding_type = 'rope_gpt_neox'
+    hf_config.rotary_base = nemo_model_config.get('rotary_base', 10000.0)
+    hf_config.rotary_pct = nemo_model_config.get('rotary_percentage', 1.0)
+    assert hf_config.rotary_pct >= 0 and hf_config.rotary_pct <= 1
+
+    rotary_scaling_factor = nemo_model_config.get(
+        'seq_len_interpolation_factor', None)
+    if rotary_scaling_factor is None:
+        hf_config.rotary_scaling = None
+    else:
+        assert rotary_scaling_factor > 1
+        hf_config.rotary_scaling = {
+            'type': 'linear',
+            'factor': rotary_scaling_factor
+        }
 
     tokenizer_config = update_tokenizer_paths(
         nemo_model_config["tokenizer"],
@@ -1610,9 +1584,30 @@ def load_nemo_gpt_config(
 
 
 @torch.no_grad()
+def load_torch_checkpoints(checkpoints_paths,
+                           merge_factor,
+                           tp_rank,
+                           pp_rank,
+                           map_location_fn,
+                           handle_model_level_weights,
+                           layer_rename_config: Dict[str, str] = {}):
+    models = []
+    for k in range(merge_factor):
+        rank_weights = checkpoints_paths[tp_rank * merge_factor + k][pp_rank]
+        model = torch.load(rank_weights, map_location=map_location_fn)
+        model = rename_keys(model, layer_rename_config)
+        handle_model_level_weights(model, tp_rank * merge_factor + k, pp_rank)
+        layers = extract_layers_with_prefix(model,
+                                            "model.language_model.encoder.")
+        models.append(layers)
+    return models
+
+
+@torch.no_grad()
 def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
                      mapping: Mapping,
-                     dtype: str = 'float32'):
+                     dtype: str = 'float32',
+                     layer_rename_config: Dict[str, str] = None):
     nemo_model_config = unpacked_checkpoints_dir.model_config
 
     checkpoints_paths = unpacked_checkpoints_dir.get_checkpoints_paths(
@@ -1629,9 +1624,10 @@ def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
     # load position_embedding from rank 0
     model_00 = torch.load(checkpoints_paths[0][0], map_location=map_location_fn)
     model_00 = model_00.get("state_dict", model_00)
-
+    model_00 = rename_keys(model_00, layer_rename_config)
     has_position_embedding = "model.language_model.embedding.position_embeddings.weight" in model_00
     has_lm_head = "model.language_model.output_layer.weight" in model_00
+    del model_00
 
     num_layers = nemo_model_config["num_layers"]
     training_tp_size = nemo_model_config.get("tensor_model_parallel_size", 1)
@@ -1680,18 +1676,11 @@ def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
     tp_rank = inference_tp_rank // split_factor
     # for tp_rank in range(training_tp_size // merge_factor):
     for pp_rank in range(training_pp_size):
-        models = []
-        for k in range(merge_factor):
-            rank_weights = checkpoints_paths[tp_rank * merge_factor +
-                                             k][pp_rank]
-            model = torch.load(rank_weights, map_location=map_location_fn)
-            handle_model_level_weights(model, tp_rank * merge_factor + k,
-                                       pp_rank)
-            layers = extract_layers_with_prefix(
-                model, "model.language_model.encoder.")
-            models.append(layers)
-
-        for name in models[0].keys():
+        models = load_torch_checkpoints(checkpoints_paths, merge_factor,
+                                        tp_rank, pp_rank, map_location_fn,
+                                        handle_model_level_weights,
+                                        layer_rename_config)
+        for name in list(models[0].keys()):
             params = [model[name] for model in models]
             if transpose_weights and params[0].ndim == 2:
                 params = [p.T for p in params]
@@ -1825,14 +1814,14 @@ def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
                     weights['transformer.ln_f.weight'] = params[0]
                 else:
                     weights['transformer.ln_f.bias'] = params[0]
-
-    for key, params in model_level_weights.items():
-        weights[key] = torch.concat(params, dim=0)
-
-    weights = {
-        key: param.to(dtype).contiguous()
-        for key, param in weights.items()
-    }
+            for model in models:
+                del model[name]
+        del models
+    for key in list(model_level_weights.keys()):
+        weights[key] = torch.concat(model_level_weights[key], dim=0)
+        del model_level_weights[key]
+    for key, param in weights.items():
+        weights[key] = weights[key].to(dtype).contiguous()
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -1861,22 +1850,22 @@ if __name__ == '__main__':
     if args.use_weight_only:
         if args.weight_only_precision == 'int8':
             plugin_weight_only_quant_type = torch.int8
-            quant_algo = 'W8A16'
+            quant_algo = QuantAlgo.W8A16
         elif args.weight_only_precision == 'int4':
             plugin_weight_only_quant_type = torch.quint4x2
-            quant_algo = 'W4A16'
+            quant_algo = QuantAlgo.W4A16
     elif args.smoothquant:
         if args.per_token and args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
         elif not args.per_token and not args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
         elif not args.per_token and args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN
         elif args.per_token and not args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
 
     if args.int8_kv_cache:
-        kv_cache_quant_algo = "INT8"
+        kv_cache_quant_algo = QuantAlgo.INT8
 
     if args.model_dir is not None:
         hf_config, gpt_variant = load_gpt_config(args.model_dir,
@@ -1886,8 +1875,12 @@ if __name__ == '__main__':
         nemo_dir = unpack_nemo_ckpt(args.nemo_ckpt_path, nemo_dir)
         unpacked_checkpoints_dir = UnpackedNemoCheckpointDir(
             nemo_dir, load_checkpoints_to_cpu=not args.load_nemo_on_gpu)
+        layer_rename_config = {
+            pattern.split(':')[0]: pattern.split(':')[1]
+            for pattern in args.nemo_rename_key
+        }
         hf_config, tokenizer_config = load_nemo_gpt_config(
-            unpacked_checkpoints_dir)
+            unpacked_checkpoints_dir, layer_rename_config)
         copy_tokenizer_files(tokenizer_config, Path(args.output_dir))
         args.use_parallel_embedding = True
         args.embedding_sharding_dim = 0
@@ -1940,20 +1933,34 @@ if __name__ == '__main__':
         getattr(hf_config, 'apply_query_key_layer_scaling', False),
         'rotary_pct':
         getattr(hf_config, 'rotary_pct', 1.0),
-        'max_lora_rank':
-        args.max_lora_rank,
-        'lora_target_modules':
-        args.lora_target_modules,
+        'rotary_base':
+        getattr(hf_config, 'rotary_base', 10000.0),
+        'rotary_scaling':
+        getattr(hf_config, 'rotary_scaling', None),
+        'qk_layernorm':
+        args.model_dir is not None and gpt_variant == 'persimmon',
+        'inner_layernorm':
+        args.model_dir is not None and gpt_variant == 'kosmos-2',
+        'norm_before_bmm1':
+        args.model_dir is not None and gpt_variant == 'kosmos-2',
+        'scale_embedding':
+        args.model_dir is not None and gpt_variant == 'kosmos-2'
+        and hf_config.text_config.scale_embedding,
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
 
     if args.model_dir is not None:
-        hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                        trust_remote_code=True,
-                                                        device_map="auto",
-                                                        torch_dtype="auto")
+        if gpt_variant == 'kosmos-2':
+            hf_model = AutoModelForVision2Seq.from_pretrained(
+                args.model_dir, trust_remote_code=True)
+        else:
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                args.model_dir,
+                trust_remote_code=True,
+                device_map="auto",
+                torch_dtype="auto")
         if args.smoothquant is not None or args.int8_kv_cache:
             os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
                 "TOKENIZERS_PARALLELISM", "false")
@@ -1963,7 +1970,7 @@ if __name__ == '__main__':
             if args.smoothquant is not None:
                 smooth_gpt_model(hf_model, act_range, args.smoothquant)
 
-    def covert_and_save(rank):
+    def convert_and_save(rank):
         mapping = Mapping(world_size=world_size,
                           rank=rank,
                           tp_size=args.tp_size,
@@ -1985,6 +1992,7 @@ if __name__ == '__main__':
                     per_token=args.per_token,
                     int8_kv_cache=args.int8_kv_cache,
                     act_range=act_range,
+                    rank=rank,
                 )
             else:
                 weights = convert_hf_gpt(
@@ -2002,18 +2010,18 @@ if __name__ == '__main__':
 
         elif args.nemo_ckpt_path is not None:
             weights = convert_nemo_gpt(unpacked_checkpoints_dir, mapping,
-                                       args.dtype)
+                                       args.dtype, layer_rename_config)
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))
 
     if args.workers == 1:
         for rank in range(world_size):
-            covert_and_save(rank)
+            convert_and_save(rank)
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as p:
             futures = [
-                p.submit(covert_and_save, rank) for rank in range(world_size)
+                p.submit(convert_and_save, rank) for rank in range(world_size)
             ]
             exceptions = []
             for future in as_completed(futures):

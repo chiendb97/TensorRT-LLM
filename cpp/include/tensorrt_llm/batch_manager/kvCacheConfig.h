@@ -25,28 +25,33 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+//! @brief Encapsulates parameters to configure paged KV cache.
 class KvCacheConfig
 {
 public:
-    using SizeType = tensorrt_llm::runtime::SizeType;
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
-    explicit KvCacheConfig(std::optional<SizeType> maxTokens = std::nullopt,
-        std::optional<SizeType> maxAttentionWindow = std::nullopt,
-        std::optional<SizeType> sinkTokenLength = std::nullopt,
-        std::optional<float> freeGpuMemoryFraction = std::nullopt, bool enableBlockReuse = false, bool useUvm = false)
+    explicit KvCacheConfig(std::optional<SizeType32> maxTokens = std::nullopt,
+        std::optional<SizeType32> maxAttentionWindow = std::nullopt,
+        std::optional<SizeType32> sinkTokenLength = std::nullopt,
+        std::optional<float> freeGpuMemoryFraction = std::nullopt, bool enableBlockReuse = false, bool useUvm = false,
+        std::optional<size_t> hostCacheSize = std::nullopt, bool onboardBlocks = true)
         : maxTokens{maxTokens}
         , maxAttentionWindow{maxAttentionWindow}
         , sinkTokenLength{sinkTokenLength}
         , freeGpuMemoryFraction{freeGpuMemoryFraction}
         , enableBlockReuse(enableBlockReuse)
         , useUvm(useUvm)
+        , hostCacheSize(hostCacheSize)
+        , onboardBlocks(onboardBlocks)
     {
     }
 
     explicit KvCacheConfig(executor::KvCacheConfig const& kvCacheConfig)
         : KvCacheConfig(kvCacheConfig.getMaxTokens(), kvCacheConfig.getMaxAttentionWindow(),
             kvCacheConfig.getSinkTokenLength(), kvCacheConfig.getFreeGpuMemoryFraction(),
-            kvCacheConfig.getEnableBlockReuse(), false)
+            kvCacheConfig.getEnableBlockReuse(), false, kvCacheConfig.getHostCacheSize(),
+            kvCacheConfig.getOnboardBlocks())
     {
     }
 
@@ -54,15 +59,20 @@ public:
     {
         return maxTokens == other.maxTokens && maxAttentionWindow == other.maxAttentionWindow
             && sinkTokenLength == other.sinkTokenLength && freeGpuMemoryFraction == other.freeGpuMemoryFraction
-            && enableBlockReuse == other.enableBlockReuse && useUvm == other.useUvm;
+            && enableBlockReuse == other.enableBlockReuse && useUvm == other.useUvm
+            && hostCacheSize == other.hostCacheSize && onboardBlocks == other.onboardBlocks;
     }
 
-    std::optional<SizeType> maxTokens;
-    std::optional<SizeType> maxAttentionWindow;
-    std::optional<SizeType> sinkTokenLength;
+    friend std::ostream& operator<<(std::ostream& os, KvCacheConfig const& self);
+
+    std::optional<SizeType32> maxTokens;
+    std::optional<SizeType32> maxAttentionWindow;
+    std::optional<SizeType32> sinkTokenLength;
     std::optional<float> freeGpuMemoryFraction;
     bool enableBlockReuse;
     static constexpr auto kDefaultGpuMemFraction = 0.9f;
     bool useUvm;
+    std::optional<size_t> hostCacheSize;
+    bool onboardBlocks;
 };
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

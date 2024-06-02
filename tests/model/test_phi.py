@@ -30,7 +30,7 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
-from examples.phi.convert_checkpoint import convert_hf_phi
+from tensorrt_llm.models.phi.convert import convert_hf_weights
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
@@ -61,8 +61,7 @@ class TestPhi(unittest.TestCase):
                                                 trust_remote_code=True)
         gpt_config.num_hidden_layers = 2
         model = AutoModelForCausalLM.from_config(
-            gpt_config, code_revision=HF_CODE_REVISION,
-            trust_remote_code=True).cuda().to(
+            gpt_config, trust_remote_code=True).cuda().to(
                 tensorrt_llm._utils.str_dtype_to_torch(dtype)).eval()
         return gpt_config, model
 
@@ -92,7 +91,7 @@ class TestPhi(unittest.TestCase):
         }
         config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         config.set_rank(rank)
-        weights = convert_hf_phi(hf_model, dtype=dtype)
+        weights = convert_hf_weights(hf_model, dtype=dtype)
         trtllm_model = tensorrt_llm.models.PhiForCausalLM(config)
         trtllm_model.load(weights)
 

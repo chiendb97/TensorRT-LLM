@@ -60,8 +60,9 @@ def smooth_quant_gemm(input: Tensor, weights: Tensor, scales_a: Tensor,
         ]
         layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_plug)
         _add_plugin_info(layer, plg_creator, "sq_gemm", pfc)
-        layer.get_input(0).set_dynamic_range(-127, 127)
-        layer.get_input(1).set_dynamic_range(-127, 127)
+        if not default_net().strongly_typed:
+            layer.get_input(0).set_dynamic_range(-127, 127)
+            layer.get_input(1).set_dynamic_range(-127, 127)
         return _create_tensor(layer.get_output(0), layer)
 
 
@@ -69,17 +70,21 @@ def weight_only_quant_matmul(input: Tensor,
                              weights: Tensor,
                              scales: Tensor,
                              weightTypeId: int,
-                             dtype: str = 'float16') -> Tensor:
+                             dtype: str = 'float16',
+                             transa: bool = False,
+                             transb: bool = False) -> Tensor:
 
-    if not default_net().plugin_config.weight_only_quant_matmul_plugin:
+    if not default_net(
+    ).plugin_config.weight_only_quant_matmul_plugin or transa or transb:
+        scale_axis = 0 if transb else 1
         if weights.dtype != trt.int8:
             # Q->DQ
             weights = quantize(weights, scales, dtype='int8', axis=1)
-            weights = dequantize(weights, scales, 1, input.dtype)
+            weights = dequantize(weights, scales, scale_axis, input.dtype)
         else:
-            weights = dequantize(weights, scales, 1, input.dtype)
+            weights = dequantize(weights, scales, scale_axis, input.dtype)
 
-        res = matmul(input, weights)
+        res = matmul(input, weights, transa=transa, transb=transb)
         return cast(res, dtype)
     else:
         plg_creator = trt.get_plugin_registry().get_plugin_creator(
@@ -100,7 +105,8 @@ def weight_only_quant_matmul(input: Tensor,
         plug_inputs = [input.trt_tensor, weights.trt_tensor, scales.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, matmul_plug)
         _add_plugin_info(layer, plg_creator, "woq_matmul", pfc)
-        layer.get_input(1).set_dynamic_range(-127, 127)
+        if not default_net().strongly_typed:
+            layer.get_input(1).set_dynamic_range(-127, 127)
         return _create_tensor(layer.get_output(0), layer)
 
 
@@ -235,7 +241,8 @@ def smooth_quant_layer_norm(input: Tensor,
             scale.trt_tensor
         ]
         layer = default_trtnet().add_plugin_v2(plug_inputs, layernorm_plug)
-        layer.get_output(0).set_dynamic_range(-127, 127)
+        if not default_net().strongly_typed:
+            layer.get_output(0).set_dynamic_range(-127, 127)
         _add_plugin_info(layer, plg_creator, "layernorm_quantized", pfc)
         if not dynamic_act_scaling:
             return _create_tensor(layer.get_output(0), layer)
@@ -285,7 +292,8 @@ def smooth_quant_rms_norm(input: Tensor,
             scale.trt_tensor
         ]
         layer = default_trtnet().add_plugin_v2(plug_inputs, rmsnorm_plug)
-        layer.get_output(0).set_dynamic_range(-127, 127)
+        if not default_net().strongly_typed:
+            layer.get_output(0).set_dynamic_range(-127, 127)
         _add_plugin_info(layer, plg_creator, "rmsnorm_quantized", pfc)
         if not dynamic_act_scaling:
             return _create_tensor(layer.get_output(0), layer)
@@ -350,7 +358,8 @@ def quantize_per_token(x: Tensor) -> Tuple[Tensor]:
 
         plug_inputs = [x.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, quantize_plug)
-        layer.get_output(0).set_dynamic_range(-127, 127)
+        if not default_net().strongly_typed:
+            layer.get_output(0).set_dynamic_range(-127, 127)
         _add_plugin_info(layer, plg_creator, "quantize_per_token_plugin", pfc)
 
         quantized = _create_tensor(layer.get_output(0), layer)
@@ -375,7 +384,8 @@ def quantize_tensor(x, scale):
 
         plug_inputs = [x.trt_tensor, scale.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, quantize_plug)
-        layer.get_output(0).set_dynamic_range(-127, 127)
+        if not default_net().strongly_typed:
+            layer.get_output(0).set_dynamic_range(-127, 127)
         _add_plugin_info(layer, plg_creator, "quantize_tensor_plugin", pfc)
 
         quantized = _create_tensor(layer.get_output(0), layer)

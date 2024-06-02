@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 
@@ -31,8 +32,8 @@ namespace tensorrt_llm::plugins
 class AllreducePlugin : public BasePlugin
 {
 public:
-    AllreducePlugin(
-        std::set<int> group, nvinfer1::DataType type, kernels::AllReduceStrategyType strategy, int32_t counter);
+    AllreducePlugin(std::set<int> group, nvinfer1::DataType type, kernels::AllReduceStrategyType strategy,
+        kernels::AllReduceStrategyConfig config, int32_t counter);
 
     AllreducePlugin(void const* data, size_t length);
 
@@ -65,14 +66,20 @@ public:
     void serialize(void* buffer) const noexcept override;
     void destroy() noexcept override;
 
+private:
     bool isCustomAllReduceSuported(int ranks_per_node) const noexcept;
+    void initGroupTopology() noexcept;
+    kernels::AllReduceStrategyType selectImplementation(
+        size_t messageSize, int worldSize, nvinfer1::DataType type) noexcept;
 
 private:
-    static kernels::AllReduceStrategyType selectImplementation(size_t messageSize, int worldSize) noexcept;
-    const std::string mLayerName;
+    std::string const mLayerName;
     std::set<int> mGroup;
+    bool mIsNVLINKSupported;
+    bool mIsP2PSupported;
     nvinfer1::DataType mType;
     kernels::AllReduceStrategyType mStrategy;
+    kernels::AllReduceStrategyConfig mConfig;
     int32_t mCounter;
 };
 

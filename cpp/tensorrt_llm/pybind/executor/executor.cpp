@@ -70,20 +70,31 @@ void Executor::shutdown()
 void Executor::initBindings(py::module_& m)
 {
     py::class_<Executor>(m, "Executor")
-        .def(py::init<std::filesystem::path const&, tle::ModelType, tle::ExecutorConfig>(), py::arg("model_path"),
-            py::arg("model_type"), py::arg("executor_config"))
-        .def(py::init<std::string const&, std::string const&, tle::ModelType, tle::ExecutorConfig>(),
+        .def(py::init<std::filesystem::path const&, tle::ModelType, tle::ExecutorConfig const&>(),
+            py::arg("model_path"), py::arg("model_type"), py::arg("executor_config"))
+        .def(py::init<std::string const&, std::string const&, tle::ModelType, tle::ExecutorConfig const&>(),
             py::arg("engine_buffer"), py::arg("json_config_str"), py::arg("model_type"), py::arg("executor_config"))
         .def("shutdown", &Executor::shutdown)
         .def("__enter__", &Executor::enter)
         .def("__exit__", &Executor::exit)
         .def("enqueue_request", &Executor::enqueueRequest, py::arg("request"))
         .def("enqueue_requests", &Executor::enqueueRequests, py::arg("requests"))
-        .def("await_responses", &Executor::awaitResponses, py::arg("id") = py::none(), py::arg("timeout") = py::none())
+        .def("await_responses",
+            py::overload_cast<std::optional<std::chrono::milliseconds> const&>(&Executor::awaitResponses),
+            py::arg("timeout") = py::none())
+        .def("await_responses",
+            py::overload_cast<tle::IdType const&, std::optional<std::chrono::milliseconds> const&>(
+                &Executor::awaitResponses),
+            py::arg("id"), py::arg("timeout") = py::none())
+        .def("await_responses",
+            py::overload_cast<std::vector<tle::IdType> const&, std::optional<std::chrono::milliseconds> const&>(
+                &Executor::awaitResponses),
+            py::arg("ids"), py::arg("timeout") = py::none())
         .def("get_num_responses_ready", &Executor::getNumResponsesReady, py::arg("id") = py::none())
         .def("cancel_request", &Executor::cancelRequest, py::arg("id") = py::none())
         .def("get_latest_iteration_stats", &Executor::getLatestIterationStats)
-        .def("get_latest_request_stats", &Executor::getLatestRequestStats);
+        .def("get_latest_request_stats", &Executor::getLatestRequestStats)
+        .def("can_enqueue_requests", &Executor::canEnqueueRequests);
 }
 
 } // namespace tensorrt_llm::pybind::executor

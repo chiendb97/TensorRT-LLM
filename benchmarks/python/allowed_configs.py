@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import asdict, dataclass
-from typing import Dict, Optional, Union
+from dataclasses import asdict, dataclass, field
+from typing import Dict, List, Optional, Union
 
 try:
     from typing import Literal
@@ -60,9 +60,14 @@ class BuildConfig:
     remove_input_padding: bool = None
     parallel_attention: bool = None
     new_decoder_architecture: bool = None
-    mamba_d_state: int = 0
-    mamba_d_conv: int = 0
-    mamba_expand: int = 0
+    state_size: int = 0
+    conv_kernel: int = 0
+    layer_types: List[str] = field(default_factory=list)
+    rnn_hidden_size: int = 0
+    logits_soft_cap: float = 0.0
+    opt_batch_size: Optional[int] = None
+    opt_num_tokens: Optional[int] = None
+    use_bias: bool = None
 
 
 @dataclass
@@ -275,6 +280,24 @@ _allowed_configs = {
                     pre_norm=False,
                     do_layer_norm_before=True,
                 )),
+    "opt_30b":
+    ModelConfig(name="opt_30b",
+                family="opt",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=48,
+                    num_heads=56,
+                    hidden_size=7168,
+                    vocab_size=50272,
+                    hidden_act='relu',
+                    n_positions=2048,
+                    max_batch_size=256,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                    pre_norm=False,
+                    do_layer_norm_before=True,
+                )),
     "opt_66b":
     ModelConfig(name="opt_66b",
                 family="opt",
@@ -292,6 +315,42 @@ _allowed_configs = {
                     builder_opt=None,
                     pre_norm=True,
                     do_layer_norm_before=True,
+                )),
+    "starcoder_15.5b":
+    ModelConfig(name="starcoder_15.5b",
+                family="gpt",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=40,
+                    num_heads=48,
+                    num_kv_heads=1,
+                    hidden_size=6144,
+                    vocab_size=49152,
+                    hidden_act='gelu',
+                    n_positions=8192,
+                    max_batch_size=256,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "starcoder2_3b":
+    ModelConfig(name="starcoder2_3b",
+                family="gpt",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=30,
+                    num_heads=24,
+                    num_kv_heads=2,
+                    hidden_size=3072,
+                    vocab_size=49152,
+                    hidden_act='gelu',
+                    n_positions=16384,
+                    position_embedding_type='rope_gpt_neox',
+                    rotary_pct=1.0,
+                    max_batch_size=256,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
                 )),
     "llama_7b":
     ModelConfig(name="llama_7b",
@@ -1091,6 +1150,39 @@ _allowed_configs = {
                     max_output_len=200,
                     builder_opt=None,
                 )),
+    "qwen1.5_7b_chat":
+    ModelConfig(name="qwen1.5_7b_chat",
+                family="qwen2",
+                benchmark_type="gpt",
+                build_config=BuildConfig(num_layers=32,
+                                         num_heads=32,
+                                         hidden_size=4096,
+                                         vocab_size=151936,
+                                         hidden_act='silu',
+                                         n_positions=8192,
+                                         inter_size=11008,
+                                         max_batch_size=128,
+                                         max_input_len=512,
+                                         max_output_len=200,
+                                         builder_opt=None,
+                                         bias=False)),
+    "qwen1.5_14b_chat":
+    ModelConfig(name="qwen1.5_14b_chat",
+                family="qwen2",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=40,
+                    num_heads=40,
+                    hidden_size=5120,
+                    vocab_size=152064,
+                    hidden_act='silu',
+                    n_positions=8192,
+                    inter_size=13696,
+                    max_batch_size=64,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
     "mamba_2.8b":
     ModelConfig(name="mamba_2.8b",
                 family="mamba",
@@ -1105,9 +1197,11 @@ _allowed_configs = {
                     max_batch_size=64,
                     max_input_len=1024,
                     max_output_len=1024,
-                    mamba_d_state=16,
-                    mamba_d_conv=4,
-                    mamba_expand=2,
+                    state_size=16,
+                    conv_kernel=4,
+                    rnn_hidden_size=5120,
+                    layer_types=["recurrent"],
+                    use_bias=False,
                 )),
     "mamba_1.4b":
     ModelConfig(name="mamba_1.4b",
@@ -1123,9 +1217,11 @@ _allowed_configs = {
                     max_batch_size=64,
                     max_input_len=1024,
                     max_output_len=1024,
-                    mamba_d_state=16,
-                    mamba_d_conv=4,
-                    mamba_expand=2,
+                    state_size=16,
+                    conv_kernel=4,
+                    rnn_hidden_size=4096,
+                    layer_types=["recurrent"],
+                    use_bias=False,
                 )),
     "mamba_790m":
     ModelConfig(name="mamba_790m",
@@ -1141,9 +1237,11 @@ _allowed_configs = {
                     max_batch_size=64,
                     max_input_len=1024,
                     max_output_len=1024,
-                    mamba_d_state=16,
-                    mamba_d_conv=4,
-                    mamba_expand=2,
+                    state_size=16,
+                    conv_kernel=4,
+                    rnn_hidden_size=3072,
+                    layer_types=["recurrent"],
+                    use_bias=False,
                 )),
     "mamba_370m":
     ModelConfig(name="mamba_370m",
@@ -1159,9 +1257,11 @@ _allowed_configs = {
                     max_batch_size=64,
                     max_input_len=1024,
                     max_output_len=1024,
-                    mamba_d_state=16,
-                    mamba_d_conv=4,
-                    mamba_expand=2,
+                    state_size=16,
+                    conv_kernel=4,
+                    rnn_hidden_size=2048,
+                    layer_types=["recurrent"],
+                    use_bias=False,
                 )),
     "mamba_130m":
     ModelConfig(name="mamba_130m",
@@ -1177,9 +1277,11 @@ _allowed_configs = {
                     max_batch_size=64,
                     max_input_len=1024,
                     max_output_len=1024,
-                    mamba_d_state=16,
-                    mamba_d_conv=4,
-                    mamba_expand=2,
+                    state_size=16,
+                    conv_kernel=4,
+                    rnn_hidden_size=1536,
+                    layer_types=["recurrent"],
+                    use_bias=False,
                 )),
     "whisper_large_v3":
     ModelConfig(name="whisper_large_v3",
@@ -1201,6 +1303,30 @@ _allowed_configs = {
                     max_decoder_input_len=1,
                     max_output_len=200,
                     builder_opt=None,
+                )),
+    "recurrentgemma_2b":
+    ModelConfig(name="recurrentgemma_2b",
+                family="recurrentgemma",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=26,
+                    num_heads=10,
+                    num_kv_heads=1,
+                    hidden_size=2560,
+                    inter_size=7680,
+                    vocab_size=256000,
+                    hidden_act="gelu",
+                    n_positions=8192,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_output_len=1024,
+                    position_embedding_type='rope_gpt_neox',
+                    rotary_pct=0.5,
+                    conv_kernel=4,
+                    state_size=1,
+                    layer_types=["recurrent", "recurrent", "attention"],
+                    rnn_hidden_size=2560,
+                    logits_soft_cap=30.0,
                 )),
 }
 

@@ -26,6 +26,8 @@
 #include "tensorrt_llm/plugins/layernormQuantizationPlugin/layernormQuantizationPlugin.h"
 #include "tensorrt_llm/plugins/lookupPlugin/lookupPlugin.h"
 #include "tensorrt_llm/plugins/loraPlugin/loraPlugin.h"
+#include "tensorrt_llm/plugins/lruPlugin/lruPlugin.h"
+#include "tensorrt_llm/plugins/mambaConv1dPlugin/mambaConv1dPlugin.h"
 #include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
 #if ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/plugins/ncclPlugin/allgatherPlugin.h"
@@ -34,6 +36,7 @@
 #include "tensorrt_llm/plugins/ncclPlugin/reduceScatterPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/sendPlugin.h"
 #endif // ENABLE_MULTI_DEVICE
+#include "tensorrt_llm/plugins/cumsumLastDimPlugin/cumsumLastDimPlugin.h"
 #include "tensorrt_llm/plugins/quantizePerTokenPlugin/quantizePerTokenPlugin.h"
 #include "tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.h"
 #include "tensorrt_llm/plugins/rmsnormQuantizationPlugin/rmsnormQuantizationPlugin.h"
@@ -73,7 +76,7 @@ public:
 GlobalLoggerFinder gGlobalLoggerFinder{};
 
 #if !defined(_MSC_VER)
-__attribute__((constructor))
+[[maybe_unused]] __attribute__((constructor))
 #endif
 void initOnLoad()
 {
@@ -88,6 +91,40 @@ void initOnLoad()
 bool pluginsInitialized = false;
 
 } // namespace
+
+namespace tensorrt_llm::plugins::api
+{
+
+LoggerManager& tensorrt_llm::plugins::api::LoggerManager::getInstance() noexcept
+{
+    static LoggerManager instance;
+    return instance;
+}
+
+void LoggerManager::setLoggerFinder(nvinfer1::ILoggerFinder* finder)
+{
+    std::lock_guard<std::mutex> lk(mMutex);
+    if (mLoggerFinder == nullptr && finder != nullptr)
+    {
+        mLoggerFinder = finder;
+    }
+}
+
+[[maybe_unused]] nvinfer1::ILogger* LoggerManager::logger()
+{
+    std::lock_guard<std::mutex> lk(mMutex);
+    if (mLoggerFinder != nullptr)
+    {
+        return mLoggerFinder->findLogger();
+    }
+    return nullptr;
+}
+
+nvinfer1::ILogger* LoggerManager::defaultLogger() noexcept
+{
+    return gLogger;
+}
+} // namespace tensorrt_llm::plugins::api
 
 // New Plugin APIs
 
@@ -127,7 +164,7 @@ extern "C"
 
     [[maybe_unused]] void setLoggerFinder([[maybe_unused]] nvinfer1::ILoggerFinder* finder)
     {
-        tensorrt_llm::plugins::api::LoggerFinder::getInstance().setLoggerFinder(finder);
+        tensorrt_llm::plugins::api::LoggerManager::getInstance().setLoggerFinder(finder);
     }
 
     [[maybe_unused]] nvinfer1::IPluginCreator* const* getPluginCreators(std::int32_t& nbCreators)
@@ -155,6 +192,9 @@ extern "C"
         static tensorrt_llm::plugins::LookupPluginCreator lookupPluginCreator;
         static tensorrt_llm::plugins::LoraPluginCreator loraPluginCreator;
         static tensorrt_llm::plugins::SelectiveScanPluginCreator selectiveScanPluginCreator;
+        static tensorrt_llm::plugins::MambaConv1dPluginCreator mambaConv1DPluginCreator;
+        static tensorrt_llm::plugins::lruPluginCreator lruPluginCreator;
+        static tensorrt_llm::plugins::CumsumLastDimPluginCreator cumsumLastDimPluginCreator;
 
         static std::array pluginCreators
             = { creatorPtr(identityPluginCreator),
@@ -179,37 +219,16 @@ extern "C"
                   creatorPtr(lookupPluginCreator),
                   creatorPtr(loraPluginCreator),
                   creatorPtr(selectiveScanPluginCreator),
+                  creatorPtr(mambaConv1DPluginCreator),
+                  creatorPtr(lruPluginCreator),
+                  creatorPtr(cumsumLastDimPluginCreator),
               };
         nbCreators = pluginCreators.size();
         return pluginCreators.data();
     }
 
+    [[maybe_unused]] nvinfer1::IPluginCreatorInterface* const* getCreators(std::int32_t& nbCreators)
+    {
+        return reinterpret_cast<nvinfer1::IPluginCreatorInterface* const*>(getPluginCreators(nbCreators));
+    }
 } // extern "C"
-
-namespace tensorrt_llm::plugins::api
-{
-LoggerFinder& tensorrt_llm::plugins::api::LoggerFinder::getInstance() noexcept
-{
-    static LoggerFinder instance;
-    return instance;
-}
-
-void LoggerFinder::setLoggerFinder(nvinfer1::ILoggerFinder* finder)
-{
-    std::lock_guard<std::mutex> lk(mMutex);
-    if (mLoggerFinder == nullptr && finder != nullptr)
-    {
-        mLoggerFinder = finder;
-    }
-}
-
-nvinfer1::ILogger* LoggerFinder::findLogger()
-{
-    std::lock_guard<std::mutex> lk(mMutex);
-    if (mLoggerFinder != nullptr)
-    {
-        return mLoggerFinder->findLogger();
-    }
-    return nullptr;
-}
-} // namespace tensorrt_llm::plugins::api

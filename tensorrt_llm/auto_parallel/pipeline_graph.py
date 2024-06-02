@@ -508,12 +508,11 @@ class PipelineGraph:
         if prefix is not None:
             layer_name = prefix + layer_name
         new_layer.name = layer_name
+        new_layer.metadata = new_layer.name
         if layer.precision_is_set:
             new_layer.precision = layer.precision
         for i in range(layer.num_outputs):
-            # TODO: Remove WAR for shape layer after https://nvbugs/4557631 fixed.
-            if layer.output_type_is_set(
-                    i) and layer_type != trt.LayerType.SHAPE:
+            if layer.output_type_is_set(i):
                 new_layer.set_output_type(i, layer.get_output_type(i))
             output = new_layer.get_output(i)
             self._add_tensor(output, layer.get_output(i), prefix)

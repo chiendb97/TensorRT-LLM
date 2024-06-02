@@ -39,31 +39,51 @@ public:
         [[maybe_unused]] pybind11::handle traceback);
     void shutdown();
 
-    tle::IdType enqueueRequest(tle::Request request)
+    [[nodiscard]] tle::IdType enqueueRequest(tle::Request request)
     {
         return mExecutor->enqueueRequest(std::move(request));
     }
 
-    std::vector<tle::IdType> enqueueRequests(std::vector<tle::Request> requests)
+    [[nodiscard]] std::vector<tle::IdType> enqueueRequests(std::vector<tle::Request> requests)
     {
         return mExecutor->enqueueRequests(std::move(requests));
     }
 
-    std::vector<tle::Response> awaitResponses(
-        std::optional<tle::IdType> id = std::nullopt, std::optional<std::chrono::milliseconds> timeout = std::nullopt)
+    [[nodiscard]] std::vector<tle::Response> awaitResponses(
+        std::optional<std::chrono::milliseconds> const& timeout = std::nullopt)
     {
-
-        return mExecutor->awaitResponses(id, timeout);
+        // Await responses blocks until a response is received. Release GIL so that it can be ran in a background
+        // thread.
+        pybind11::gil_scoped_release release;
+        return mExecutor->awaitResponses(timeout);
     }
 
-    tle::SizeType getNumResponsesReady(std::optional<tle::IdType> id = std::nullopt)
+    [[nodiscard]] std::vector<tle::Response> awaitResponses(
+        tle::IdType const& requestId, std::optional<std::chrono::milliseconds> const& timeout = std::nullopt)
     {
-        return mExecutor->getNumResponsesReady(id);
+        // Await responses blocks until a response is received. Release GIL so that it can be ran in a background
+        // thread.
+        pybind11::gil_scoped_release release;
+        return mExecutor->awaitResponses(requestId, timeout);
     }
 
-    void cancelRequest(tle::IdType id)
+    [[nodiscard]] std::vector<std::vector<tle::Response>> awaitResponses(std::vector<tle::IdType> const& requestIds,
+        std::optional<std::chrono::milliseconds> const& timeout = std::nullopt)
     {
-        mExecutor->cancelRequest(id);
+        // Await responses blocks until a response is received. Release GIL so that it can be ran in a background
+        // thread.
+        pybind11::gil_scoped_release release;
+        return mExecutor->awaitResponses(requestIds, timeout);
+    }
+
+    [[nodiscard]] tle::SizeType32 getNumResponsesReady(std::optional<tle::IdType> const& requestId = std::nullopt) const
+    {
+        return mExecutor->getNumResponsesReady(requestId);
+    }
+
+    void cancelRequest(tle::IdType requestId)
+    {
+        mExecutor->cancelRequest(requestId);
     }
 
     std::deque<tle::IterationStats> getLatestIterationStats()
@@ -74,6 +94,11 @@ public:
     std::deque<tle::RequestStatsPerIteration> getLatestRequestStats()
     {
         return mExecutor->getLatestRequestStats();
+    }
+
+    [[nodiscard]] bool canEnqueueRequests() const
+    {
+        return mExecutor->canEnqueueRequests();
     }
 
     static void initBindings(pybind11::module_& m);

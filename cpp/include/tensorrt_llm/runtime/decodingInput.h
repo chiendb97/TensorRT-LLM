@@ -29,8 +29,8 @@ class DecodingInput
 public:
     using TensorPtr = std::shared_ptr<ITensor const>;
 
-    DecodingInput(SizeType maxLength, SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxBatchSize,
-        TensorPtr logits, TensorPtr endIds)
+    DecodingInput(SizeType32 maxLength, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength,
+        SizeType32 maxBatchSize, TensorPtr logits, TensorPtr endIds)
         : step{maxLength}
         , maxLength{maxLength}
         , maxAttentionWindow{maxAttentionWindow}
@@ -46,17 +46,17 @@ public:
     }
 
     // mandatory parameters
-    SizeType step;
-    SizeType maxLength;
-    SizeType maxAttentionWindow;
-    SizeType sinkTokenLength;
-    SizeType maxBatchSize;
-    SizeType maxStopWordsLen; // The maximum value in the `stopWordsLens` tensor
-    SizeType maxBadWordsLen;  // The maximum value in the `badWordsLens` tensor
-    TensorPtr logits;         // [batchSize, beamWidth, vocabSizePadded], on gpu
+    SizeType32 step;
+    SizeType32 maxLength;
+    SizeType32 maxAttentionWindow;
+    SizeType32 sinkTokenLength;
+    SizeType32 maxBatchSize;
+    SizeType32 maxStopWordsLen; // The maximum value in the `stopWordsLens` tensor
+    SizeType32 maxBadWordsLen;  // The maximum value in the `badWordsLens` tensor
+    TensorPtr logits;           // [batchSize, beamWidth, vocabSizePadded], on gpu
     std::optional<std::vector<TensorPtr>>
-        logitsVec;            // vector of size [batchSize] contains logits of size [beamWidth, vocabSizePadded], on gpu
-    TensorPtr endIds;         // [maxBatchSize * beamWidth], on gpu
+        logitsVec;    // vector of size [batchSize] contains logits of size [beamWidth, vocabSizePadded], on gpu
+    TensorPtr endIds; // [maxBatchSize * beamWidth], on gpu
 
     // optional parameters
     TensorPtr finished;            // [maxBatchSize, beamWidth], finished states at current iteration.
@@ -76,6 +76,20 @@ public:
 
     // parameters for beam search
     TensorPtr cacheIndirection; // [maxBatchSize, beamWidth, maxSeqLen] - the k/v cache index for beam search, on gpu
+
+    // Medusa
+    class MedusaInputs
+    {
+    public:
+        TensorPtr medusaPaths;               // [maxBatchSize, maxTokensPerStep, maxMedusaHeads + 1], on gpu
+        TensorPtr medusaTreeIds;             // [maxBatchSize, maxTokensPerStep], on gpu
+        std::vector<std::vector<TensorPtr>>
+            medusaLogits;                    // [maxBatchSize][maxMedusaHeads][tokensPerStep, vocabSizePadded], on gpu
+        TensorPtr medusaCurTokensPerStep;    // [maxBatchSize], on gpu
+        TensorPtr medusaTargetTokensPerStep; // [maxBatchSize], on gpu
+    };
+
+    std::optional<MedusaInputs> medusaInputs;
 };
 
 } // namespace tensorrt_llm::runtime

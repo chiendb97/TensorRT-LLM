@@ -12,9 +12,8 @@ import tensorrt as trt
 import torch
 from filelock import FileLock
 
-from tensorrt_llm._utils import (preview_trt_version, trt_dtype_to_np,
-                                 trt_dtype_to_torch)
-from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm._utils import trt_dtype_to_np, trt_dtype_to_torch, trt_gte_10
+from tensorrt_llm.functional import AllReduceConfig, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import (PluginInfo, delete_plugin_info, get_np_weight,
@@ -39,7 +38,7 @@ from .tensor_parallel.sharding_strategy import ShardingStrategy
 from .utils import (get_builder_flags, get_updated_plugin, to_base_class_layer,
                     to_subclass_layer, to_trt_weights)
 
-default_int_dtype = trt.int64 if preview_trt_version() else trt.int32
+default_int_dtype = trt.int64 if trt_gte_10() else trt.int32
 
 
 @dataclass
@@ -1234,6 +1233,7 @@ class GraphGroupBase(GraphGroup):
                 set_plugin_info(network, layer_name, plugin_info)
                 delete_plugin_info(network, layer.name)
         layer.name = layer_name
+        layer.metadata = layer.name
         if not keep_tensor_name:
             for i in range(layer.num_outputs):
                 output_tensor = layer.get_output(i)
@@ -1575,7 +1575,7 @@ class DistributedGraphGroup(GraphGroupBase):
             if self.use_custom_all_reduce:
                 strategy = AllReduceStrategy.AUTO
             else:
-                strategy = AllReduceStrategy.RING
+                strategy = AllReduceStrategy.NCCL
             allreduce_plg_creator = trt.get_plugin_registry(
             ).get_plugin_creator('AllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
             assert allreduce_plg_creator is not None
@@ -1590,7 +1590,11 @@ class DistributedGraphGroup(GraphGroupBase):
             pf_strategy = trt.PluginField("strategy",
                                           np.array([int(strategy)], np.int8),
                                           trt.PluginFieldType.INT8)
-            pfc = [group, pf_type, pf_strategy]
+            config = AllReduceConfig(0)
+            pf_config = trt.PluginField("config",
+                                        np.array([int(config)], np.int8),
+                                        trt.PluginFieldType.INT8)
+            pfc = [group, pf_type, pf_strategy, pf_config]
             if self.use_custom_all_reduce:
                 pf_counter = trt.PluginField(
                     "counter",

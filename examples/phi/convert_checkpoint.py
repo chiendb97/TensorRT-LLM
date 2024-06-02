@@ -13,17 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
-import json
 import os
 import time
 
-import safetensors
-from transformers import AutoModelForCausalLM
-
 import tensorrt_llm
-from tensorrt_llm.models.phi.convert import convert_hf_config, convert_hf_phi
-
-__all__ = ['convert_hf_phi', 'convert_hf_config']
+from tensorrt_llm.models import Phi3ForCausalLM, PhiForCausalLM
 
 
 def parse_arguments():
@@ -37,6 +31,12 @@ def parse_arguments():
                         type=str,
                         default='tllm_checkpoint',
                         help='The path to save the TensorRT-LLM checkpoint')
+    parser.add_argument(
+        '--model_type',
+        type=str,
+        default='phi-2',
+        choices=['phi-2', 'Phi-3-mini-4k-instruct', 'Phi-3-mini-128k-instruct'],
+        help='Model to be converted.')
     args = parser.parse_args()
 
     return args
@@ -50,17 +50,10 @@ if __name__ == '__main__':
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                    torch_dtype="auto",
-                                                    trust_remote_code=True)
-
-    trtllm_config = convert_hf_config(hf_model.config, args)
-    with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
-        json.dump(trtllm_config, f, indent=4)
-
-    trtllm_weights = convert_hf_phi(hf_model, dtype=args.dtype)
-    safetensors.torch.save_file(
-        trtllm_weights, os.path.join(args.output_dir, f'rank0.safetensors'))
+    modelForCausalLM = PhiForCausalLM if args.model_type == "phi-2" else Phi3ForCausalLM
+    modelForCausalLM.convert_hf_checkpoint(args.model_dir,
+                                           dtype=args.dtype,
+                                           output_dir=args.output_dir)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
