@@ -175,10 +175,10 @@ def smooth_quantize(model, quant_config: QuantConfig):
 def fp8_quantize(model, quant_config: QuantConfig, current_key_name=None):
     assert quant_config.quant_mode.has_fp8_qdq()
 
-    for name, module in model.named_children():
-        if current_key_name is None:
-            current_key_name = []
-        current_key_name.append(name)
+    quant_map = {
+        ColumnLinear: FP8Linear,
+        RowLinear: FP8RowLinear,
+    }
 
     quantize_layers(
         model,
