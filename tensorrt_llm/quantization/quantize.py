@@ -19,6 +19,7 @@ def quantize_layers(
     quant_map,
     preprocess_init_params=None,
 ):
+    import os
     enable_quantize_lm_head = os.getenv("ENABLE_QUANTIZE_LM_HEAD", 'False').lower() in ('true', '1', 't')
     if enable_quantize_lm_head:
         exclude_modules = quant_config.exclude_modules or [
