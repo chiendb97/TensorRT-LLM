@@ -440,6 +440,9 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
             tensorrt_llm_config["num_medusa_layers"] = medusa_config.medusa_num_layers
             tensorrt_llm_config["max_draft_len"] = max_draft_len
 
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
+
         if model_type == 'phi':
             with open(f"{export_path}/config.json", "r") as f:
                 tensorrt_llm_config = json.load(f)
