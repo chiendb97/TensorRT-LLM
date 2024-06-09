@@ -280,6 +280,7 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
 
     model = get_model(model_dir, dtype)
     model_type = get_model_type(model)
+    model_arch = type(model).__name__
     if "vila" in model_dir:
         tokenizer = get_tokenizer(model_dir + "/llm",
                                   max_seq_length=tokenizer_max_seq_length,
@@ -429,7 +430,7 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
                 json.dump(tensorrt_llm_config, f, indent=4)
 
         # Workaround for medusa version
-        if type(model).__name__ == "MedusaForCausalLM":
+        if model_arch == "MedusaForCausalLM":
             with open(f"{export_path}/config.json", "r") as f:
                 tensorrt_llm_config = json.load(f)
             medusa_config = AutoConfig.from_pretrained(model_dir,

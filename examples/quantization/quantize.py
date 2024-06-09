@@ -84,7 +84,7 @@ if __name__ == "__main__":
                         help="KV Cache dtype.",
                         default=None,
                         choices=["int8", "fp8", None])
-    parser.add_argument('--max_draft_len', type=int, default=63)
+    parser.add_argument('--max_draft_len', type=int, default=None)
     args = parser.parse_args()
 
     if args.model_dir is not None:
