@@ -234,8 +234,16 @@ void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginCon
     if (loraTargetModules.has_value())
     {
 
+        auto mlp_hidden_size = modelConfig.getMlpHiddenSize();
+        auto const& pretrained_config = engineVersionNone ? json.at("builder_config") : json.at("pretrained_config");
+        if (pretrained_config.contains("qwen_type")) {
+            auto const qwen_type = engineVersionNone ? std::string("none") : pretrained_config.at("qwen_type").template get<std::string>();
+            if (qwen_type == "qwen") {
+                mlp_hidden_size /= 2;
+            }
+        }
         modelConfig.setLoraModules(LoraModule::createLoraModules(loraTargetModules.value(), modelConfig.getHiddenSize(),
-            modelConfig.getMlpHiddenSize(), modelConfig.getNbHeads(), modelConfig.getNbKvHeads(),
+            mlp_hidden_size, modelConfig.getNbHeads(), modelConfig.getNbKvHeads(),
             modelConfig.getSizePerHead(), tensorParallelism));
     }
 

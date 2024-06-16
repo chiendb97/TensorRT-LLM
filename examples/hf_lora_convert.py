@@ -42,31 +42,37 @@ def save_val(val, dir, key, tp_num=None, write_npy=False):
         val.tofile(dir / f"model.{key}.{suffix}")
 
 
-def get_all_lora_weights(lora_weights):
+def get_all_lora_weights(lora_weights, add_layer_name=False):
     all_weights = defaultdict(lambda: defaultdict(dict))
     pattern = re.compile(
-        r'.*\.layers\.([0-9]+)\.(self_attn|mlp)\.([a-z_]+)\.lora_(A|B)\.weight.*'
+        r'.*\.(h|layers)\.([0-9]+)\.(attn|self_attn|mlp)\.([a-z1-2_]+)\.lora_(A|B)\.weight.*'
     )
     for key, weights in lora_weights.items():
         m = pattern.match(key)
         if not m:
             print(f"no match {key}")
             continue
-        layer_idx = int(m.group(1))
-        hf_module = m.group(3)
-        inout = "in" if m.group(4) == "A" else "out"
+        layer_idx = int(m.group(2))
+        hf_module = m.group(4) if not add_layer_name else m.group(3) + "." + m.group(4)
+        inout = "in" if m.group(5) == "A" else "out"
+
         all_weights[layer_idx][hf_module][inout] = weights
     return all_weights
 
 
 hf_modules_to_trtllm_modules = {
+    "attn.c_attn": "attn_qkv",
     "q_proj": "attn_q",
     "v_proj": "attn_v",
     "k_proj": "attn_k",
     "o_proj": "attn_dense",
+    "attn.c_proj": "attn_dense",
     "gate_proj": "mlp_h_to_4h",
     "down_proj": "mlp_4h_to_h",
-    "up_proj": "mlp_gate"
+    "up_proj": "mlp_gate",
+    "mlp.w1": "mlp_gate",
+    "mlp.w2": "mlp_h_to_4h",
+    "mlp.c_proj": "mlp_4h_to_h"
 }  # lora modules on llama
 hf_modules_to_module_id = {
     k: LoraManager.LORA_MODULE_IDS[v]
@@ -89,7 +95,7 @@ def convert_hf_model(model_dir, dtype, out_dir):
         scale = alpha / rank
 
     lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
-    all_weights = get_all_lora_weights(lora_model)
+    all_weights = get_all_lora_weights(lora_model, add_layer_name=True)
     converted_weights = []
     converted_config = []
     for layer_idx, layer_weights in all_weights.items():
