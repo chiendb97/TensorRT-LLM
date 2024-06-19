@@ -1,3 +1,5 @@
+import fnmatch
+
 from .._utils import get_init_params
 from ..layers import (MLP, Attention, ColumnLinear, Embedding, GatedMLP,
                       LayerNorm, RmsNorm, RowLinear)
@@ -23,23 +25,28 @@ def quantize_layers(
     enable_quantize_lm_head = os.getenv("ENABLE_QUANTIZE_LM_HEAD", 'False').lower() in ('true', '1', 't')
     if enable_quantize_lm_head:
         exclude_modules = quant_config.exclude_modules or [
-            'router',
-            'vocab_embedding',
-            'position_embedding',
-            'block_embedding',
+            '*router',
+            '*vocab_embedding',
+            '*position_embedding',
+            '*block_embedding',
         ]
     else:
         exclude_modules = quant_config.exclude_modules or [
             'lm_head',
-            'router',
-            'vocab_embedding',
-            'position_embedding',
-            'block_embedding',
+            '*router',
+            '*vocab_embedding',
+            '*position_embedding',
+            '*block_embedding',
         ]
 
     for name, module, parent in model.named_modules_with_parent():
         module_name = name.rsplit('.', 1)[-1]
-        if module_name not in exclude_modules:
+        is_excluded = False
+        for exclude_module in exclude_modules:
+            if fnmatch.fnmatchcase(name, exclude_module):
+                is_excluded = True
+                break
+        if not is_excluded:
             quant_cls = None
             for cls in quant_map:
                 if isinstance(module, cls):

@@ -1,24 +1,25 @@
 # KiLM
 
-This document shows how to build and run a KiLM model in TensorRT-LLM on both single GPU, single node multi-GPU.
+This document shows how to build and run a [KiLM](https://huggingface.co/KiLM) model in TensorRT-LLM on both single GPU, single node multi-GPU.
 
 - [KiLM](#kilm)
-   - [Overview](#overview)
-   - [Support Matrix](#support-matrix)
-   - [Usage](#usage)
-      - [Download model weights](#download-model-weights)
-      - [Build TensorRT engine(s)](#build-tensorrt-engines)
-         - [INT8 KV cache](#int8-kv-cache)
-         - [SmoothQuant](#smoothquant)
-         - [INT4-GPTQ](#int4-gptq)
-         - [INT4-AWQ](#int4-awq)
-      - [Run](#run)
-      - [Summarization using the KiLM model](#summarization-using-the-kilm-model)
-   - [Credits](#credits)
+    - [Overview](#overview)
+    - [Support Matrix](#support-matrix)
+    - [Usage](#usage)
+        - [Download model weights](#download-model-weights)
+        - [Build TensorRT engine(s)](#build-tensorrt-engines)
+            - [INT8 KV cache](#int8-kv-cache)
+            - [SmoothQuant](#smoothquant)
+            - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+            - [INT4-GPTQ](#int4-gptq)
+            - [INT4-AWQ](#int4-awq)
+        - [Run](#run)
+        - [Summarization using the KiLM model](#summarization-using-the-kilm-model)
+    - [Credits](#credits)
 
 ## Overview
 
-The TensorRT-LLM KiLM implementation can be found in [model.py](../../tensorrt_llm/models/kilm/model.py). The TensorRT-LLM KiLM example code is located in [`examples/kilm`](./). There is one main file:
+The TensorRT-LLM KiLM implementation can be found in [models/kilm](../../tensorrt_llm/models/kilm/). The TensorRT-LLM KiLM example code is located in [`examples/kilm`](./). There is one main file:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the KiLM model.
 
@@ -28,23 +29,31 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
-|   Model Name    | FP16  | FMHA  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  ST   | C++ Runtime | benchmark |  IFB  |  Arch   |
-| :-------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---------: | :-------: | :---: | :-----: |
-| KiLM-7B(-Chat)  |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
-| KiLM-14B(-Chat) |   Y   |   Y   |   Y   |  Y*   |   Y   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
-| KiLM-72B(-Chat) |   Y   |   Y   |   Y   |   -   |   Y   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
+|   Model Name       | FP16/BF16  |  FP8  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  Arch   |
+| :-------------:    |   :---:    | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :-----: |
+| KiLM-1_8B(-Chat)   |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM-7B(-Chat)     |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM-14B(-Chat)    |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM-72B(-Chat)    |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-7B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-14B(-Chat) |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-32B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-72B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-110B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| KiLM1.5-MoE-A2.7B(-Chat)|   Y   |   -   |   Y   |   -   |   -   |   -   |   Y   |   Y   | Ampere+ |
 
-*Please note that KiLM-14B-Chat model supports AWQ only with single GPU.
+*Please note that these models supports AWQ only with single GPU.
+
 * Model Name: the name of the model, the same as the name on HuggingFace
-* FMHA: Fused MultiHead Attention
 * WO: Weight Only Quantization (int8 / int4)
 * AWQ: Activation Aware Weight Quantization (int4)
 * GPTQ: Generative Pretrained Transformer Quantization (int4)
-* SQ: Smooth Quantization
+* SQ: Smooth Quantization (int8)
 * TP: Tensor Parallel
 * PP: Pipeline Parallel
-* ST: Strongly Typed
-* IFB: In-flight Batching
 
 *Currently KiLM models does not support dynamic NTK and logn attention. Therefore, accuracy on long sequence input for the 7B and 14B model is not promised.
 
@@ -70,14 +79,6 @@ Download one or more KiLM models that you would like to build to TensorRT-LLM en
 git clone https://huggingface.co/KiLM/KiLM-7B-Chat   ./tmp/KiLM/7B
 git clone https://huggingface.co/KiLM/KiLM-14B-Chat  ./tmp/KiLM/14B
 git clone https://huggingface.co/KiLM/KiLM-72B-Chat  ./tmp/KiLM/72B
-```
-
-Or download from the [ModelScope](https://www.modelscope.cn) hub:
-
-```bash
-git clone https://www.modelscope.cn/kilm/KiLM-7B-Chat.git   ./tmp/KiLM/7B
-git clone https://www.modelscope.cn/kilm/KiLM-14B-Chat.git  ./tmp/KiLM/14B
-git clone https://www.modelscope.cn/kilm/KiLM-72B-Chat.git  ./tmp/KiLM/72B
 ```
 
 ### Build TensorRT engine(s)
@@ -181,7 +182,7 @@ INT8 KV cache could be enabled to reduce memory footprint. It will bring more pe
 
 For INT8 KV cache, [`convert_checkpoint.py`](./convert_checkpoint.py) features a
 `--int8_kv_cache` option. Setting `--int8_kv_cache` will calibrate the model,
-and then export the scaling factors needed for INT8 KV cache inference. Remember to set `--strongly_typed` when building the engine if you are not using INT8 weight only quantization at the same time.
+and then export the scaling factors needed for INT8 KV cache inference.
 
 Example:
 
@@ -193,7 +194,6 @@ python convert_checkpoint.py --model_dir ./tmp/KiLM/7B/   \
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_sq \
              --output_dir ./engine_outputs \
-             --strongly_typed \
              --gemm_plugin float16
 ```
 
@@ -235,6 +235,29 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_sq \
              --gemm_plugin float16
 ```
 
+#### FP8 Post-Training Quantization
+
+The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
+
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+
+
+```bash
+# Quantize model into FP8 and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir ./tmp/KiLM/7B/ \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ./tllm_checkpoint_1gpu_fp8 \
+                                   --calib_size 512
+
+# Build trtllm engines from the trtllm checkpoint
+# Enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable`
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
+             --output_dir ./engine_outputs \
+             --gemm_plugin float16 \
+```
+
 #### INT4-GPTQ
 You may find the official GPTQ quantized INT4 weights of KiLM-7B-Chat here: [KiLM-7B-Chat-Int4](https://huggingface.co/KiLM/KiLM-7B-Chat-Int4). And you need to first install auto-gptq:
 ```bash
@@ -259,7 +282,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_gptq \
 To run the AWQ KiLM example, the following steps are required:
 1. Weight quantization
 
-   NVIDIA AMMO toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for AMMO installation instructions.
+   NVIDIA Modelopt toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for Modelopt installation instructions.
 
     ```bash
     # Quantize KiLM-7B-Chat checkpoint into INT4 AWQ format

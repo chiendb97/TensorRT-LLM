@@ -47,7 +47,9 @@ def load_from_gptq_kilm(
 
     model_params = {k: v for k, v in model.state_dict().items()}
     torch.cuda.empty_cache()
-
+    assert kilm_type in [
+        'kilm', 'kilm2'
+    ], "Currently, only kilm and kilm2 support gptq. kilm2_moe is not supported yet."
     layer_prefix = "transformer.h." if kilm_type == 'kilm' else "model.layers."
     key_list = get_kilm_key_list(kilm_type)
 
@@ -189,7 +191,7 @@ def load_from_gptq_kilm(
             process_and_assign_weight(qkv_dense_list,
                                       f'{tllm_prex}.attention.dense',
                                       tp_dim=0))
-        # attention.dense.bias
+        # 4.3.1 attention.dense.bias
         suf = ".bias"
         dense_bias = model_params[prefix + key_list[1] + suf].to(
             torch_dtype).cpu().contiguous()
