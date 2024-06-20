@@ -213,6 +213,7 @@ DEFAULT_HF_DATASET_META = {
     'ccdv/cnn_dailymail': ('3.0.0', 'train', 'article'),
     'cnn_dailymail': ('3.0.0', 'train', 'article'),
     'lambada': (None, 'validation', 'text'),
+    '': (None, 'train', 'text'),
 }
 
 

@@ -360,7 +360,7 @@ def capture_activation_range(model,
     act_scales = defaultdict(lambda: {"x": None, "y": None, "w": None})
 
     if kilm_type == 'kilm':
-        tokenizer.pad_token_id = tokenizer.im_end_id
+        tokenizer.pad_token_id = tokenizer.encode('<|im_end|>', add_special_tokens=False)[0]
     else:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -1141,7 +1141,7 @@ def smooth_quant(model,
     gen_config_path = os.path.join(model_dir, 'generation_config.json')
     with open(gen_config_path, 'r') as f:
         gen_config = json.load(f)
-    chat_format = getattr(gen_config, 'chat_format', 'chatml')
+    chat_format = getattr(gen_config, 'chat_format', 'raw')
     act_range = capture_activation_range(model, kilm_type, tokenizer, dataset,
                                          system_prompt, chat_format)
     if smoothquant is not None:
