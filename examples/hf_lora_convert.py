@@ -42,7 +42,7 @@ def save_val(val, dir, key, tp_num=None, write_npy=False):
         val.tofile(dir / f"model.{key}.{suffix}")
 
 
-def get_all_lora_weights(lora_weights, add_layer_name=False):
+def get_all_lora_weights(lora_weights):
     all_weights = defaultdict(lambda: defaultdict(dict))
     pattern = re.compile(
         r'.*\.(h|layers)\.([0-9]+)\.(attn|self_attn|mlp)\.([a-z1-2_]+)\.lora_(A|B)\.weight.*'
@@ -53,7 +53,12 @@ def get_all_lora_weights(lora_weights, add_layer_name=False):
             print(f"no match {key}")
             continue
         layer_idx = int(m.group(2))
-        hf_module = m.group(4) if not add_layer_name else m.group(3) + "." + m.group(4)
+        if m.group(3) in ["attn", "self_attn"]:
+            attn_or_bias = "attn"
+        else:
+            attn_or_bias = "mlp"
+
+        hf_module = attn_or_bias + "." + m.group(4)
         inout = "in" if m.group(5) == "A" else "out"
 
         all_weights[layer_idx][hf_module][inout] = weights
@@ -62,14 +67,14 @@ def get_all_lora_weights(lora_weights, add_layer_name=False):
 
 hf_modules_to_trtllm_modules = {
     "attn.c_attn": "attn_qkv",
-    "q_proj": "attn_q",
-    "v_proj": "attn_v",
-    "k_proj": "attn_k",
-    "o_proj": "attn_dense",
+    "attn.q_proj": "attn_q",
+    "attn.v_proj": "attn_v",
+    "attn.k_proj": "attn_k",
+    "attn.o_proj": "attn_dense",
     "attn.c_proj": "attn_dense",
-    "gate_proj": "mlp_h_to_4h",
-    "down_proj": "mlp_4h_to_h",
-    "up_proj": "mlp_gate",
+    "mlp.gate_proj": "mlp_h_to_4h",
+    "mlp.down_proj": "mlp_4h_to_h",
+    "mlp.up_proj": "mlp_gate",
     "mlp.w1": "mlp_gate",
     "mlp.w2": "mlp_h_to_4h",
     "mlp.c_proj": "mlp_4h_to_h"
@@ -95,7 +100,7 @@ def convert_hf_model(model_dir, dtype, out_dir):
         scale = alpha / rank
 
     lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
-    all_weights = get_all_lora_weights(lora_model, add_layer_name=True)
+    all_weights = get_all_lora_weights(lora_model)
     converted_weights = []
     converted_config = []
     for layer_idx, layer_weights in all_weights.items():
