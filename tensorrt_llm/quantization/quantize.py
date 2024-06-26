@@ -67,7 +67,10 @@ def quantize_layers(
             if preprocess_init_params is not None:
                 preprocess_init_params(init_params, name, module)
             quant_layer = quant_cls(**init_params)
-            setattr(parent, module_name, quant_layer)
+            if parent is not None:
+                setattr(parent, module_name, quant_layer)
+            else:
+                model = quant_layer
 
     setattr(model, 'quant_mode', quant_config.quant_mode)
     return model
@@ -88,7 +91,7 @@ def weight_only_quantize(model, quant_config: QuantConfig):
             module_name = name.rsplit('.', 1)[-1]
             init_params["transb"] = module_name == "lm_head"
 
-    quantize_layers(
+    model = quantize_layers(
         model,
         quant_config,
         quant_map,
@@ -112,7 +115,7 @@ def weight_only_groupwise_quantize(model, quant_config: QuantConfig):
         init_params[
             "use_w4a8_awq"] = quant_config.quant_algo == QuantAlgo.W4A8_AWQ
 
-    quantize_layers(
+    model = quantize_layers(
         model,
         quant_config,
         quant_map,
@@ -130,7 +133,7 @@ def smooth_quantize_ootb(
         RowLinear: Int8SmoothQuantRowLinear,
     }
 
-    quantize_layers(
+    model = quantize_layers(
         model,
         quant_config,
         quant_map,
@@ -148,7 +151,7 @@ def smooth_quantize_plugin(model, quant_mode):
     }
     for name, layer, parent in model.named_modules_with_parent():
         layer_name = name.rsplit('.', 1)[-1]
-        if layer_name in ['ln_f']:
+        if layer_name in ['ln_f', 'ln_embed']:
             continue
 
         quant_cls = None
@@ -166,7 +169,10 @@ def smooth_quantize_plugin(model, quant_mode):
             init_params[
                 "num_attention_heads"] = layer.num_attention_heads * layer.tp_size
         quant_layer = quant_cls(**init_params)
-        setattr(parent, layer_name, quant_layer)
+        if parent is not None:
+            setattr(parent, layer_name, quant_layer)
+        else:
+            model = quant_layer
 
     setattr(model, 'quant_mode', quant_mode)
     return model
@@ -188,7 +194,7 @@ def fp8_quantize(model, quant_config: QuantConfig, current_key_name=None):
         RowLinear: FP8RowLinear,
     }
 
-    quantize_layers(
+    model = quantize_layers(
         model,
         quant_config,
         quant_map,

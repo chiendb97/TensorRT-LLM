@@ -14,17 +14,18 @@ import safetensors
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer
+from transformers import LlamaConfig, LlamaForCausalLM, LlamaTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
-from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.convert_utils import load_calib_dataset
 from tensorrt_llm.models.llama.convert import load_weights_from_hf_by_shard
+from tensorrt_llm.models.medusa.weight import (get_tllm_linear_weight,
+                                               load_medusa_hf)
 from tensorrt_llm.quantization import QuantAlgo
 
 try:
@@ -58,7 +59,7 @@ def parse_arguments():
         default=False,
         action="store_true",
         help='Quantize weights for the various GEMMs to INT4/INT8.'
-        'See --weight_only_precision to set the precision')
+             'See --weight_only_precision to set the precision')
     parser.add_argument(
         '--weight_only_precision',
         const='int8',
@@ -83,8 +84,8 @@ def parse_arguments():
         type=float,
         default=None,
         help="Set the α parameter (see https://arxiv.org/pdf/2211.10438.pdf)"
-        " to Smoothquant the model, and output int8 weights."
-        " A good first try is 0.5. Must be in [0, 1]")
+             " to Smoothquant the model, and output int8 weights."
+             " A good first try is 0.5. Must be in [0, 1]")
     parser.add_argument(
         '--per_channel',
         action="store_true",
@@ -108,11 +109,6 @@ def parse_arguments():
         help=
         'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
-    parser.add_argument(
-        '--modelopt_quant_ckpt_path',
-        type=str,
-        default=None,
-        help='Path of a quantized model checkpoint in .npz format')
 
     parser.add_argument(
         '--per_group',
@@ -145,8 +141,8 @@ def parse_arguments():
                         type=str,
                         default=None,
                         help="cache dir to load the hugging face dataset")
-    parser.add_argument("--load_model_on_cpu", action="store_true")
-    parser.add_argument("--convert_model_on_cpu", action="store_true")
+    parser.add_argument("--load-model-on-cpu", action="store_true")
+    parser.add_argument("--convert-model-on-cpu", action="store_true")
     parser.add_argument(
         '--use_parallel_embedding',
         action="store_true",
@@ -182,13 +178,6 @@ def parse_arguments():
         help='The number of workers for converting checkpoint in parallel')
 
     parser.add_argument('--num_medusa_heads', type=int, default=4)
-    parser.add_argument(
-        '--fixed_num_medusa_heads',
-        type=int,
-        default=None,
-        help="If exist, fix medusa_num_heads from config.json."
-        "num_medusa_heads < medusa_num_heads in config.json < fixed_num_medusa_heads"
-    )
     parser.add_argument('--num_medusa_layers', type=int, default=1)
     parser.add_argument('--max_medusa_token_len', type=int, default=63)
     parser.add_argument('--medusa_hidden_act', type=str, default="silu")
@@ -285,7 +274,7 @@ def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
         scale_w_quant_orig_t_expand = np.ones([weights.shape[-1]])
         scale_w_quant_orig_t_expand[:hidden_dim] = scale_w_quant_orig_t[0]
         scale_w_quant_orig_t_expand[hidden_dim:hidden_dim +
-                                    kv_dim] = scale_w_quant_orig_t[1]
+                                               kv_dim] = scale_w_quant_orig_t[1]
         scale_w_quant_orig_t_expand[-kv_dim:] = scale_w_quant_orig_t[2]
         weight_int8 = to_i8(weights * scale_w_quant_orig_t_expand)
     else:
@@ -410,7 +399,7 @@ def smooth_llama_model(model, scales, alpha, llama_qkv_para, llama_smoother):
             module.self_attn.q_proj.weight, module.self_attn.k_proj.weight,
             module.self_attn.v_proj.weight
         ],
-                           dim=0)
+            dim=0)
 
         smoother = smooth_gemm(weight, scales[layer_name_q]["x"],
                                module.input_layernorm.weight, None, alpha)
@@ -421,7 +410,7 @@ def smooth_llama_model(model, scales, alpha, llama_qkv_para, llama_smoother):
             scales[layer_name_q]["y"], scales[layer_name_k]["y"],
             scales[layer_name_v]["y"]
         ],
-                                                dim=0)
+            dim=0)
 
         # see transpose_weights function
         llama_qkv_para[layer_name_qkv] = weight.transpose(0, 1)
@@ -568,29 +557,6 @@ def get_bias(config, prefix, dtype):
 
 def get_weight_and_bias(config, prefix, dtype):
     return get_weight(config, prefix, dtype), get_bias(config, prefix, dtype)
-
-
-def get_tllm_linear_weight(weight,
-                           prefix,
-                           bias=None,
-                           use_weight_only=False,
-                           plugin_weight_only_quant_type=torch.int8,
-                           postfix='weight'):
-    results = {}
-    if use_weight_only:
-        v = weight.t().contiguous().cpu()
-        processed_torch_weights, torch_weight_scales = \
-            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                v, plugin_weight_only_quant_type)
-        results[prefix + postfix] = processed_torch_weights
-        results[prefix + 'per_channel_scale'] = torch_weight_scales
-    else:
-        results[prefix + postfix] = weight.contiguous()
-
-    if bias is not None:
-        results[prefix + 'bias'] = bias
-
-    return results
 
 
 def dup_kv_weight(v, num_head, tp_size):
@@ -766,25 +732,6 @@ def convert_hf_llama(hf_model,
 
             split_v = split_qkv_tp(qkv_weight, num_attention_heads, hidden_size,
                                    tensor_parallel, mapping.tp_rank)
-
-        if prefix + 'self_attn.q_proj.bias' in model_params:
-            # only used in Internlm 7B models
-            q_bias = get_bias(model_params, prefix + 'self_attn.q_proj', dtype)
-            k_bias = get_bias(model_params, prefix + 'self_attn.k_proj', dtype)
-            v_bias = get_bias(model_params, prefix + 'self_attn.v_proj', dtype)
-            if not mha_mode:
-                bq = split(q_bias, mapping.tp_size, mapping.tp_rank)
-                bk = split(k_bias, mapping.tp_size, mapping.tp_rank)
-                bv = split(v_bias, mapping.tp_size, mapping.tp_rank)
-                split_bias_v = torch.concat((bq, bk, bv))
-            else:
-                qkv_bias = torch.cat((q_bias, k_bias, v_bias))
-                split_bias_v = split_qkv_bias_tp(qkv_bias, num_attention_heads,
-                                                 hidden_size, tensor_parallel,
-                                                 mapping.tp_rank)
-        else:
-            split_bias_v = None
-
         if use_smooth_quant:
             qkv_weight = qkv_para[prefix + 'self_attn.qkv_proj']
 
@@ -809,12 +756,11 @@ def convert_hf_llama(hf_model,
                     tllm_prex + 'attention.qkv.', [
                         1, 3 * hidden_size // tensor_parallel
                         if mha_mode else hidden_size // tensor_parallel +
-                        (hidden_size // num_key_value_heads) //
-                        tensor_parallel * 2
+                                         (hidden_size // num_key_value_heads) //
+                                         tensor_parallel * 2
                     ],
                     tensor_parallel,
                     is_qkv=True,
-                    bias=split_bias_v,
                     per_token=per_token,
                     per_channel=per_channel,
                     last_prefix=tllm_prex + 'input_layernorm.scale_to_int',
@@ -826,7 +772,7 @@ def convert_hf_llama(hf_model,
         else:
             weights.update(
                 get_tllm_linear_weight(split_v, tllm_prex + 'attention.qkv.',
-                                       split_bias_v, use_weight_only,
+                                       None, use_weight_only,
                                        plugin_weight_only_quant_type))
 
         if int8_kv_cache:
@@ -835,7 +781,7 @@ def convert_hf_llama(hf_model,
                 act_range.get(prefix + 'self_attn.k_proj')["y"],
                 act_range.get(prefix + 'self_attn.v_proj')["y"]
             ],
-                              dim=0)
+                dim=0)
 
             int8_kv_scales = qkv_y.max() / 127.
 
@@ -844,7 +790,7 @@ def convert_hf_llama(hf_model,
             kv_cache_weights[
                 tllm_prex +
                 'attention.kv_cache_scaling_factor'] = int8_kv_scales.reshape(
-                    [1])
+                [1])
 
         attn_dense_weight = get_weight(model_params,
                                        prefix + 'self_attn.o_proj', dtype)
@@ -852,13 +798,6 @@ def convert_hf_llama(hf_model,
                                   tensor_parallel,
                                   mapping.tp_rank,
                                   dim=1)
-
-        if prefix + 'self_attn.o_proj.bias' in model_params:
-            attn_dense_bias = get_bias(model_params,
-                                       prefix + 'self_attn.o_proj', dtype)
-        else:
-            attn_dense_bias = None
-
         if use_smooth_quant:
             attn_dense_weight = attn_dense_weight.t()
             int8_weights = generate_int8(
@@ -869,11 +808,10 @@ def convert_hf_llama(hf_model,
                     tllm_prex + 'attention.dense.', [1, hidden_size],
                     tensor_parallel,
                     is_qkv=False,
-                    bias=attn_dense_bias,
                     per_token=per_token,
                     per_channel=per_channel,
                     last_prefix=tllm_prex +
-                    'attention.quantization_scaling_factor',
+                                'attention.quantization_scaling_factor',
                     smoother_value=smoother[(prefix + 'self_attn.o_proj')],
                     smoother_shape=[1, hidden_size // tensor_parallel],
                     rank=mapping.tp_rank,
@@ -881,7 +819,7 @@ def convert_hf_llama(hf_model,
         else:
             weights.update(
                 get_tllm_linear_weight(split_v, tllm_prex + 'attention.dense.',
-                                       attn_dense_bias, use_weight_only,
+                                       None, use_weight_only,
                                        plugin_weight_only_quant_type))
 
         mlp_gate_weight = get_weight(model_params, prefix + 'mlp.up_proj',
@@ -1045,8 +983,6 @@ if __name__ == '__main__':
         args.rms_norm_eps = hf_config.rms_norm_eps
         args.vocab_size = hf_config.vocab_size
         args.n_positions = hf_config.max_position_embeddings
-        args.attn_bias = getattr(hf_config, 'bias', False) or getattr(
-            hf_config, 'attention_bias', False)
 
     elif args.meta_ckpt_dir is not None:
 
@@ -1064,10 +1000,9 @@ if __name__ == '__main__':
             n_embd = int(4 * args.n_embd * 2 / 3)
             args.ffn_dim_multiplier = meta_config.get("ffn_dim_multiplier", 1)
             args.inter_size = args.multiple_of * (
-                (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1)
-                // args.multiple_of)
+                    (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1)
+                    // args.multiple_of)
         args.rms_norm_eps = meta_config["norm_eps"]
-        attn_bias = meta_config.get("bias", False) or meta_config.get("attention_bias", False)
 
     if args.rotary_scaling is not None:
         # assert args.use_gpt_attention_plugin, "RoPE scaling is only supported through GPT attention plugin."
@@ -1095,7 +1030,6 @@ if __name__ == '__main__':
         'rotary_base': args.rotary_base,
         'rotary_scaling': args.rotary_scaling,
         'norm_epsilon': args.rms_norm_eps,
-        'attn_bias': args.attn_bias,
         'quantization': {
             'quant_algo': None,
             'kv_cache_quant_algo': None,
@@ -1109,8 +1043,8 @@ if __name__ == '__main__':
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
         'max_draft_len': args.max_medusa_token_len,
-        'num_medusa_heads': args.num_medusa_heads if args.fixed_num_medusa_heads is None else args.fixed_num_medusa_heads,
-        'num_medusa_layers': args.num_medusa_layers,
+        'num_medusa_heads': args.num_medusa_heads,
+        'num_medusa_layers': args.num_medusa_layers
     }
 
     if args.use_weight_only:
@@ -1162,7 +1096,7 @@ if __name__ == '__main__':
         hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
 
         model = hf_model.from_pretrained(args.model_dir,
-                                         torch_dtype=torch.float16,
+                                         torch_dtype='auto',
                                          device_map="auto",
                                          trust_remote_code=True)
 
@@ -1173,9 +1107,8 @@ if __name__ == '__main__':
                 logger.warning(
                     "Note that running capture_activation_range on cpu would be very small."
                 )
-            tokenizer = AutoTokenizer.from_pretrained(args.model_dir,
-                                                      trust_remote_code=True,
-                                                      padding_side='left')
+            tokenizer = LlamaTokenizer.from_pretrained(args.model_dir,
+                                                       padding_side='left')
             dataset = load_calib_dataset(args.calib_dataset,
                                          cache_dir=args.dataset_cache_dir)
 
@@ -1222,77 +1155,28 @@ if __name__ == '__main__':
                     qkv_para=convert_args['llama_qkv_para'],
                     smoother=convert_args['llama_smoother'])
 
-                def load_medusa_hf(medusa_path: str,
-                                   mapping=Mapping(),
-                                   dtype='float32'):
-                    logger.info("Loading Medusa heads' weights ...")
-                    is_ckpt_safetensors = False
-
-                    ckpt_file = Path(medusa_path) / "medusa_lm_head.pt"
-                    if not ckpt_file.exists():
-                        ckpt_file = Path(
-                            medusa_path) / "medusa_lm_head.safetensors"
-                        is_ckpt_safetensors = True
-
-                    if is_ckpt_safetensors:
-                        logger.info("Safetensors Found ...")
-                        from safetensors.torch import load_file
-                        state_dict = load_file(ckpt_file)
-                    else:
-                        state_dict = torch.load(ckpt_file, map_location="cpu")
-
-                    torch_dtype = str_dtype_to_torch(dtype)
-                    weights = {}
-
-                    for h in range(args.num_medusa_heads):
-                        for l in range(args.num_medusa_layers):
-                            w = state_dict[f"{h}.{l}.linear.weight"].clone().to(
-                                torch_dtype)
-
-                            split_v = split(w, mapping.tp_size, mapping.tp_rank)
-                            weights.update(
-                                get_tllm_linear_weight(
-                                    split_v,
-                                    f'medusa_heads.{h}.medusa_layers.{l}.linear.',
-                                    None, args.use_weight_only,
-                                    plugin_weight_only_quant_type))
-
-                            b = state_dict[f"{h}.{l}.linear.bias"].clone().to(
-                                torch_dtype)
-
-                            weights[
-                                'medusa_heads.{}.medusa_layers.{}.linear.bias'.
-                                format(h, l)] = split(b, mapping.tp_size,
-                                                      mapping.tp_rank)
-
-                        lm = state_dict[
-                            f"{h}.{args.num_medusa_layers}.weight"].clone().to(
-                            torch_dtype)  # LM Head
-
-                        weights['medusa_heads.{}.lm_head.weight'.format(
-                            h)] = split(lm, mapping.tp_size, mapping.tp_rank)
-
-                    return weights
-
                 if args.medusa_model_dir is not None:
                     config_file = Path(args.medusa_model_dir) / "config.json"
                     with open(config_file) as fp:
                         config = json.load(fp)
-                    args.num_medusa_heads = config.get('medusa_num_heads',
-                                                       args.num_medusa_heads)
+                    num_medusa_heads_from_config = config.get(
+                        'medusa_num_heads', args.num_medusa_heads)
                     args.num_medusa_layers = config.get('medusa_num_layers',
                                                         args.num_medusa_layers)
-                    if args.fixed_num_medusa_heads is not None and args.fixed_num_medusa_heads != args.num_medusa_heads:
-                        logger.info(
-                            f"fixing num_medusa_heads from {args.num_medusa_heads} to {args.fixed_num_medusa_heads}"
-                        )
-                        args.num_medusa_heads = args.fixed_num_medusa_heads
+                    if args.num_medusa_heads is None:
+                        args.num_medusa_heads = num_medusa_heads_from_config
 
                     assert args.max_medusa_token_len > 0, "should have max_medusa_token_len > 0"
 
-                    medusa_weights = load_medusa_hf(args.medusa_model_dir,
-                                                    mapping,
-                                                    dtype=args.dtype)
+                    medusa_weights = load_medusa_hf(
+                        medusa_path=args.medusa_model_dir,
+                        num_medusa_heads=args.num_medusa_heads,
+                        num_medusa_layers=args.num_medusa_layers,
+                        mapping=mapping,
+                        dtype=args.dtype,
+                        use_weight_only=args.use_weight_only,
+                        plugin_weight_only_quant_type=
+                        plugin_weight_only_quant_type)
                     weights.update(medusa_weights)
 
         safetensors.torch.save_file(
