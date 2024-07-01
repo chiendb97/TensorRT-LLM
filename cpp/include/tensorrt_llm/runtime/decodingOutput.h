@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <optional>
 #include <utility>
@@ -88,17 +89,21 @@ public:
 
     BeamHypotheses beamHypotheses;
 
-    // Medusa
-    class MedusaOutputs
+    // Speculative decoding
+    class SpeculativeDecodingOutputs
     {
     public:
-        TensorPtr medusaNextDraftTokens;       // [maxBatchSize, maxTokensPerStep]
-        TensorPtr medusaAcceptedTokensLen;     // [maxBatchSize]
-        TensorPtr medusaAcceptedLengthsCumSum; // [maxBatchSize + 1]
-        TensorPtr medusaPathsOffsets;          // [maxBatchSize * maxNumHeads]
+        TensorPtr nextDraftTokens;       // [maxBatchSize, maxDraftTokens]
+        TensorPtr nextDraftTokensLen;    // [maxBatchSize]
+        TensorPtr prevDraftTokensLen;    // [maxBatchSize]
+        TensorPtr acceptedTokensLen;     // [maxBatchSize]
+        TensorPtr acceptedLengthsCumSum; // [maxBatchSize + 1]
+        TensorPtr pathsOffsets;          // [maxBatchSize, maxAcceptedDraftTokensPerStep]
     };
 
-    std::optional<MedusaOutputs> medusaOutputs;
+    std::optional<SpeculativeDecodingOutputs> speculativeDecodingOutputs;
+
+    std::optional<ExplicitDraftTokensBuffers::Inputs> explicitDraftTokensBuffers;
 };
 
 } // namespace tensorrt_llm::runtime

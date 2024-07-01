@@ -41,6 +41,8 @@ protected:
         XQAParams const& xqaParams, KVBlockArray const& kv_block_array, cudaStream_t const& stream) override;
 
 private:
+    std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
+
     void initSupportedConfigs();
     //! Whether DecoderXQAImplJIT supports xqaParams.
     bool supportConfig(XQAParams const& xqaParams) const;
@@ -58,7 +60,8 @@ private:
     bool mForceXQA;
     int mSM;
 
-    jit::CubinObjRegistry* mCubinObjRegistry;
+    jit::CubinObjRegistry mInitializedCubinObjRegistry;
+
     jit::CubinObjKey getCubinObjKeyFromXQAParams(XQAParams const& xqaParams) const;
 
     //! The first prototype just takes whatever available from the Precompiled cubins.

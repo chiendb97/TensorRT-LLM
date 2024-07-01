@@ -20,16 +20,23 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
+#include <csignal>
 
 namespace tle = tensorrt_llm::executor;
 
 int main(int argc, char* argv[])
 {
 #if ENABLE_MULTI_DEVICE
+
+    if (std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY") != nullptr)
+    {
+        TLLM_LOG_INFO("FORCE_NCCL_ALL_REDUCE_STRATEGY env variable detected in worker");
+    }
+
     // Register the TRT-LLM plugins
     initTrtLlmPlugins();
 
-    tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE);
+    tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE, true);
 
     MPI_Comm parentComm;
     MPI_Comm_get_parent(&parentComm);
@@ -80,6 +87,8 @@ int main(int argc, char* argv[])
     // In orchestrator mode, the spawned threads will wait for termination signal from orchestrator
     auto executor = tle::Executor(modelPath, modelType, executorConfig);
 
+    // Wait for all workers to have created their instances
+    MPI_Barrier(parentComm);
     TLLM_LOG_INFO("Executor instance created by worker");
 
 #endif // ENABLE_MULTI_DEVICE

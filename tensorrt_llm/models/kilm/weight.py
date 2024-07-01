@@ -47,7 +47,9 @@ def load_from_gptq_kilm(
 
     model_params = {k: v for k, v in model.state_dict().items()}
     torch.cuda.empty_cache()
-
+    assert kilm_type in [
+        'kilm', 'kilm2'
+    ], "Currently, only kilm and kilm2 support gptq. kilm2_moe is not supported yet."
     layer_prefix = "transformer.h." if kilm_type == 'kilm' else "model.layers."
     key_list = get_kilm_key_list(kilm_type)
 
@@ -167,18 +169,19 @@ def load_from_gptq_kilm(
         if kilm_type == 'kilm':
             qkv_bias = model_params[prefix + key_list[0] +
                                     suf].to(torch_dtype).cpu().contiguous()
+            q_emb = qkv_bias.shape[0] // 3
+            qkv_bias = qkv_bias.reshape(3, q_emb)
+            split_v = split(qkv_bias, mapping.tp_size, mapping.rank, dim=1)
+            qkv_bias = split_v.reshape(3 * (q_emb // mapping.tp_size))
         else:
             qkv_bias_list = []
             for comp in ["q_proj", "k_proj", "v_proj"]:
                 comp_part = model_params[prefix + key_list[0] + comp + suf].to(
                     torch_dtype).cpu().contiguous()
+                comp_part = torch_split(comp_part, dim=0)
                 qkv_bias_list.append(comp_part)
             qkv_bias = torch.cat(qkv_bias_list, dim=0)
-        q_emb = qkv_bias.shape[0] // 3
-        qkv_bias = qkv_bias.reshape(3, q_emb)
-        split_v = split(qkv_bias, mapping.tp_size, mapping.rank, dim=1)
-        split_v = split_v.reshape(3 * (q_emb // mapping.tp_size))
-        weights[tllm_prex + ".attention.qkv.bias"] = split_v
+        weights[tllm_prex + ".attention.qkv.bias"] = qkv_bias
         # 4.3 attention.dense
         qkv_dense_list = []
         for suf in suffixs:
@@ -188,7 +191,7 @@ def load_from_gptq_kilm(
             process_and_assign_weight(qkv_dense_list,
                                       f'{tllm_prex}.attention.dense',
                                       tp_dim=0))
-        # attention.dense.bias
+        # 4.3.1 attention.dense.bias
         suf = ".bias"
         dense_bias = model_params[prefix + key_list[1] + suf].to(
             torch_dtype).cpu().contiguous()

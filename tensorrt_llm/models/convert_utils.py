@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 import torch
+from datasets import load_dataset
 
 from ..quantization import QuantAlgo
 
@@ -67,10 +68,13 @@ def weight_only_quantize_dict(weights: Dict[str, torch.Tensor],
                                   'qkv.weight', 'dense.weight', 'fc.weight',
                                   'proj.weight', 'gate.weight'
                               ],
+                              exclude_weights=['shared_expert_gate.weight'],
                               plugin: bool = True):
     if quant_algo not in [QuantAlgo.W4A16, QuantAlgo.W8A16]:
         return weights
     for name in list(weights):
+        if any([_name in name for _name in exclude_weights]):
+            continue
         if any([_name in name for _name in quant_weights
                 ]) and weights[name].dtype != torch.int8:
             quant_weight, quant_scale = weight_only_quantize(
@@ -199,3 +203,38 @@ def iterate_shard_files(model_dir: Union[Path, str],
 
     for shard_file in shard_files:
         yield shard_file
+
+
+def has_safetensors(model_dir: str):
+    return len(list(Path(model_dir).glob('*.safetensors'))) > 0
+
+
+DEFAULT_HF_DATASET_META = {
+    'ccdv/cnn_dailymail': ('3.0.0', 'train', 'article'),
+    'cnn_dailymail': ('3.0.0', 'train', 'article'),
+    'lambada': (None, 'validation', 'text'),
+    '': (None, 'train', 'text'),
+}
+
+
+def load_calib_dataset(dataset_name_or_dir: str,
+                       config_name: Optional[str] = None,
+                       split: Optional[str] = None,
+                       key: Optional[str] = None,
+                       **kwargs):
+    if config_name is None:
+        for name, meta in DEFAULT_HF_DATASET_META.items():
+            if name in dataset_name_or_dir:
+                if config_name is None:
+                    config_name = meta[0]
+                if split is None:
+                    split = meta[1]
+                if key is None:
+                    key = meta[2]
+                break
+
+    dataset = load_dataset(dataset_name_or_dir,
+                           name=config_name,
+                           split=split,
+                           **kwargs)
+    return dataset[key]

@@ -45,28 +45,39 @@ def save_val(val, dir, key, tp_num=None, write_npy=False):
 def get_all_lora_weights(lora_weights):
     all_weights = defaultdict(lambda: defaultdict(dict))
     pattern = re.compile(
-        r'.*\.layers\.([0-9]+)\.(self_attn|mlp)\.([a-z_]+)\.lora_(A|B)\.weight.*'
+        r'.*\.(h|layers)\.([0-9]+)\.(attn|self_attn|mlp)\.([a-z1-2_]+)\.lora_(A|B)\.weight.*'
     )
     for key, weights in lora_weights.items():
         m = pattern.match(key)
         if not m:
             print(f"no match {key}")
             continue
-        layer_idx = int(m.group(1))
-        hf_module = m.group(3)
-        inout = "in" if m.group(4) == "A" else "out"
+        layer_idx = int(m.group(2))
+        if m.group(3) in ["attn", "self_attn"]:
+            attn_or_bias = "attn"
+        else:
+            attn_or_bias = "mlp"
+
+        hf_module = attn_or_bias + "." + m.group(4)
+        inout = "in" if m.group(5) == "A" else "out"
+
         all_weights[layer_idx][hf_module][inout] = weights
     return all_weights
 
 
 hf_modules_to_trtllm_modules = {
-    "q_proj": "attn_q",
-    "v_proj": "attn_v",
-    "k_proj": "attn_k",
-    "o_proj": "attn_dense",
-    "gate_proj": "mlp_h_to_4h",
-    "down_proj": "mlp_4h_to_h",
-    "up_proj": "mlp_gate"
+    "attn.c_attn": "attn_qkv",
+    "attn.q_proj": "attn_q",
+    "attn.v_proj": "attn_v",
+    "attn.k_proj": "attn_k",
+    "attn.o_proj": "attn_dense",
+    "attn.c_proj": "attn_dense",
+    "mlp.gate_proj": "mlp_h_to_4h",
+    "mlp.down_proj": "mlp_4h_to_h",
+    "mlp.up_proj": "mlp_gate",
+    "mlp.w1": "mlp_gate",
+    "mlp.w2": "mlp_h_to_4h",
+    "mlp.c_proj": "mlp_4h_to_h"
 }  # lora modules on llama
 hf_modules_to_module_id = {
     k: LoraManager.LORA_MODULE_IDS[v]
@@ -79,7 +90,15 @@ def convert_hf_model(model_dir, dtype, out_dir):
     saved_dir.mkdir(parents=True, exist_ok=True)
     with open(f"{model_dir}/adapter_config.json", "r") as f:
         config = json.load(f)
-        config["r"]
+
+    rank = config.get("r")
+    alpha = config.get("lora_alpha")
+    use_rslora = config.get("use_rslora", False)
+    if use_rslora:
+        scale = alpha / np.sqrt(rank)
+    else:
+        scale = alpha / rank
+
     lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
     all_weights = get_all_lora_weights(lora_model)
     converted_weights = []
@@ -104,7 +123,8 @@ def convert_hf_model(model_dir, dtype, out_dir):
                 elif dim0 < dim1 and inout == "out":
                     adapter_size = dim0
                     w = w.transpose(1, 0)
-
+                if inout == "out":
+                    w = w * scale
                 w = w.contiguous().flatten().to(dtype=str_dtype_to_torch(dtype))
                 in_out_weights.append(w)
             in_out_weights = torch.concatenate(in_out_weights).flatten()

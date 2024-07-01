@@ -28,8 +28,8 @@ def make_context(
 
     if chat_format == "chatml":
         im_start, im_end = "<|im_start|>", "<|im_end|>"
-        im_start_tokens = [tokenizer.im_start_id]
-        im_end_tokens = [tokenizer.im_end_id]
+        im_start_tokens = [tokenizer.encode(im_start, add_special_tokens=False)[0]]
+        im_end_tokens = [tokenizer.encode(im_end, add_special_tokens=False)[0]]
         nl_tokens = tokenizer.encode("\n")
 
         def _tokenize_str(role, content):

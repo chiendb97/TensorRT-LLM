@@ -13,7 +13,6 @@ import yaml
 from ._utils import (DictConversion, pad_vocab_size, release_gc,
                      str_dtype_to_torch, torch_to_numpy)
 from .layers.linear import ColumnLinear
-from .layers.moe import MoeConfig
 from .logger import logger
 from .mapping import Mapping
 from .models.convert_utils import (get_model_path, load_state_dict,
@@ -546,7 +545,6 @@ class LoraManager(object):
 
         lora_target_modules = model_config.lora_target_modules
         dtype = model_config.dtype
-        moe_tp_mode = model_config.moe_tp_mode
         hf_modules_to_trtllm_modules = invert_module_mapping(
             model_config.trtllm_modules_to_hf_modules)
         hf_modules = set(hf_modules_to_trtllm_modules.keys())
@@ -565,6 +563,7 @@ class LoraManager(object):
             all_weights = get_all_hf_lora_weights(lora_model, hf_modules,
                                                   component)
             rank = int(hf_config["r"])
+            rs_lora = bool(hf_config.get("use_rslora", False))
 
             self._lora_uid_to_low_ranks[uid] = {}
             self._lora_weights_pointers_list[uid] = {}
@@ -605,7 +604,7 @@ class LoraManager(object):
                         t_out = module_weights["out"]
                     if lora_module in ["moe_router"]:
                         pass
-                    elif "moe" in lora_module and moe_tp_mode == MoeConfig.ParallelismMode.EXPERT_PARALLEL:
+                    elif "moe" in lora_module and runtime_mapping.has_moe_ep():
                         pass
                     elif lora_module in [
                             "attn_dense",
@@ -629,7 +628,10 @@ class LoraManager(object):
 
                     t_in = t_in.cuda().contiguous()
                     t_out = t_out.cuda().contiguous()
-                    scale = float(hf_config["lora_alpha"]) / rank
+                    if rs_lora:
+                        scale = float(hf_config["lora_alpha"]) / np.sqrt(rank)
+                    else:
+                        scale = float(hf_config["lora_alpha"]) / rank
                     t_out = t_out * scale
                     t_in = t_in.to(str_dtype_to_torch(dtype))
                     t_out = t_out.to(str_dtype_to_torch(dtype))

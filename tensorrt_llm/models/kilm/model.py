@@ -18,9 +18,9 @@ from typing import Optional
 from tensorrt_llm.lora_manager import LoraConfig, use_lora
 
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, recv, send
-from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                       GatedMLP, RmsNorm)
+from ...functional import Tensor, recv, send, sigmoid
+from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
+                       Embedding, GatedMLP, RmsNorm, RowLinear)
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
@@ -46,6 +46,7 @@ class KiLMDecoderLayer(Module):
         self.attention = Attention(
             local_layer_idx=local_layer_idx,
             hidden_size=config.hidden_size,
+            attention_head_size=config.head_size,
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
@@ -59,17 +60,49 @@ class KiLMDecoderLayer(Module):
             quant_mode=config.quant_mode,
             dense_bias=True)
 
-        # KiLM's real inter_size is one half of what's in the config while KiLM2 is aligned with the config
-        intermediate_size = config.intermediate_size // 2 if self.config.kilm_type == 'kilm' else config.intermediate_size
+        ClsMLP = GatedMLP
+        mlp_kwargs = {}
+        if config.kilm_type == 'kilm2_moe':
+            ClsMLP = MOE
+            mlp_kwargs = {
+                "moe_config": config.moe,
+                "mapping": config.mapping,
+            }
 
-        self.mlp = GatedMLP(hidden_size=config.hidden_size,
-                            ffn_hidden_size=intermediate_size,
-                            hidden_act=config.hidden_act,
-                            dtype=dtype,
-                            bias=False,
-                            tp_group=tp_group,
-                            tp_size=tp_size,
-                            quant_mode=config.quant_mode)
+        if config.kilm_type == 'kilm2_moe':
+            self.shared_expert = MLP(
+                hidden_size=config.hidden_size,
+                ffn_hidden_size=config.moe_shared_expert_intermediate_size,
+                hidden_act=config.hidden_act,
+                dtype=dtype,
+                bias=False,
+                tp_group=tp_group,
+                tp_size=tp_size,
+                quant_mode=config.quant_mode)
+            self.shared_expert_gate = RowLinear(config.hidden_size,
+                                                1,
+                                                bias=False,
+                                                dtype=dtype,
+                                                tp_group=None,
+                                                tp_size=1)
+
+        # KiLM's real inter_size depends on kilm_type
+        if self.config.kilm_type == 'kilm':
+            intermediate_size = config.intermediate_size // 2
+        elif self.config.kilm_type == 'kilm2_moe':
+            intermediate_size = config.moe_intermediate_size
+        else:
+            intermediate_size = config.intermediate_size
+
+        self.mlp = ClsMLP(hidden_size=config.hidden_size,
+                          ffn_hidden_size=intermediate_size,
+                          hidden_act=config.hidden_act,
+                          dtype=dtype,
+                          bias=False,
+                          tp_group=tp_group,
+                          tp_size=tp_size,
+                          quant_mode=config.quant_mode,
+                          **mlp_kwargs)
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                       eps=config.norm_epsilon,
                                       dtype=dtype)
@@ -102,8 +135,18 @@ class KiLMDecoderLayer(Module):
 
         hidden_states = self.post_layernorm(hidden_states)
 
+        shared_output = None
+        if self.config.kilm_type == 'kilm2_moe':
+            shared_output = self.shared_expert(hidden_states)
+            if self.shared_expert_gate is not None:
+                shared_output = sigmoid(
+                    self.shared_expert_gate(hidden_states)) * shared_output
+
         hidden_states = self.mlp(hidden_states,
                                  lora_layer_params=lora_layer_params)
+
+        if shared_output is not None:
+            hidden_states = hidden_states + shared_output
 
         hidden_states = residual + hidden_states
         if use_cache:
@@ -191,11 +234,11 @@ class KiLMForCausalLM(DecoderModelForCausalLM):
         self.quant_mode = config.quant_mode
         self.mapping = config.mapping
         self.trtllm_modules_to_hf_modules = {
-            "attn_qkv": "c_attn",
+            "attn_qkv": "attn.c_attn",
             "attn_dense": "attn.c_proj",
-            "mlp_h_to_4h": "w2",
+            "mlp_h_to_4h": "mlp.w2",
             "mlp_4h_to_h": "mlp.c_proj",
-            "mlp_gate": "w1",
+            "mlp_gate": "mlp.w1",
         }
         super().__init__(config, transformer, lm_head)
 
