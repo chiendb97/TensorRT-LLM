@@ -119,6 +119,9 @@ def main(args):
     max_attention_window_size = args.max_attention_window_size
     sink_token_length = args.sink_token_length
 
+    if args.end_id:
+        end_id = args.end_id
+
     stop_words_list = None
     if args.stop_words:
         stop_words_list = tensorrt_llm.runtime.decode_words_list(

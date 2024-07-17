@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import argparse as _arg
+import copy
 import logging as _log
 import os as _os
 import pathlib as _pl
@@ -80,6 +81,7 @@ def run_tests(build_dir: _pl.Path,
               run_encoder=False,
               run_bart=False,
               run_t5=False,
+              run_redrafter=False,
               run_fp8=False,
               only_multi_gpu=False,
               build_only=False,
@@ -135,9 +137,18 @@ def run_tests(build_dir: _pl.Path,
         "--num-loras=128",
     ]
 
+    generate_gpt2_lora_data_args_tp1 = [
+        python_exe,
+        str(resources_dir / "scripts" / "generate_test_lora_weights.py"),
+        "--out-dir=cpp/tests/resources/data/lora-test-weights-gpt2-tp1",
+        "--tp-size=1", "--hidden-size=768", "--num-layers=12",
+        "--config-ids-filter=0", "--no-generate-cache-pages"
+    ]
+
     run_command(generate_lora_data_args_tp1, cwd=root_dir, timeout=100)
     run_command(generate_lora_data_args_tp2, cwd=root_dir, timeout=100)
     run_command(generate_multi_lora_tp2_args, cwd=root_dir, timeout=100)
+    run_command(generate_gpt2_lora_data_args_tp1, cwd=root_dir, timeout=100)
 
     if not skip_unit_tests:
         run_unit_tests(build_dir=build_dir, timeout=test_timeout)
@@ -159,6 +170,7 @@ def run_tests(build_dir: _pl.Path,
                                 run_encoder=run_encoder,
                                 run_bart=run_bart,
                                 run_t5=run_t5,
+                                run_redrafter=run_redrafter,
                                 run_fp8=run_fp8)
 
         if build_only:
@@ -175,6 +187,7 @@ def run_tests(build_dir: _pl.Path,
                              run_encoder=run_encoder,
                              run_bart=run_bart,
                              run_t5=run_t5,
+                             run_redrafter=run_redrafter,
                              run_fp8=run_fp8,
                              timeout=test_timeout)
 
@@ -212,6 +225,7 @@ def prepare_all_model_tests(python_exe: str,
                             run_encoder=False,
                             run_bart=False,
                             run_t5=False,
+                            run_redrafter=False,
                             run_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
 
@@ -312,6 +326,15 @@ def prepare_all_model_tests(python_exe: str,
                             model_cache_arg=model_cache_arg)
     else:
         _log.info("Skipping T5 tests")
+
+    if run_redrafter:
+        prepare_model_tests(model_name="redrafter",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping ReDrafter tests")
 
 
 def prepare_multi_gpu_model_tests(python_exe: str,
@@ -418,6 +441,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
                          run_encoder,
                          run_bart,
                          run_t5,
+                         run_redrafter,
                          run_fp8,
                          timeout=3600):
     build_tests(build_dir=build_dir)
@@ -446,9 +470,11 @@ def run_single_gpu_tests(build_dir: _pl.Path,
     if run_encoder:
         included_tests.append("EncoderModelTestSingleGPU")
     if run_bart:
-        included_tests.append("BartBasicTest/EncDecParamsTest.Forward*")
+        included_tests.append("BartBasicTest")
     if run_t5:
-        included_tests.append("T5BasicTest/EncDecParamsTest.Forward*")
+        included_tests.append("T5BasicTest")
+    if run_redrafter:
+        included_tests.append("ExplicitDraftTokens")
 
     excluded_tests = []
     if not run_fp8:
@@ -484,9 +510,15 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     ]
     run_command(trt_model_test, cwd=tests_dir, env=cpp_env,
                 timeout=timeout)  # expecting ~ 1200s
+    cpp_blocking_env = copy.copy(cpp_env)
+    cpp_blocking_env["CUDA_LAUNCH_BLOCKING"] = '1'
+    run_command(trt_model_test,
+                cwd=tests_dir,
+                env=cpp_blocking_env,
+                timeout=timeout)  # expecting ~ 1200s
 
     #Executor test in leader mode
-    new_env = cpp_env
+    new_env = copy.copy(cpp_env)
     xml_output_file = build_dir / "results-multi-gpu-llama-exec-leader-mode.xml"
     new_env["RUN_LLAMA_MULTI_GPU"] = "true"
     trt_model_test = [
@@ -507,7 +539,7 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
     #EncDec test in leader mode
-    new_env = cpp_env
+    new_env = copy.copy(cpp_env)
     xml_output_file = build_dir / "results-multi-gpu-t5-exec-leader-mode.xml"
     trt_model_test = [
         "mpirun", "-n", "4", "--allow-run-as-root", "executor/executorTest",
@@ -520,6 +552,17 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
 def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
                    resources_dir: _pl.Path):
 
+    # At this moment, CI env might not installed tensorrt_llm before, so tensorrt_llm module might not be available.
+    import pathlib
+    import sys
+
+    import model_spec
+    src_root_dir = pathlib.Path(
+        __file__).parent.resolve().parent.parent.parent.parent
+
+    sys.path.insert(0, str(src_root_dir))
+    import tensorrt_llm.bindings as _tb
+
     make_benchmarks = [
         "cmake", "--build", ".", "--config", "Release", "-j", "--target",
         "benchmarks"
@@ -528,10 +571,16 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
 
     benchmark_exe_dir = build_dir / "benchmarks"
     gpt_engine_dir = resources_dir / "models" / "rt_engine" / "gpt2"
+
+    input_file = 'input_tokens.npy'
+    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+    model_spec_obj.use_gpt_plugin()
+
     benchmark = [
         str(benchmark_exe_dir / "gptSessionBenchmark"), "--engine_dir",
-        str(gpt_engine_dir / "fp16-plugin" / "tp1-pp1-gpu"), "--batch_size",
-        "8", "--input_output_len", "10,20", "--duration", "10"
+        str(gpt_engine_dir / model_spec_obj.get_model_path() / "tp1-pp1-gpu"),
+        "--batch_size", "8", "--input_output_len", "10,20", "--duration", "10"
     ]
     run_command(benchmark, cwd=root_dir, timeout=600)
 
@@ -555,6 +604,9 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
     ]
     max_input_lens = ["256", "20"]
     num_reqs = ["50", "10"]
+
+    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.use_packed_input()
 
     for prompt_ds_args, tokens_f, len, num_req in zip(prompt_datasets_args,
                                                       token_files,
@@ -586,7 +638,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
                 benchmark = [
                     str(benchmark_exe_dir / "gptManagerBenchmark"),
                     "--engine_dir",
-                    str(gpt_engine_dir / "fp16-plugin-packed-paged" /
+                    str(gpt_engine_dir / model_spec_obj.get_model_path() /
                         "tp1-pp1-gpu"), "--type",
                     str(batching_type), "--api",
                     str(api_type), "--dataset",
@@ -600,24 +652,24 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
 
         benchmark = [
             str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
-            str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
-            "--type", "IFB", "--dataset",
+            str(gpt_engine_dir / model_spec_obj.get_model_path() /
+                "tp1-pp1-gpu"), "--type", "IFB", "--dataset",
             str(data_dir / tokens_f), "--api", "executor", "--streaming"
         ]
         run_command(benchmark, cwd=root_dir, timeout=600)
 
         benchmark = [
             str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
-            str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
-            "--type", "IFB", "--dataset",
+            str(gpt_engine_dir / model_spec_obj.get_model_path() /
+                "tp1-pp1-gpu"), "--type", "IFB", "--dataset",
             str(data_dir / tokens_f), "--api", "gptManager", "--streaming"
         ]
         run_command(benchmark, cwd=root_dir, timeout=600)
 
         benchmark = [
             str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
-            str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
-            "--type", "IFB", "--dataset",
+            str(gpt_engine_dir / model_spec_obj.get_model_path() /
+                "tp1-pp1-gpu"), "--type", "IFB", "--dataset",
             str(data_dir / tokens_f), "--api", "gptManager", "--streaming",
             "request_rate", "100", "--enable_exp_delays"
         ]
@@ -683,6 +735,9 @@ if __name__ == "__main__":
     tests_config_parser.add_argument("--run_t5",
                                      action="store_true",
                                      help="Run the tests for T5")
+    tests_config_parser.add_argument("--run_redrafter",
+                                     action="store_true",
+                                     help="Run the tests for ReDrafter")
     tests_config_parser.add_argument(
         "--run_fp8",
         action="store_true",
@@ -711,6 +766,17 @@ if __name__ == "__main__":
     test_args = arg_groups[test_config_group]
     test_args.build_dir = get_build_dir(build_args.build_dir,
                                         build_args.build_type)
+    # Make modelSpec module since build engine and generate output scripts will need it.
+    make_modelSpec = [
+        "cmake", "--build",
+        test_args.build_dir.__str__(), "--config", build_args.build_type, "-j",
+        "--target", "modelSpec"
+    ]
+    run_command(make_modelSpec, cwd=build_args.build_dir, timeout=300)
+
+    from build_engines_utils import init_model_spec_module
+
+    init_model_spec_module()
 
     if test_args.run_all_models:
         test_args.run_gpt = True

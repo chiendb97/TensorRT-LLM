@@ -182,15 +182,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
         json_config = GptJsonConfig.parse_file(config_path)
         model_config = json_config.model_config
 
-        if max_batch_size is None:
-            max_batch_size = model_config.max_batch_size
-        if max_input_len is None:
-            max_input_len = model_config.max_input_len
-        if max_output_len is None:
-            max_output_len = model_config.max_seq_len - model_config.max_input_len
-        if max_beam_width is None:
-            max_beam_width = model_config.max_beam_width
-
         # Note: Parallel configuration will be fetched automatically from trtllm.Executor constructor
         # by inspecting the json file. These lines serve the purpose of serving vocab_size_padded and
         # num_layers properties.
@@ -221,8 +212,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
             assert max_batch_size <= model_config.max_batch_size
         if max_input_len is None:
             max_input_len = model_config.max_input_len
-        else:
-            assert max_input_len <= model_config.max_input_len
+        # NOTE{pengyunl}: remove assertion here for temp fix,
+        # model_config.max_input_len is not the upper bound of input length.
+        # If runtime max_input_len is not properly set,
+        # C++ runtime will throw an error when fetching new requests
         if max_output_len is None:
             max_seq_len = model_config.max_seq_len
         else:
@@ -233,9 +226,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
         else:
             assert max_beam_width <= model_config.max_beam_width
 
-        trtllm_config = trtllm.ExecutorConfig(max_beam_width=max_beam_width,
-                                              kv_cache_config=kv_cache_config,
-                                              decoding_config=decoding_config)
+        trtllm_config = trtllm.ExecutorConfig(
+            max_beam_width=max_beam_width,
+            kv_cache_config=kv_cache_config,
+            decoding_config=decoding_config,
+            gpu_weights_percent=gpu_weights_percent)
         trtllm_config.enable_chunked_context = enable_chunked_context
         executor = trtllm.Executor(engine_dir, trtllm.ModelType.DECODER_ONLY,
                                    trtllm_config)

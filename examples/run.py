@@ -140,7 +140,7 @@ def parse_input(tokenizer,
                 range(base_vocab_size,
                       base_vocab_size + length)) + batch_input_ids[i]
 
-    if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
+    if input_file is None and model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
         for ids in batch_input_ids:
             ids.append(tokenizer.sop_token_id)
 
@@ -262,6 +262,9 @@ def main(args):
         model_version=model_version,
         tokenizer_type=args.tokenizer_type,
     )
+
+    if args.end_id:
+        end_id = args.end_id
 
     stop_words_list = None
     if args.stop_words:

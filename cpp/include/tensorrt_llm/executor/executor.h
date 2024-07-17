@@ -37,6 +37,9 @@ class MpiComm;
 namespace tensorrt_llm::executor
 {
 
+/// @brief Version of TRT-LLM
+char const* version() noexcept;
+
 class Model;
 class Serialization;
 
@@ -264,7 +267,8 @@ public:
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<std::string> logitsPostProcessorName = std::nullopt,
-        std::optional<VecTokens> encoderInputTokenIds = std::nullopt, bool returnAllGeneratedTokens = false);
+        std::optional<VecTokens> encoderInputTokenIds = std::nullopt, std::optional<IdType> clientId = std::nullopt,
+        bool returnAllGeneratedTokens = false);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -290,6 +294,7 @@ public:
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
     [[nodiscard]] std::optional<std::string> getLogitsPostProcessorName() const;
     [[nodiscard]] std::optional<VecTokens> getEncoderInputTokenIds() const;
+    [[nodiscard]] std::optional<IdType> getClientId() const;
     [[nodiscard]] bool getReturnAllGeneratedTokens() const;
 
     void setStreaming(bool streaming);
@@ -305,6 +310,7 @@ public:
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLogitsPostProcessorName(std::string const& logitsPostProcessorName);
     void setEncoderInputTokenIds(VecTokens const& encoderInputTokenIds);
+    void setClientId(IdType clientId);
     void setReturnAllGeneratedTokens(bool returnAllGeneratedTokens);
 
 private:

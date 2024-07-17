@@ -130,13 +130,6 @@ def parse_arguments():
         ('If this option is specified, it will override the max input len of '
          'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
-        '--max_output_len',
-        type=int,
-        default=None,
-        help=
-        ('If this option is specified, it will override the max output len of '
-         'TRT engines to the specified value instead of using pre-defined one'))
-    parser.add_argument(
         '--max_seq_len',
         '--max_decoder_seq_len',
         dest='max_seq_len',
@@ -295,7 +288,8 @@ def build_gpt(args):
     builder_config_extra_kwargs = {}
     extra_items = [
         'layer_types', 'conv_kernel', 'rnn_hidden_size', 'logits_soft_cap',
-        'state_size', 'use_bias'
+        'state_size', 'use_bias', 'rnn_head_size', 'rnn_conv_dim_size',
+        'mamba_version', 'ssm_rmsnorm', 'ngroups', 'chunk_size'
     ]
     for item in extra_items:
         if item in build_config:
@@ -876,10 +870,16 @@ def build_gpt(args):
             'state_size': build_config['state_size'],
             'conv_kernel': build_config['conv_kernel'],
             'rnn_hidden_size': build_config['rnn_hidden_size'],
+            'rnn_head_size': build_config['rnn_head_size'],
+            'rnn_conv_dim_size': build_config['rnn_conv_dim_size'],
             'rms_norm': True,
             'residual_in_fp32': True,
             'pad_vocab_size_multiple': 8,
             'use_bias': build_config['use_bias'],
+            'mamba_version': build_config['mamba_version'],
+            'ssm_rmsnorm': build_config['ssm_rmsnorm'],
+            'ngroups': build_config['ngroups'],
+            'chunk_size': build_config['chunk_size'],
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.MambaForCausalLM(config)
@@ -912,6 +912,8 @@ def build_gpt(args):
             'state_size': build_config['state_size'],
             'layer_types': build_config['layer_types'],
             'rnn_hidden_size': build_config['rnn_hidden_size'],
+            'rnn_head_size': build_config['rnn_head_size'],
+            'rnn_conv_dim_size': build_config['rnn_conv_dim_size'],
             'logits_soft_cap': build_config['logits_soft_cap'],
             'rotary_pct': build_config['rotary_pct'],
         }

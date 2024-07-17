@@ -55,7 +55,8 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_
     tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
     nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention, int max_distance,
     bool pos_shift_enabled, bool dense_context_fmha, bool use_paged_context_fmha, bool use_fp8_context_fmha,
-    bool use_cache, bool is_spec_decoding_enabled)
+    bool use_cache, bool is_spec_decoding_enabled, bool spec_decoding_is_generation_length_variable,
+    int spec_decoding_max_generation_length)
     : GPTAttentionPluginCommon(layer_idx, num_heads, vision_start, vision_length, num_kv_heads, head_size,
         unidirectional, q_scaling, qk_tanh_scale, position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale, rotary_embedding_short_m_scale,
@@ -63,7 +64,8 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_
         tp_rank, unfuse_qkv_gemm, context_fmha_type, multi_block_mode, enable_xqa, kv_cache_quant_mode,
         remove_input_padding, mask_type, block_sparse_params, paged_kv_cache, tokens_per_block, type,
         max_context_length, qkv_bias_enabled, cross_attention, max_distance, pos_shift_enabled, dense_context_fmha,
-        use_paged_context_fmha, use_fp8_context_fmha, use_cache, is_spec_decoding_enabled)
+        use_paged_context_fmha, use_fp8_context_fmha, use_cache, is_spec_decoding_enabled,
+        spec_decoding_is_generation_length_variable, spec_decoding_max_generation_length)
 {
     initEntryIdx();
 }
@@ -275,8 +277,23 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
 {
     TLLM_CHECK(mHeadSize > 0);
 
-    int const beamWidth
-        = isCrossAttention() ? 1 : (useKVCache() ? in[getIdx(IdxEntry::CACHE_INDIR)].desc.dims.d[1] : 1);
+    int beamWidth = -1;
+    if (!isCrossAttention() && useKVCache())
+    {
+        // desc_val == -1 means beam_width is not static, we should look at min/max/opt.
+        //
+        // In prepareEnqueueGeneration, we'll prepare for all cases where beam_width doesn't exceed max.
+        // TODO(minwei): pass min AND max to prepareEnqueueGeneration instead of max only.
+        int desc_val = in[getIdx(IdxEntry::CACHE_INDIR)].desc.dims.d[1];
+        int max_val = in[getIdx(IdxEntry::CACHE_INDIR)].max.d[1];
+        beamWidth = desc_val == -1 ? max_val : desc_val;
+    }
+    else
+    {
+        beamWidth = 1;
+    }
+    TLLM_CHECK(beamWidth != -1);
+
     // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
     // unless each layer has different attention window sizes.
     // the kv_cache capacity.
@@ -774,6 +791,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             enqueue_params.spec_decoding_packed_mask = spec_decoding_packed_mask;
             enqueue_params.spec_decoding_position_offsets = spec_decoding_position_offsets;
             enqueue_params.spec_decoding_generation_lengths = spec_decoding_generation_lengths;
+            enqueue_params.spec_decoding_is_generation_length_variable = mSpecDecodingIsGenerationLengthVariable;
+            enqueue_params.spec_decoding_max_generation_length = mSpecDecodingMaxGenerationLength;
         }
         enqueue_params.total_num_input_tokens = localNbTokens;
 
@@ -960,7 +979,9 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             static_cast<bool>(p.getScalar<int8_t>("use_paged_context_fmha").value()),
             static_cast<bool>(p.getScalar<int8_t>("use_fp8_context_fmha").value()),
             static_cast<bool>(p.getScalar<int32_t>("use_cache").value()),
-            static_cast<bool>(p.getScalar<int8_t>("is_spec_decoding_enabled").value()));
+            static_cast<bool>(p.getScalar<int8_t>("is_spec_decoding_enabled").value()),
+            static_cast<bool>(p.getScalar<int8_t>("spec_decoding_is_generation_length_variable").value()),
+            p.getScalar<int32_t>("spec_decoding_max_generation_length").value());
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

@@ -20,6 +20,7 @@ from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, LayerNorm, MoeConfig,
                        PositionEmbeddingType)
 from ...lora_manager import LoraConfig, use_lora
+from ...mapping import Mapping
 from ...module import Module
 from ...quantization import QuantMode
 from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
@@ -34,7 +35,7 @@ def MLPFactory(hidden_size,
                moe_config: MoeConfig = MoeConfig(),
                tp_group=None,
                tp_size=1,
-               tp_rank=0,
+               mapping=Mapping(),
                quant_mode=QuantMode(0),
                inner_layernorm=False,
                eps=1e-05):
@@ -43,11 +44,11 @@ def MLPFactory(hidden_size,
                    hidden_size,
                    ffn_hidden_size,
                    hidden_act,
-                   bias,
-                   dtype,
-                   tp_group,
-                   tp_size,
-                   tp_rank,
+                   mapping=mapping,
+                   bias=bias,
+                   dtype=dtype,
+                   tp_group=tp_group,
+                   tp_size=tp_size,
                    quant_mode=quant_mode)
     MLPClass = GatedMLP if is_gated_activation(hidden_act) else MLP
     hidden_act = non_gated_version(hidden_act)
@@ -84,6 +85,8 @@ class GPTDecoderLayer(Module):
         local_layer_idx = layer_idx - layers_range[0]
         inner_layernorm = config.inner_layernorm if hasattr(
             config, "inner_layernorm") else False
+        attention_head_size = config.head_size if hasattr(config,
+                                                          "head_size") else None
         self.attention = Attention(
             local_layer_idx=local_layer_idx,
             hidden_size=config.hidden_size,
@@ -95,6 +98,7 @@ class GPTDecoderLayer(Module):
             apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
             dtype=config.dtype,
             attention_mask_type=AttentionMaskType.causal,
+            attention_head_size=attention_head_size,
             position_embedding_type=config.position_embedding_type,
             rotary_embedding_percentage=config.rotary_pct,
             rotary_embedding_base=config.rotary_base,
@@ -120,7 +124,7 @@ class GPTDecoderLayer(Module):
                               moe_config=config.moe,
                               tp_group=tp_group,
                               tp_size=tp_size,
-                              tp_rank=tp_rank,
+                              mapping=config.mapping,
                               quant_mode=config.quant_mode,
                               inner_layernorm=inner_layernorm,
                               eps=config.norm_epsilon)
