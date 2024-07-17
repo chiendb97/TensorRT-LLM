@@ -128,6 +128,7 @@ MODEL_NAME_PATTERN_MAP = {
     "MedusaForCausalLM": "llama",
     "Phi3SmallForCausalLM": "phi3small",
     "Phi3ForCausalLM": "phi3",
+    "Starcoder2ForCausalLM": "gptnext",
 }
 
 

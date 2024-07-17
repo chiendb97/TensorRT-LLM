@@ -233,13 +233,18 @@ class QWenForCausalLM(DecoderModelForCausalLM):
             lm_head = None
         self.quant_mode = config.quant_mode
         self.mapping = config.mapping
-        self.trtllm_modules_to_hf_modules = {
-            "attn_qkv": "attn.c_attn",
-            "attn_dense": "attn.c_proj",
-            "mlp_h_to_4h": "mlp.w2",
-            "mlp_4h_to_h": "mlp.c_proj",
-            "mlp_gate": "mlp.w1",
-        }
+
+        if config.qwen_type == 'qwen':
+            self.trtllm_modules_to_hf_modules = {
+                "attn_qkv": "attn.c_attn",
+                "attn_dense": "attn.c_proj",
+                "mlp_h_to_4h": "mlp.w2",
+                "mlp_4h_to_h": "mlp.c_proj",
+                "mlp_gate": "mlp.w1",
+            }
+        else:
+            self.trtllm_modules_to_hf_modules = None
+
         super().__init__(config, transformer, lm_head)
 
     def check_config(self, config):
