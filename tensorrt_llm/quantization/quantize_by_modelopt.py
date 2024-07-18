@@ -125,7 +125,6 @@ MODEL_NAME_PATTERN_MAP = {
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
     "ArcticForCausalLM": "llama",
-    "MedusaForCausalLM": "llama",
     "Phi3SmallForCausalLM": "phi3small",
     "Phi3ForCausalLM": "phi3",
     "Starcoder2ForCausalLM": "gptnext",
@@ -140,6 +139,10 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
         padding_side="left",
         trust_remote_code=True,
     )
+    if model_type and model_type == "qwen":
+        # qwen use token id 151643 as pad and eos tokens
+        tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
+        tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
 
     # can't set attribute 'pad_token' for "<unk>"
     if tokenizer.pad_token != "<unk>":  # nosec B105
@@ -383,7 +386,6 @@ def quantize_and_export(*,
 
     model = get_model(model_dir, dtype, device=device)
     model_type = get_model_type(model)
-    model_arch = type(model).__name__
     if "vila" in model_dir:
         tokenizer = get_tokenizer(model_dir + "/llm",
                                   max_seq_length=tokenizer_max_seq_length,
@@ -514,29 +516,17 @@ def quantize_and_export(*,
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
-        # Workaround for kilm version
         if model_type == 'kilm':
             with open(f"{export_path}/config.json", "r") as f:
                 tensorrt_llm_config = json.load(f)
             kilm_config = AutoConfig.from_pretrained(model_dir,
                                                      trust_remote_code=True)
             tensorrt_llm_config["kilm_type"] = kilm_config.model_type
+            if kilm_config.model_type == "kilm2":
+                tensorrt_llm_config["norm_epsilon"] = kilm_config.rms_norm_eps
+                tensorrt_llm_config["rotary_base"] = kilm_config.rope_theta
             tensorrt_llm_config[
                 "intermediate_size"] = kilm_config.intermediate_size
-            with open(f"{export_path}/config.json", "w") as f:
-                json.dump(tensorrt_llm_config, f, indent=4)
-
-        # Workaround for medusa version
-        if model_arch == "MedusaForCausalLM":
-            with open(f"{export_path}/config.json", "r") as f:
-                tensorrt_llm_config = json.load(f)
-            medusa_config = AutoConfig.from_pretrained(model_dir,
-                                                       trust_remote_code=True)
-            tensorrt_llm_config["architecture"] = "MedusaForCausalLM"
-            tensorrt_llm_config["num_medusa_heads"] = medusa_config.medusa_num_heads
-            tensorrt_llm_config["num_medusa_layers"] = medusa_config.medusa_num_layers
-            tensorrt_llm_config["max_draft_len"] = max_draft_len
-
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 

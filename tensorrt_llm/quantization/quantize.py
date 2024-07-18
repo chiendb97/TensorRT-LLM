@@ -17,10 +17,10 @@ from .mode import W8A8_SQ_PLUGIN_LIST, QuantAlgo, QuantMode
 
 
 def quantize_layers(
-    model,
-    quant_config: QuantConfig,
-    quant_map,
-    preprocess_init_params=None,
+        model,
+        quant_config: QuantConfig,
+        quant_map,
+        preprocess_init_params=None,
 ):
     import os
     enable_quantize_lm_head = os.getenv("ENABLE_QUANTIZE_LM_HEAD", 'False').lower() in ('true', '1', 't')
@@ -136,8 +136,8 @@ def weight_only_groupwise_quantize(model, quant_config: QuantConfig):
 
 
 def smooth_quantize_ootb(
-    model,
-    quant_config: QuantConfig,
+        model,
+        quant_config: QuantConfig,
 ):
     quant_map = {
         ColumnLinear: Int8SmoothQuantLinear,
@@ -197,7 +197,7 @@ def smooth_quantize(model, quant_config: QuantConfig):
         return smooth_quantize_ootb(model, quant_config)
 
 
-def fp8_quantize(model, quant_config: QuantConfig, current_key_name=None):
+def fp8_quantize(model, quant_config: QuantConfig):
     assert quant_config.quant_mode.has_fp8_qdq()
 
     quant_map = {
