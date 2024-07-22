@@ -144,6 +144,12 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
         tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
         tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
 
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = "<pad>"
+
+        if tokenizer.eos_token is None:
+            tokenizer.eos_token = "</s>"
+
     # can't set attribute 'pad_token' for "<unk>"
     if tokenizer.pad_token != "<unk>":  # nosec B105
         tokenizer.pad_token = tokenizer.eos_token

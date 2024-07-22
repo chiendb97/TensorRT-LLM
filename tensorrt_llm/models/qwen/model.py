@@ -64,9 +64,9 @@ class QWenDecoderLayer(Module):
         ClsMLP = GatedMLP
         mlp_kwargs = {}
 
-        moe_config = MoeConfig(config.moe_num_experts, config.moe_top_k,
-                               config.moe_normalization_mode).validate()
         if config.qwen_type == 'qwen2_moe':
+            moe_config = MoeConfig(config.moe_num_experts, config.moe_top_k,
+                                   config.moe_normalization_mode).validate()
             ClsMLP = MOE
             mlp_kwargs = {
                 "moe_config": moe_config,
