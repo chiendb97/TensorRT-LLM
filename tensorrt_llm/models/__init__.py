@@ -42,7 +42,6 @@ from .opt.model import OPTForCausalLM, OPTModel
 from .phi3.model import Phi3ForCausalLM, Phi3Model
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
-from .kilm.model import KiLMForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
 from .redrafter.model import ReDrafterForCausalLM
 
@@ -77,8 +76,9 @@ __all__ = [
     'ChatGLMForCausalLM',
     'ChatGLMModel',
     'BaichuanForCausalLM',
+    'QWenConfig'
     'QWenForCausalLM',
-    'KiLMForCausalLM',
+    'QWenModel',
     'EncoderModel',
     'DecoderModel',
     'PretrainedConfig',
@@ -98,9 +98,17 @@ __all__ = [
 ]
 
 MODEL_MAP = {
+    'GPT2LMHeadModel': GPTForCausalLM,
+    'GPT2LMHeadCustomModel': GPTForCausalLM,
+    'GPTBigCodeForCausalLM': GPTForCausalLM,
+    'Starcoder2ForCausalLM': GPTForCausalLM,
+    'FuyuForCausalLM': GPTForCausalLM,
+    'Kosmos2ForConditionalGeneration': GPTForCausalLM,
+    'JAISLMHeadModel': GPTForCausalLM,
     'GPTForCausalLM': GPTForCausalLM,
     'OPTForCausalLM': OPTForCausalLM,
     'BloomForCausalLM': BloomForCausalLM,
+    'RWForCausalLM': FalconForCausalLM,
     'FalconForCausalLM': FalconForCausalLM,
     'PhiForCausalLM': PhiForCausalLM,
     'Phi3ForCausalLM': Phi3ForCausalLM,
@@ -109,6 +117,8 @@ MODEL_MAP = {
     'GPTNeoXForCausalLM': GPTNeoXForCausalLM,
     'GPTJForCausalLM': GPTJForCausalLM,
     'MPTForCausalLM': MPTForCausalLM,
+    'GLMModel': ChatGLMForCausalLM,
+    'ChatGLMModel': ChatGLMForCausalLM,
     'ChatGLMForCausalLM': ChatGLMForCausalLM,
     'LlamaForCausalLM': LLaMAForCausalLM,
     'MistralForCausalLM': LLaMAForCausalLM,
@@ -120,10 +130,13 @@ MODEL_MAP = {
     'MedusaForCausalLM': MedusaForCausalLm,
     'ReDrafterForCausalLM': ReDrafterForCausalLM,
     'BaichuanForCausalLM': BaichuanForCausalLM,
+    'BaiChuanForCausalLM': BaichuanForCausalLM,
     'SkyworkForCausalLM': LLaMAForCausalLM,
     'GemmaForCausalLM': GemmaForCausalLM,
+    'QWenLMHeadModel': QWenForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
-    'KiLMForCausalLM': KiLMForCausalLM,
+    'Qwen2ForCausalLM': QWenForCausalLM,
+    'Qwen2MoeForCausalLM': QWenForCausalLM,
     'WhisperEncoder': WhisperEncoder,
     'EncoderModel': EncoderModel,
     'DecoderModel': DecoderModel,

@@ -121,7 +121,6 @@ MODEL_NAME_PATTERN_MAP = {
     "Bloom": "bloom",
     "ChatGLM": "chatglm",
     "QWen": "qwen",
-    "KiLM": "kilm",
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
     "ArcticForCausalLM": "llama",
@@ -139,22 +138,14 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
         padding_side="left",
         trust_remote_code=True,
     )
-    if model_type and model_type == "qwen":
-        # qwen use token id 151643 as pad and eos tokens
-        tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
-        tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
 
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = "<pad>"
-
-        if tokenizer.eos_token is None:
-            tokenizer.eos_token = "</s>"
-
-    # can't set attribute 'pad_token' for "<unk>"
-    if tokenizer.pad_token != "<unk>":  # nosec B105
-        tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        if model_type and model_type == "qwen":
+            # qwen use token id 151643 as pad and eos tokens
+            tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
+            tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
+        else:
+            tokenizer.pad_token = tokenizer.eos_token
     assert tokenizer.pad_token is not None, f"Pad token for {model_type} cannot be set!"
 
     return tokenizer
@@ -519,20 +510,6 @@ def quantize_and_export(*,
                 tensorrt_llm_config["rotary_base"] = qwen_config.rope_theta
             tensorrt_llm_config[
                 "intermediate_size"] = qwen_config.intermediate_size
-            with open(f"{export_path}/config.json", "w") as f:
-                json.dump(tensorrt_llm_config, f, indent=4)
-
-        if model_type == 'kilm':
-            with open(f"{export_path}/config.json", "r") as f:
-                tensorrt_llm_config = json.load(f)
-            kilm_config = AutoConfig.from_pretrained(model_dir,
-                                                     trust_remote_code=True)
-            tensorrt_llm_config["kilm_type"] = kilm_config.model_type
-            if kilm_config.model_type == "kilm2":
-                tensorrt_llm_config["norm_epsilon"] = kilm_config.rms_norm_eps
-                tensorrt_llm_config["rotary_base"] = kilm_config.rope_theta
-            tensorrt_llm_config[
-                "intermediate_size"] = kilm_config.intermediate_size
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
