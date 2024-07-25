@@ -80,34 +80,23 @@ def preprocess_lora_weights(lora_model):
 
 
 hf_modules_to_trtllm_modules = {
-<<<<<<< HEAD
     "attn.c_attn": "attn_qkv",
+    "attn.query_key_value": "attn_qkv",
     "attn.q_proj": "attn_q",
     "attn.v_proj": "attn_v",
     "attn.k_proj": "attn_k",
     "attn.o_proj": "attn_dense",
     "attn.c_proj": "attn_dense",
+    "attn.dense": "attn_dense",
     "mlp.gate_proj": "mlp_h_to_4h",
     "mlp.down_proj": "mlp_4h_to_h",
     "mlp.up_proj": "mlp_gate",
     "mlp.w1": "mlp_gate",
     "mlp.w2": "mlp_h_to_4h",
-    "mlp.c_proj": "mlp_4h_to_h"
-=======
-    "q_proj": "attn_q",
-    "v_proj": "attn_v",
-    "k_proj": "attn_k",
-    "qkv_proj": "attn_qkv",
-    "query_key_value": "attn_qkv",
-    "o_proj": "attn_dense",
-    "dense": "attn_dense",
-    "gate_proj": "mlp_h_to_4h",
-    "down_proj": "mlp_4h_to_h",
-    "up_proj": "mlp_gate",
-    "gate_up_proj": "mlp_h_to_4h",
-    "c_fc": "mlp_h_to_4h",
-    "c_proj": "mlp_4h_to_h",
->>>>>>> main
+    "mlp.c_proj": "mlp_4h_to_h",
+    "mlp.gate_up_proj": "mlp_h_to_4h",
+    "mlp.c_fc": "mlp_h_to_4h",
+    "mlp.c_proj": "mlp_4h_to_h",
 }  # lora modules on llama
 hf_modules_to_module_id = {
     k: LoraManager.LORA_MODULE_IDS[v]
