@@ -27,7 +27,6 @@ import torch
 from tensorrt_llm.auto_parallel import infer_cluster_config
 from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
 from tensorrt_llm.builder import BuildConfig, Engine, build
-from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraManager
 from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
@@ -104,8 +103,9 @@ def parse_arguments():
         type=int,
         default=None,
         help='It equals to max_batch_size*max_beam_width by default, set this '
-             'value as close as possible to the actual number of tokens on your workload. '
-             'Note that this argument might be removed in the future.')
+        'value as close as possible to the actual number of tokens on your workload. '
+        'Note that this argument might be removed in the future.')
+    parser.add_argument('--cp_size', type=int, default=1)
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument(
@@ -270,6 +270,7 @@ def build_model(
     bool = False,  # return the modified BuildConfig without actually building the engine
     **kwargs
 ) -> Union[Engine, BuildConfig]:
+
     model_config = copy.deepcopy(model_config)
 
     logits_dtype = kwargs.get('logits_dtype')
@@ -413,6 +414,7 @@ def main():
     kwargs = {
         'logits_dtype': args.logits_dtype,
         'use_fused_mlp': args.use_fused_mlp,
+        'cp_size': args.cp_size,
         'tp_size': args.tp_size,
         'pp_size': args.pp_size,
         'lora_dir': args.lora_dir,
@@ -443,47 +445,6 @@ def main():
             cluster_config = dict(cluster_key=args.cluster_key)
         else:
             cluster_config = infer_cluster_config()
-
-        # Extract rotary scaling which will be used for checks and default value of max_seq_len
-        rotary_scaling = getattr(model_config, "rotary_scaling", None)
-        if rotary_scaling is not None:
-            rotary_type = rotary_scaling['type']
-            rotary_factor = rotary_scaling.get(
-                'factor', 1.0) if rotary_type != 'su' else 1
-        else:
-            rotary_factor = 1
-
-        if args.max_seq_len is None:
-            # Step 1: Find the upper bound of max_seq_len
-            deduced_max_seq_len = 2048
-            if model_config.max_position_embeddings is not None:
-                deduced_max_seq_len = model_config.max_position_embeddings
-
-            # Step 2: Scale max_seq_len with rotary scaling
-            if rotary_factor != 1:
-                deduced_max_seq_len *= rotary_factor
-                logger.warning(
-                    f'max_seq_len is scaled to {deduced_max_seq_len} by rotary scaling {rotary_factor}'
-                )
-
-            # Step 3: Assign the new max_seq_len
-            args.max_seq_len = deduced_max_seq_len
-            logger.info(
-                f'max_seq_len is not specified, using value {deduced_max_seq_len}'
-            )
-        else:
-            if not plugin_config.streamingllm and model_config.max_position_embeddings is not None \
-                and model_config.position_embedding_type != PositionEmbeddingType.relative:
-                if args.max_seq_len > model_config.max_position_embeddings * rotary_factor:
-                    logger.warning(
-                        f'max_seq_len {args.max_seq_len} is larger than max_position_embeddings {model_config.max_position_embeddings} * rotary scaling {rotary_factor}, '
-                        'the model accuracy might be affected')
-
-        if args.max_input_len > args.max_seq_len:
-            logger.warning(
-                f'max_input_len is {args.max_input_len} is larger than max_seq_len {args.max_seq_len}, clipping it to max_seq_len'
-            )
-            args.max_input_len = args.max_seq_len
 
         build_config = BuildConfig.from_dict(
             {

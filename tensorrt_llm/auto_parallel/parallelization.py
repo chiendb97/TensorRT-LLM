@@ -13,7 +13,7 @@ import torch
 from filelock import FileLock
 
 from tensorrt_llm._utils import (str_dtype_to_trt, trt_dtype_to_np,
-                                 trt_dtype_to_torch, trt_gte_10)
+                                 trt_dtype_to_torch)
 from tensorrt_llm.functional import (AllReduceConfig, AllReduceFusionParams,
                                      AllReduceStrategy, create_allreduce_plugin)
 from tensorrt_llm.logger import logger
@@ -21,8 +21,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import (PluginInfo, delete_plugin_info, get_np_weight,
                                   get_plugin_info, set_plugin_info)
 from tensorrt_llm.plugin import TRT_LLM_PLUGIN_NAMESPACE, init_all_reduce_helper
-from tensorrt_llm.plugin.plugin import (CustomAllReduceHelper,
-                                        current_all_reduce_helper)
+from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 from tensorrt_llm.version import __version__
 
 from .config import AutoParallelConfig
@@ -39,7 +38,7 @@ from .tensor_parallel.sharding_strategy import ShardingStrategy
 from .utils import (get_updated_plugin, to_base_class_layer, to_subclass_layer,
                     to_trt_weights)
 
-default_int_dtype = trt.int64 if trt_gte_10() else trt.int32
+default_int_dtype = trt.int64
 
 
 @dataclass
@@ -1564,7 +1563,6 @@ class DistributedGraphGroup(GraphGroupBase):
 
     def add_all_reduce_layer(self, context: GraphContext, input_name,
                              output_name, device_ids, to_reduce_tensors):
-        counter = current_all_reduce_helper().gen_id()
         for device_id, to_reduce_tensor in zip(np.nditer(device_ids),
                                                to_reduce_tensors):
             device_id = device_id.item()
@@ -1583,7 +1581,6 @@ class DistributedGraphGroup(GraphGroupBase):
                 strategy=strategy,
                 dtype=to_reduce_tensor.dtype,
                 config=AllReduceConfig(0),
-                counter=counter,
                 reduce_fusion_params=AllReduceFusionParams(),
             )
             plugin_info = PluginInfo(allreduce_plg_creator, "allreduce", pfc)
@@ -2198,7 +2195,7 @@ def parallelize(
     if not debug_mode:
         init_all_reduce_helper()
         tp_size = phy_mesh.size // config.graph_config.num_stages
-        shape = (CustomAllReduceHelper.POINTERS_PER_RANK * tp_size, )
+        shape = (CustomAllReduceHelper.POINTERS_PER_RANK * tp_size + 1, )
         workspace = graph.as_trt().add_input(
             name="all_reduce_workspace",
             dtype=trt.int64,

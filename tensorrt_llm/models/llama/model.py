@@ -14,6 +14,8 @@
 # limitations under the License.
 from typing import Optional, Union
 
+import transformers
+
 from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
@@ -310,7 +312,8 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                                mapping=mapping,
                                                quant_config=quant_config,
                                                **kwargs)
-
+        if config.remove_duplicated_kv_heads:
+            config.num_key_value_heads /= 2
         if use_preloading:
             assert not load_by_shard
             weights = load_weights_from_hf_model(hf_model, config)
@@ -324,7 +327,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
             weights = load_weights_from_hf_model(hf_model, config)
 
         check_share_embedding(weights, config)
-        model = LLaMAForCausalLM(config)
+        model = cls(config)
         model.load(weights)
         return model
 
@@ -350,7 +353,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         weights = load_weights_from_meta_ckpt(meta_ckpt_dir, config)
 
         check_share_embedding(weights, config)
-        model = LLaMAForCausalLM(config)
+        model = cls(config)
         model.load(weights)
         return model
 

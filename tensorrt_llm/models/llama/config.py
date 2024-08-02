@@ -21,7 +21,6 @@ import torch
 
 from ..._utils import torch_dtype_to_str
 from ...layers import MoeConfig
-from ...logger import logger
 from ...mapping import Mapping
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
@@ -37,6 +36,7 @@ class LLaMAConfig(PretrainedConfig):
                  residual_mlp: bool = False,
                  disable_weight_only_quant_plugin: bool = False,
                  moe: Optional[Union[MoeConfig, dict]] = None,
+                 remove_duplicated_kv_heads: bool = False,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -56,6 +56,7 @@ class LLaMAConfig(PretrainedConfig):
             moe = MoeConfig.from_dict(moe)
         assert isinstance(moe, MoeConfig)
         self.moe = moe.validate()
+        self.remove_duplicated_kv_heads = remove_duplicated_kv_heads
 
         super().__init__(**kwargs)
 
@@ -119,14 +120,12 @@ class LLaMAConfig(PretrainedConfig):
         attn_bias = getattr(hf_config, 'bias', False) or getattr(
             hf_config, 'attention_bias', False)
         rotary_scaling = getattr(hf_config, "rope_scaling", None)
-        if getattr(hf_config, "use_scaled_rope", False):
-            rotary_scaling = {"type": "wavelen"}
-        else:
-            rotary_scaling = getattr(hf_config, "rope_scaling", None)
         rotary_base = getattr(hf_config, "rope_theta", 10000.0)
         residual_mlp = getattr(hf_config, "parallel_attn_mlp_res", False)
         disable_weight_only_quant_plugin = kwargs.pop(
             'disable_weight_only_quant_plugin', False)
+        remove_duplicated_kv_heads = kwargs.pop('remove_duplicated_kv_heads',
+                                                False)
 
         if hf_config.model_type == "mixtral" or hf_config.model_type == "arctic":
             # HF LLaMA-type models are implicitly using gated activation.
@@ -150,14 +149,9 @@ class LLaMAConfig(PretrainedConfig):
                 dtype = torch_dtype_to_str(dtype)
             if dtype == 'float32':
                 dtype = 'float16'
-        if dtype == 'bfloat16' and torch.cuda.get_device_properties(
-                0).major < 8:
-            logger.warning(
-                "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
-            dtype = 'float16'
 
         return cls(
-            architecture='LlamaForCausalLM',
+            architecture=hf_config.architectures[0],
             dtype=dtype,
             num_hidden_layers=hf_config.num_hidden_layers,
             num_attention_heads=hf_config.num_attention_heads,
@@ -178,6 +172,7 @@ class LLaMAConfig(PretrainedConfig):
             moe=moe_config,
             mapping=mapping,
             quantization=quant_config,
+            remove_duplicated_kv_heads=remove_duplicated_kv_heads,
             **kwargs)
 
     @classmethod
@@ -212,14 +207,9 @@ class LLaMAConfig(PretrainedConfig):
 
         if dtype == 'auto':
             dtype = 'bfloat16'
-        if dtype == 'bfloat16' and torch.cuda.get_device_properties(
-                0).major < 8:
-            logger.warning(
-                "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
-            dtype = 'float16'
 
         if meta_config.get('use_scaled_rope'):
-            rotary_scaling = {"type": "wavelen"}
+            rotary_scaling = {"type": "llama3"}
         else:
             rotary_scaling = meta_config.get("rope_scaling")
 

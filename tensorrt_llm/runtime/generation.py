@@ -34,7 +34,7 @@ from tensorrt_llm.runtime.redrafter_utils import *
 
 from .._ipc_utils import set_peer_access
 from .._utils import (pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
-                      trt_dtype_to_torch, trt_gte_10)
+                      trt_dtype_to_torch)
 from ..logger import logger
 from ..lora_manager import LoraManager
 from ..mapping import Mapping
@@ -266,7 +266,7 @@ class _Runtime(object):
         self.engine_inspector = self.engine.create_engine_inspector()
         # cuda graph ping-pong instances
         self.cuda_graph_instances = [None for _ in range(2)]
-        if not (trt_gte_10() and self.engine.streamable_weights_size):
+        if not self.engine.streamable_weights_size:
             # engine does not have weight streaming enabled
             self.__prepare_execution_contexts()
 
@@ -371,20 +371,16 @@ class _Runtime(object):
         self.context_1 = None
         self.ctx_context = None
 
-        if not trt_gte_10():
-            assert gpu_weights_percent == 1, "Weight streaming is only supported by TensorRT 10.0 or later."
-            return
-        else:
-            min = self.engine.minimum_weight_streaming_budget
-            max = self.engine.streamable_weights_size
-            budget = int(min + gpu_weights_percent * (max - min))
+        min = self.engine.minimum_weight_streaming_budget
+        max = self.engine.streamable_weights_size
+        budget = int(min + gpu_weights_percent * (max - min))
 
-            budget_config = budget if gpu_weights_percent != 1 else 0
-            self.engine.weight_streaming_budget = budget_config
-            assert self.engine.weight_streaming_budget == budget_config, "Failed to set weight streaming budget!"
-            logger.info(
-                f"Set gpu weights percent to {gpu_weights_percent}, which is {budget} bytes. Valid range: {min} bytes ~ {max} bytes."
-            )
+        budget_config = budget if gpu_weights_percent != 1 else 0
+        self.engine.weight_streaming_budget = budget_config
+        assert self.engine.weight_streaming_budget == budget_config, "Failed to set weight streaming budget!"
+        logger.info(
+            f"Set gpu weights percent to {gpu_weights_percent}, which is {budget} bytes. Valid range: {min} bytes ~ {max} bytes."
+        )
 
         if self.engine.streamable_weights_size:
             try:
@@ -1086,9 +1082,6 @@ class GenerationSession(object):
         if not self.has_attn_layers:
             # Create two cuda graph once.If cuda graph has already existed, skip it.
             if self.runtime.cuda_graph_instances[instance_idx] is not None:
-                return
-            # WAR for TRT 9.x
-            if not trt_gte_10() and step < 3:
                 return
         # capture cuda graph
         CUASSERT(
@@ -2427,6 +2420,8 @@ class GenerationSession(object):
 
         if self.is_redrafter_mode:
             self.buffer['position_ids_base'] = context_lengths.clone()
+            # NOTE: Generate random tensors using torch
+            redrafter_prepare_random_tensors(self, batch_size, initialize=True)
 
         return ret
 
@@ -2466,24 +2461,25 @@ class GenerationSession(object):
             torch.cuda.nvtx.range_pop()
         ret = {'last_token_ids': last_token_ids}
 
-        if self.is_redrafter_mode:
-            torch.cuda.nvtx.range_push("position_ids_update")
-            #  set position_ids
-            # buffers are swapped but sequence_length is not updated at this point
+        if use_gpt_attention_plugin:
+            if self.is_redrafter_mode:
+                torch.cuda.nvtx.range_push("position_ids_update")
+                #  set position_ids
+                # buffers are swapped but sequence_length is not updated at this point
 
-            if step != 0:
-                self.buffer['position_ids_base'] += self.buffer[
-                    'num_accepted_tokens']
-            position_ids = self.buffer['packed_position_ids'].view(
-                -1)[:self.host_total_gen_token]
-            if step == 0:
-                position_ids -= 1
+                if step != 0:
+                    self.buffer['position_ids_base'] += self.buffer[
+                        'num_accepted_tokens']
+                position_ids = self.buffer['packed_position_ids'].view(
+                    -1)[:self.host_total_gen_token]
+                if step == 0:
+                    position_ids -= 1
 
-            torch.cuda.nvtx.range_pop()
-        elif use_gpt_attention_plugin:
-            position_ids = context_lengths + step
-            if not remove_input_padding:
-                position_ids = torch.unsqueeze(position_ids, 1)
+                torch.cuda.nvtx.range_pop()
+            else:
+                position_ids = context_lengths + step
+                if not remove_input_padding:
+                    position_ids = torch.unsqueeze(position_ids, 1)
 
             perf_knob_tensor_size = 16
             gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
@@ -2512,19 +2508,7 @@ class GenerationSession(object):
             redrafter_convert_spec_decoding_mask_to_packed_mask(
                 self, self.buffer['spec_decoding_generation_lengths'])
             # NOTE: Generate random tensors using torch
-            torch.cuda.nvtx.range_push("torch_rand")
-            # NOTE: Tried a single rand() instead of 2, no change in perf
-            torch.manual_seed(self.sequence_length_buffer.max())
-            self.buffer['rand_data_sample'] = torch.rand([batch_size],
-                                                         dtype=self.dtype,
-                                                         device=self.device)
-            self.buffer['rand_data_validation'] = torch.rand([
-                batch_size, self._model_config.redrafter_num_beams,
-                self._model_config.redrafter_draft_len_per_beam
-            ],
-                                                             dtype=self.dtype,
-                                                             device=self.device)
-            torch.cuda.nvtx.range_pop()
+            redrafter_prepare_random_tensors(self, batch_size)
         torch.cuda.nvtx.range_pop()
 
         return ret

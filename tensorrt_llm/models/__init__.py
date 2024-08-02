@@ -27,6 +27,7 @@ from .falcon.model import FalconForCausalLM, FalconModel
 from .gemma.model import GemmaForCausalLM
 from .gpt.config import GPTConfig
 from .gpt.model import GPTForCausalLM, GPTModel
+from .gptj.config import GPTJConfig
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .grok.model import GrokForCausalLM
@@ -65,12 +66,15 @@ __all__ = [
     'MedusaConfig',
     'MedusaForCausalLm',
     'ReDrafterForCausalLM',
+    'GPTJConfig',
     'GPTJModel',
     'GPTJForCausalLM',
     'GPTNeoXModel',
     'GPTNeoXForCausalLM',
     'PhiModel',
+    'PhiConfig',
     'Phi3Model',
+    'Phi3Config',
     'PhiForCausalLM',
     'Phi3ForCausalLM',
     'ChatGLMForCausalLM',
@@ -112,6 +116,7 @@ MODEL_MAP = {
     'FalconForCausalLM': FalconForCausalLM,
     'PhiForCausalLM': PhiForCausalLM,
     'Phi3ForCausalLM': Phi3ForCausalLM,
+    'Phi3VForCausalLM': Phi3ForCausalLM,
     'Phi3SmallForCausalLM': Phi3ForCausalLM,
     'MambaForCausalLM': MambaForCausalLM,
     'GPTNeoXForCausalLM': GPTNeoXForCausalLM,

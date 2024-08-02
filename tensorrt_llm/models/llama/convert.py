@@ -14,7 +14,6 @@
 # limitations under the License.
 import copy
 import functools
-import json
 import os
 import sys
 import time
@@ -473,8 +472,8 @@ def fp8_per_channel_quant_weight_gpu(weight, clamp_val, rank=0):
     xmax = x.abs().max(-1, keepdim=True).values
     # minimum scaling factor.
     torch_weight_scales = (xmax / 448.0).clamp(min=1.0 / (448.0 * 512.0))
+    out = x / torch_weight_scales
     torch_weight_scales = torch_weight_scales.reshape(-1)
-    out = x * 448.0 / xmax
     out = torch.clamp(out, -448, 448)
     processed_torch_weights = out.to(torch.float8_e4m3fn)
 
@@ -1321,13 +1320,12 @@ def quantize(hf_model_dir: str,
     '''
     #TODO: currently only smooth quant and kv cache quantization are supported, needs to support mode quant algorithm calling modelopt
 
-    with open(os.path.join(output_dir, 'config.json'), 'w') as f:
-        json.dump(config.to_dict(), f, indent=4)
+    config.to_json_file(os.path.join(output_dir, 'config.json'))
 
     mapping = config.mapping
     assert mapping.rank == -1, "You shall call quantize only once in one rank, assert rank==-1 for precaution"
-    quant_config = config.quantization
 
+    quant_config = config.quantization
     use_smooth_quant = quant_config.use_plugin_sq
     int8_kv_cache = quant_config.kv_cache_quant_algo == QuantAlgo.INT8
 
@@ -1386,6 +1384,9 @@ class QkvWeightHelper:
         self.head_size = None if not hasattr(config,
                                              "head_size") else config.head_size
         self._qkv_weights = {}
+        self.remove_duplicated_kv_heads = getattr(config,
+                                                  'remove_duplicated_kv_heads',
+                                                  False)
 
     @staticmethod
     def is_qkv_weight(name):
@@ -1418,6 +1419,17 @@ class QkvWeightHelper:
             return None
         weights = self._qkv_weights.pop(layer_idx)  # to prevent memory leak.
         q, k, v = (torch.tensor(weights[t]) for t in ['q', 'k', 'v'])
+
+        if self.remove_duplicated_kv_heads:
+            head_size = self.hidden_size // self.num_heads if self.head_size is None else self.head_size
+            k = k.reshape(
+                [k.shape[0] // head_size // 2, 2, head_size, self.hidden_size])
+            v = v.reshape(
+                [v.shape[0] // head_size // 2, 2, head_size, self.hidden_size])
+            assert (k[:, 0] == k[:, 1]).all()
+            assert (v[:, 0] == v[:, 1]).all()
+            k = k[:, 0].reshape([-1, self.hidden_size])
+            v = v[:, 0].reshape([-1, self.hidden_size])
 
         if not self.is_mha:
             head_size = self.hidden_size // self.num_heads if self.head_size is None else self.head_size
@@ -2096,6 +2108,29 @@ def load_weights_from_gptq(quant_ckpt_path: str, config: LLaMAConfig):
     return weights
 
 
+def load_torch_meta_ckpt(meta_ckpt_path: Path):
+    '''
+        meta_ckpt_path: The format of meta_ckpt_path is like <xxx>/consolidated.xx There are two possible cases:
+            1. A file like <xxx>/consolidated.xx.pth, loading it by torch.load directly
+            2. A folder like <xxx>/consolidated.xx/, need to load all weights in the folder.
+    '''
+    file_path = meta_ckpt_path.parent / (meta_ckpt_path.name + ".pth")
+    if file_path.exists() and file_path.is_file():
+        return torch.load(file_path, map_location="cpu")
+    else:
+        folder_path = meta_ckpt_path
+        assert folder_path.exists() and folder_path.is_dir()
+
+        ckpts = list(Path(folder_path).glob("consolidated-*.pth"))
+
+        all_weights = {}
+        for ckpt in ckpts:
+            _weight = torch.load(ckpt, map_location="cpu")
+            all_weights = all_weights | _weight
+            del _weight
+        return all_weights
+
+
 def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
     torch_dtype = str_dtype_to_torch(config.dtype)
     mapping = config.mapping
@@ -2153,9 +2188,8 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
             file_ids = list(range(fs, fs + nf))
             ckpts = []
             for f in file_ids:
-                ckpt = torch.load(Path(meta_ckpt_dir,
-                                       f"consolidated.{f:02d}.pth"),
-                                  map_location="cpu")
+                ckpt = load_torch_meta_ckpt(
+                    Path(meta_ckpt_dir, f"consolidated.{f:02d}"))
                 ckpts.append(ckpt)
             return gather_ckpts(ckpts)
         elif num_ckpts < mapping.tp_size:
@@ -2166,15 +2200,13 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
             ckpt_rank = mapping.tp_rank % ranks_per_ckpt
             nH_per_ckpt = config.num_attention_heads // num_ckpts
             assert (nH_per_ckpt % ranks_per_ckpt) == 0
-            ckpt = torch.load(Path(meta_ckpt_dir,
-                                   f"consolidated.{ckpt_fid:02d}.pth"),
-                              map_location="cpu")
+            ckpt = load_torch_meta_ckpt(
+                Path(meta_ckpt_dir, f"consolidated.{ckpt_fid:02d}"))
             return split_ckpt(ckpt, ranks_per_ckpt, ckpt_rank)
 
         # num_ckpts == tensor_parallel, 1:1 mapping from files to TP
-        return torch.load(Path(meta_ckpt_dir,
-                               f"consolidated.{mapping.tp_rank:02d}.pth"),
-                          map_location="cpu")
+        return load_torch_meta_ckpt(
+            Path(meta_ckpt_dir, f"consolidated.{mapping.tp_rank:02d}"))
 
     def permute(w, nH, d, dH):
         # due to MQA's wk, nH*dH != d could be true
@@ -2213,9 +2245,8 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
         if load_weights_from_meta_ckpt.saved_embed is None:
             embeds = [None] * num_ckpts
             for i in range(num_ckpts):
-                ckpt = torch.load(Path(meta_ckpt_dir,
-                                       f"consolidated.{i:02d}.pth"),
-                                  map_location="cpu")
+                ckpt = load_torch_meta_ckpt(
+                    Path(meta_ckpt_dir, f"consolidated.{i:02d}"))
                 embeds[i] = ckpt[name]
             embed = combine_embeddings(embeds, num_ckpts).to(torch_dtype)
             load_weights_from_meta_ckpt.saved_embed = embed
@@ -2228,14 +2259,19 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
     num_kv_heads = config.num_key_value_heads
     mha_mode = (num_kv_heads == config.num_attention_heads)
 
-    ckpts = list(Path(meta_ckpt_dir).glob("consolidated.*.pth"))
+    ckpts = list(Path(meta_ckpt_dir).glob("consolidated.*"))
     num_ckpts = len(ckpts)
     # llama/llama2 doesn't have MQA. So, simplifying loader logic by not worrying about it.
     assert num_kv_heads > 1 or num_kv_heads >= num_ckpts, \
         f"We don't know how the {num_kv_heads} KV heads are distributed among {num_ckpts} checkpoints."
 
-    head_size = config.hidden_size // config.num_attention_heads
+    tik = time.time()
     ckpt = get_current_weights(num_ckpts)
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    logger.info(f'[{mapping.rank}] get_current_weights. Total time: {t}')
+
+    head_size = config.hidden_size // config.num_attention_heads
     layers_range = mapping.pp_layers(config.num_hidden_layers)
 
     for l in layers_range:
@@ -2289,12 +2325,12 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
         else:
             # layer specific weights
             layer_idx = extract_layer_idx(k)
-            # Meta's recipe of not using fp8 rowwise for the first and last layer.
-            use_fp8_rowwise_in_layer = use_fp8_rowwise and (
-                layer_idx not in exclude_layers_id)
-
             if layer_idx is None or int(layer_idx) not in layers_range:
                 continue
+
+            # Meta's recipe of not using fp8 rowwise for the first and last layer.
+            use_fp8_rowwise_in_layer = use_fp8_rowwise and (
+                int(layer_idx) not in exclude_layers_id)
             idx = int(layer_idx) - layers_range[0]
             tllm_prex = f'transformer.layers.{idx}.'
 
