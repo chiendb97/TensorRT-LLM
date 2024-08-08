@@ -903,6 +903,8 @@ def load_weights_from_hf_model(hf_model,
             attn_dense_bias = None
         if use_smooth_quant:
             attn_dense_weight = attn_dense_weight.t()
+            proj_out_dim = attn_dense_weight.shape[0]
+
             int8_weights = generate_int8(
                 attn_dense_weight, act_range.get(prefix + 'self_attn.o_proj'))
             weights.update(
@@ -917,7 +919,7 @@ def load_weights_from_hf_model(hf_model,
                     last_prefix=tllm_prex +
                     'attention.quantization_scaling_factor',
                     smoother_value=smoother[(prefix + 'self_attn.o_proj')],
-                    smoother_shape=[1, config.hidden_size // mapping.tp_size],
+                    smoother_shape=[1, proj_out_dim // mapping.tp_size],
                     rank=mapping.tp_rank,
                     cat_dim=0))
         else:
@@ -1702,7 +1704,8 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
 
 
 def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
-    logger.info('Loading weights from Huggingface LLaMA safetensors...')
+    logger.info('Loading weights from Huggingface {} safetensors...'.format(
+        config.architecture.split('ForCausalLM')[0]))
     tik = time.time()
     import json
     import os
