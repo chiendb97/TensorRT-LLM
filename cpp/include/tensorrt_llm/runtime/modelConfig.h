@@ -40,10 +40,11 @@ public:
     enum class ModelVariant : std::int32_t
     {
         kGpt = 0,
-        kGlm = 1,            // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
-        kMamba = 2,          // https://github.com/state-spaces/mamba
-        kRecurrentGemma = 3, // https://github.com/google-deepmind/recurrentgemma
-        kEncDec = 4,
+        kChatGlm = 1,        // https://github.com/THUDM/ChatGLM-6B
+        kGlm = 2,            // https://github.com/THUDM/GLM
+        kMamba = 3,          // https://github.com/state-spaces/mamba
+        kRecurrentGemma = 4, // https://github.com/google-deepmind/recurrentgemma
+        kEncDec = 5,
     };
 
     struct RnnConfig
@@ -51,6 +52,8 @@ public:
         SizeType32 stateSize = 0;
         SizeType32 convKernel = 0;
         SizeType32 rnnHiddenSize = 0;
+        SizeType32 rnnHeadSize = 0;
+        SizeType32 rnnConvDimSize = 0;
     };
 
     enum class LayerType : std::int32_t
@@ -84,9 +87,7 @@ public:
         , mComputeContextLogits(false)
         , mComputeGenerationLogits(false)
         , mModelVariant(ModelVariant::kGpt)
-        , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
-        , mMaxDraftLen(0)
         , mContextFMHA(false)
         , mPagedContextFMHA(false)
         , mUseXQA{false}
@@ -118,13 +119,11 @@ public:
 
     [[nodiscard]] SizeType32 constexpr getNbAttentionLayers(SizeType32 pipelineParallelism = 1) const
     {
-        TLLM_CHECK(mNbAttentionLayers % pipelineParallelism == 0);
         return mNbAttentionLayers / pipelineParallelism;
     }
 
     [[nodiscard]] SizeType32 constexpr getNbRnnLayers(SizeType32 pipelineParallelism = 1) const
     {
-        TLLM_CHECK(mNbRnnLayers % pipelineParallelism == 0);
         return mNbRnnLayers / pipelineParallelism;
     }
 
@@ -354,29 +353,14 @@ public:
         mModelVariant = modelVariant;
     }
 
-    [[nodiscard]] bool constexpr useCustomAllReduce() const noexcept
+    [[nodiscard]] SizeType32 getMaxDecodingDraftTokens() const
     {
-        return mUseCustomAllReduce;
+        return getSpeculativeDecodingMode().isNone() ? 0 : getSpeculativeDecodingModule().getMaxDecodingDraftTokens();
     }
 
-    void constexpr useCustomAllReduce(bool customAllReduce) noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxDecodingTokens() const noexcept
     {
-        mUseCustomAllReduce = customAllReduce;
-    }
-
-    void constexpr setMaxDraftLen(SizeType32 maxDraftLen) noexcept
-    {
-        mMaxDraftLen = maxDraftLen;
-    }
-
-    [[nodiscard]] SizeType32 getMaxDraftLen() const
-    {
-        return mMaxDraftLen;
-    }
-
-    [[nodiscard]] SizeType32 constexpr getMaxTokensPerStep() const noexcept
-    {
-        return mMaxDraftLen + 1;
+        return getSpeculativeDecodingMode().isNone() ? 1 : getSpeculativeDecodingModule().getMaxDecodingTokens();
     }
 
     void constexpr setContextFMHA(bool contextFMHA) noexcept
@@ -532,7 +516,7 @@ public:
     [[nodiscard]] bool constexpr isTransformerBased() const noexcept
     {
         return mModelVariant == ModelVariant::kGpt || mModelVariant == ModelVariant::kGlm
-            || mModelVariant == ModelVariant::kRecurrentGemma;
+            || mModelVariant == ModelVariant::kChatGlm || mModelVariant == ModelVariant::kRecurrentGemma;
     }
 
     [[nodiscard]] bool hasRnnConfig() const noexcept
@@ -565,7 +549,7 @@ public:
         mLayerTypes = layerTypes;
     }
 
-    [[nodiscard]] SpeculativeDecodingMode getSpeculativeDecodingMode() const noexcept
+    [[nodiscard]] SpeculativeDecodingMode constexpr getSpeculativeDecodingMode() const noexcept
     {
         return mSpeculativeDecodingMode;
     }
@@ -615,11 +599,8 @@ private:
     bool mComputeContextLogits;
     bool mComputeGenerationLogits;
     ModelVariant mModelVariant;
-    bool mUseCustomAllReduce;
 
     SizeType32 mMaxPromptEmbeddingTableSize;
-    // TODO(rkobus): remove this from ModelConfig and use mSpeculativeDecodingModule
-    SizeType32 mMaxDraftLen;
 
     bool mContextFMHA;
     bool mPagedContextFMHA;

@@ -37,6 +37,9 @@ class MpiComm;
 namespace tensorrt_llm::executor
 {
 
+/// @brief Version of TRT-LLM
+char const* version() noexcept;
+
 class Model;
 class Serialization;
 
@@ -105,6 +108,7 @@ private:
     static std::optional<TokenIdType> const& checkTopPResetIds(std::optional<TokenIdType> const& topPResetIds);
     static std::optional<FloatType> const& checkTopPDecay(std::optional<FloatType> const& topPDecay);
     static std::optional<FloatType> const& checkTemperature(std::optional<FloatType> const& temperature);
+    static std::optional<FloatType> const& checkRepetitionPenalty(std::optional<FloatType> const& penalty);
     static std::optional<SizeType32> const& checkMinLength(std::optional<SizeType32> const& minLength);
     static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
     static std::optional<FloatType> const& checkBeamSearchDiversityRate(
@@ -233,6 +237,8 @@ private:
 class Request
 {
 public:
+    static constexpr PriorityType kDefaultPriority = 0.5;
+
     /// @brief The Request constructor
 
     /// @param inputTokenIds The input token ids
@@ -251,6 +257,9 @@ public:
     /// @param logitsPostProcessorName The logits postprocessor name. Must correspond to one of the logits postprocessor
     /// name provided to the ExecutorConfig.
     /// @param encoderInputTokenIds The encoder input token ids for encoder-decoder models, or encoder-only models
+    /// @param returnAllGeneratedTokens Indicates whether to return the full beams or just the newly generated tokens
+    /// after every streaming step.
+    /// @param priority Sets the execution priority of this request.
     Request(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -261,7 +270,8 @@ public:
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<std::string> logitsPostProcessorName = std::nullopt,
-        std::optional<VecTokens> encoderInputTokenIds = std::nullopt);
+        std::optional<VecTokens> encoderInputTokenIds = std::nullopt, std::optional<IdType> clientId = std::nullopt,
+        bool returnAllGeneratedTokens = false, PriorityType priority = kDefaultPriority);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -287,6 +297,9 @@ public:
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
     [[nodiscard]] std::optional<std::string> getLogitsPostProcessorName() const;
     [[nodiscard]] std::optional<VecTokens> getEncoderInputTokenIds() const;
+    [[nodiscard]] std::optional<IdType> getClientId() const;
+    [[nodiscard]] PriorityType getPriority() const;
+    [[nodiscard]] bool getReturnAllGeneratedTokens() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -301,6 +314,9 @@ public:
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLogitsPostProcessorName(std::string const& logitsPostProcessorName);
     void setEncoderInputTokenIds(VecTokens const& encoderInputTokenIds);
+    void setClientId(IdType clientId);
+    void setPriority(PriorityType priority);
+    void setReturnAllGeneratedTokens(bool returnAllGeneratedTokens);
 
 private:
     friend class Serialization;
@@ -445,6 +461,33 @@ private:
     bool mOnboardBlocks;
 };
 
+/// @brief Configuration class for the runtime perf knobs
+class ExtendedRuntimePerfKnobConfig
+{
+public:
+    explicit ExtendedRuntimePerfKnobConfig(bool multiBlockMode = false, bool enableContextFMHAFP32Acc = false);
+
+    [[nodiscard]] bool getMultiBlockMode() const;
+    [[nodiscard]] bool getEnableContextFMHAFP32Acc() const;
+
+    void setMultiBlockMode(bool const multiBlockMode);
+    void setEnableContextFMHAFP32Acc(bool const enableContextFMHAFP32Acc);
+
+    bool operator==(ExtendedRuntimePerfKnobConfig const& other) const
+    {
+        return mMultiBlockMode == other.mMultiBlockMode && mEnableContextFMHAFP32Acc == other.mEnableContextFMHAFP32Acc;
+    }
+
+private:
+    friend class Serialization;
+
+    /// @brief Control if multi block mode should be enabled or not.
+    bool mMultiBlockMode;
+
+    /// @brief If enable FMHA runner FP32 accumulation.
+    bool mEnableContextFMHAFP32Acc;
+};
+
 SizeType32 const kDefaultIterStatsMaxIterations = 1000;
 // Per request stats may have additional overhead due to going through all requests. Turned off by default.
 SizeType32 const kDefaultRequestStatsMaxIterations = 0;
@@ -453,20 +496,23 @@ class OrchestratorConfig
 {
 public:
     explicit OrchestratorConfig(bool isOrchestrator = true, std::string workerExecutablePath = "",
-        std::shared_ptr<mpi::MpiComm> orchLeaderComm = nullptr);
+        std::shared_ptr<mpi::MpiComm> orchLeaderComm = nullptr, bool spawnProcesses = true);
 
     [[nodiscard]] bool getIsOrchestrator() const;
     [[nodiscard]] std::string getWorkerExecutablePath() const;
     [[nodiscard]] std::shared_ptr<mpi::MpiComm> getOrchLeaderComm() const;
+    [[nodiscard]] bool getSpawnProcesses() const;
 
     void setIsOrchestrator(bool isOrchestrator);
     void setWorkerExecutablePath(std::string const& workerExecutablePath);
     void setOrchLeaderComm(std::shared_ptr<mpi::MpiComm> const& orchLeaderComm);
+    void setSpawnProcesses(bool spawnProcesses);
 
 private:
     bool mIsOrchestrator;
     std::string mWorkerExecutablePath;
     std::shared_ptr<mpi::MpiComm> mOrchLeaderComm;
+    bool mSpawnProcesses;
 };
 
 /// @brief A configuration class for the parallel execution parameters
@@ -648,11 +694,14 @@ public:
         bool normalizeLogProbs = true, SizeType32 iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
         SizeType32 requestStatsMaxIterations = kDefaultRequestStatsMaxIterations,
         BatchingType batchingType = BatchingType::kINFLIGHT, std::optional<SizeType32> maxBatchSize = std::nullopt,
+        std::optional<SizeType32> maxNumTokens = std::nullopt,
         std::optional<ParallelConfig> parallelConfig = std::nullopt,
         std::optional<PeftCacheConfig> const& peftCacheConfig = std::nullopt,
         std::optional<LogitsPostProcessorMap> logitsPostProcessorMap = std::nullopt,
         std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched = std::nullopt,
-        std::optional<DecodingConfig> decodingConfig = std::nullopt, float gpuWeightsPercent = 1);
+        std::optional<DecodingConfig> decodingConfig = std::nullopt, float gpuWeightsPercent = 1,
+        std::optional<SizeType32> maxQueueSize = std::nullopt,
+        ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig = ExtendedRuntimePerfKnobConfig());
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -663,15 +712,19 @@ public:
     [[nodiscard]] SizeType32 getRequestStatsMaxIterations() const;
     [[nodiscard]] BatchingType getBatchingType() const;
     [[nodiscard]] std::optional<SizeType32> getMaxBatchSize() const;
+    [[nodiscard]] std::optional<SizeType32> getMaxNumTokens() const;
     [[nodiscard]] std::optional<ParallelConfig> getParallelConfig() const;
     [[nodiscard]] std::optional<PeftCacheConfig> getPeftCacheConfig() const;
     [[nodiscard]] std::optional<LogitsPostProcessorMap> getLogitsPostProcessorMap() const;
     [[nodiscard]] std::optional<LogitsPostProcessorBatched> getLogitsPostProcessorBatched() const;
     [[nodiscard]] std::optional<DecodingConfig> getDecodingConfig() const;
     [[nodiscard]] float getGpuWeightsPercent() const;
+    [[nodiscard]] std::optional<SizeType32> getMaxQueueSize() const;
+    [[nodiscard]] ExtendedRuntimePerfKnobConfig getExtendedRuntimePerfKnobConfig() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
+    void setMaxNumTokens(SizeType32 maxNumTokens);
     void setSchedulerConfig(SchedulerConfig const& schedulerConfig);
     void setKvCacheConfig(KvCacheConfig const& kvCacheConfig);
     void setEnableChunkedContext(bool enableChunkedContext);
@@ -685,6 +738,8 @@ public:
     void setLogitsPostProcessorBatched(LogitsPostProcessorBatched const& logitsPostProcessorBatched);
     void setDecodingConfig(DecodingConfig const& decodingConfig);
     void setGpuWeightsPercent(float const& gpuWeightsPercent);
+    void setMaxQueueSize(std::optional<SizeType32> const& maxQueueSize);
+    void setExtendedRuntimePerfKnobConfig(ExtendedRuntimePerfKnobConfig const& ExtendedRuntimePerfKnobConfig);
 
 private:
     friend class Serialization;
@@ -716,14 +771,26 @@ private:
     /// @brief The max batch size of requests
     std::optional<SizeType32> mMaxBatchSize;
 
+    /// @brief The max number of tokens per batch
+    std::optional<SizeType32> mMaxNumTokens;
+
     /// @brief The parallel execution configuration.
     std::optional<ParallelConfig> mParallelConfig;
     std::optional<PeftCacheConfig> mPeftCacheConfig;
     std::optional<LogitsPostProcessorMap> mLogitsPostProcessorMap;
     std::optional<LogitsPostProcessorBatched> mLogitsPostProcessorBatched;
+
     /// @brief Decoding configuration.
     std::optional<DecodingConfig> mDecodingConfig;
+
+    /// @brief GPU weights percent for weight streaming.
     float mGpuWeightsPercent;
+
+    /// @brief The maximum number of requests allowed in queue before rejecting new requests.
+    std::optional<SizeType32> mMaxQueueSize;
+
+    /// @brief Config for perf knobs that can be set in runtime.
+    ExtendedRuntimePerfKnobConfig mExtendedRuntimePerfKnobConfig;
 };
 
 /// @brief The executor is responsible for receiving new requests and sending responses, and running the inference

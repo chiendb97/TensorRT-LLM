@@ -137,6 +137,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _gpt_attention_plugin: Optional[str] = field(default="auto", init=False)
     _gemm_plugin: Optional[str] = field(default=None, init=False)
     _gemm_swiglu_plugin: Optional[str] = field(default=None, init=False)
+    _fp8_rowwise_gemm_plugin: Optional[str] = field(default=None, init=False)
     _smooth_quant_gemm_plugin: Optional[str] = field(default=None, init=False)
     _identity_plugin: Optional[str] = field(default=None, init=False)
     _layernorm_quantization_plugin: Optional[str] = field(default=None,
@@ -157,15 +158,12 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
     # Features
     _context_fmha: bool = field(default=True, init=False)
-    _context_fmha_fp32_acc: bool = field(
+    _bert_context_fmha_fp32_acc: bool = field(
         default=False, init=False)  # will use fp16 if disabled
     _paged_kv_cache: bool = field(default=True, init=False)
     _remove_input_padding: bool = field(default=True, init=False)
-    _use_custom_all_reduce: bool = field(default=True, init=False)
     _reduce_fusion: bool = field(default=False, init=False)
-    _multi_block_mode: bool = field(default=False, init=False)
     _enable_xqa: bool = field(default=True, init=False)
-    _attention_qk_half_accumulation: bool = field(default=False, init=False)
     _tokens_per_block: int = field(default=64, init=False)
     _use_paged_context_fmha: bool = field(default=False, init=False)
     _use_fp8_context_fmha: bool = field(default=False, init=False)
@@ -221,7 +219,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
     @property
     def context_fmha_type(self):
-        if self.context_fmha_fp32_acc:
+        if self.bert_context_fmha_fp32_acc:
             return ContextFMHAType.enabled_with_fp32_acc
         elif self.context_fmha:
             return ContextFMHAType.enabled
@@ -232,18 +230,26 @@ class PluginConfig(metaclass=PluginConfigMeta):
     def context_fmha_type(self, value):
         if value == ContextFMHAType.disabled:
             self.context_fmha = False
-            self.context_fmha_fp32_acc = False
+            self.bert_context_fmha_fp32_acc = False
         else:
             self.context_fmha = True
             if value == ContextFMHAType.enabled:
-                self.context_fmha_fp32_acc = False
+                self.bert_context_fmha_fp32_acc = False
             elif value == ContextFMHAType.enabled_with_fp32_acc:
-                self.context_fmha_fp32_acc = True
+                self.bert_context_fmha_fp32_acc = True
 
     def set_smooth_quant_plugins(self, dtype: str = "auto"):
         self.smooth_quant_gemm_plugin = dtype
         self.rmsnorm_quantization_plugin = dtype
         self.layernorm_quantization_plugin = dtype
+        self.quantize_per_token_plugin = True
+        self.quantize_tensor_plugin = True
+        return self
+
+    def set_fp8_rowwise_quant_plugins(self, dtype: str = "auto"):
+        self.fp8_rowwise_gemm_plugin = dtype
+        self.rmsnorm_quantization_plugin = dtype
+        # self.layernorm_quantization_plugin = dtype
         self.quantize_per_token_plugin = True
         self.quantize_tensor_plugin = True
         return self
@@ -258,17 +264,9 @@ class PluginConfig(metaclass=PluginConfigMeta):
         self.tokens_per_block = tokens_per_block
         return self
 
-    def set_nccl_plugin(self,
-                        dtype: str = "auto",
-                        use_custom_all_reduce: bool = True):
-        if not use_custom_all_reduce:
-            logger.warning(
-                "allreduce algorithm is selected automatically during execution now. "
-                "use_custom_all_reduce will be deprecated in future releases. ")
+    def set_nccl_plugin(self, dtype: str = "auto"):
         self.nccl_plugin = dtype
-        self.use_custom_all_reduce = use_custom_all_reduce
-        if use_custom_all_reduce:
-            init_all_reduce_helper()
+        init_all_reduce_helper()
         return self
 
 
@@ -278,6 +276,7 @@ cli_plugin_args = [
     "gpt_attention_plugin",
     "gemm_plugin",
     "gemm_swiglu_plugin",
+    "fp8_rowwise_gemm_plugin",
     "lookup_plugin",
     "lora_plugin",
     "moe_plugin",
@@ -286,13 +285,10 @@ cli_plugin_args = [
 
     # Features
     "context_fmha",
-    "context_fmha_fp32_acc",
+    "bert_context_fmha_fp32_acc",
     "paged_kv_cache",
     "remove_input_padding",
-    "use_custom_all_reduce",
-    "multi_block_mode",
     "enable_xqa",
-    "attention_qk_half_accumulation",
     "tokens_per_block",
     "use_paged_context_fmha",
     "use_fp8_context_fmha",
@@ -340,12 +336,6 @@ class CustomAllReduceHelper:
         Globally visible class to help usage of custom_all_reduce plugin.
         Provides the following utilities:
 
-        gen_id: int
-            Used for synchronization with custom kernels. Plugins instances MUST have the same
-            id across GPUs. I.e.: GPU#0's allreduce after MLP at layer i must have the same id as
-            GPU#1, GPU#2... Also, ids MUST be unique per model. There should not be two allreduce instances
-            in GPU#0 that have the same id.
-
         workspace: Tensor
             When using CUSTOM or AUTO mode, a tensor containing pointers to memory
             visible to all GPUs. It should be 3 pointers per TP rank -
@@ -353,26 +343,19 @@ class CustomAllReduceHelper:
             It must be initialized using IpcMemory class.
 
         Usage:
-            - Use `init_all_reduce_helper` to reset the id counter. This must be done in main model class.
             - Set custom_all_reduce_helper.workspace with the required tensor.
               Then, each instance of allreduce will reference that tensor automatically.
     """
     POINTERS_PER_RANK = 4
 
     def __init__(self) -> None:
-        self.current_id: int = 1
         self.workspace: Optional[Tensor] = None
-
-    def gen_id(self) -> int:
-        result = self.current_id
-        self.current_id += 1
-        return result
 
     def set_workspace_tensor(self,
                              mapping: Mapping,
                              num_profiles: Optional[int] = None):
         from ..functional import Tensor
-        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size
+        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size + 1
 
         dim_range = None
         if num_profiles is not None:
@@ -394,14 +377,20 @@ class CustomAllReduceHelper:
 
     @staticmethod
     def allocate_workspace(mapping: Mapping,
-                           size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
+                           size: int,
+                           is_p2p_supported: bool = True
+                           ) -> Tuple[List[IpcMemory], "torch.tensor"]:
         import torch
-        ipc_buffers_ping = IpcMemory(mapping, size * mapping.tp_size)
-        ipc_buffers_pong = IpcMemory(mapping, size * mapping.tp_size)
+        ipc_buffers_ping = IpcMemory(mapping, size * mapping.tp_size,
+                                     is_p2p_supported)
+        ipc_buffers_pong = IpcMemory(mapping, size * mapping.tp_size,
+                                     is_p2p_supported)
         ipc_barriers_in = IpcMemory(
-            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2)
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
+            is_p2p_supported)
         ipc_barriers_out = IpcMemory(
-            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2)
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
+            is_p2p_supported)
         buffers = [
             ipc_buffers_ping,
             ipc_buffers_pong,
@@ -411,7 +400,7 @@ class CustomAllReduceHelper:
 
         return buffers, torch.tensor(
             ipc_buffers_ping.serialize() + ipc_buffers_pong.serialize() +
-            ipc_barriers_in.serialize() + ipc_barriers_out.serialize(),
+            ipc_barriers_in.serialize() + ipc_barriers_out.serialize() + [0],
             dtype=torch.int64,
             device="cpu")
 

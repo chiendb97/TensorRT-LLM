@@ -14,8 +14,11 @@ This document shows how to build and run an Encoder-Decoder (Enc-Dec) model in T
     - [Build TensorRT engine(s)](#build-tensorrt-engines)
     - [Run](#run)
       - [Run C++ runtime](#run-c-runtime)
+      - [Run with Triton Backend](#run-with-triton-backend)
       - [Run Python runtime](#run-python-runtime)
     - [Benchmark](#benchmark)
+      - [Benchmark C++ runtime](#benchmark-c-runtime)
+      - [Benchmark Python runtime](#benchmark-python-runtime)
     - [Run BART with LoRA](#run-bart-with-lora)
     - [Reminders](#reminders)
     - [Attention Scaling Factors](#attention-scaling-factors)
@@ -97,6 +100,8 @@ We should distinguish between `X` - TP size and `Y` - total number of GPU ranks:
 
 The default value of `--max_input_len` is 1024. When building DecoderModel, specify decoder input length with `--max_input_len=1` for encoder-decoder model to start generation from decoder_start_token_id of length 1. If the start token is a single token (the default behavior of T5/BART/etc.), you should set `--max_input_len` as 1; if you want the decoder-only type of generation, set `--max_input_len` above 1 to get similar behavior as HF's `decoder_forced_input_ids`.
 
+EncoderModel does not generate prompt. `--max_seq_len` should be the same as `--max_input_len`. `--max_seq_len` would be set as `--max_input_len` if not specified.
+
 DecoderModel takes `--max_encoder_input_len` and `--max_input_len` as model inputs, `--max_encoder_input_len` is set to 1024 as default since `--max_input_len` is 1024 for EncoderModel.
 
 To be noted:
@@ -112,10 +117,9 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
                 --paged_kv_cache disable \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
-                --max_seq_len 1224 \
+                --max_input_len 1024 \
                 --gemm_plugin ${INFERENCE_PRECISION} \
                 --bert_attention_plugin ${INFERENCE_PRECISION} \
                 --gpt_attention_plugin ${INFERENCE_PRECISION} \
@@ -127,16 +131,16 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
                 --output_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
+                --max_input_len 1 \
                 --max_seq_len 201 \
+                --max_encoder_input_len 1024 \
                 --gemm_plugin ${INFERENCE_PRECISION} \
                 --bert_attention_plugin ${INFERENCE_PRECISION} \
                 --gpt_attention_plugin ${INFERENCE_PRECISION} \
                 --remove_input_padding enable \
-                --context_fmha disable \
-                --max_input_len 1
+                --context_fmha disable
 
 ```
 
@@ -164,10 +168,9 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
                 --paged_kv_cache disable \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
-                --max_seq_len 1224 \
+                --max_input_len 1024 \
                 --gemm_plugin ${INFERENCE_PRECISION} \
                 --bert_attention_plugin ${INFERENCE_PRECISION} \
                 --gpt_attention_plugin ${INFERENCE_PRECISION} \
@@ -179,15 +182,15 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
                 --output_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
+                --max_input_len 1 \
                 --max_seq_len 201 \
+                --max_encoder_input_len 1024 \
                 --gemm_plugin ${INFERENCE_PRECISION} \
                 --bert_attention_plugin ${INFERENCE_PRECISION} \
                 --gpt_attention_plugin ${INFERENCE_PRECISION} \
-                --remove_input_padding enable \
-                --max_input_len 1
+                --remove_input_padding enable
                 # --context_fmha disable should be removed
 
 ```
@@ -207,14 +210,19 @@ Please refer to the documentation for the details of [paged kv cache](../../docs
 #### Run C++ runtime
 **Note: to use inflight batching and paged kv cache features in C++ runtime, please make sure you have set `--paged_kv_cache enable` (which is by default enabled) in the `trtllm-build` command of the decoder. Meanwhile, if using Python runtime, it is recommended to disable this flag by `--paged_kv_cache disable` to avoid any unnecessary overhead.**
 
+Note that for C++ runtime and Triton backend, Pipeline Parallelism (PP) is not supported yet, because PP usage is relatively rare for encoder-decoder models. If PP is really needed, it is recommended to use the Python runtime instead.
+
 For good usability, Python binding of the C++ runtime is provided. You can use the high-level C++ `ModelRunner` under the `examples/` root folder.
 
 ```python
 # Inferencing via python binding of C++ runtime with inflight batching (IFB)
-python3 ../run.py --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} --tokenizer_dir tmp/hf_models/${MODEL_NAME} --max_output_len 64 --input_text "translate English to German: The house is wonderful."
+python3 ../run.py --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} --tokenizer_dir tmp/hf_models/${MODEL_NAME} --max_output_len 64 --num_beams=1 --input_text "translate English to German: The house is wonderful."
 ```
 
 For pure C++ runtime, there is no example given yet. Please check the [`Executor`](../../cpp/include/tensorrt_llm/executor/executor.h) API to implement your own end-to-end workflow. It is highly recommended to leverage more encapsulated solutions such as the above C++ Python binding or [Triton backend](https://github.com/triton-inference-server/tensorrtllm_backend).
+
+#### Run with Triton Backend
+[Triton backend](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/encoder_decoder.md) contains the tutorial on how to run encoder-decoder engines with Tritonserver.
 
 #### Run Python runtime
 
@@ -230,6 +238,12 @@ mpirun --allow-run-as-root -np ${WORLD_SIZE} python3 run.py --engine_dir tmp/trt
 
 ### Benchmark
 
+#### Benchmark C++ runtime
+
+The tutorial for encoder-decoder C++ runtime benchmark can be found in [`benchmarks/cpp`](../../benchmarks/cpp/README.md#2-launch-c-benchmarking-inflightv1-batching)
+
+#### Benchmark Python runtime
+
 The benchmark implementation and entrypoint can be found in [`benchmarks/python/benchmark.py`](../../benchmarks/python/benchmark.py). Specifically, [`benchmarks/python/enc_dec_benchmark.py`](../../benchmarks/python/enc_dec_benchmark.py) is the benchmark script for Encoder-Decoder models.
 
 In `benchmarks/python/`:
@@ -237,17 +251,19 @@ In `benchmarks/python/`:
 ```bash
 # Example 1: Single-GPU benchmark
 python benchmark.py \
-    -m t5_small \
+    -m enc-dec \
     --batch_size "1;8" \
     --input_output_len "60,20;128,20" \
+    --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} \
     --dtype float32 \
     --csv # optional
 
 # Example 2: Multi-GPU benchmark
 mpirun --allow-run-as-root -np 4 python benchmark.py \
-    -m t5_small \
+    -m enc-dec \
     --batch_size "1;8" \
     --input_output_len "60,20;128,20" \
+    --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} \
     --dtype float32 \
     --csv # optional
 ```
@@ -284,10 +300,9 @@ trtllm-build --checkpoint_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISIO
                 --paged_kv_cache disable \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
-                --max_seq_len 1224 \
+                --max_input_len 1024 \
                 --gemm_plugin ${INFERENCE_PRECISION} \
                 --bert_attention_plugin ${INFERENCE_PRECISION} \
                 --gpt_attention_plugin ${INFERENCE_PRECISION} \
@@ -300,15 +315,15 @@ trtllm-build --checkpoint_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISIO
                 --output_dir tmp/trt_engines/bart-large-cnn/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
+                --max_input_len 1 \
                 --max_seq_len 201 \
+                --max_encoder_input_len 1024 \
                 --gemm_plugin ${INFERENCE_PRECISION} \
                 --bert_attention_plugin ${INFERENCE_PRECISION} \
                 --gpt_attention_plugin ${INFERENCE_PRECISION} \
                 --remove_input_padding disable \
-                --max_input_len 1 \
                 --lora_plugin ${INFERENCE_PRECISION} \
                 --lora_dir tmp/hf_models/bart-large-cnn-samsum-lora/ \
                 --lora_target_modules attn_q cross_attn_q attn_v cross_attn_v
@@ -342,8 +357,7 @@ python run.py \
 
 ### Reminders
 
-- Flan-T5 models have known issues regarding FP16 precision and using BF16 precision is recommended, regardless of TRT-LLM. While we are working on improving FP16 results, please stay with FP32 or BF16 precision for Flan-T5 family.
-- Batched/Ragged input with beam search is having subtle issues with some sequence results being truncated. For the time being, please follow (1) if batch size = 1, no problem (2) if batched input is padded (i.e., not using `--remove_input_padding` flag), no problem (3) if batched input is ragged (i.e., using `--remove_input_padding`), only use greedy search for now.
+- Flan-T5 models have known issues regarding FP16 precision and using BF16 precision is recommended, regardless of TRT-LLM. Please stay with FP32 or BF16 precision for Flan-T5 family.
 - For T5 and Flan-T5 family that have relative attention bias design, the relative attention table is split along `num_heads` dimension in Tensor Parallelism mode. Therefore, `num_heads` must be divisible by `tp_size`. Please be aware of this when setting the TP parameter.
 - For mBART, models that can control output languages (e.g. [`mbart-large-50-many-to-many-mmt`](https://huggingface.co/facebook/mbart-large-50-many-to-many-mmt)) are not currently supported, as the script does not support `ForcedBOSTokenLogitsProcessor` to control output languages.
 
@@ -391,10 +405,9 @@ trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/encode
                 --paged_kv_cache disable \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
-                --max_seq_len 1224 \
+                --max_input_len 1024 \
                 --bert_attention_plugin ${INFERENCE_PRECISION} \
                 --gpt_attention_plugin ${INFERENCE_PRECISION} \
                 --remove_input_padding disable
@@ -403,14 +416,14 @@ trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/decode
                 --output_dir tmp/trt_engines/wmt14/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
+                --max_input_len 1 \
                 --max_seq_len 201 \
+                --max_encoder_input_len 1024 \
                 --bert_attention_plugin ${INFERENCE_PRECISION} \
                 --gpt_attention_plugin ${INFERENCE_PRECISION} \
-                --remove_input_padding disable \
-                --max_input_len 1
+                --remove_input_padding disable
 # Run
 mpirun --allow-run-as-root -np ${WORLD_SIZE} python3 run.py --engine_dir tmp/trt_engines/wmt14/${INFERENCE_PRECISION} --engine_name wmt14 --model_name tmp/fairseq_models/wmt14/${INFERENCE_PRECISION} --max_new_token=24 --num_beams=1
 ```

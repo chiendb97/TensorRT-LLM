@@ -121,13 +121,12 @@ MODEL_NAME_PATTERN_MAP = {
     "Bloom": "bloom",
     "ChatGLM": "chatglm",
     "QWen": "qwen",
-    "KiLM": "kilm",
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
     "ArcticForCausalLM": "llama",
-    "MedusaForCausalLM": "llama",
     "Phi3SmallForCausalLM": "phi3small",
     "Phi3ForCausalLM": "phi3",
+    "Starcoder2ForCausalLM": "gptnext",
 }
 
 
@@ -140,11 +139,13 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
         trust_remote_code=True,
     )
 
-    # can't set attribute 'pad_token' for "<unk>"
-    if tokenizer.pad_token != "<unk>":  # nosec B105
-        tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        if model_type and model_type == "qwen":
+            # qwen use token id 151643 as pad and eos tokens
+            tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
+            tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
+        else:
+            tokenizer.pad_token = tokenizer.eos_token
     assert tokenizer.pad_token is not None, f"Pad token for {model_type} cannot be set!"
 
     return tokenizer
@@ -174,14 +175,21 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
         raise NotImplementedError(f"Unknown dtype {dtype}")
 
     # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
+    hf_config = AutoConfig.from_pretrained(ckpt_path, trust_remote_code=True)
+    model_cls = AutoModelForCausalLM
+    if hf_config.model_type == "llava":
+        from transformers import LlavaForConditionalGeneration
+        model_cls = LlavaForConditionalGeneration
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
     else:
-        model = AutoModelForCausalLM.from_pretrained(
+        model = model_cls.from_pretrained(
             ckpt_path,
             device_map="auto" if device != "cpu" else "cpu",
             torch_dtype="auto",
             trust_remote_code=True)
+        if hf_config.model_type == "llava":
+            model = model.language_model
     model.eval()
 
     model_dtype = next(model.parameters()).dtype
@@ -375,7 +383,6 @@ def quantize_and_export(*,
 
     model = get_model(model_dir, dtype, device=device)
     model_type = get_model_type(model)
-    model_arch = type(model).__name__
     if "vila" in model_dir:
         tokenizer = get_tokenizer(model_dir + "/llm",
                                   max_seq_length=tokenizer_max_seq_length,
@@ -506,29 +513,28 @@ def quantize_and_export(*,
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
-        # Workaround for kilm version
-        if model_type == 'kilm':
+        # Set rotary parameters correctly for chatglm.
+        if model_type == 'chatglm':
+            rotary_base = 10000.0
+            rotary_embedding_scaling = None
+            chatglm_config = AutoConfig.from_pretrained(model_dir,
+                                                        trust_remote_code=True)
+            chatglm_version = tensorrt_llm_config['chatglm_version']
+            rope_ratio = tensorrt_llm_config.get('rope_ratio', 1.0)
+            if chatglm_version == 'chatglm2':
+                if rope_ratio > 1:
+                    rotary_embedding_scaling = {
+                        'type': 'linear',
+                        'factor': rope_ratio
+                    }
+            elif chatglm_version == 'chatglm3':
+                rotary_base *= rope_ratio
+
             with open(f"{export_path}/config.json", "r") as f:
                 tensorrt_llm_config = json.load(f)
-            kilm_config = AutoConfig.from_pretrained(model_dir,
-                                                     trust_remote_code=True)
-            tensorrt_llm_config["kilm_type"] = kilm_config.model_type
-            tensorrt_llm_config[
-                "intermediate_size"] = kilm_config.intermediate_size
-            with open(f"{export_path}/config.json", "w") as f:
-                json.dump(tensorrt_llm_config, f, indent=4)
-
-        # Workaround for medusa version
-        if model_arch == "MedusaForCausalLM":
-            with open(f"{export_path}/config.json", "r") as f:
-                tensorrt_llm_config = json.load(f)
-            medusa_config = AutoConfig.from_pretrained(model_dir,
-                                                       trust_remote_code=True)
-            tensorrt_llm_config["architecture"] = "MedusaForCausalLM"
-            tensorrt_llm_config["num_medusa_heads"] = medusa_config.medusa_num_heads
-            tensorrt_llm_config["num_medusa_layers"] = medusa_config.medusa_num_layers
-            tensorrt_llm_config["max_draft_len"] = max_draft_len
-
+            tensorrt_llm_config['rotary_base'] = rotary_base
+            tensorrt_llm_config['rotary_scaling'] = rotary_embedding_scaling
+            tensorrt_llm_config['rotary_pct'] = 0.5
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 

@@ -53,11 +53,14 @@ using IterationType = std::uint64_t;
 using RandomSeedType = std::uint64_t;
 using VecLogProbs = std::vector<FloatType>;
 using StreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
-using LogitsPostProcessor = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr const&)>;
+using LogitsPostProcessor
+    = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>;
 using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcessor>;
 using LogitsPostProcessorBatched = std::function<void(std::vector<IdType> const&, std::vector<Tensor>&,
-    std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&)>;
+    std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&,
+    std::vector<std::optional<IdType>> const&)>;
 using MedusaChoices = std::vector<std::vector<SizeType32>>;
+using PriorityType = float;
 
 enum class DataType
 {
@@ -279,6 +282,8 @@ struct IterationStats
     double iterLatencyMS;
     /// @brief Number of active requests
     SizeType32 numActiveRequests;
+    /// @brief Number of queued requests
+    SizeType32 numQueuedRequests;
     /// @brief Number of max active requests
     SizeType32 maxNumActiveRequests;
     /// @brief GPU memory usage in bytes
@@ -375,7 +380,7 @@ public:
 
     static auto constexpr Medusa()
     {
-        return DecodingMode{kMedusa | kUseMinLength | kStandardStopCriteria};
+        return DecodingMode{kMedusa | kUseMinLength | kStandardStopCriteria | kUseExplicitEosStop};
     }
 
     static auto constexpr Lookahead()

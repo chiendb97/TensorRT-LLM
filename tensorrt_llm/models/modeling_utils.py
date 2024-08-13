@@ -14,9 +14,10 @@ import torch
 from .._common import default_net
 from .._utils import (get_init_params, numpy_to_torch, release_gc,
                       str_dtype_to_torch, str_dtype_to_trt, trt_dtype_to_torch)
-from ..functional import PositionEmbeddingType, Tensor, gather_last_token_logits
-from ..layers import (AttentionParams, Embedding, FusedGatedMLP, FusedRgLru,
-                      GatedMLP, KeyValueCacheParams, LoraParams,
+from ..functional import (PositionEmbeddingType, Tensor,
+                          gather_last_token_logits, tanh)
+from ..layers import (MLP, AttentionParams, Embedding, FusedGatedMLP,
+                      FusedRgLru, GatedMLP, KeyValueCacheParams, LoraParams,
                       PromptTuningEmbedding, RgLru)
 from ..layers.attention import Attention, BertAttention
 from ..layers.linear import ColumnLinear, Linear, RowLinear
@@ -26,6 +27,7 @@ from ..logger import logger
 from ..mapping import Mapping
 from ..module import Module, ModuleList
 from ..parameter import Parameter
+from ..plugin import init_all_reduce_helper
 from ..quantization import QuantMode
 from ..quantization.layers import (WeightOnlyGroupwiseQuantLinear,
                                    WeightOnlyGroupwiseQuantRowLinear,
@@ -72,6 +74,7 @@ class QuantConfig:
     kv_cache_quant_algo: Optional[QuantAlgo] = None
     group_size: Optional[int] = 128
     smoothquant_val: Optional[float] = None
+    clamp_val: Optional[List[float]] = None
     has_zero_point: Optional[bool] = False
     pre_quant_scale: Optional[bool] = False
     exclude_modules: Optional[List[str]] = None
@@ -208,6 +211,10 @@ class PretrainedConfig:
             raise NotImplementedError(
                 "Embedding table cannot be shared for pipeline parallelism")
 
+        if share_embedding_table and mapping.cp_size > 1:
+            raise NotImplementedError(
+                "Embedding table cannot be shared for context parallelism")
+
         if head_size is None:
             head_size = hidden_size // num_attention_heads
         self.head_size = head_size
@@ -274,6 +281,7 @@ class PretrainedConfig:
     def set_rank(self, rank):
         self.mapping = Mapping(self.mapping.world_size,
                                rank=rank,
+                               cp_size=self.mapping.cp_size,
                                tp_size=self.mapping.tp_size,
                                pp_size=self.mapping.pp_size,
                                moe_tp_size=self.mapping.moe_tp_size,
@@ -370,6 +378,7 @@ class PretrainedModel(Module,
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
+        init_all_reduce_helper()
         self.config = config
 
     def __post_init__(self):
@@ -411,8 +420,6 @@ class PretrainedModel(Module,
         if rank is not None:
             config.set_rank(rank)
 
-        model = cls(config)
-        weights = None
         if config.architecture in WEIGHT_LOADER_MODELS:
             weights_path = os.path.join(ckpt_dir, 'rank0.safetensors')
         else:
@@ -423,12 +430,9 @@ class PretrainedModel(Module,
         weights = safetensors.torch.load_file(weights_path)
 
         is_checkpoint_pruned = getattr(config, 'is_pruned', False)
-        if weights is not None:
-            preprocess_weights(weights,
-                               config,
-                               from_pruned=is_checkpoint_pruned)
-            model.load(weights, from_pruned=is_checkpoint_pruned)
-
+        preprocess_weights(weights, config, from_pruned=is_checkpoint_pruned)
+        model = cls(config)
+        model.load(weights, from_pruned=is_checkpoint_pruned)
         return model
 
     def load(self, weights, from_pruned=False):
@@ -499,22 +503,24 @@ class PretrainedModel(Module,
         if save_config:
             self.config.to_json_file(os.path.join(output_dir, 'config.json'))
 
-    def prepare_inputs(self,
-                       max_batch_size,
-                       max_input_len,
-                       max_seq_len,
-                       max_num_tokens,
-                       use_cache,
-                       max_beam_width: int = 1,
-                       opt_num_tokens: int = None,
-                       prompt_embedding_table_size: int = 0,
-                       position_encoding_2d: bool = False,
-                       max_draft_len: int = 0,
-                       speculative_decoding_draft_tokens_external: bool = False,
-                       gather_context_logits: bool = False,
-                       gather_generation_logits: bool = False,
-                       lora_target_modules: List[str] = None,
-                       opt_batch_size: int = 0):
+    def prepare_inputs(
+            self,
+            max_batch_size,
+            max_input_len,
+            max_seq_len,
+            max_num_tokens,
+            use_cache,
+            max_beam_width: int = 1,
+            opt_num_tokens: int = None,
+            prompt_embedding_table_size: int = 0,
+            position_encoding_2d: bool = False,
+            max_draft_len: int = 0,
+            speculative_decoding_draft_tokens_external: bool = False,
+            spec_decoding_is_generation_length_variable: bool = False,
+            gather_context_logits: bool = False,
+            gather_generation_logits: bool = False,
+            lora_target_modules: List[str] = None,
+            opt_batch_size: int = 0):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -528,8 +534,6 @@ class PretrainedModel(Module,
         use_gemm_plugin = default_net().plugin_config.gemm_plugin
         paged_kv_cache = default_net().plugin_config.paged_kv_cache
         tokens_per_block = default_net().plugin_config.tokens_per_block
-        use_custom_all_reduce = default_net(
-        ).plugin_config.use_custom_all_reduce
         use_lora_plugin = default_net().plugin_config.lora_plugin
         multiple_profiles = default_net().plugin_config.multiple_profiles
         streamingllm = default_net().plugin_config.streamingllm
@@ -558,11 +562,12 @@ class PretrainedModel(Module,
             mapping=self.config.mapping,
             gather_context_logits=gather_context_logits,
             gather_generation_logits=gather_generation_logits,
-            use_custom_all_reduce=use_custom_all_reduce,
             use_lora_plugin=use_lora_plugin,
             max_draft_len=max_draft_len,
             speculative_decoding_draft_tokens_external=
             speculative_decoding_draft_tokens_external,
+            spec_decoding_is_generation_length_variable=
+            spec_decoding_is_generation_length_variable,
             lora_target_modules=lora_target_modules,
             multiple_profiles=multiple_profiles,
             streamingllm=streamingllm,
@@ -600,7 +605,8 @@ class PretrainedModel(Module,
                 context_lengths=model_inputs['context_lengths'],
                 host_context_lengths=model_inputs['host_context_lengths'],
                 max_context_length=max_input_len,
-                host_request_types=model_inputs['host_request_types'])
+                host_request_types=model_inputs['host_request_types'],
+                host_runtime_perf_knobs=model_inputs['host_runtime_perf_knobs'])
         }
 
         if prompt_embedding_table_size > 0:
@@ -615,7 +621,7 @@ class PretrainedModel(Module,
                 model_inputs['lora_ranks'],
                 model_inputs['lora_weights_pointers'],
                 host_context_lengths=model_inputs['host_context_lengths'],
-                max_context_length=max_input_len,
+                max_num_tokens=max_num_tokens,
                 host_request_types=model_inputs['host_request_types'])
         if model_inputs['spec_decoding_params'] is not None:
             result['spec_decoding_params'] = model_inputs[
@@ -632,12 +638,13 @@ class PretrainedModel(Module,
         mapping: Optional[Mapping] = None,
         quant_config: Optional[QuantConfig] = None,
         *,
-        calib_dataset='cnn_dailymail',
-        calib_batches=512,
-        calib_batch_size=1,
-        calib_max_seq_length=512,
-        random_seed=1234,
-        tokenizer_max_seq_length=2048,
+        device: str = 'cuda',
+        calib_dataset: str = 'cnn_dailymail',
+        calib_batches: int = 512,
+        calib_batch_size: int = 1,
+        calib_max_seq_length: int = 512,
+        random_seed: int = 1234,
+        tokenizer_max_seq_length: int = 2048,
     ):
         if mapping is None:  # single gpu
             mapping = Mapping()
@@ -652,7 +659,7 @@ class PretrainedModel(Module,
             hf_model_dir)  # quantize_and_export has some code can not take Path
         quantize_and_export(
             model_dir=hf_model_dir,
-            device='cuda',
+            device=device,
             calib_dataset=calib_dataset,
             dtype=dtype,
             qformat=modelopt_qformat,
@@ -677,6 +684,9 @@ class DecoderModelForCausalLM(PretrainedModel):
         self.lm_head = lm_head
         self.mup_width_multiplier = getattr(config, 'mup_width_multiplier',
                                             None)
+        # Create constant attention parameters to be reused by all layers.
+        Attention.create_attention_const_params(self, config)
+        self.position_embedding_type = config.position_embedding_type
 
     def forward(self,
                 input_ids: Tensor,
@@ -692,6 +702,11 @@ class DecoderModelForCausalLM(PretrainedModel):
                 prompt_vocab_size: Optional[Tensor] = None,
                 lora_params=None,
                 spec_decoding_params=None):
+
+        # fill attention params.
+        attention_params = Attention.fill_attention_params(
+            self, attention_params)
+
         kwargs = {
             'input_ids': input_ids,
             'position_ids': position_ids,
@@ -730,6 +745,12 @@ class DecoderModelForCausalLM(PretrainedModel):
                 lm_logits *= getattr(self.config, 'output_multiplier_scale', 1)
             if self.mup_width_multiplier is not None:
                 lm_logits = lm_logits / self.mup_width_multiplier
+            if hasattr(self.config, "query_pre_attn_scalar"
+                       ) and self.config.final_logit_softcapping:
+                lm_logits = lm_logits * float(
+                    1 / self.config.final_logit_softcapping)
+                lm_logits = tanh(lm_logits) * float(
+                    self.config.final_logit_softcapping)
             lm_logits.mark_output('logits', self.config.logits_dtype)
         else:
             hidden_states.mark_output('hidden_states_output', self.config.dtype)
@@ -756,6 +777,10 @@ def fuse_gate_mlp(
     from ..quantization.quantize import fp8_quantize
 
     quant_algo = model.config.quantization.quant_algo
+    if quant_algo != QuantAlgo.FP8 and quant_algo is not None:
+        logger.warning("fuse_gate_mlp cannot be done for this model. Skipping.")
+        return model
+
     for name, mlp, layer in model.named_modules_with_parent():
         if isinstance(mlp, GatedMLP):
             init_params = get_init_params(mlp)
@@ -981,7 +1006,7 @@ def add_lora(model: PretrainedModel,
                 out_hidden_sizes=[layer.out_features],
                 max_low_rank=max_rank,
             )
-        if isinstance(layer, FusedGatedMLP):
+        if isinstance(layer, (MLP, FusedGatedMLP)):
             if max_rank is None:
                 max_rank = min(layer.hidden_size,
                                layer.ffn_hidden_size // layer.tp_size)
@@ -1002,7 +1027,7 @@ def to_ootb_moe(model: PretrainedModel) -> PretrainedModel:
     for name, layer, parent in model.named_modules_with_parent():
         if isinstance(layer, MOE):
             layer_name = name.rsplit('.', 1)[-1]
-            ootb_layer = layer.to(MoeOOTB, model.config)
+            ootb_layer = layer.to(MoeOOTB, model.config.quantization)
             setattr(parent, layer_name, ootb_layer)
     return model
 
@@ -1095,9 +1120,17 @@ def optimize_model(
 
 def preprocess_weights(weights: Dict[str, torch.Tensor],
                        model_config: PretrainedConfig,
-                       from_pruned=False) -> Dict[str, torch.Tensor]:
+                       from_pruned=False) -> None:
+    """This function in-place modifies weights and model_config, making them compatible with each other.
+
+    Note: Typically, it should be called before model creation and weight loading. For example,
+        preprocess_weights(weights, model_config)
+        model = XXXForCausalLM(model_config)
+        model.load(weights)
+    """
     quant_algo = model_config.quantization.quant_algo
     kv_cache_quant_algo = model_config.quantization.kv_cache_quant_algo
+    exclude_modules = model_config.quantization.exclude_modules
 
     # INT4_AWQ
     if quant_algo == QuantAlgo.W4A8_AWQ or quant_algo == QuantAlgo.W4A16_AWQ:
@@ -1156,10 +1189,21 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
                 model_config.dtype)
             weights.pop('lm_head.weights_scaling_factor', None)
             weights.pop('lm_head.activation_scaling_factor', None)
+    elif quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
+        for name, param in weights.items():
+            if name.endswith('weight') and param.dtype == torch.int8:
+                weights[name] = param.view(torch.float8_e4m3fn)
+        # lm_head is not quantized to FP8
+        if "lm_head.weight" in weights:
+            assert weights['lm_head.weight'].dtype == str_dtype_to_torch(
+                model_config.dtype)
+            weights.pop('lm_head.weights_scaling_factor', None)
+            weights.pop('lm_head.activation_scaling_factor', None)
 
     elif quant_algo in [QuantAlgo.W4A16, QuantAlgo.W8A16]:
         weights = weight_only_quantize_dict(weights=weights,
                                             quant_algo=quant_algo,
+                                            exclude_modules=exclude_modules,
                                             plugin=True)
 
     # FP8 kv_cache_scaling_factor is always 1.0
@@ -1176,6 +1220,11 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
                     weights[name] = torch.zeros_like(param)
 
     # For share_embedding_table
+    check_share_embedding(weights, model_config)
+
+
+def check_share_embedding(weights: Dict[str, torch.Tensor],
+                          model_config: PretrainedConfig):
     if model_config.share_embedding_table:
         if "lm_head.weight" in weights and "transformer.vocab_embedding.weight" in weights:
             if (weights["lm_head.weight"] -

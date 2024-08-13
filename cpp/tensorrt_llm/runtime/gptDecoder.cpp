@@ -16,8 +16,6 @@
 
 #include "tensorrt_llm/runtime/gptDecoder.h"
 
-#include "tensorrt_llm/common/cudaAllocator.h"
-#include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/externalDraftTokensKernels.h"
 #include "tensorrt_llm/layers/decodingParams.h"
@@ -30,36 +28,39 @@
 namespace tle = tensorrt_llm::executor;
 namespace tc = tensorrt_llm::common;
 namespace tl = tensorrt_llm::layers;
-namespace tcc = tensorrt_llm::common::conversion;
 namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 
 using namespace tensorrt_llm::runtime;
+
+using BufferConstPtr = IBuffer::SharedConstPtr;
+using BufferPtr = IBuffer::SharedPtr;
+using TensorConstPtr = ITensor::SharedConstPtr;
+using TensorPtr = ITensor::SharedPtr;
 
 template <typename T>
 GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth,
     size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
     std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule)
-    : mManager{stream}
+    : mManager{std::make_shared<BufferManager>(stream)}
     , mMaxBatchSize(maxBatchSize)
     , mDecodingMode{mode}
 {
     auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
         maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, speculativeDecodingModule);
-    auto allocator = std::make_shared<common::CudaAllocator>(mManager);
-    mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
-        mode, decodingDomain, stream->get(), std::move(allocator));
-
+    mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(mode, decodingDomain, mManager);
     auto constexpr nvFloatType = TRTDataType<float>::value;
-    mLogProbsTiled = mManager.gpu(ITensor::makeShape({static_cast<SizeType32>(maxSequenceLength),
-                                      static_cast<SizeType32>(maxBatchSize), static_cast<SizeType32>(maxBeamWidth)}),
+    mLogProbsTiled = mManager->gpu(ITensor::makeShape({static_cast<SizeType32>(maxSequenceLength),
+                                       static_cast<SizeType32>(maxBatchSize), static_cast<SizeType32>(maxBeamWidth)}),
         nvFloatType);
-    mManager.setZero(*mLogProbsTiled);
+    mManager->setZero(*mLogProbsTiled);
 }
 
 template <typename T>
 void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize,
-    std::optional<TensorPtr> const& batchSlots, std::optional<DecodingOutput> const& output)
+    std::optional<TensorConstPtr> const& batchSlots, std::optional<DecodingOutput> const& output)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     mSamplingConfig = samplingConfig;
     auto setupParams = std::make_shared<layers::DynamicDecodeSetupParams>();
 
@@ -126,29 +127,21 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         TLLM_CHECK_WITH_INFO(output.has_value(), "Output tensors must be provided for ExplicitDraftTokens");
         auto explicitDraftTokensParams = std::make_shared<tl::ExplicitDraftTokensSetupParams>();
         explicitDraftTokensParams->temperature = mSamplingConfig.temperature;
-        explicitDraftTokensParams->randomDataSample
-            = tcc::toTllmTensor(*output->explicitDraftTokensBuffers->randomDataSample);
-        explicitDraftTokensParams->temperatures = tcc::toTllmTensor(*output->explicitDraftTokensBuffers->temperatures);
+        explicitDraftTokensParams->randomDataSample = output->explicitDraftTokensBuffers->randomDataSample;
+        explicitDraftTokensParams->temperatures = output->explicitDraftTokensBuffers->temperatures;
 
         setupParams->decodingParams = explicitDraftTokensParams;
     }
 
     setupParams->decodingParams->randomSeed = mSamplingConfig.randomSeed;
 
-    auto const batchSlotsPtr = batchSlots.has_value() ? bufferCast<SizeType32>(*(batchSlots.value())) : nullptr;
-    mDynamicDecodeLayer->setup(batchSize, mSamplingConfig.beamWidth, batchSlotsPtr, setupParams);
+    mDynamicDecodeLayer->setup(batchSize, mSamplingConfig.beamWidth, batchSlots.value_or(nullptr), setupParams);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 namespace
 {
-void safeInsert(tc::TensorMap& map, std::string const& key, DecodingOutput::TensorPtr const& tensor)
-{
-    if (tensor)
-    {
-        ITensor const& t{*tensor};
-        map.insert({key, tcc::toTllmTensor(t)});
-    }
-}
 
 std::shared_ptr<tl::BanWordsDecodingInputs> prepareBanWordsInputs(DecodingInput const& input)
 {
@@ -156,8 +149,8 @@ std::shared_ptr<tl::BanWordsDecodingInputs> prepareBanWordsInputs(DecodingInput 
     if (input.badWordsPtrs)
     {
         TLLM_CHECK_WITH_INFO(input.badWordsPtrs, "Bad word lengths must be provided when badWordsPtrs is given");
-        banWordsParams->badWordsPtr = tcc::toTllmTensor(*input.badWordsPtrs);
-        banWordsParams->badWordsLengths = tcc::toTllmTensor(*input.badWordsLens);
+        banWordsParams->badWordsPtr = input.badWordsPtrs;
+        banWordsParams->badWordsLengths = input.badWordsLens;
         banWordsParams->maxBadWordsLen = input.maxBadWordsLen;
     }
 
@@ -171,14 +164,14 @@ std::shared_ptr<tl::StopCriteriaDecodingInputs> prepareStopCriteriaInputs(Decodi
     {
         TLLM_CHECK_WITH_INFO(input.stopWordsLens, "Stop word lengths must be provided when stopWordsPtrs is given");
 
-        stopCriteriaParams->stopWordsPtr = tcc::toTllmTensor(*input.stopWordsPtrs);
-        stopCriteriaParams->stopWordsLengths = tcc::toTllmTensor(*input.stopWordsLens);
+        stopCriteriaParams->stopWordsPtr = input.stopWordsPtrs;
+        stopCriteriaParams->stopWordsLengths = input.stopWordsLens;
         stopCriteriaParams->maxStopWordsLen = input.maxStopWordsLen;
     }
 
     if (input.sequenceLimitLength)
     {
-        stopCriteriaParams->sequenceLimitLength = tcc::toTllmTensor(*input.sequenceLimitLength);
+        stopCriteriaParams->sequenceLimitLength = input.sequenceLimitLength;
     }
 
     return stopCriteriaParams;
@@ -193,14 +186,14 @@ void prepareMedusaInputs(
 
     auto const& medusaInputs = inputs.medusaInputs.value();
 
-    inputParams->curTokensPerStep = tcc::toTllmTensor(*medusaInputs.medusaCurTokensPerStep);
-    inputParams->targetTokensPerStep = tcc::toTllmTensor(*medusaInputs.medusaTargetTokensPerStep);
-    inputParams->paths = tcc::toTllmTensor(*medusaInputs.medusaPaths);
-    inputParams->treeIds = tcc::toTllmTensor(*medusaInputs.medusaTreeIds);
+    inputParams->curTokensPerStep = medusaInputs.medusaCurTokensPerStep;
+    inputParams->targetTokensPerStep = medusaInputs.medusaTargetTokensPerStep;
+    inputParams->paths = medusaInputs.medusaPaths;
+    inputParams->treeIds = medusaInputs.medusaTreeIds;
     auto const batchSlots = bufferCast<SizeType32>(*inputs.batchSlots);
     if (medusaInputs.medusaLogits.size())
     {
-        std::vector<std::vector<tc::Tensor>> medusaLogits;
+        std::vector<std::vector<TensorPtr>> medusaLogits;
         auto const batchSize = medusaInputs.medusaLogits.size();
         medusaLogits.resize(maxBatchSize);
         for (size_t bi = 0; bi < batchSize; ++bi)
@@ -213,7 +206,7 @@ void prepareMedusaInputs(
             {
                 if (logitsHeads[hi])
                 {
-                    medusaLogits[slot][hi] = tcc::toTllmTensor(*logitsHeads[hi]);
+                    medusaLogits[slot][hi] = logitsHeads[hi];
                 }
             }
         }
@@ -233,45 +226,44 @@ void prepareExplicitDraftTokensInput(
 
     TLLM_CHECK_WITH_INFO(explicitDraftTokensInputs.has_value(), "ExplicitDraftTokensInputs are not set");
 
-    inputParams->nextDraftTokens = tcc::toTllmTensor(*explicitDraftTokensInputs->nextDraftTokens);
-    inputParams->nextFlatTokens = tcc::toTllmTensor(*explicitDraftTokensInputs->nextFlatTokens);
-    inputParams->nextDraftIndices = tcc::toTllmTensor(*explicitDraftTokensInputs->nextDraftIndices);
-    inputParams->nextDraftProbs = tcc::toTllmTensor(*explicitDraftTokensInputs->nextDraftProbs);
-    inputParams->lastDraftTokens = tcc::toTllmTensor(*explicitDraftTokensInputs->lastDraftTokens);
-    inputParams->lastDraftIndices = tcc::toTllmTensor(*explicitDraftTokensInputs->lastDraftIndices);
-    inputParams->masks = tcc::toTllmTensor(*explicitDraftTokensInputs->masks);
-    inputParams->packedPosIds = tcc::toTllmTensor(*explicitDraftTokensInputs->packedPositionIds);
-    inputParams->bestPathLengths = tcc::toTllmTensor(*explicitDraftTokensInputs->bestPathLengths);
-    inputParams->bestPathIndices = tcc::toTllmTensor(*explicitDraftTokensInputs->bestPathIndices);
-    inputParams->generationLengths = tcc::toTllmTensor(*explicitDraftTokensInputs->nextGenerationLengths);
-    inputParams->positionIdsBase = tcc::toTllmTensor(*explicitDraftTokensInputs->lastPositionIdsBase);
-    inputParams->lastGenerationLengths = tcc::toTllmTensor(*explicitDraftTokensInputs->lastGenerationLengths);
-    inputParams->maxGenLengthDevice = tcc::toTllmTensor(*explicitDraftTokensInputs->maxGenLengthDevice);
-    inputParams->seqSlots = tcc::toTllmTensor(*explicitDraftTokensInputs->seqSlots);
+    inputParams->nextDraftTokens = explicitDraftTokensInputs->nextDraftTokens;
+    inputParams->nextFlatTokens = explicitDraftTokensInputs->nextFlatTokens;
+    inputParams->nextDraftIndices = explicitDraftTokensInputs->nextDraftIndices;
+    inputParams->nextDraftProbs = explicitDraftTokensInputs->nextDraftProbs;
+    inputParams->lastDraftTokens = explicitDraftTokensInputs->lastDraftTokens;
+    inputParams->lastDraftIndices = explicitDraftTokensInputs->lastDraftIndices;
+    inputParams->masks = explicitDraftTokensInputs->masks;
+    inputParams->packedPosIds = explicitDraftTokensInputs->packedPositionIds;
+    inputParams->bestPathLengths = explicitDraftTokensInputs->bestPathLengths;
+    inputParams->bestPathIndices = explicitDraftTokensInputs->bestPathIndices;
+    inputParams->generationLengths = explicitDraftTokensInputs->nextGenerationLengths;
+    inputParams->positionIdsBase = explicitDraftTokensInputs->lastPositionIdsBase;
+    inputParams->lastGenerationLengths = explicitDraftTokensInputs->lastGenerationLengths;
+    inputParams->maxGenLengthDevice = explicitDraftTokensInputs->maxGenLengthDevice;
+    inputParams->seqSlots = explicitDraftTokensInputs->seqSlots;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
-    DecodingInput const& input, size_t maxBatchSize, tle::DecodingMode const& decodingMode)
+std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(DecodingInput const& input, size_t maxBatchSize,
+    tle::DecodingMode const& decodingMode, std::shared_ptr<BufferManager> bufferManager)
 {
     auto constexpr ite = 0;
 
     std::shared_ptr<tl::DecodingInputs> forwardParams;
     if (decodingMode.isTopKorTopP())
     {
-        forwardParams
-            = std::make_shared<tl::SamplingInputs>(tcc::toTllmTensor(*input.endIds), input.step, ite, input.batchSize);
+        forwardParams = std::make_shared<tl::SamplingInputs>(input.endIds, input.step, ite, input.batchSize);
     }
     else if (decodingMode.isBeamSearch())
     {
-        forwardParams = std::make_shared<tl::DecodingInputs>(tcc::toTllmTensor(*input.endIds), input.step, ite,
-            input.batchSize, input.maxAttentionWindow, input.sinkTokenLength);
+        forwardParams = std::make_shared<tl::DecodingInputs>(
+            input.endIds, input.step, ite, input.batchSize, input.maxAttentionWindow, input.sinkTokenLength);
     }
     else if (decodingMode.isMedusa())
     {
-        forwardParams = std::make_shared<tl::MedusaDecodingInputs>(tcc::toTllmTensor(*input.endIds), input.batchSize);
+        forwardParams = std::make_shared<tl::MedusaDecodingInputs>(input.endIds, input.batchSize);
     }
     else if (decodingMode.isLookahead())
     {
@@ -279,8 +271,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     }
     else if (decodingMode.isExplicitDraftTokens())
     {
-        forwardParams
-            = std::make_shared<tl::ExplicitDraftTokensInputs>(tcc::toTllmTensor(*input.endIds), input.batchSize);
+        forwardParams = std::make_shared<tl::ExplicitDraftTokensInputs>(input.endIds, input.batchSize);
     }
 
     // No logits for explicit draft tokens
@@ -288,34 +279,34 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     {
         if (input.logitsVec)
         {
-            std::vector<tc::Tensor> logitsVec;
+            std::vector<TensorPtr> logitsVec;
             for (auto const& logits : input.logitsVec.value())
             {
                 TLLM_CHECK(logits->getDataType() == TRTDataType<T>::value);
-                logitsVec.push_back(tcc::toTllmTensor(*logits));
+                logitsVec.push_back(logits);
             }
             forwardParams->logitsVec = logitsVec;
         }
         else if (input.logits)
         {
             TLLM_CHECK(input.logits->getDataType() == TRTDataType<T>::value);
-            forwardParams->logits = tcc::toTllmTensor(*input.logits);
+            forwardParams->logits = input.logits;
         }
     }
 
     if (input.cacheIndirection)
     {
-        forwardParams->srcCacheIndirection = tcc::toTllmTensor(*input.cacheIndirection);
+        forwardParams->srcCacheIndirection = input.cacheIndirection;
     }
 
     if (input.embeddingBias)
     {
-        forwardParams->embeddingBias = tcc::toTllmTensor(*input.embeddingBias);
+        forwardParams->embeddingBias = input.embeddingBias;
     }
 
     if (input.lengths)
     {
-        forwardParams->inputLengths = tcc::toTllmTensor(*input.lengths);
+        forwardParams->inputLengths = input.lengths;
     }
 
     forwardParams->banWordsInputs = prepareBanWordsInputs(input);
@@ -324,12 +315,12 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
 
     if (input.finished)
     {
-        forwardParams->finished = tcc::toTllmTensor(*input.finished);
+        forwardParams->finished = input.finished;
     }
 
     if (input.batchSlots)
     {
-        forwardParams->batchSlots = tcc::toTllmTensor(*input.batchSlots);
+        forwardParams->batchSlots = input.batchSlots;
     }
 
     // Medusa
@@ -390,7 +381,7 @@ void prepareBeamSearchOutputs(DecodingOutput& output, std::shared_ptr<tl::BaseDe
 
     if (output.cacheIndirection)
     {
-        outputParams->tgtCacheIndirection = tcc::toTllmTensor(*output.cacheIndirection);
+        outputParams->tgtCacheIndirection = output.cacheIndirection;
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -406,17 +397,17 @@ void prepareSpeculativeDecodingOutputs(DecodingOutput& output, std::shared_ptr<t
     auto const& speculativeDecodingOutputs = output.speculativeDecodingOutputs;
     TLLM_CHECK_WITH_INFO(speculativeDecodingOutputs.has_value(), "speculativeDecodingOutputs is not set");
 
-    outputParams->nextDraftTokens = tcc::toTllmTensor(*speculativeDecodingOutputs->nextDraftTokens);
-    outputParams->numNewTokens = tcc::toTllmTensor(*speculativeDecodingOutputs->acceptedTokensLen);
-    outputParams->numNewTokensCumSum = tcc::toTllmTensor(*speculativeDecodingOutputs->acceptedLengthsCumSum);
-    outputParams->pathsOffsets = tcc::toTllmTensor(*speculativeDecodingOutputs->pathsOffsets);
+    outputParams->nextDraftTokens = speculativeDecodingOutputs->nextDraftTokens;
+    outputParams->numNewTokens = speculativeDecodingOutputs->acceptedTokensLen;
+    outputParams->numNewTokensCumSum = speculativeDecodingOutputs->acceptedLengthsCumSum;
+    outputParams->pathsOffsets = speculativeDecodingOutputs->pathsOffsets;
     if (speculativeDecodingOutputs->nextDraftTokensLen)
     {
-        outputParams->nextDraftLengths = tcc::toTllmTensor(*speculativeDecodingOutputs->nextDraftTokensLen);
+        outputParams->nextDraftLengths = speculativeDecodingOutputs->nextDraftTokensLen;
     }
     if (speculativeDecodingOutputs->prevDraftTokensLen)
     {
-        outputParams->prevDraftLengths = tcc::toTllmTensor(*speculativeDecodingOutputs->prevDraftTokensLen);
+        outputParams->prevDraftLengths = speculativeDecodingOutputs->prevDraftTokensLen;
     }
 
     if (decodingMode.isExplicitDraftTokens())
@@ -424,18 +415,19 @@ void prepareSpeculativeDecodingOutputs(DecodingOutput& output, std::shared_ptr<t
         auto outputParams = std::dynamic_pointer_cast<tl::ExplicitDraftTokensOutputs>(baseOutputs);
         auto const& explicitDraftTokensBuffers = output.explicitDraftTokensBuffers;
         TLLM_CHECK_WITH_INFO(explicitDraftTokensBuffers.has_value(), "explicitDraftTokensBuffers is not set");
-        outputParams->packedMasks = tcc::toTllmTensor(*explicitDraftTokensBuffers->packedMasks);
-        outputParams->nextDraftPosIds = tcc::toTllmTensor(*explicitDraftTokensBuffers->positionIds);
+        outputParams->packedMasks = explicitDraftTokensBuffers->packedMasks;
+        outputParams->nextDraftPosIds = explicitDraftTokensBuffers->positionIds;
 
-        outputParams->unpackedNextDraftTokens = tcc::toTllmTensor(*explicitDraftTokensBuffers->draftTokens);
-        outputParams->unpackedNextDraftIndices = tcc::toTllmTensor(*explicitDraftTokensBuffers->draftIndices);
-        outputParams->nextDraftProbs = tcc::toTllmTensor(*explicitDraftTokensBuffers->draftProbs);
-        outputParams->positionIdsBase = tcc::toTllmTensor(*explicitDraftTokensBuffers->positionIdsBase);
-        outputParams->randomDataSample = tcc::toTllmTensor(*explicitDraftTokensBuffers->randomDataSample);
-        outputParams->randomDataValidation = tcc::toTllmTensor(*explicitDraftTokensBuffers->randomDataValidation);
-        outputParams->temperatures = tcc::toTllmTensor(*explicitDraftTokensBuffers->temperatures);
-        outputParams->generationLengths = tcc::toTllmTensor(*explicitDraftTokensBuffers->generationLengths);
-        outputParams->maxGenLengthHost = tcc::toTllmTensor(*explicitDraftTokensBuffers->maxGenLengthHost);
+        outputParams->unpackedNextDraftTokens = explicitDraftTokensBuffers->draftTokens;
+        outputParams->unpackedNextDraftIndices = explicitDraftTokensBuffers->draftIndices;
+        outputParams->nextDraftProbs = explicitDraftTokensBuffers->draftProbs;
+        outputParams->positionIdsBase = explicitDraftTokensBuffers->positionIdsBase;
+        outputParams->randomDataSample = explicitDraftTokensBuffers->randomDataSample;
+        outputParams->randomDataValidation = explicitDraftTokensBuffers->randomDataValidation;
+        outputParams->temperatures = explicitDraftTokensBuffers->temperatures;
+        outputParams->generationLengths = explicitDraftTokensBuffers->generationLengths;
+        outputParams->generationLengthsHost = explicitDraftTokensBuffers->generationLengthsHost;
+        outputParams->maxGenLengthHost = explicitDraftTokensBuffers->maxGenLengthHost;
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -449,53 +441,53 @@ std::shared_ptr<tl::BaseDecodingOutputs> prepareOutputs(
 
     if (decodingMode.isBeamSearch())
     {
-        outputParams = std::make_shared<tl::BeamSearchOutputs>(tcc::toTllmTensor(*output.ids));
+        outputParams = std::make_shared<tl::BeamSearchOutputs>(output.ids);
     }
     else if (decodingMode.isMedusa() || decodingMode.isLookahead())
     {
-        outputParams = std::make_shared<tl::SpeculativeDecodingOutputs>(tcc::toTllmTensor(*output.ids));
+        outputParams = std::make_shared<tl::SpeculativeDecodingOutputs>(output.ids);
     }
     else if (decodingMode.isExplicitDraftTokens())
     {
-        outputParams = std::make_shared<tl::ExplicitDraftTokensOutputs>(tcc::toTllmTensor(*output.ids));
+        outputParams = std::make_shared<tl::ExplicitDraftTokensOutputs>(output.ids);
     }
     else
     {
-        outputParams = std::make_shared<tl::BaseDecodingOutputs>(tcc::toTllmTensor(*output.ids));
+        outputParams = std::make_shared<tl::BaseDecodingOutputs>(output.ids);
     }
 
     // Common outputs
-    outputParams->newTokens = tcc::toTllmTensor(*output.newTokens);
+    outputParams->newTokens = output.newTokens;
 
     if (output.cumLogProbs)
     {
-        outputParams->cumLogProbs = tcc::toTllmTensor(*output.cumLogProbs);
+        outputParams->cumLogProbs = output.cumLogProbs;
     }
 
     if (output.parentIds)
     {
-        outputParams->parentIds = tcc::toTllmTensor(*output.parentIds);
+        outputParams->parentIds = output.parentIds;
     }
 
     if (output.finished)
     {
-        outputParams->finished = tcc::toTllmTensor(*output.finished);
+        outputParams->finished = output.finished;
     }
 
     if (output.finishedSum)
     {
-        outputParams->finishedSum = tcc::toTllmTensor(*output.finishedSum);
+        outputParams->finishedSum = output.finishedSum;
     }
 
     if (output.lengths)
     {
-        outputParams->sequenceLength = tcc::toTllmTensor(*output.lengths);
+        outputParams->sequenceLength = output.lengths;
     }
 
     if (output.logProbs)
     {
-        outputParams->outputLogProbs = tcc::toTllmTensor(*output.logProbs);
-        outputParams->outputLogProbsTiled = tcc::toTllmTensor(*logProbsTiled);
+        outputParams->outputLogProbs = output.logProbs;
+        outputParams->outputLogProbsTiled = logProbsTiled;
     }
 
     // Beam search outputs
@@ -520,7 +512,7 @@ template <typename T>
 void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode);
+    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode, mManager);
     auto outputParams = prepareOutputs(output, mLogProbsTiled, mDecodingMode);
 
     mDynamicDecodeLayer->forwardAsync(outputParams, forwardParams);
@@ -532,7 +524,7 @@ template <typename T>
 void GptDecoder<T>::forwardSync(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode);
+    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode, mManager);
     auto outputParams = prepareOutputs(output, mLogProbsTiled, mDecodingMode);
 
     mDynamicDecodeLayer->forwardSync(outputParams, forwardParams);
@@ -543,7 +535,8 @@ void GptDecoder<T>::forwardSync(DecodingOutput& output, DecodingInput const& inp
 // Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
 template <typename T>
 void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
-    DecodingInput const& decodingInput, BufferManager const& manager)
+    DecodingInput const& decodingInput, BufferManager const& manager,
+    std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const& finalOutputIdsShape = finalOutputIds.getShape();
@@ -570,25 +563,26 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
         bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream);
     sync_check_cuda_error();
 
-    // Prepare length penalty, use the value from mSamplingConfig or 1.0f by default
+    // Prepare length penalty, use the value from samplingConfig or 1.0f by default
+    SamplingConfig const& samplingConf = samplingConfig ? (*samplingConfig).get() : mSamplingConfig;
     std::vector<float> lengthPenaltyVec;
     TensorPtr lengthPenaltyPtr
         = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value));
-    if (!mSamplingConfig.lengthPenalty.has_value() || mSamplingConfig.lengthPenalty.value().size() == 0)
+    if (!samplingConf.lengthPenalty.has_value() || samplingConf.lengthPenalty.value().size() == 0)
     {
         lengthPenaltyVec = std::vector<float>(batchSize, 1.0f);
     }
-    else if (long int const size = mSamplingConfig.lengthPenalty.value().size(); size == 1)
+    else if (long int const size = samplingConf.lengthPenalty.value().size(); size == 1)
     {
-        lengthPenaltyVec = std::vector<float>(batchSize, mSamplingConfig.lengthPenalty.value()[0]);
+        lengthPenaltyVec = std::vector<float>(batchSize, samplingConf.lengthPenalty.value()[0]);
     }
     else
     {
         TLLM_CHECK_WITH_INFO(size == batchSize,
-            common::fmtstr("Size of lengthPenalty in SimplingConfig (" FMT_DIM ") is different from batchSize (" FMT_DIM
+            common::fmtstr("Size of lengthPenalty in SamplingConfig (" FMT_DIM ") is different from batchSize (" FMT_DIM
                            ")",
                 size, batchSize));
-        lengthPenaltyVec = mSamplingConfig.lengthPenalty.value();
+        lengthPenaltyVec = samplingConf.lengthPenalty.value();
     }
 
     lengthPenaltyPtr = manager.copyFrom(lengthPenaltyVec, ITensor::makeShape({batchSize}), runtime::MemoryType::kGPU);
@@ -601,7 +595,7 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
     bh.lengthPenalties = bufferCast<float>(*lengthPenaltyPtr);
     bh.inputLengths = bufferCast<SizeType32>(*decodingInput.lengths);
     bh.outputIds = bufferCast<TokenIdType>(finalOutputIds);
-    bh.logProbs = (decodingOutput.logProbs == nullptr) ? nullptr : bufferCast<float>(*decodingOutput.logProbs);
+    bh.logProbs = bufferCastOrNull<float>(decodingOutput.logProbs);
     bh.logProbsTiled = bufferCast<float>(*mLogProbsTiled);
     bh.sequenceLengths = bufferCast<SizeType32>(*decodingOutput.lengths);
     bh.cumLogProbs = bufferCast<float>(*decodingOutput.cumLogProbs);
@@ -647,7 +641,7 @@ void IGptDecoder::acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor 
     auto const targetTokenIdsShape = targetTokenIds.getShape();
     auto const beamWidth = targetTokenIdsShape.d[1];
     auto const maxSeqLength = targetTokenIdsShape.d[2];
-    auto const maxDraftTokens = draftTokenIds.getShape().d[1];
+    auto const maxDraftTokens = draftTokenIds.getDimension<1>();
 
     TLLM_CHECK_WITH_INFO(beamWidth == 1,
         common::fmtstr("Beam width (" FMT_DIM ") > 1 is not supported for the speculative decoding", beamWidth));
@@ -656,21 +650,21 @@ void IGptDecoder::acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor 
         common::fmtstr("Batch size (" FMT_DIM ") is not smaller or equal to max batch size (" FMT_DIM ")", batchSize,
             maxBatchSize));
 
-    TLLM_CHECK_WITH_INFO(draftTokenIds.getShape().d[0] == maxBatchSize,
+    TLLM_CHECK_WITH_INFO(draftTokenIds.getDimension<0>() == maxBatchSize,
         common::fmtstr("Draft tokens batch size (" FMT_DIM ") is not equal to target batch size (" FMT_DIM ")",
-            draftTokenIds.getShape().d[0], maxBatchSize));
+            draftTokenIds.getDimension<0>(), maxBatchSize));
 
-    TLLM_CHECK_WITH_INFO(contextLengths.getShape().d[0] == maxBatchSize,
+    TLLM_CHECK_WITH_INFO(contextLengths.getDimension<0>() == maxBatchSize,
         common::fmtstr("Context length batch size (" FMT_DIM ") is not equal to batch size (" FMT_DIM ")",
-            contextLengths.getShape().d[0], maxBatchSize));
+            contextLengths.getDimension<0>(), maxBatchSize));
 
-    TLLM_CHECK_WITH_INFO(numDraftTokens.getShape().d[0] == maxBatchSize,
+    TLLM_CHECK_WITH_INFO(numDraftTokens.getDimension<0>() == maxBatchSize,
         common::fmtstr("Num draft tokens batch size (" FMT_DIM ") is not equal to batch size (" FMT_DIM ")",
-            numDraftTokens.getShape().d[0], maxBatchSize));
+            numDraftTokens.getDimension<0>(), maxBatchSize));
 
-    TLLM_CHECK_WITH_INFO(sequenceLengths.getShape().d[0] == maxBatchSize,
+    TLLM_CHECK_WITH_INFO(sequenceLengths.getDimension<0>() == maxBatchSize,
         common::fmtstr("Sequence length batch size (" FMT_DIM ") is not equal to batch size (" FMT_DIM ")",
-            sequenceLengths.getShape().d[0], maxBatchSize));
+            sequenceLengths.getDimension<0>(), maxBatchSize));
 
     tksd::invokeAcceptDraftTokensByIds(bufferCast<TokenIdType>(draftTokenIds), bufferCast<TokenIdType>(targetTokenIds),
         bufferCast<SizeType32>(contextLengths), bufferCast<SizeType32>(numDraftTokens),

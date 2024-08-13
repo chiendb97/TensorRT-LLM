@@ -9,12 +9,12 @@ template = '''{{
   "ep_size": {ep_size},
   "world_rank": {world_rank},
   "num_tokens": {num_tokens},
-  "bias": 0,
   "act_fn": {act_fn},
   "norm_mode": {norm_mode},
   {dtype_string}
   {routing_string}
-  "tactic_id": {tactic_id}
+  {tactic_string}
+  "bias": 0
 }}'''
 
 
@@ -27,17 +27,26 @@ def make_dtype_string(dtypes=None):
     return f'"dtypes": ["{join_term.join(dtypes)}"],'
 
 
-def make_routing_string(name=None, values=None):
+def make_routing_string(name=None, values=None, is_distribution=False):
     if values is None and name is None:
         return ""
+    values_field = "routing_distribution" if is_distribution else "routing_values"
     if values is None:
-        return f'"routing_values": "{name}",'
+        return f'"{values_field}": "{name}",'
 
-    values = f'"routing_values": [{",".join(values)}],'
+    values = f'"{values_field}": [{",".join(map(str, values))}],'
     if name is not None:
         values += f' "routing_values_name": "{name}",'
 
     return values
+
+
+def make_tactic_string(tactic_id=None, tactic_id1=None, tactic_id2=None):
+    if tactic_id is not None:
+        return f'"tactic_id": {tactic_id},'
+    if not tactic_id1 and not tactic_id2:
+        return f'"tactic_id": "auto",'
+    return f'"tactic_id1": {tactic_id1},\n  "tactic_id2": {tactic_id2},'
 
 
 def populate_benchmark_config(**kwargs):
@@ -56,8 +65,10 @@ act_fn = 3
 norm_mode = 1
 dtype_string = make_dtype_string()  # All dtypes
 routing_string = make_routing_string(
-    name="balanced")  # Use the default uniform distribution
-tactic_id = '"auto"'
+    name="uniform",
+    is_distribution=True)  # Use the default uniform random distribution
+tactic_id1 = '"auto"'
+tactic_id2 = '"auto"'
 
 configs = []
 for num_tokens in [1, 8, 64, 2048, 65536]:
@@ -75,7 +86,8 @@ for num_tokens in [1, 8, 64, 2048, 65536]:
             norm_mode=norm_mode,
             dtype_string=dtype_string,
             routing_string=routing_string,
-            tactic_id=tactic_id,
+            tactic_string=make_tactic_string(tactic_id1=tactic_id1,
+                                             tactic_id2=tactic_id2),
         ))
 
 full_string = "[\n" + ",\n".join(configs) + "\n]"

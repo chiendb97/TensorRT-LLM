@@ -25,7 +25,7 @@ from datasets import load_dataset
 from transformers import (AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, GenerationConfig)
 from utils import (DEFAULT_HF_MODEL_DIRS, add_common_args, load_tokenizer,
-                   read_model_name)
+                   read_model_name, supports_inflight_batching)
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
@@ -63,6 +63,7 @@ def main(args):
         vocab_file=args.vocab_file,
         model_name=model_name,
         model_version=model_version,
+        tokenizer_type=args.tokenizer_type,
     )
     profiler.stop('load tokenizer')
     logger.info(
@@ -119,10 +120,20 @@ def main(args):
     max_attention_window_size = args.max_attention_window_size
     sink_token_length = args.sink_token_length
 
+    if args.end_id:
+        end_id = args.end_id
+
     stop_words_list = None
     if args.stop_words:
         stop_words_list = tensorrt_llm.runtime.decode_words_list(
             args.stop_words, tokenizer)
+    if model_version == 'glm-4':  # adddefault stop token ids for GLM-4
+        glm4_stop_ids = [[151329], [151336], [151338]]
+        if stop_words_list is None:
+            stop_words_list = [glm4_stop_ids] * args.batch_size
+        else:
+            for req_stop_words_list in stop_words_list:
+                req_stop_words_list.extend(glm4_stop_ids)
 
     bad_words_list = None
     if args.bad_words:
@@ -173,13 +184,12 @@ def main(args):
             curr_text = curr_text.strip().replace(" n't", "n't")
 
             # TODO: The below lines are used to be compatible with the original code; may need fix
-            if model_name == 'ChatGLMForCausalLM' and model_version in [
-                    'chatglm2', 'chatglm3'
-            ]:
+            if 'GLM' in model_name and model_version in ('chatglm2',
+                                                         'chatglm3'):
                 input_ids = tokenizer.encode(curr_text,
                                              return_tensors='pt').squeeze(0)
                 input_ids = input_ids[:test_token_num]
-            elif model_name == 'QWenForCausalLM' and model_version == 'qwen':
+            elif 'qwen' in model_name.lower() and model_version == 'qwen':
                 # use make_content to generate prompt
                 system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
                 _, input_id_list = make_context(
@@ -191,7 +201,7 @@ def main(args):
                 )
                 input_ids = torch.tensor(input_id_list)
             else:
-                if model_name == 'QWenForCausalLM' and model_version == 'qwen2':
+                if 'qwen' in model_name.lower() and 'qwen2' in model_version:
                     messages = [{
                         "role": "system",
                         "content": "You are a helpful assistant."
@@ -404,11 +414,21 @@ def main(args):
         return output_lines_list, tokens_list, ppls
 
     if test_trt_llm:
+        if not supports_inflight_batching(args.engine_dir):
+            logger.warning(
+                "The given engine does not support in-flight batching, fallback to python session"
+            )
+            args.use_py_session = True
+
         if not PYTHON_BINDINGS and not args.use_py_session:
             logger.warning(
                 "Python bindings of C++ session is unavailable, fallback to Python session."
             )
             args.use_py_session = True
+        if args.return_all_generated_tokens:
+            raise ValueError(
+                "Returning all the generated tokens at each step is not supported in summarize.py"
+            )
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
         runner_kwargs = dict(engine_dir=args.engine_dir,
                              rank=runtime_rank,
@@ -432,7 +452,9 @@ def main(args):
                 kv_cache_free_gpu_memory_fraction=args.
                 kv_cache_free_gpu_memory_fraction,
                 enable_chunked_context=args.enable_chunked_context,
-            )
+                multi_block_mode=args.multi_block_mode)
+        runner_kwargs.update(
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
             "PPL evaluation requires engine built with gather_all_token_logits enabled"
@@ -473,6 +495,7 @@ def main(args):
                 min_input_length=args.min_input_length)
             if output_tensorrt_llm == []:
                 data_point_idx += max_batch_size
+                ite_count += 1
                 continue
             profiler.stop('tensorrt_llm')
             if runtime_rank == 0:
@@ -513,7 +536,7 @@ def main(args):
             ite_count += 1
         del runner
 
-    if test_hf:
+    if test_hf and runtime_rank == 0:
         profiler.start('load HF model')
         dtype_alias_mapping = {
             'fp32': 'float32',
@@ -522,9 +545,9 @@ def main(args):
         }
         args.hf_data_type = dtype_alias_mapping.get(args.hf_data_type,
                                                     args.hf_data_type)
-        if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
+        if 'GLM' in model_name and model_version == 'glm':
             auto_model_cls = AutoModelForSeq2SeqLM
-        elif model_name == 'ChatGLMForCausalLM' and model_version == 'chatglm':
+        elif 'GLM' in model_name and model_version == 'chatglm':
             auto_model_cls = AutoModel
         else:
             auto_model_cls = AutoModelForCausalLM
@@ -586,6 +609,7 @@ def main(args):
             profiler.stop('hf')
             if output_hf == []:
                 data_point_idx += max_batch_size
+                ite_count += 1
                 continue
             if runtime_rank == 0:
                 seq_lengths = [len(tokens) for tokens in token_list]

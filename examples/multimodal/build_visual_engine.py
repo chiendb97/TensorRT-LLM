@@ -11,13 +11,6 @@ import yaml
 import torch
 import tensorrt as trt
 from tensorrt_llm.builder import Builder
-# isort: on
-import json
-import math
-
-import torch.nn.functional as F
-from PIL import Image
-from safetensors.torch import save_file
 from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           AutoModelForVision2Seq, AutoProcessor,
                           Blip2ForConditionalGeneration, Blip2Processor,
@@ -25,6 +18,13 @@ from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           LlavaForConditionalGeneration, NougatProcessor,
                           Pix2StructForConditionalGeneration,
                           VisionEncoderDecoderModel)
+# isort: on
+import json
+import math
+
+import torch.nn.functional as F
+from PIL import Image
+from safetensors.torch import save_file
 
 
 def parse_arguments():
@@ -33,10 +33,9 @@ def parse_arguments():
                         type=str,
                         default=None,
                         choices=[
-                            'opt-2.7b', 'opt-6.7b', 'flan-t5-xl', 'flan-t5-xxl',
-                            'llava', 'vila', 'nougat', 'cogvlm', 'fuyu',
-                            'pix2struct', 'neva', 'kosmos-2', 'video-neva',
-                            'phi-3-vision'
+                            'blip2', 'llava', 'llava_next', 'vila', 'nougat',
+                            'cogvlm', 'fuyu', 'pix2struct', 'neva', 'kosmos-2',
+                            'video-neva', 'phi-3-vision'
                         ],
                         help="Model type")
     parser.add_argument(
@@ -67,21 +66,21 @@ class VisionEngineBuilder:
         args.device = torch.device(
             "cuda") if torch.cuda.is_available() else "cpu"
         if args.output_dir is None:
-            args.output_dir = 'visual_engines/%s' % (
-                args.model_path.split('/')[-1] if args.vila_path is not None
-                else args.model_path.split('/')[-1])
-        if not os.path.exists(args.output_dir):
-            os.makedirs(args.output_dir)
+            # default path to save the engines
+            model_name = args.model_path.split('/')[-1]
+            args.output_dir = f'tmp/trt_engines/{model_name}/vision_encoder'
+
+        os.makedirs(args.output_dir, exist_ok=True)
 
         self.args = args
 
     def build(self):
         args = self.args
-        if 'opt' in args.model_type or 't5' in args.model_type:
+        if args.model_type == 'blip2':
             build_blip2_engine(args)
         elif args.model_type == 'pix2struct':
             build_pix2struct_engine(args)
-        elif args.model_type == 'llava':
+        elif 'llava' in args.model_type:
             build_llava_engine(args)
         elif args.model_type == 'vila':
             assert args.vila_path is not None, "Please clone and provide VILA source code path"
@@ -104,35 +103,42 @@ class VisionEngineBuilder:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
 
-def export_visual_wrapper_onnx(visual_wrapper,
-                               input,
-                               output_dir,
-                               input_names=['input'],
-                               dynamic_axes={'input': {
-                                   0: 'batch'
-                               }}):
-    logger.log(trt.Logger.INFO, "Exporting onnx")
-    os.makedirs(f'{output_dir}/onnx', exist_ok=True)
-    torch.onnx.export(visual_wrapper,
+def export_onnx(model,
+                input,
+                onnx_dir,
+                onnx_name='model.onnx',
+                input_names=['input'],
+                output_names=['output'],
+                dynamic_axes={'input': {
+                    0: 'batch'
+                }},
+                logger=trt.Logger(trt.Logger.INFO)):
+    logger.log(trt.Logger.INFO, f"Exporting onnx to {onnx_dir}/{onnx_name}")
+    os.makedirs(onnx_dir, exist_ok=True)
+    torch.onnx.export(model,
                       input,
-                      f'{output_dir}/onnx/visual_encoder.onnx',
+                      f'{onnx_dir}/{onnx_name}',
                       opset_version=17,
                       input_names=input_names,
-                      output_names=['output'],
+                      output_names=output_names,
                       dynamic_axes=dynamic_axes)
 
 
 def build_trt_engine(model_type,
                      input_sizes,
-                     output_dir,
+                     onnx_dir,
+                     engine_dir,
                      max_batch_size,
                      dtype=torch.float16,
-                     num_frames=None):
-    part_name = 'visual_encoder'
-    onnx_file = '%s/onnx/%s.onnx' % (output_dir, part_name)
-    engine_file = '%s/%s.engine' % (output_dir, part_name)
-    config_file = '%s/%s' % (output_dir, "config.json")
-    logger.log(trt.Logger.INFO, "Building TRT engine for %s" % part_name)
+                     num_frames=None,
+                     onnx_name='model.onnx',
+                     engine_name='model.engine',
+                     delete_onnx=True,
+                     logger=trt.Logger(trt.Logger.INFO)):
+    onnx_file = f'{onnx_dir}/{onnx_name}'
+    engine_file = f'{engine_dir}/{engine_name}'
+    config_file = f'{engine_dir}/config.json'
+    logger.log(trt.Logger.INFO, f"Building TRT engine to {engine_file}")
 
     builder = trt.Builder(logger)
     network = builder.create_network(
@@ -158,9 +164,6 @@ def build_trt_engine(model_type,
                 logger.log(trt.Logger.ERROR, parser.get_error(error))
         logger.log(trt.Logger.INFO, "Succeeded parsing %s" % onnx_file)
 
-    # Delete onnx files since we don't need them now
-    shutil.rmtree(f'{output_dir}/onnx')
-
     nBS = -1
     nMinBS = 1
     nOptBS = max(nMinBS, int(max_batch_size / 2))
@@ -168,8 +171,9 @@ def build_trt_engine(model_type,
 
     inputT = network.get_input(0)
 
-    # input sizes can be a list of ints (e.g., [3, H, W]) when inputs are images,
-    # or a list of three int lists (e.g., [[1, 1, 2700], [1, 500, 2700], [1, 4096, 2700]]).
+    # input sizes can be:
+    # - integer list, when inputs are constant size images. e.g. [3, H, W]
+    # - list of integer lists, when inputs are dynamic size images. e.g. [[1, 1, 2700], [1, 500, 2700], [1, 4096, 2700]]
     assert isinstance(input_sizes, list), "input_sizes must be a list"
     if isinstance(input_sizes[0], int):
         logger.log(trt.Logger.INFO, f"Processed input sizes {input_sizes}")
@@ -201,15 +205,19 @@ def build_trt_engine(model_type,
     else:
         logger.log(trt.Logger.INFO,
                    "Succeeded building %s in %d s" % (engine_file, t1 - t0))
+        os.makedirs(engine_dir, exist_ok=True)
         with open(engine_file, 'wb') as f:
             f.write(engine_string)
+
+        # Clear onnx files since we no longer need them after a successful engine build
+        if delete_onnx:
+            shutil.rmtree(onnx_dir)
 
     Builder.save_config(config_wrapper, config_file)
 
 
 def build_blip2_engine(args):
-    model_type = 'Salesforce/blip2-' + args.model_type
-    processor = Blip2Processor.from_pretrained(model_type)
+    processor = Blip2Processor.from_pretrained(args.model_path)
 
     raw_image = Image.new('RGB', [10, 10])  # dummy image
     prompt = "Question: what is this? Answer:"
@@ -234,15 +242,24 @@ def build_blip2_engine(args):
             return self.projector(qformer_output.last_hidden_state)
 
     model = Blip2ForConditionalGeneration.from_pretrained(
-        model_type, torch_dtype=torch.float16)
+        args.model_path, torch_dtype=torch.float16)
+
+    blip2_llm = ""
+    if model.language_model.config.architectures[
+            0] == 'T5ForConditionalGeneration':
+        blip2_llm = "t5"
+    elif model.language_model.config.architectures[0] == 'OPTForCausalLM':
+        blip2_llm = "opt"
+
     wrapper = Blip2VisionWrapper(model.vision_model, model.qformer,
                                  model.language_projection, model.query_tokens)
     wrapper.to(args.device)
 
-    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     build_trt_engine(
-        model_type,
+        args.model_type + "-" + blip2_llm,  # blip2-t5 or blip2-opt
         [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size)
 
@@ -278,58 +295,94 @@ def build_pix2struct_engine(args):
     # falls within a relatively narrow range. To improve performance, we can avoid using
     # dynamic axis for the input patches and instead use a fixed number of patches along
     # with an attention mask.
-    export_visual_wrapper_onnx(wrapper, (image, attention_mask),
-                               args.output_dir,
-                               input_names=['input', 'attention_mask'],
-                               dynamic_axes={
-                                   'input': {
-                                       0: 'batch'
-                                   },
-                                   'attention_mask': {
-                                       0: 'batch'
-                                   }
-                               })
+    export_onnx(wrapper, (image, attention_mask),
+                f'{args.output_dir}/onnx',
+                input_names=['input', 'attention_mask'],
+                dynamic_axes={
+                    'input': {
+                        0: 'batch'
+                    },
+                    'attention_mask': {
+                        0: 'batch'
+                    }
+                })
     build_trt_engine(
         args.model_type,
         [image.shape[1], image.shape[2]],  # Number of Patches, Hidden Dimension
+        f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size,
-        torch.bfloat16)
+        dtype=torch.bfloat16)
 
 
 def build_llava_engine(args):
     processor = AutoProcessor.from_pretrained(args.model_path)
-    raw_image = Image.new('RGB', [10, 10])  # dummy image
-    image = processor(text="dummy", images=raw_image,
-                      return_tensors="pt")['pixel_values'].to(
-                          args.device, torch.float16)
+    if args.model_type == "llava":
+        raw_image = Image.new('RGB', [10, 10])  # dummy image
+        image = processor(text="dummy", images=raw_image,
+                          return_tensors="pt")['pixel_values'].to(
+                              args.device, torch.float16)
 
-    class LlavaVisionWrapper(torch.nn.Module):
+        class LlavaVisionWrapper(torch.nn.Module):
 
-        def __init__(self, tower, projector, feature_layer):
-            super().__init__()
-            self.tower = tower
-            self.projector = projector
-            self.feature_layer = feature_layer
+            def __init__(self, tower, projector, feature_layer):
+                super().__init__()
+                self.tower = tower
+                self.projector = projector
+                self.feature_layer = feature_layer
 
-        def forward(self, image):
-            all_hidden_states = self.tower(
-                image, output_hidden_states=True).hidden_states
-            features = all_hidden_states[self.feature_layer][:, 1:]
-            return self.projector(features)
+            def forward(self, image):
+                all_hidden_states = self.tower(
+                    image, output_hidden_states=True).hidden_states
+                features = all_hidden_states[self.feature_layer][:, 1:]
+                return self.projector(features)
 
-    model = LlavaForConditionalGeneration.from_pretrained(
-        args.model_path, torch_dtype=torch.float16)
-    wrapper = LlavaVisionWrapper(model.vision_tower.to(args.device),
-                                 model.multi_modal_projector.to(args.device),
-                                 model.config.vision_feature_layer)
+        model = LlavaForConditionalGeneration.from_pretrained(
+            args.model_path, torch_dtype=torch.float16)
+        wrapper = LlavaVisionWrapper(
+            model.vision_tower.to(args.device),
+            model.multi_modal_projector.to(args.device),
+            model.config.vision_feature_layer)
+    elif args.model_type == "llava_next":
+        from transformers import LlavaNextForConditionalGeneration
+        raw_image = Image.new('RGB', [512, 512])
+        image = processor(text="dummy", images=raw_image,
+                          return_tensors="pt")['pixel_values'].to(
+                              args.device, torch.float16)[0]
 
-    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+        class LlavaNextVisionWrapper(torch.nn.Module):
+
+            def __init__(self, vision_tower, projector):
+                super().__init__()
+                self.vision_tower = vision_tower
+                self.projector = projector
+
+            def forward(self, pixel_values):
+                image_features = self.vision_tower(pixel_values,
+                                                   output_hidden_states=True)
+                selected_image_feature = image_features.hidden_states[-2][:, 1:]
+                image_features = self.projector(selected_image_feature)
+                return image_features  # (bs, 576, c)
+
+        model = LlavaNextForConditionalGeneration.from_pretrained(
+            args.model_path, torch_dtype=torch.float16)
+        wrapper = LlavaNextVisionWrapper(
+            model.vision_tower.vision_model.to(args.device),
+            model.multi_modal_projector.to(args.device),
+        )
+
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     build_trt_engine(
         args.model_type,
         [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size)
+    if args.model_type == "llava_next":
+        image_newline = model.image_newline.data
+        tensor_img_newline = {"image_newline": image_newline}
+        save_file(tensor_img_newline,
+                  os.path.join(args.output_dir, "image_newlines.safetensors"))
 
 
 def build_vila_engine(args):
@@ -368,10 +421,11 @@ def build_vila_engine(args):
     )
     wrapper = VilaVisionWrapper(model.get_vision_tower().to(args.device),
                                 model.mm_projector.to(args.device))
-    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     build_trt_engine(
         args.model_type,
         [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size)
 
@@ -396,10 +450,11 @@ def build_nougat_engine(args):
     swin_encoder = model.get_encoder().to(args.device)
     wrapper = SwinEncoderWrapper(swin_encoder)
 
-    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     build_trt_engine(
         args.model_type,
         [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size)
 
@@ -431,13 +486,14 @@ def build_cogvlm_engine(args):
     vit_encoder = cogvlm.model.vision.to(args.device).eval()
 
     wrapper = CogVlmVisionWrapper(vit_encoder)
-    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     build_trt_engine(
         args.model_type,
         [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size,
-        dtype)
+        dtype=dtype)
 
 
 def build_fuyu_engine(args):
@@ -462,13 +518,13 @@ def build_fuyu_engine(args):
     vision_encoder = model.vision_embed_tokens
     wrapper = FuyuEncoderWrapper(vision_encoder).to(args.device)
 
-    export_visual_wrapper_onnx(wrapper,
-                               image,
-                               args.output_dir,
-                               dynamic_axes={'input': {
-                                   0: 'batch',
-                                   2: 'patch'
-                               }})
+    export_onnx(wrapper,
+                image,
+                f'{args.output_dir}/onnx',
+                dynamic_axes={'input': {
+                    0: 'batch',
+                    2: 'patch'
+                }})
     build_trt_engine(
         args.model_type,
         # [nImgs, nImgPatches, nDims]
@@ -476,6 +532,7 @@ def build_fuyu_engine(args):
         # nImgPatches depends on image size (patch size: 30x30)
         # nDims is 30x30x3=2700 (patch size x color channels)
         [[1, 1, 2700], [1, 500, 2700], [1, 4096, 2700]],
+        f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size)
 
@@ -511,7 +568,12 @@ def build_neva_engine(args):
             vision_x = self.connector(vision_x)
             return vision_x
 
-    encoder = AutoModel.from_pretrained(vision_config["from_pretrained"],
+    vision_path = vision_config["from_pretrained"]
+    joined_path = os.path.join(os.path.dirname(args.model_path),
+                               os.path.basename(vision_path))
+    if os.path.isdir(joined_path):
+        vision_path = joined_path
+    encoder = AutoModel.from_pretrained(vision_path,
                                         torch_dtype=torch.bfloat16,
                                         trust_remote_code=True)
     vision_encoder = encoder.vision_model
@@ -544,13 +606,14 @@ def build_neva_engine(args):
     dummy_image = torch.empty(
         1, 3, image_size, image_size, dtype=dtype,
         device=args.device)  # dummy image shape [B, C, H, W]
-    export_visual_wrapper_onnx(wrapper, dummy_image, args.output_dir)
+    export_onnx(wrapper, dummy_image, f'{args.output_dir}/onnx')
     build_trt_engine(
         args.model_type,
         [3, image_size, image_size],  # [3, H, W]
+        f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size,
-        dtype)
+        dtype=dtype)
 
 
 def build_video_neva_engine(args):
@@ -624,13 +687,14 @@ def build_video_neva_engine(args):
                               image_size,
                               dtype=dtype,
                               device=args.device)  # dummy image
-    export_visual_wrapper_onnx(wrapper, dummy_video, args.output_dir)
+    export_onnx(wrapper, dummy_video, f'{args.output_dir}/onnx')
     build_trt_engine(
         args.model_type,
         [num_frames, 3, image_size, image_size],  # [num_frames, 3, H, W]
+        f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size,
-        dtype,
+        dtype=dtype,
         num_frames=num_frames)
 
 
@@ -662,10 +726,11 @@ def build_kosmos_engine(args):
         model.vision_model.to(args.device),
         model.image_to_text_projection.to(args.device))
 
-    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     build_trt_engine(
         args.model_type,
         [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size)
 
@@ -738,10 +803,10 @@ def build_phi_engine(args):
         model.model.vision_embed_tokens.sub_GN)
     tensors = {"glb_GN": glb_GN, "sub_GN": sub_GN}
     save_file(tensors, args.output_dir + "/image_newlines.safetensors")
-    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     build_trt_engine(
-        args.model_type,
-        [image.shape[1], image.shape[2], image.shape[3]], args.output_dir,
+        args.model_type, [image.shape[1], image.shape[2], image.shape[3]],
+        f'{args.output_dir}/onnx', args.output_dir,
         args.max_batch_size * (num_crops + 1))  #TODO: Take input from config
 
 

@@ -46,7 +46,7 @@ The following table shows the supported software for TensorRT-LLM.
     * - Container
       - [24.05](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
     * - TensorRT
-      - [10.1](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+      - [10.2](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
     * - Precision
       -
         - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4
@@ -67,7 +67,7 @@ The following table shows the supported software for TensorRT-LLM.
         - [FairSeq NMT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
         - [Falcon](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/falcon)
         - [Flan-T5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec) (4)
-        - [Gemma](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gemma)
+        - [Gemma/Gemma2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gemma)
         - [GPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
         - [GPT-J](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptj)
         - [GPT-Nemo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
@@ -83,7 +83,7 @@ The following table shows the supported software for TensorRT-LLM.
         - [mT5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
         - [OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/opt)
         - [Phi-1.5/Phi-2/Phi-3](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/phi)
-        - [Qwen](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen)
+        - [Qwen/Qwen1.5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen)
         - [Qwen-VL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl)
         - [RecurrentGemma](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/recurrentgemma)
         - [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)
@@ -103,8 +103,9 @@ The following table shows the supported software for TensorRT-LLM.
         - [Fuyu](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [Kosmos](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [LLaVA-v1.5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+        - [LLaVa-Next](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-        - [Nougat](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal) Nougat-small, Nougat-base
+        - [Nougat](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [Phi-3-vision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [Video NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [VILA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
@@ -114,7 +115,7 @@ The following table shows the supported software for TensorRT-LLM.
 (2) INT4 AWQ and GPTQ are not supported on SM < 75.<br>
 (3) INT4 AWQ and GPTQ with FP8 activations require SM >= 89.<br>
 (4) [Encoder-Decoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/main/examples/enc_dec) provides general encoder-decoder functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, NMT family, and so on.
-(5) Multi-modal provides general multi-modal functionality that supports many multi-modal architectures such as BLIP family, LLaVA family, and so on.
+(5) Multi-modal provides general multi-modal functionality that supports many multi-modal architectures such as BLIP2 family, LLaVA family, and so on.
 (6) Only supports bfloat16 precision.
 
 

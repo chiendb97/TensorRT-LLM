@@ -29,8 +29,10 @@ from transformers import (AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer,
 
 import tensorrt_llm
 from tensorrt_llm import logger
+from tensorrt_llm._ipc_utils import set_peer_access
 from tensorrt_llm._utils import torch_to_numpy, trt_dtype_to_torch
 from tensorrt_llm.lora_manager import LoraManager
+from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
 
@@ -88,7 +90,6 @@ def read_config(config_path: Path):
     skip_cross_qkv = pretrained_config.get('skip_cross_qkv', False)
     has_position_embedding = pretrained_config["has_position_embedding"]
     has_token_type_embedding = hasattr(pretrained_config, "type_vocab_size")
-    use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
     dtype = pretrained_config["dtype"]
 
     paged_kv_cache = plugin_config['paged_kv_cache']
@@ -116,7 +117,6 @@ def read_config(config_path: Path):
         cross_attention=cross_attention,
         has_position_embedding=has_position_embedding,
         has_token_type_embedding=has_token_type_embedding,
-        use_custom_all_reduce=use_custom_all_reduce,
         dtype=dtype,
         gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
@@ -162,16 +162,15 @@ def parse_arguments():
 
 class TRTLLMEncDecModel:
 
-    def __init__(
-        self,
-        engine_name,
-        engine_dir,
-        lora_dir=None,
-        lora_task_uids=None,
-        debug_mode=False,
-        skip_encoder=False,
-        stream: torch.cuda.Stream = None,
-    ):
+    def __init__(self,
+                 engine_name,
+                 engine_dir,
+                 lora_dir=None,
+                 lora_task_uids=None,
+                 debug_mode=False,
+                 skip_encoder=False,
+                 stream: torch.cuda.Stream = None,
+                 enable_context_fmha_fp32_acc: bool = None):
         # in multi-node setup, it's important to set_device at the very beginning so .to('cuda') refers to current device
         # accordingly, all input & output tensors should be moved to current device
         # otherwise, it's default to 'cuda:0'
@@ -181,6 +180,7 @@ class TRTLLMEncDecModel:
         self.device = torch.cuda.current_device()
         self.skip_encoder = skip_encoder
         self.lora_task_uids = lora_task_uids
+        self.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
 
         # when enc-dec runs by itself, stream can be None and we create new stream here
         # when enc-dec has to run as a component in a bigger workflow (e.g., multimodal), earlier components in the workflow may have results in its stream, which we should pass that stream in to avoid unnecessary stream sync
@@ -278,14 +278,16 @@ class TRTLLMEncDecModel:
                     lora_task_uids=None,
                     debug_mode=False,
                     skip_encoder=False,
-                    stream=None):
+                    stream=None,
+                    enable_context_fmha_fp32_acc=None):
         return cls(engine_name,
                    engine_dir,
                    lora_dir,
                    lora_task_uids,
                    debug_mode=debug_mode,
                    skip_encoder=skip_encoder,
-                   stream=stream)
+                   stream=stream,
+                   enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc)
 
     def process_input(self,
                       input_ids,
@@ -387,19 +389,27 @@ class TRTLLMEncDecModel:
             (max_input_length, ),
             dtype=hidden_states_dtype('max_input_length'),
             device=self.device).contiguous()
-        batch_size = input_lengths.size(0)
-        inputs['host_request_types'] = torch.IntTensor([0] *
-                                                       batch_size).to('cpu')
-        if self.encoder_model_config.remove_input_padding:
-            inputs['host_context_lengths'] = input_lengths.to('cpu')
 
-        if self.encoder_model_config.lora_plugin and self.encoder_lora_manager is not None:
+        if self.encoder_runtime_mapping.tp_size > 1:
+            is_p2p_supported = set_peer_access(self.encoder_runtime_mapping)
+            ipc_buffers, all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
+                self.encoder_runtime_mapping,
+                CustomAllReduceHelper.max_workspace_size_auto(
+                    self.encoder_runtime_mapping.tp_size), is_p2p_supported)
+            inputs['all_reduce_workspace'] = all_reduce_workspace
+
+        if self.encoder_model_config.lora_plugin:
             inputs.update(
                 self.encoder_lora_manager.input_buffers(
                     self.lora_task_uids,
                     self.encoder_runtime_mapping,
                     self.encoder_model_config.num_layers,
                 ))
+            batch_size = input_lengths.size(0)
+            inputs['host_request_types'] = torch.IntTensor([0] *
+                                                           batch_size).to('cpu')
+            if self.encoder_model_config.remove_input_padding:
+                inputs['host_context_lengths'] = input_lengths.to('cpu')
 
         # Note: runtime.Session's run() method will set input/output tensor address, here we only need to provide tensor shape
         self.encoder_session.set_shapes(inputs)
@@ -570,7 +580,7 @@ class TRTLLMEncDecModel:
             encoder_max_input_length=encoder_max_input_length,
             lora_manager=self.decoder_lora_manager,
             lora_uids=self.lora_task_uids,
-        )
+            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc)
 
         output = self.decoder_session.decode(
             decoder_input_ids,

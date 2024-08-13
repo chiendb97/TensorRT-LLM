@@ -21,7 +21,6 @@ import torch
 
 from ..._utils import torch_dtype_to_str
 from ...layers import MoeConfig
-from ...logger import logger
 from ...mapping import Mapping
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
@@ -37,6 +36,7 @@ class LLaMAConfig(PretrainedConfig):
                  residual_mlp: bool = False,
                  disable_weight_only_quant_plugin: bool = False,
                  moe: Optional[Union[MoeConfig, dict]] = None,
+                 remove_duplicated_kv_heads: bool = False,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -56,6 +56,7 @@ class LLaMAConfig(PretrainedConfig):
             moe = MoeConfig.from_dict(moe)
         assert isinstance(moe, MoeConfig)
         self.moe = moe.validate()
+        self.remove_duplicated_kv_heads = remove_duplicated_kv_heads
 
         super().__init__(**kwargs)
 
@@ -98,7 +99,12 @@ class LLaMAConfig(PretrainedConfig):
             if hf_config.model_type == "llava":
                 # LLaVA = Vision model + Llama LLM
                 # We load a llava config and use its' text config as llama config
+                from transformers import LlavaConfig
                 hf_config = LlavaConfig.from_pretrained(
+                    hf_config_dir).text_config
+            if hf_config.model_type == "llava_next":
+                from transformers import LlavaNextConfig
+                hf_config = LlavaNextConfig.from_pretrained(
                     hf_config_dir).text_config
             if hf_config.model_type == "llava_llama":
                 hf_config.llm_cfg["architecture"] = hf_config.llm_cfg[
@@ -108,6 +114,10 @@ class LLaMAConfig(PretrainedConfig):
 
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
+        head_dim = getattr(
+            hf_config, "head_dim",
+            hf_config.hidden_size // hf_config.num_attention_heads)
+        head_size = getattr(hf_config, "kv_channels", head_dim)
         hidden_act = hf_config.hidden_act
         attn_bias = getattr(hf_config, 'bias', False) or getattr(
             hf_config, 'attention_bias', False)
@@ -116,6 +126,8 @@ class LLaMAConfig(PretrainedConfig):
         residual_mlp = getattr(hf_config, "parallel_attn_mlp_res", False)
         disable_weight_only_quant_plugin = kwargs.pop(
             'disable_weight_only_quant_plugin', False)
+        remove_duplicated_kv_heads = kwargs.pop('remove_duplicated_kv_heads',
+                                                False)
 
         if hf_config.model_type == "mixtral" or hf_config.model_type == "arctic":
             # HF LLaMA-type models are implicitly using gated activation.
@@ -139,20 +151,16 @@ class LLaMAConfig(PretrainedConfig):
                 dtype = torch_dtype_to_str(dtype)
             if dtype == 'float32':
                 dtype = 'float16'
-        if dtype == 'bfloat16' and torch.cuda.get_device_properties(
-                0).major < 8:
-            logger.warning(
-                "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
-            dtype = 'float16'
 
         return cls(
-            architecture='LlamaForCausalLM',
+            architecture=hf_config.architectures[0],
             dtype=dtype,
             num_hidden_layers=hf_config.num_hidden_layers,
             num_attention_heads=hf_config.num_attention_heads,
             hidden_size=hf_config.hidden_size,
             intermediate_size=hf_config.intermediate_size,
             num_key_value_heads=num_key_value_heads,
+            head_size=head_size,
             vocab_size=hf_config.vocab_size,
             position_embedding_type='rope_gpt_neox',
             max_position_embeddings=hf_config.max_position_embeddings,
@@ -166,6 +174,7 @@ class LLaMAConfig(PretrainedConfig):
             moe=moe_config,
             mapping=mapping,
             quantization=quant_config,
+            remove_duplicated_kv_heads=remove_duplicated_kv_heads,
             **kwargs)
 
     @classmethod
@@ -200,11 +209,11 @@ class LLaMAConfig(PretrainedConfig):
 
         if dtype == 'auto':
             dtype = 'bfloat16'
-        if dtype == 'bfloat16' and torch.cuda.get_device_properties(
-                0).major < 8:
-            logger.warning(
-                "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
-            dtype = 'float16'
+
+        if meta_config.get('use_scaled_rope'):
+            rotary_scaling = {"type": "llama3"}
+        else:
+            rotary_scaling = meta_config.get("rope_scaling")
 
         # meta checkpoint don't have vocab_size|hidden_act|rotary_base specified, use same default value as HF
         return cls(architecture="LlamaForCausalLM",
@@ -218,6 +227,7 @@ class LLaMAConfig(PretrainedConfig):
                    position_embedding_type='rope_gpt_neox',
                    max_position_embeddings=2048,
                    hidden_act='silu',
+                   rotary_scaling=rotary_scaling,
                    rotary_base=meta_config.get('rope_theta', 10000),
                    norm_epsilon=meta_config["norm_eps"],
                    mapping=mapping,

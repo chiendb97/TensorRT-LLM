@@ -209,6 +209,7 @@ class Network(object):
             shape=shape,
             dtype=dtype,
         )
+        assert tensor.trt_tensor is not None, f"Couldn't create TRT tensor for {name} {dtype} {shape}"
         if dim_range is not None:
             logger.debug(
                 f'Add input: {name}, shape: {shape}, dtype: {dtype}, dimension names:{list(dim_range.keys())}'
@@ -247,9 +248,15 @@ class Network(object):
         frame = inspect.currentframe().f_back.f_back
         while frame:
             func_name = frame.f_code.co_name
+            line_num = frame.f_lineno
             if func_name == "forward":
                 break
-            func_stack.insert(0, func_name)
+            func_stack.insert(0, f"{func_name}_L{line_num}")
+            if len(func_stack) >= 10:
+                # NOTE: TRT error messages has a character limit.
+                #       Limiting to only 10 levels helps retain
+                #       the true error message from TRT.
+                break
             frame = frame.f_back
         current_module = f"{current_module}.{'.'.join(func_stack)}"
 

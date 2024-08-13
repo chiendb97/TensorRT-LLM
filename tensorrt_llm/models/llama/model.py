@@ -14,6 +14,8 @@
 # limitations under the License.
 from typing import Optional, Union
 
+import transformers
+
 from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
@@ -23,11 +25,10 @@ from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
 from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
-from ...plugin import init_all_reduce_helper
 from ...quantization import W8A8_SQ_PLUGIN_LIST, QuantAlgo
 from ..convert_utils import has_safetensors
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, preprocess_weights)
+                              QuantConfig, check_share_embedding)
 from .config import LLaMAConfig
 from .convert import (load_hf_llama, load_weights_from_hf_by_shard,
                       load_weights_from_hf_model,
@@ -201,7 +202,6 @@ class LLaMAModel(Module):
 
     def __init__(self, config: LLaMAConfig) -> None:
         super().__init__()
-        init_all_reduce_helper()
 
         self.mapping = config.mapping
         if self.mapping.is_first_pp_rank():
@@ -312,7 +312,8 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                                mapping=mapping,
                                                quant_config=quant_config,
                                                **kwargs)
-
+        if config.remove_duplicated_kv_heads:
+            config.num_key_value_heads = config.num_key_value_heads // 2
         if use_preloading:
             assert not load_by_shard
             weights = load_weights_from_hf_model(hf_model, config)
@@ -324,9 +325,9 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         else:
             hf_model = load_hf_llama(hf_model_dir, load_model_on_cpu)
             weights = load_weights_from_hf_model(hf_model, config)
-        preprocess_weights(weights, config)
 
-        model = LLaMAForCausalLM(config)
+        check_share_embedding(weights, config)
+        model = cls(config)
         model.load(weights)
         return model
 
@@ -350,9 +351,9 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                             **kwargs)
 
         weights = load_weights_from_meta_ckpt(meta_ckpt_dir, config)
-        preprocess_weights(weights, config)
 
-        model = LLaMAForCausalLM(config)
+        check_share_embedding(weights, config)
+        model = cls(config)
         model.load(weights)
         return model
 
@@ -365,12 +366,13 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         mapping: Optional[Mapping] = None,
         quant_config: Optional[QuantConfig] = None,
         *,
-        calib_dataset='cnn_dailymail',
-        calib_batches=512,
-        calib_batch_size=1,
-        calib_max_seq_length=512,
-        random_seed=1234,
-        tokenizer_max_seq_length=2048,
+        device: str = 'cuda',
+        calib_dataset: str = 'cnn_dailymail',
+        calib_batches: int = 512,
+        calib_batch_size: int = 1,
+        calib_max_seq_length: int = 512,
+        random_seed: int = 1234,
+        tokenizer_max_seq_length: int = 2048,
         **kwargs,
     ):
         DEFAULT_MODELOPT_FLOW = [
@@ -389,6 +391,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                              dtype=config.dtype,
                              mapping=config.mapping,
                              quant_config=config.quantization,
+                             device=device,
                              calib_dataset=calib_dataset,
                              calib_batches=calib_batches,
                              calib_batch_size=calib_batch_size,
@@ -398,8 +401,10 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         else:
             # non-modelopt, the legacy TRT-LLM native quantization algorithm:
             # sq, int4/int8 weights only, int8 kv cache
-            NATIVE_QUANT_FLOW = [QuantAlgo.W4A16, QuantAlgo.W8A16, None
-                                 ] + W8A8_SQ_PLUGIN_LIST
+            NATIVE_QUANT_FLOW = [
+                QuantAlgo.W4A16, QuantAlgo.W8A16,
+                QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN, None
+            ] + W8A8_SQ_PLUGIN_LIST
             is_valid_native_quant = (quant_config.quant_algo in NATIVE_QUANT_FLOW) and \
                 (quant_config.kv_cache_quant_algo in [QuantAlgo.INT8, None])
             assert quant_config.quant_algo is not None or quant_config.kv_cache_quant_algo is not None, \
@@ -410,6 +415,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
             convert.quantize(hf_model_dir,
                              output_dir,
                              config=config,
+                             device=device,
                              calib_dataset=calib_dataset)
 
     def use_lora(self, lora_config: LoraConfig):

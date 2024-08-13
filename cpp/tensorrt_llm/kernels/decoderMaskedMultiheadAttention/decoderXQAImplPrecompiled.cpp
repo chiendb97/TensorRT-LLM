@@ -113,8 +113,16 @@ public:
         unsigned int beam_width = xqaParams.beam_width;
         // MultiQueryToken kernels can support any num_q_heads_over_kv that is power of 2.
         unsigned int kernel_num_q_heads_over_kv = xqaParams.multi_query_tokens ? 0 : num_q_heads_over_kv;
-        // MultiQueryToken kernels can handle either 16/32 for M direction per CTA.
-        unsigned int m_tilesize = xqaParams.multi_query_tokens ? 16 : num_q_heads_over_kv;
+        unsigned int m_tilesize;
+        if (xqaParams.multi_query_tokens)
+        {
+            // MultiQueryToken kernels can handle either 16/32 for M direction per CTA.
+            m_tilesize = xqaParams.generation_input_length <= 16 ? 16 : 32;
+        }
+        else
+        {
+            m_tilesize = num_q_heads_over_kv;
+        }
 
         XQAKernelRuntimeHashKey hash_key
             = {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, m_tilesize,
@@ -185,6 +193,7 @@ public:
         decoder_params.rotaryEmbeddingDim = xqaParams.rotary_embedding_dim;
         decoder_params.rotaryScalingType = xqaParams.rotary_embedding_scale_type;
         decoder_params.rotaryEmbeddingInvFreq = launchParams.rotary_inv_freq_buf;
+        decoder_params.rotaryEmbeddingInvFreqCache = xqaParams.rotary_embedding_inv_freq_cache;
         decoder_params.rotaryEmbeddingMaxPositions = xqaParams.rotary_embedding_max_positions;
 
         invokeBuildDecoderInfo(decoder_params, stream);
@@ -210,9 +219,6 @@ public:
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParms, stream);
         sync_check_cuda_error();
 
-        // Use mTileSize = 16 kernels when qSeqLen <= 16.
-        unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
-        unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
         XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams);
         auto const findIter = mFunctions.find(hash_key);
 
@@ -228,11 +234,17 @@ public:
             // MultiQueryTokens (generation_input_length > 1) need extra parameters (like qSeqLen, headGrpSize, and
             // mask). Input parameters for MultiQueryTokens kernels.
             unsigned int headGrpSize = num_q_heads_over_kv;
+            // Use mTileSize = 16 kernels when qSeqLen <= 16.
+            unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
+            unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
             unsigned int nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, mTileSize);
             int const* maskPtr = xqaParams.spec_decoding_packed_mask;
             int const* cuQSeqLens = launchParams.cu_seq_lens;
+            unsigned int maxQSeqLen = xqaParams.spec_decoding_is_generation_length_variable ? // true for ReDrafter
+                xqaParams.spec_decoding_max_generation_length
+                                                                                            : qSeqLen;
             // TODO: merge SingleQueryToken params and MultiQueryTokens params into one kernelParams.
-            void* kernelParams[] = {&qSeqLen, &launchParams.num_k_heads, &headGrpSize, &cuQSeqLens,
+            void* kernelParams[] = {&maxQSeqLen, &launchParams.num_k_heads, &headGrpSize, &cuQSeqLens,
                 &launchParams.output, &xqa_q_input_ptr, &maskPtr, &launchParams.kvCacheParams, &launchParams.batch_size,
                 &launchParams.kv_scale_quant_orig, &launchParams.scratch};
             int multi_block = 1;
@@ -391,12 +403,96 @@ void DecoderXQAImplPrecompiled::runDispatchBuffer(
 
 #undef XQA_KERNEL_RUN
 
-bool DecoderXQAImplPrecompiled::shouldUse(XQAParams const& xqaParams, bool /*forConfigurePlugin*/)
+#define SUPPORT_RETURN_FALSE(X)                                                                                        \
+    {                                                                                                                  \
+        return false;                                                                                                  \
+    }
+
+bool DecoderXQAImplPrecompiled::shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin)
 {
+    if (!(xqaParams.data_type == DATA_TYPE_FP16 || xqaParams.data_type == DATA_TYPE_BF16))
+    {
+        SUPPORT_RETURN_FALSE("data type");
+    }
+    bool const isGPTJBeam4Kernel = (xqaParams.head_size == 256 && xqaParams.beam_width == 4 && xqaParams.paged_kv_cache
+        && (xqaParams.tokens_per_block == 64 || xqaParams.tokens_per_block == 128));
+    if (xqaParams.head_size != 128 && xqaParams.head_size != 256 && !isGPTJBeam4Kernel)
+    {
+        SUPPORT_RETURN_FALSE("head_size");
+    }
+    if (xqaParams.unidirectional != 1)
+    {
+        SUPPORT_RETURN_FALSE("unidirectional");
+    }
+    if (xqaParams.q_scaling != 1.0f)
+    {
+        SUPPORT_RETURN_FALSE("q_scaling");
+    }
+    if (xqaParams.mask_type != tensorrt_llm::kernels::AttentionMaskType::CAUSAL)
+    {
+        SUPPORT_RETURN_FALSE("mask_type");
+    }
+    if (xqaParams.cross_attention)
+    {
+        SUPPORT_RETURN_FALSE("cross_attention");
+    }
+    // Only support 64/128 tokens per block.
+    if (xqaParams.paged_kv_cache && xqaParams.tokens_per_block != 64 && xqaParams.tokens_per_block != 128)
+    {
+        SUPPORT_RETURN_FALSE("paged_kv_cache");
+    }
+    if (xqaParams.beam_width != 1 && !isGPTJBeam4Kernel)
+    {
+        SUPPORT_RETURN_FALSE("beam_width");
+    }
+    if (xqaParams.cyclic_attention_window_size != xqaParams.max_attention_window_size)
+    {
+        SUPPORT_RETURN_FALSE("cyclic_attention_window_size != max_attention_window_size");
+    }
+    if (xqaParams.position_shift_enabled || xqaParams.sink_token_length > 0)
+    {
+        SUPPORT_RETURN_FALSE("streaming-llm");
+    }
+
+    // OPTIMIZE: For the standard generation-phase MHA, there are still extra limitations.
+    // NOTE: Medusa mode = Multi_query_tokens > 1.
+    int const nbQHeads = xqaParams.num_q_heads;
+    int const nbKVHeads = xqaParams.num_kv_heads;
+    int const nbQHeadsPerKV = nbQHeads / nbKVHeads;
+    // MultiQueryTokens mode (Medusa mode) can support any nbQHeadsPerKV.
+    if (!xqaParams.multi_query_tokens)
+    {
+        if (nbQHeadsPerKV != 16 && nbQHeadsPerKV != 8 && nbQHeadsPerKV != 1)
+        {
+            SUPPORT_RETURN_FALSE("nbHeads");
+        }
+    }
+
+    if (!forConfigurePlugin)
+    {
+        // Inference time checks.
+        if (xqaParams.host_past_key_value_lengths == nullptr)
+        {
+            SUPPORT_RETURN_FALSE("host_past_key_value_lengths");
+        }
+        for (int i = 0; i < xqaParams.batch_size; ++i)
+        {
+            // Only checks for non-medusa case, because medusa may not accept all tokens in host_past_key_value_lengths.
+            // FIXME(perkzz): medusa should check for sliding-window attention.
+            if (!xqaParams.multi_query_tokens
+                && xqaParams.host_past_key_value_lengths[i] + 1 > xqaParams.max_attention_window_size)
+            {
+                SUPPORT_RETURN_FALSE("sliding window attention");
+            }
+        }
+    }
+
     XQAKernelList const* xqa_kernel = getXQAKernels(mRunner->mDataType, tensorrt_llm::common::getSMVersion());
     return xqa_kernel->supportConfig(xqaParams)
         && xqa_kernel->mayHavePerfGain(xqaParams, mRunner->mMultiProcessorCount);
 }
+
+#undef SUPPORT_RETURN_FALSE
 
 void DecoderXQAImplPrecompiled::prepare(XQAParams const&)
 {

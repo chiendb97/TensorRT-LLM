@@ -16,6 +16,7 @@
 #include "tllmRuntime.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tllmLogger.h"
 
@@ -62,7 +63,7 @@ class StreamReader final : public nvinfer1::IStreamReader
 public:
     StreamReader(std::filesystem::path fp)
     {
-        mFile.open(fp.string());
+        mFile.open(fp.string(), std::ios::binary | std::ios::in);
         TLLM_CHECK_WITH_INFO(mFile.good(), std::string("Error opening engine file: " + fp.string()));
     }
 
@@ -91,12 +92,11 @@ void setWeightStreaming(nvinfer1::ICudaEngine& engine, float const gpuWeightsPer
 {
     if (gpuWeightsPercent < 1)
     {
-        int64_t min = engine.getMinimumWeightStreamingBudget();
-        int64_t max = engine.getStreamableWeightsSize();
-        int64_t budget = min + gpuWeightsPercent * (max - min);
+        int64_t streamableSize = engine.getStreamableWeightsSize();
+        int64_t budget = gpuWeightsPercent * streamableSize;
         TLLM_LOG_INFO("Set gpu weights percent to %f, which is %lld bytes. Valid range: %lld bytes - %lld bytes.",
-            gpuWeightsPercent, budget, min, max);
-        engine.setWeightStreamingBudget(budget);
+            gpuWeightsPercent, budget, 0, streamableSize);
+        engine.setWeightStreamingBudgetV2(budget);
     }
 }
 } // namespace
@@ -131,7 +131,7 @@ TllmRuntime::TllmRuntime(
 
     setWeightStreaming(getEngine(), gpuWeightsPercent);
 
-    auto const devMemorySize = mEngine->getDeviceMemorySize();
+    auto const devMemorySize = mEngine->getDeviceMemorySizeV2();
     mEngineBuffer = mBufferManager.gpu(devMemorySize);
 
     // Print context memory size for CI/CD to track.
@@ -155,7 +155,7 @@ nvinfer1::IExecutionContext& TllmRuntime::addContext(std::int32_t profileIndex)
         }
     }
     auto& context = *mContexts.back();
-    context.setDeviceMemory(mEngineBuffer->data());
+    context.setDeviceMemoryV2(mEngineBuffer->data(), static_cast<int64_t>(mEngineBuffer->getCapacity()));
     context.setOptimizationProfileAsync(profileIndex, mStream->get());
     // If nvtx verbosity is DETAILED, print an info about potential perf overhead.
     if (context.getNvtxVerbosity() == nvinfer1::ProfilingVerbosity::kDETAILED)
@@ -184,6 +184,7 @@ bool TllmRuntime::executeContext(SizeType32 contextIndex) const
 
 void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tensorMap)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
     for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
@@ -256,10 +257,12 @@ void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tens
         TLLM_CHECK_WITH_INFO(context.allInputDimensionsSpecified(), "Input dimensions not specified");
         TLLM_CHECK_WITH_INFO(context.allInputShapesSpecified(), "Input shapes not specified");
     }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void TllmRuntime::setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
     for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
@@ -299,6 +302,7 @@ void TllmRuntime::setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap
             }
         }
     }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 CudaStream const& TllmRuntime::getStream() const

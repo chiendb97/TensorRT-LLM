@@ -2,19 +2,13 @@ import argparse
 import os
 from pathlib import Path
 
+from transformers import AutoTokenizer
+
 import tensorrt_llm
 from tensorrt_llm import BuildConfig, build
 from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.hlapi import SamplingParams
 from tensorrt_llm.models import LLaMAForCausalLM
-
-
-def read_input():
-    while (True):
-        input_text = input("<")
-        if input_text in ("q", "quit"):
-            break
-        yield input_text
 
 
 def parse_args():
@@ -51,7 +45,7 @@ def main():
                                max_batch_size=1)
     # just for fast build, not best for production
     build_config.builder_opt = 0
-    build_config.plugin_config.gemm_plugin = "float16"
+    build_config.plugin_config.gemm_plugin = 'auto'
 
     if args.clean_build or not args.engine_dir.exists():
         args.engine_dir.mkdir(exist_ok=True, parents=True)
@@ -60,12 +54,16 @@ def main():
         engine = build(llama, build_config)
         engine.save(args.engine_dir)
 
-    tokenizer_dir = args.hf_model_dir
-    executor = GenerationExecutor.create(args.engine_dir, tokenizer_dir)
-    sampling_params = SamplingParams(max_new_tokens=20)
-    for inp in read_input():
-        output = executor.generate(inp, sampling_params=sampling_params)
-        print(f">{output.text}")
+    tokenizer = AutoTokenizer.from_pretrained(args.hf_model_dir)
+    executor = GenerationExecutor.create(args.engine_dir)
+    sampling_params = SamplingParams(max_new_tokens=5)
+
+    input_str = "What should you say when someone gives you a gift? You should say:"
+    output = executor.generate(tokenizer.encode(input_str),
+                               sampling_params=sampling_params)
+    output_str = tokenizer.decode(output.outputs[0].token_ids)
+    print(f"{input_str} {output_str}")
 
 
-main()
+if __name__ == "__main__":
+    main()

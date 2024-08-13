@@ -46,8 +46,8 @@ FieldType parseJsonFieldOr(Json const& json, std::string_view name, FieldType de
     }
     catch (nlohmann::json::out_of_range& e)
     {
-        TLLM_LOG_INFO("Parameter %s cannot be read from json:", std::string(name).c_str());
-        TLLM_LOG_INFO(e.what());
+        TLLM_LOG_DEBUG("Parameter %s cannot be read from json:", std::string(name).c_str());
+        TLLM_LOG_DEBUG(e.what());
     }
     return value;
 }
@@ -62,13 +62,13 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     }
     catch (nlohmann::json::out_of_range const& e)
     {
-        TLLM_LOG_INFO(e.what());
-        TLLM_LOG_INFO("Optional value for parameter %s will not be set.", std::string(name).c_str());
+        TLLM_LOG_DEBUG(e.what());
+        TLLM_LOG_DEBUG("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
     catch (nlohmann::json::type_error const& e)
     {
-        TLLM_LOG_INFO(e.what());
-        TLLM_LOG_INFO("Optional value for parameter %s will not be set.", std::string(name).c_str());
+        TLLM_LOG_DEBUG(e.what());
+        TLLM_LOG_DEBUG("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
     return value;
 }
@@ -184,7 +184,6 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
     auto const maxBeamWidth = parseJsonFieldOr(builderConfig, "max_beam_width", 0);
     auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
     auto const maxSequenceLen = parseJsonFieldOr(builderConfig, "max_seq_len", 0);
-    auto const maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
     auto const maxNumTokens = parseJsonFieldOptional<SizeType32>(builderConfig, "max_num_tokens");
     auto const maxPromptEmbeddingTableSize
         = parseJsonFieldOr<SizeType32>(builderConfig, "max_prompt_embedding_table_size", 0);
@@ -198,7 +197,6 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
     modelConfig.setMaxInputLen(maxInputLen);
     modelConfig.setMaxSequenceLen(maxSequenceLen);
     modelConfig.setMaxNumTokens(maxNumTokens);
-    modelConfig.setMaxDraftLen(maxDraftLen);
     modelConfig.setMaxPromptEmbeddingTableSize(maxPromptEmbeddingTableSize);
     modelConfig.computeContextLogits(computeContextLogits);
     modelConfig.computeGenerationLogits(computeGenerationLogits);
@@ -215,7 +213,6 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
     auto const& pagedKvCache = pluginConfig.at("paged_kv_cache");
     auto const& tokensPerBlock = pluginConfig.at("tokens_per_block");
-    auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
     auto const contextFMHA = pluginConfig.at("context_fmha").template get<bool>();
     auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
     auto const pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
@@ -230,7 +227,6 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     modelConfig.usePagedKvCache(pagedKvCache);
     modelConfig.usePagedState(pagedState);
     modelConfig.setTokensPerBlock(tokensPerBlock);
-    modelConfig.useCustomAllReduce(useCustomAllReduce);
     modelConfig.setContextFMHA(contextFMHA);
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
     modelConfig.useXQA(useXQA);
@@ -246,7 +242,7 @@ void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginCon
 
     if (loraTargetModules.has_value())
     {
-
+        // Fix bug qwen lora
         auto mlp_hidden_size = modelConfig.getMlpHiddenSize();
         auto const& pretrained_config = engineVersionNone ? json.at("builder_config") : json.at("pretrained_config");
         if (pretrained_config.contains("qwen_type")) {
@@ -255,6 +251,7 @@ void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginCon
                 mlp_hidden_size /= 2;
             }
         }
+
         modelConfig.setLoraModules(LoraModule::createLoraModules(loraTargetModules.value(), modelConfig.getHiddenSize(),
             mlp_hidden_size, modelConfig.getNbHeads(), modelConfig.getNbKvHeads(),
             modelConfig.getSizePerHead(), tensorParallelism));
@@ -351,22 +348,32 @@ GptJsonConfig parseJson(InputType&& input)
 
     if (engineVersionNone)
     {
-        if (name == std::string("chatglm_6b") || name == std::string("glm_10b"))
+        if (name == std::string("chatglm_6b"))
+        {
+            modelConfig.setModelVariant(ModelConfig::ModelVariant::kChatGlm);
+            // kChatGlm is only for ChatGLM-6B
+        }
+        if (name == std::string("glm_10b"))
         {
             modelConfig.setModelVariant(ModelConfig::ModelVariant::kGlm);
-            // kGlm is only for ChatGLM-6B and GLM-10B
+            // kGlm is only for GLM-10B
         }
     }
     else
     {
-        if (name == "ChatGLMForCausalLM")
+        if (name.find("GLM") != std::string::npos)
         {
             auto const& pretrainedConfig = json.at("pretrained_config");
             auto const chatglmVersion = pretrainedConfig.at("chatglm_version").template get<std::string>();
-            if (chatglmVersion == "glm" || chatglmVersion == "chatglm")
+            if (chatglmVersion == "chatglm")
+            {
+                modelConfig.setModelVariant(ModelConfig::ModelVariant::kChatGlm);
+                // kChatGlm is only for ChatGLM-6B
+            }
+            if (chatglmVersion == "glm")
             {
                 modelConfig.setModelVariant(ModelConfig::ModelVariant::kGlm);
-                // kGlm is only for ChatGLM-6B and GLM-10B
+                // kGlm is only for GLM-10B
             }
         }
     }
@@ -374,15 +381,14 @@ GptJsonConfig parseJson(InputType&& input)
     // Speculative decoding module
     if (!engineVersionNone)
     {
-        SizeType32 maxDraftLen{0};
         if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
         {
             auto const& pretrainedConfig = json.at("pretrained_config");
 
             // TODO(rkobus): adjust param names
-            auto const maxNumPaths = parseJsonFieldOr(pretrainedConfig, "explicit_num_beams", 0);
-            auto const maxDraftPathLen = parseJsonFieldOr(pretrainedConfig, "explicit_draft_len_per_beam", 0);
-            maxDraftLen = maxNumPaths * maxDraftPathLen;
+            auto const maxNumPaths = parseJsonFieldOr(pretrainedConfig, "redrafter_num_beams", 0);
+            auto const maxDraftPathLen = parseJsonFieldOr(pretrainedConfig, "redrafter_draft_len_per_beam", 0);
+            auto const maxDraftLen = maxNumPaths * maxDraftPathLen;
 
             auto explicitDraftTokensModule
                 = std::make_shared<ExplicitDraftTokensModule>(maxDraftPathLen, maxDraftLen, maxNumPaths);
@@ -392,7 +398,7 @@ GptJsonConfig parseJson(InputType&& input)
         else if (modelConfig.getSpeculativeDecodingMode().isMedusa())
         {
             auto const& pretrainedConfig = json.at("pretrained_config");
-            maxDraftLen = parseJsonFieldOr(pretrainedConfig, "max_draft_len", 0);
+            auto const maxDraftLen = parseJsonFieldOr(pretrainedConfig, "max_draft_len", 0);
             auto const medusaHeads = parseJsonFieldOptional<SizeType32>(pretrainedConfig, "num_medusa_heads");
             TLLM_CHECK_WITH_INFO(medusaHeads.has_value() && maxDraftLen > 0,
                 "Both num_medusa_heads and max_draft_len have to be provided for Medusa model");
@@ -402,7 +408,7 @@ GptJsonConfig parseJson(InputType&& input)
         }
         else
         {
-            maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
+            auto const maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
             if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
             {
                 TLLM_CHECK_WITH_INFO(
@@ -413,10 +419,12 @@ GptJsonConfig parseJson(InputType&& input)
             else if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
             {
                 TLLM_CHECK_WITH_INFO(
-                    maxDraftLen, "max_draft_len has to be larger than 0 for decoding with external draft tokens");
+                    maxDraftLen > 0, "max_draft_len has to be larger than 0 for decoding with external draft tokens");
+                auto speculativeDecodingModule
+                    = std::make_shared<SpeculativeDecodingModule>(maxDraftLen, maxDraftLen, 1);
+                modelConfig.setSpeculativeDecodingModule(speculativeDecodingModule);
             }
         }
-        modelConfig.setMaxDraftLen(maxDraftLen);
     }
 
     // RNN config
@@ -437,10 +445,17 @@ GptJsonConfig parseJson(InputType&& input)
             auto const& stateSize = pretrainedConfig.at("state_size").template get<SizeType32>();
             auto const& convKernel = pretrainedConfig.at("conv_kernel").template get<SizeType32>();
             auto const& rnnHiddenSize = pretrainedConfig.at("rnn_hidden_size").template get<SizeType32>();
+            auto const& rnnConvDimSize = pretrainedConfig.at("rnn_conv_dim_size").template get<SizeType32>();
             ModelConfig::RnnConfig rnnConfig{};
             rnnConfig.stateSize = stateSize;
             rnnConfig.convKernel = convKernel;
             rnnConfig.rnnHiddenSize = rnnHiddenSize;
+            rnnConfig.rnnConvDimSize = rnnConvDimSize;
+            if (pretrainedConfig.contains("rnn_head_size"))
+            {
+                auto const& rnnHeadSize = pretrainedConfig.at("rnn_head_size").template get<SizeType32>();
+                rnnConfig.rnnHeadSize = rnnHeadSize;
+            }
             modelConfig.setRnnConfig(rnnConfig);
         }
     }
@@ -459,10 +474,17 @@ GptJsonConfig parseJson(InputType&& input)
             auto const& stateSize = builderConfig.at("state_size").template get<SizeType32>();
             auto const& convKernel = builderConfig.at("conv_kernel").template get<SizeType32>();
             auto const& rnnHiddenSize = builderConfig.at("rnn_hidden_size").template get<SizeType32>();
+            auto const& rnnConvDimSize = builderConfig.at("rnn_conv_dim_size").template get<SizeType32>();
             ModelConfig::RnnConfig rnnConfig{};
             rnnConfig.stateSize = stateSize;
             rnnConfig.convKernel = convKernel;
             rnnConfig.rnnHiddenSize = rnnHiddenSize;
+            rnnConfig.rnnConvDimSize = rnnConvDimSize;
+            if (builderConfig.contains("rnn_head_size"))
+            {
+                auto const& rnnHeadSize = builderConfig.at("rnn_head_size").template get<SizeType32>();
+                rnnConfig.rnnHeadSize = rnnHeadSize;
+            }
             modelConfig.setRnnConfig(rnnConfig);
         }
     }

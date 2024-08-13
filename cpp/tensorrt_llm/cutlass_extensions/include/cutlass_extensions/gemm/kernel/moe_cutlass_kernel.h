@@ -145,7 +145,7 @@ public:
         ElementC* ptr_C;
         ElementC* ptr_D;
 
-        int64_t* total_rows_before_expert;
+        int64_t const* total_tokens_including_expert;
         int64_t gemm_n;
         int64_t gemm_k;
 
@@ -166,7 +166,7 @@ public:
             , weight_scales(nullptr)
             , ptr_C(nullptr)
             , ptr_D(nullptr)
-            , total_rows_before_expert(nullptr)
+            , total_tokens_including_expert(nullptr)
             , gemm_n(0)
             , gemm_k(0)
             , host_problem_sizes(nullptr)
@@ -177,7 +177,7 @@ public:
         CUTLASS_HOST_DEVICE
         Arguments(int problem_count, int threadblock_count, int group_size, typename EpilogueOutputOp::Params output_op,
             ElementA const* ptr_A, ElementB const* ptr_B, ElementScale const* weight_scales, ElementC const* ptr_C,
-            ElementC* ptr_D, int64_t* total_rows_before_expert, int64_t gemm_n, int64_t gemm_k,
+            ElementC* ptr_D, int64_t const* total_tokens_including_expert, int64_t gemm_n, int64_t gemm_k,
             GemmCoord* host_problem_sizes = nullptr)
             : problem_count(problem_count)
             , threadblock_count(threadblock_count)
@@ -188,7 +188,7 @@ public:
             , weight_scales(const_cast<ElementScale*>(weight_scales))
             , ptr_C(const_cast<ElementC*>(ptr_C))
             , ptr_D(ptr_D)
-            , total_rows_before_expert(total_rows_before_expert)
+            , total_tokens_including_expert(total_tokens_including_expert)
             , gemm_n(gemm_n)
             , gemm_k(gemm_k)
             , host_problem_sizes(nullptr)
@@ -237,7 +237,7 @@ public:
         CUTLASS_HOST_DEVICE
         Params(Arguments const& args, void* workspace = nullptr, int tile_count = 0)
             : problem_visitor(
-                args.total_rows_before_expert, args.gemm_n, args.gemm_k, args.problem_count, workspace, tile_count)
+                args.total_tokens_including_expert, args.gemm_n, args.gemm_k, args.problem_count, workspace, tile_count)
             , threadblock_count(args.threadblock_count)
             , group_size(args.group_size)
             , output_op(args.output_op)
@@ -253,8 +253,8 @@ public:
         void update(Arguments const& args, void* workspace = nullptr, int tile_count = 0)
         {
 
-            problem_visitor = typename ProblemVisitor::Params(
-                args.total_rows_before_expert, args.gemm_n, args.gemm_k, args.problem_count, workspace, tile_count);
+            problem_visitor = typename ProblemVisitor::Params(args.total_tokens_including_expert, args.gemm_n,
+                args.gemm_k, args.problem_count, workspace, tile_count);
             threadblock_count = args.threadblock_count;
             output_op = args.output_op;
             ptr_A = args.ptr_A;
@@ -446,8 +446,6 @@ public:
             // Epilogue
             //
 
-            EpilogueOutputOp output_op(params.output_op);
-
             ElementC* ptr_C = reinterpret_cast<ElementC*>(params.ptr_C) + problem_idx * gemm_n;
             ElementC* ptr_D = reinterpret_cast<ElementC*>(params.ptr_D) + rows_to_jump * gemm_n;
 
@@ -468,7 +466,20 @@ public:
             Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
 
             // Execute the epilogue operator to update the destination tensor.
-            epilogue(output_op, iterator_D, accumulators, iterator_C);
+            if constexpr (platform::is_same<EpilogueOutputOp,
+                              cutlass::epilogue::thread::LinearCombination<typename EpilogueOutputOp::ElementOutput,
+                                  EpilogueOutputOp::kCount, typename EpilogueOutputOp::ElementAccumulator,
+                                  typename EpilogueOutputOp::ElementCompute, EpilogueOutputOp::kScale,
+                                  EpilogueOutputOp::kRound>>::value)
+            {
+                EpilogueOutputOp output_op(params.output_op, problem_idx);
+                epilogue(output_op, iterator_D, accumulators, iterator_C);
+            }
+            else
+            {
+                EpilogueOutputOp output_op(params.output_op);
+                epilogue(output_op, iterator_D, accumulators, iterator_C);
+            }
 
             // Next tile
             problem_visitor.advance(gridDim.x);
@@ -501,8 +512,19 @@ public:
         run_kernel<arch::Sm70>(params, shared_storage);
 #elif (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
         run_kernel<arch::Sm75>(params, shared_storage);
-#elif (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
+#elif (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 890)
         run_kernel<arch::Sm80>(params, shared_storage);
+#elif (__CUDA_ARCH__ >= 890) && (__CUDA_ARCH__ < 900)
+        constexpr bool isFp8 = platform::is_same<ElementA, cutlass::float_e4m3_t>::value
+            || platform::is_same<ElementA, cutlass::float_e5m2_t>::value;
+        if constexpr (isFp8)
+        {
+            run_kernel<arch::Sm89>(params, shared_storage);
+        }
+        else
+        { // reuse sm80 kernel for other types, align with dispatchToArch
+            run_kernel<arch::Sm80>(params, shared_storage);
+        }
 #elif (__CUDA_ARCH__ >= 900)
         run_kernel<arch::Sm80>(params, shared_storage);
 #else

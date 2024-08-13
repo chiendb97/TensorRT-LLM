@@ -194,6 +194,7 @@ def gen_prompt(train_df, subject, k=-1):
 
 
 def evaluate(args, subject, pipeline, dev_df, test_df):
+    rank = tensorrt_llm.mpi_rank()
     cors = []
     all_probs = []
     for i in range(test_df.shape[0]):
@@ -213,18 +214,22 @@ def evaluate(args, subject, pipeline, dev_df, test_df):
         label = test_df.iloc[i, test_df.shape[1] - 1]
         pred = pipeline(prompt)
 
-        probs = [0 for _ in get_choices()]
-        cor = pred.strip().startswith(label)
-        cors.append(cor)
-        all_probs.append(probs)
+        if rank == 0:
+            probs = [0 for _ in get_choices()]
+            cor = pred.strip().startswith(label)
+            cors.append(cor)
+            all_probs.append(probs)
 
-    acc = np.mean(cors)
-    cors = np.array(cors)
+    if rank == 0:
+        acc = np.mean(cors)
+        cors = np.array(cors)
 
-    all_probs = np.array(all_probs)
-    print("Average accuracy {:.3f} - {}".format(acc, subject))
+        all_probs = np.array(all_probs)
+        print("Average accuracy {:.3f} - {}".format(acc, subject))
 
-    return cors, acc, all_probs
+        return cors, acc, all_probs
+    else:
+        return None, 0, None
 
 
 def get_tokenizer(ckpt_path, max_seq_len):
@@ -250,14 +255,16 @@ class Pipeline:
         self.pad_id = pad_id
         self.end_id = end_id
         self.max_attention_window_size = max_attention_window_size
+        self.output_len = 2
 
     def __call__(self, prompt):
+        rank = tensorrt_llm.mpi_rank()
         # Run the model in batch size 1 and beam size 1
         inputs = self.tokenizer.encode(prompt, return_tensors="pt").squeeze(0)
         batch_input_ids = [inputs]
 
         # For multi-choice tasks like MMLU, we don't need to adjust following parameters
-        output_len = 2
+        output_len = self.output_len
         top_k = 1
         top_p = 0.0
 
@@ -296,14 +303,19 @@ class Pipeline:
                     top_p=top_p,
                 )
                 torch.cuda.synchronize()
-                output_ids = outputs[0, 0, input_lengths[0]:]
+                if rank == 0:
+                    output_ids = outputs[0, 0, input_lengths[0]:]
 
-        return self.tokenizer.decode(output_ids, skip_special_tokens=True)
+        if rank == 0:
+            return self.tokenizer.decode(output_ids, skip_special_tokens=True)
+        else:
+            return None
 
     def check_valid_length(self, prompt):
         if isinstance(self.model, nn.Module):
             return True
-        return len(self.tokenizer.encode(prompt)) <= self.model.max_input_len
+        input_len = len(self.tokenizer.encode(prompt))
+        return input_len <= self.model.max_input_len and input_len + self.output_len <= self.model.max_seq_len
 
 
 def parse_args():
@@ -367,21 +379,28 @@ def main():
         runner_kwargs = {}
         if PYTHON_BINDINGS:
             runner_kwargs.update(max_beam_width=1)
+        runner_kwargs.update(
+            max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
+            kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
+            kv_cache_free_gpu_memory_fraction=args.
+            kv_cache_free_gpu_memory_fraction,
+            enable_chunked_context=args.enable_chunked_context,
+            multi_block_mode=args.multi_block_mode)
         model = runner_cls.from_dir(args.engine_dir,
                                     rank=runtime_rank,
                                     **runner_kwargs)
     else:
         assert args.test_hf, "Must test either TRT-LLM or HF"
-        if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
+        if 'GLM' in model_name and model_version == 'glm':
             auto_model_cls = AutoModelForSeq2SeqLM
-        elif model_name == 'ChatGLMForCausalLM' and model_version == 'chatglm':
+        elif 'GLM' in model_name and model_version == 'chatglm':
             auto_model_cls = AutoModel
         else:
             auto_model_cls = AutoModelForCausalLM
         model = auto_model_cls.from_pretrained(
             args.hf_model_dir,
             trust_remote_code=True,
-            torch_dtype=DTYPE_STR_MAPPING[args.data_type],
+            torch_dtype=DTYPE_STR_MAPPING[args.hf_data_type],
             device_map="auto" if args.hf_device_map_auto else None,
         )
         if not args.hf_device_map_auto:
@@ -410,19 +429,20 @@ def main():
                     cat_cors[key].append(cors)
         all_cors.append(cors)
 
-    for subcat in subcat_cors:
-        subcat_acc = np.mean(np.concatenate(subcat_cors[subcat]))
-        print("Average accuracy {:.3f} - {}".format(subcat_acc, subcat))
+    if runtime_rank == 0:
+        for subcat in subcat_cors:
+            subcat_acc = np.mean(np.concatenate(subcat_cors[subcat]))
+            print("Average accuracy {:.3f} - {}".format(subcat_acc, subcat))
 
-    for cat in cat_cors:
-        cat_acc = np.mean(np.concatenate(cat_cors[cat]))
-        print("Average accuracy {:.3f} - {}".format(cat_acc, cat))
+        for cat in cat_cors:
+            cat_acc = np.mean(np.concatenate(cat_cors[cat]))
+            print("Average accuracy {:.3f} - {}".format(cat_acc, cat))
 
-    weighted_acc = np.mean(np.concatenate(all_cors))
-    print("Average accuracy: {:.3f}".format(weighted_acc))
-    if args.check_accuracy:
-        assert weighted_acc >= args.accuracy_threshold, f"Expected accuracy >= {args.accuracy_threshold} while got {weighted_acc}"
-    return weighted_acc
+        weighted_acc = np.mean(np.concatenate(all_cors))
+        print("Average accuracy: {:.3f}".format(weighted_acc))
+        if args.check_accuracy:
+            assert weighted_acc >= args.accuracy_threshold, f"Expected accuracy >= {args.accuracy_threshold} while got {weighted_acc}"
+        return weighted_acc
 
 
 if __name__ == "__main__":

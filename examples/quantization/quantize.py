@@ -62,7 +62,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--seed",
         help="Seed the generate random numbers, the value will be used to call"
-        "random.seed(value) and numpy.random.seed(value)",
+             "random.seed(value) and numpy.random.seed(value)",
         type=int,
         default=1234)
     parser.add_argument("--tokenizer_max_seq_length",

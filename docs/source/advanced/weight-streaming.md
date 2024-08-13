@@ -6,7 +6,7 @@ TensorRT Weight Streaming can offload some weights to the CPU memory and stream 
 This can reduce the weights size in GPU memory, therefore, we can run larger models or larger batch sizes in the same GPU memory budget.
 
 
-During build time, build the engine with `--weight-streaming --gemm_plugin disable` since Weight Streaming only supports strongly typed models and non-plugin weights. During runtime, run with `--gpu_weights_percent x` to config the percent of weights that remained on the GPU. `x` can be a value from `0.0` to `1.0`.
+During build time, build the engine with `--weight-streaming --gemm_plugin disable` since Weight Streaming only supports non-plugin weights. During runtime, run with `--gpu_weights_percent x` to config the percent of weights that remained on the GPU. `x` can be a value from `0.0` to `1.0`.
 
 Here is an example to run llama-7b with Weight Streaming:
 ```bash
@@ -41,20 +41,14 @@ python3 examples/summarize.py \
 We can also benchmark the efficiency of Weight Streaming. Here is an example:
 ```bash
 python3 benchmarks/python/benchmark.py \
-    -m opt_30b \
-    --mode ootb  \
+    --engine_dir /tmp/llama_7b/trt_engines/fp16/1-gpu/ \
     --batch_size "1;32" \
-    --max_batch_size "32" \
     --input_output_len "256,32" \
-    --max_input_len 256\
-    --max_seq_len 288 \
     --gpu_weights_percent "0.0;0.3;0.6;1.0" \
     --dtype float16 \
     --csv \
     --log_level verbose
-
 ```
-Here we use `ootb` mode so that the GEMM operators won't use plugins. `ootb-except-mha` mode is also valid.
 
 
 ### API Changes

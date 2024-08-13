@@ -20,19 +20,18 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from importlib.machinery import SourceFileLoader
 from multiprocessing import get_context
-from typing import Union
+from typing import Optional, Union
 
 import torch
 
-from ..auto_parallel import infer_cluster_config
-from ..auto_parallel.cluster_info import cluster_infos
-from ..builder import BuildConfig, Engine, build
-from ..logger import logger
-from ..lora_manager import LoraConfig, LoraManager
-from ..models import MODEL_MAP, PretrainedConfig
-from ..models.modeling_utils import (WEIGHT_LOADER_MODELS,
-                                     SpeculativeDecodingMode)
-from ..plugin import PluginConfig, add_plugin_argument
+from tensorrt_llm.auto_parallel import infer_cluster_config
+from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
+from tensorrt_llm.builder import BuildConfig, Engine, build
+from tensorrt_llm.logger import logger
+from tensorrt_llm.lora_manager import LoraConfig, LoraManager
+from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
+from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
+from tensorrt_llm.plugin import PluginConfig, add_plugin_argument
 
 
 def parse_arguments():
@@ -75,25 +74,38 @@ def parse_arguments():
                         type=int,
                         default='1',
                         help='The number of workers for building in parallel')
-    parser.add_argument('--max_batch_size', type=int, default=256)
-    parser.add_argument('--max_input_len', type=int, default=1024)
+    parser.add_argument(
+        '--max_batch_size',
+        type=int,
+        default=256,
+        help="Max number of requests that the engine can handle.")
+    parser.add_argument('--max_input_len',
+                        type=int,
+                        default=1024,
+                        help="Max input length of one request.")
     parser.add_argument(
         '--max_seq_len',
         '--max_decoder_seq_len',
         dest='max_seq_len',
         type=int,
-        default=2048,
-        help="Max total length of context and generated sequence")
-    parser.add_argument('--max_output_len', type=int, default=None)
+        default=None,
+        help="Max total length of one request, including prompt and outputs. "
+        "If unspecified, will try to deduce from the model config.")
     parser.add_argument('--max_beam_width', type=int, default=1)
-    parser.add_argument('--max_num_tokens', type=int, default=8192)
+    parser.add_argument(
+        '--max_num_tokens',
+        type=int,
+        default=8192,
+        help="Max number of batched input tokens after padding is removed "
+        "(triggered by `--remove_input_padding`) in each batch.")
     parser.add_argument(
         '--opt_num_tokens',
         type=int,
         default=None,
         help='It equals to max_batch_size*max_beam_width by default, set this '
-             'value as close as possible to the actual number of tokens on your workload. '
-             'Note that this argument might be removed in the future.')
+        'value as close as possible to the actual number of tokens on your workload. '
+        'Note that this argument might be removed in the future.')
+    parser.add_argument('--cp_size', type=int, default=1)
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument(
@@ -128,6 +140,7 @@ def parse_arguments():
                         help='Gather generation logits')
 
     parser.add_argument('--builder_opt', type=int, default=None)
+    parser.add_argument('--builder_force_num_profiles', type=int, default=None)
     parser.add_argument('--logits_dtype',
                         type=str,
                         default=None,
@@ -220,6 +233,7 @@ def parse_arguments():
                             "draft_tokens_external",
                             "lookahead_decoding",
                             "medusa",
+                            "explicit_draft_tokens",
                         ],
                         help='Mode of speculative decoding.')
     parser.add_argument(
@@ -246,19 +260,17 @@ def parse_arguments():
     return args
 
 
-def preprocess_model_config(model_config, **kwargs):
-    if model_config.architecture in WEIGHT_LOADER_MODELS:
-        model_config.mapping.tp_size = kwargs['tp_size']
-        model_config.mapping.pp_size = kwargs['pp_size']
-        model_config.mapping.world_size = kwargs['tp_size'] * kwargs['pp_size']
+def build_model(
+    build_config: BuildConfig,
+    rank: int = 0,
+    ckpt_dir: str = None,
+    model_config: Union[str, PretrainedConfig] = None,
+    model_cls=None,
+    dry_run:
+    bool = False,  # return the modified BuildConfig without actually building the engine
+    **kwargs
+) -> Union[Engine, BuildConfig]:
 
-
-def build_model(build_config: BuildConfig,
-                rank: int = 0,
-                ckpt_dir: str = None,
-                model_config: Union[str, PretrainedConfig] = None,
-                model_cls=None,
-                **kwargs) -> Engine:
     model_config = copy.deepcopy(model_config)
 
     logits_dtype = kwargs.get('logits_dtype')
@@ -314,6 +326,9 @@ def build_model(build_config: BuildConfig,
         build_config.use_strip_plan = True
     build_config.use_refit = kwargs.get('refit', False)
 
+    if dry_run:
+        return build_config
+
     return build(model, build_config)
 
 
@@ -332,22 +347,14 @@ def build_and_save(rank, gpu_id, ckpt_dir, build_config, output_dir, log_level,
     return True
 
 
-def parallel_build(ckpt_dir_or_model_config: str,
+def parallel_build(model_config: PretrainedConfig,
+                   ckpt_dir: Optional[str],
                    build_config: BuildConfig,
                    output_dir: str,
                    workers: int = 1,
                    log_level: str = 'info',
                    model_cls=None,
                    **kwargs):
-    if ckpt_dir_or_model_config.lower().endswith('.json'):
-        config_path = ckpt_dir_or_model_config
-        ckpt_dir = None
-    else:
-        config_path = os.path.join(ckpt_dir_or_model_config, 'config.json')
-        ckpt_dir = ckpt_dir_or_model_config
-
-    model_config = PretrainedConfig.from_json_file(config_path)
-    preprocess_model_config(model_config, **kwargs)
 
     if build_config.auto_parallel_config.enabled:
         if model_config.mapping.world_size > 1:
@@ -407,6 +414,7 @@ def main():
     kwargs = {
         'logits_dtype': args.logits_dtype,
         'use_fused_mlp': args.use_fused_mlp,
+        'cp_size': args.cp_size,
         'tp_size': args.tp_size,
         'pp_size': args.pp_size,
         'lora_dir': args.lora_dir,
@@ -417,6 +425,17 @@ def main():
         'refit': False,
     }
     speculative_decoding_mode = SpeculativeDecodingMode.from_arguments(args)
+
+    ckpt_dir_or_model_config = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_config
+    if ckpt_dir_or_model_config.lower().endswith('.json'):
+        config_path = ckpt_dir_or_model_config
+        ckpt_dir = None
+    else:
+        config_path = os.path.join(ckpt_dir_or_model_config, 'config.json')
+        ckpt_dir = ckpt_dir_or_model_config
+
+    model_config = PretrainedConfig.from_json_file(config_path)
+
     if args.build_config is None:
         if args.multiple_profiles == "enable" and args.opt_num_tokens is not None:
             raise RuntimeError(
@@ -426,22 +445,6 @@ def main():
             cluster_config = dict(cluster_key=args.cluster_key)
         else:
             cluster_config = infer_cluster_config()
-
-        if args.max_output_len:
-            logger.warning(
-                '--max_output_len has been deprecated in favor of --max_seq_len'
-            )
-            if args.max_input_len:
-                if args.max_seq_len:
-                    logger.warning(
-                        '--max_seq_len has been overwritten due to --max_output_len being specified'
-                    )
-                args.max_seq_len = args.max_input_len + args.max_output_len
-            else:
-                raise Exception(
-                    f"--max_output_len is specified but not --max_input_len")
-
-            del args.max_output_len
 
         build_config = BuildConfig.from_dict(
             {
@@ -457,6 +460,7 @@ def main():
                 'gather_generation_logits': args.gather_generation_logits,
                 'strongly_typed': True,
                 'builder_opt': args.builder_opt,
+                'force_num_profiles': args.builder_force_num_profiles,
                 'weight_sparsity': args.weight_sparsity,
                 'profiling_verbosity': args.profiling_verbosity,
                 'enable_debug_output': args.enable_debug_output,
@@ -488,9 +492,8 @@ def main():
         build_config = BuildConfig.from_json_file(args.build_config,
                                                   plugin_config=plugin_config)
 
-    source = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_config
-    parallel_build(source, build_config, args.output_dir, workers,
-                   args.log_level, model_cls, **kwargs)
+    parallel_build(model_config, ckpt_dir, build_config, args.output_dir,
+                   workers, args.log_level, model_cls, **kwargs)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

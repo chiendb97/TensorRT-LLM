@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
@@ -45,12 +46,13 @@ class SpeculativeDecodingModule;
 class IGptDecoder
 {
 public:
-    using TensorPtr = std::shared_ptr<ITensor>;
+    using TensorPtr = runtime::ITensor::SharedPtr;
+    using TensorConstPtr = runtime::ITensor::SharedConstPtr;
 
     virtual ~IGptDecoder() = default;
 
     virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize,
-        std::optional<TensorPtr> const& batchSlots = std::nullopt,
+        std::optional<TensorConstPtr> const& batchSlots = std::nullopt,
         std::optional<DecodingOutput> const& output = std::nullopt)
         = 0;
 
@@ -59,7 +61,8 @@ public:
     virtual void forwardSync(DecodingOutput& output, DecodingInput const& input) = 0;
 
     virtual void gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
-        DecodingInput const& decodingInput, BufferManager const& manager)
+        DecodingInput const& decodingInput, BufferManager const& manager,
+        std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig = std::nullopt)
         = 0;
 
     virtual SamplingConfig const& getSamplingConfig() = 0;
@@ -93,7 +96,7 @@ public:
         std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
 
     void setup(SamplingConfig const& samplingConfig, size_t batchSize,
-        std::optional<TensorPtr> const& batchSlots = std::nullopt,
+        std::optional<TensorConstPtr> const& batchSlots = std::nullopt,
         std::optional<DecodingOutput> const& output = std::nullopt) override;
 
     void forwardAsync(DecodingOutput& output, DecodingInput const& input) override;
@@ -101,7 +104,8 @@ public:
     void forwardSync(DecodingOutput& output, DecodingInput const& input) override;
 
     void gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
-        BufferManager const& manager) override;
+        BufferManager const& manager,
+        std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig = std::nullopt) override;
 
     SamplingConfig const& getSamplingConfig() override
     {
@@ -109,7 +113,7 @@ public:
     }
 
 private:
-    BufferManager mManager;
+    std::shared_ptr<BufferManager> mManager;
     std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
 
     TensorPtr mLogProbsTiled; // Buffer used to store the transpose of the logProbs. Needed because the kernels have

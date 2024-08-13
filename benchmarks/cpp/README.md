@@ -1,7 +1,7 @@
-# Benchmark for C++ Runtime
+# Benchmark C++ Runtime
 
 This document explains how to benchmark the models supported by TensorRT-LLM on a single GPU, a single node with
-multiple GPUs or multiple nodes with multiple GPUs.
+multiple GPUs or multiple nodes with multiple GPUs using the C++ runtime.
 
 ## Usage
 
@@ -16,60 +16,15 @@ Windows users: Follow the
 instead, and be sure to set DLL paths as specified in
 [Extra Steps for C++ Runtime Usage](../../windows/README.md#extra-steps-for-c-runtime-usage).
 
-### 2. Launch C++ benchmarking (Fixed BatchSize/InputLen/OutputLen)
-
-#### Prepare TensorRT-LLM engine(s)
-
-Before you launch C++ benchmarking, please make sure that you have already built engine(s) using TensorRT-LLM API, C++ benchmarking code cannot generate engine(s) for you.
-
-Use `trtllm-build` to build the TRT-LLM engine. Alternatively, if you have already benchmarked Python Runtime, you can reuse the engine(s) built previously, please see that [`document`](../python/README.md).
-
-####  Launch benchmarking
-
-For detailed usage, you can do the following
-```
-cd cpp/build
-
-# You can directly execute the binary for help information
-./benchmarks/gptSessionBenchmark --help
-./benchmarks/bertBenchmark --help
-```
-
-Take GPT-350M as an example for single GPU
-
-```
-./benchmarks/gptSessionBenchmark \
-    --engine_dir "../../benchmarks/gpt_350m/" \
-    --batch_size "1" \
-    --input_output_len "60,20"
-
-# Expected output:
-# [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 40.81
-```
-Take GPT-175B as an example for multiple GPUs
-```
-mpirun -n 8 ./benchmarks/gptSessionBenchmark \
-    --engine_dir "../../benchmarks/gpt_175b/" \
-    --batch_size "1" \
-    --input_output_len "60,20"
-
-# Expected output:
-# [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 792.14
-```
-
-If you want to obtain context and generation logits, you could build an enigne with `--gather_context_logits` and `--gather_generation_logits`, respectively. Enable `--gather_all_token_logits` will enable both of them.
-
-If you want to get the logits, you could run gptSessionBenchmark with `--print_all_logits`. This will print a large number of logit values and has a certain impact on performance.
-
-*Please note that the expected outputs in that document are only for reference, specific performance numbers depend on the GPU you're using.*
-
-### 3. Launch Batch Manager benchmarking (Inflight/V1 batching)
+### 2. Launch C++ benchmarking (Inflight/V1 batching)
 
 #### Prepare dataset
 
-Run a preprocessing script to prepare/generate dataset into a json that gptManagerBenchmark can consume later. The processed output json has *input tokens length, input token ids and output tokens length*
+Run a preprocessing script to prepare/generate dataset into a json that `gptManagerBenchmark` can consume later. The processed output json has *input tokens length, input token ids and output tokens length*.
 
-This tool can be used in 2 different modes of traffic generation.
+For `tokenizer`, specifying the path to the local tokenizer that have already been downloaded, or simply the name of the tokenizer from HuggingFace like `meta-llama/Llama-2-7b` will both work. The tokenizer will be downloaded automatically for the latter case.
+
+This tool can be used in 3 different modes of traffic generation: `dataset`, `token-norm-dist` and `token-unif-dist`.
 
 ##### 1 – Dataset
 
@@ -110,8 +65,8 @@ python3 prepare_dataset.py \
 
 ##### 2 – Normal token length distribution
 
-This mode allows the user to generate normal token length distributions with a mean and std deviation specified.
-For example, setting mean=100 and std dev=10 would generate requests where 95.4% of values are in <80,120> range following the normal probability distribution. Setting std dev=0 will generate all requests with the same mean number of tokens.
+This mode allows the user to generate normally distributed token lengths with a mean and std deviation specified.
+For example, setting `mean=100` and `stdev=10` would generate requests where 95.4% of values are in <80,120> range following the normal probability distribution. Setting `stdev=0` will generate all requests with the same mean number of tokens.
 
 ```
 python prepare_dataset.py \
@@ -123,11 +78,25 @@ python prepare_dataset.py \
    --output-mean 15 --output-stdev 0
 ```
 
-For `tokenizer`, specifying the path to the local tokenizer that have already been downloaded, or simply the name of the tokenizer from HuggingFace like `meta-llama/Llama-2-7b` will both work. The tokenizer will be downloaded automatically for the latter case.
+##### 2 – Uniform token length distribution
+
+This mode allows the user to generate uniformly distributed token lengths with min and max lengths specified.
+For example, setting `min=50` and  `max=100` would generate requests where lengths are in the range `[50, 100]` following the uniform probability distribution. Setting `min=x` and `max=x` will generate all requests with the same mean number of tokens `x`.
+
+```
+python prepare_dataset.py \
+  --output token-norm-dist.json \
+  --tokenizer <path/to/tokenizer> \
+   token-unif-dist \
+   --num-requests 100 \
+   --input-min 50 --input-max 100 \
+   --output-min 10 --output-max 15
+```
 
 
 #### Prepare TensorRT-LLM engines
-Please make sure that the engines are built with argument `--use_inflight_batching` and `--remove_input_padding` if you'd like to benchmark inflight batching, for more details, please see the document in TensorRT-LLM examples.
+
+Before you launch C++ benchmarking, please make sure that you have already built engine(s) using `trtllm-build` command. For more details on building engine(s), please refer to the [Quick Start Guide](../../docs/source/quick-start-guide.md).
 
 #### Launch benchmarking
 
@@ -139,34 +108,63 @@ cd cpp/build
 ./benchmarks/gptManagerBenchmark --help
 ```
 
-Take GPT-350M as an example for single GPU V1 batching
-```
-./benchmarks/gptManagerBenchmark \
-    --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
-    --type V1 \
-    --request_rate 10 \
-    --dataset ../../benchmarks/cpp/preprocessed_dataset.json
-    --max_num_samples 500
-```
+`gptManagerBenchmark` now supports decoder-only models and encoder-decoder models.
 
-Take GPT-350M as an example for 2-GPU inflight batching
-```
-mpirun -n 2 ./benchmarks/gptManagerBenchmark \
-    --engine_dir ../../examples/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
-    --type IFB \
-    --request_rate 10 \
-    --dataset ../../benchmarks/cpp/preprocessed_dataset.json
-    --max_num_samples 500
-```
+1. Decoder-only Models
 
-`gptManagerBenchmark` by default uses the high-level C++ API defined by the `executor::Executor` class (see `cpp/include/tensorrt_llm/executor/executor.h`).
+    To benchmark decoder-only models, pass in the engine path with `--engine_dir` as executable input argument.
+
+    Take GPT-350M as an example for 2-GPU inflight batching
+    ```
+    mpirun -n 2 ./benchmarks/gptManagerBenchmark \
+        --engine_dir ../../examples/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
+        --request_rate 10 \
+        --dataset ../../benchmarks/cpp/preprocessed_dataset.json \
+        --max_num_samples 500
+    ```
+
+    `gptManagerBenchmark` by default uses the high-level C++ API defined by the `executor::Executor` class (see `cpp/include/tensorrt_llm/executor/executor.h`).
+
+2. Encoder-Decoder Models
+    To benchmark encoder-decoder models, pass in the encoder engine path with `--encoder_engine_dir` and the decoder engine path with `--decoder_engine_dir` as executable input arguments. `--decoder_engine_dir` is an alias of `--engine_dir`.
+
+    Currently encoder-decoder engines only support `--api executor`, `--type IFB`, `--enable_kv_cache_reuse false`, which are all default values so no specific settings required.
+
+    Prepare t5-small engine from [examples/enc_dec](/examples/enc_dec/README.md#convert-and-split-weights) for the encoder-decoder 4-GPU inflight batching example.
+
+    Prepare the dataset suitable for engine input lengths.
+    ```
+    python prepare_dataset.py \
+        --tokenizer <path/to/tokenizer> \
+        --output cnn_dailymail.json \
+        dataset \
+        --dataset-name cnn_dailymail \
+        --dataset-split validation \
+        --dataset-config-name 3.0.0 \
+        --dataset-input-key article \
+        --dataset-prompt "Summarize the following article:" \
+        --dataset-output-key "highlights" \
+        --num-requests 100 \
+        --max-input-len 512 \
+        --output-len-dist 128,20
+    ```
+
+    Run the benchmark
+    ```
+    mpirun --allow-run-as-root -np 4 ./benchmarks/gptManagerBenchmark \
+        --encoder_engine_dir ../../examples/enc_dec/tmp/trt_engines/t5-small-4gpu/bfloat16/encoder \
+        --decoder_engine_dir ../../examples/enc_dec/tmp/trt_engines/t5-small-4gpu/bfloat16/decoder \
+        --dataset cnn_dailymail.json
+    ```
+
 
 #### Emulated static batching
 
-To emulate `gptSessionBenchmark` static batching, you can use `gptManagerBenchmark` with the `--static_emulated_batch_size` and `--static_emulated-timeout` arguments.
+To emulate the deprecated `gptSessionBenchmark` static batching, you can use `gptManagerBenchmark` with the `--static_emulated_batch_size` and `--static_emulated-timeout` arguments.
+
 Given a `static_emulated_batch_size` of `n` the server will wait for `n` requests to arrive before submitting them to the batch manager at once. If the `static_emulated_timeout` (in ms) is reached before `n` requests are collected, the batch will be submitted prematurely with the current request count. New batches will only be submitted once the previous batch has been processed comepletely.
 
-`gptSessionBenchmark` uses fixed input/output lengths for benchmarking. A similar dataset for `gptManagerBenchmark` can be generated with the preprocessing script, e.g.
+Datasets with fixed input/output lengths for benchmarking can be generated with the preprocessing script, e.g.
 ```
  python prepare_dataset.py \
   --output tokens-fixed-lengths.json \
@@ -181,8 +179,7 @@ Take GPT-350M as an example for single GPU with static batching
 ```
 ./benchmarks/gptManagerBenchmark \
     --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
-    --type IFB \
-    --request-rate -1 \
+    --request_rate -1 \
     --static_emulated_batch_size 32 \
     --static_emulated_timeout 100 \
     --dataset ../../benchmarks/cpp/tokens-fixed-lengths.json
@@ -239,7 +236,7 @@ ${HOME}/.local/bin/trtllm-build \
     --lora_target_modules attn_q attn_k attn_v attn_dense mlp_h_to_4h mlp_4h_to_h mlp_gate \
     --max_lora_rank ${MAX_LORA_RANK}
 
-NUM_LORAS=(8 16 24 32 64 128 256)
+NUM_LORAS=(8 16)
 NUM_REQUESTS=1024
 
 # Convert LoRA to cpp format
@@ -271,20 +268,20 @@ for nloras in ${NUM_LORAS[@]}; do
 done
 
 # Generate random lora weights for 256 adapters
-python benchmarks/cpp/utils/generate_rand_loras.py ${CPP_LORA} ${EG_DIR}/loras 256
+python benchmarks/cpp/utils/generate_rand_loras.py ${CPP_LORA} ${EG_DIR}/loras 16
 
 # perform benchmarking
 
 # First run inference without LoRAs
 mkdir -p ${EG_DIR}/log-base-lora
 mpirun -n ${TP} --output-filename ${EG_DIR}/log-base-lora \
-    cpp/build_Debug/benchmarks/gptManagerBenchmark \
+    cpp/build/benchmarks/gptManagerBenchmark \
     --engine_dir $LORA_ENGINE \
     --type IFB \
     --dataset "${EG_DIR}/data/token-norm-dist.json" \
     --lora_host_cache_bytes 8589934592 \
     --lora_num_device_mod_layers $(( 32 * $NUM_LAYERS * $NUM_LORA_MODS * $MAX_LORA_RANK )) \
-    --kv_cache_free_gpu_mem_fraction 0.80 \
+    --kv_cache_free_gpu_mem_fraction 0.70 \
     --log_level info \
     --eos_id ${EOS_ID}
 
@@ -296,15 +293,62 @@ mpirun -n ${TP} --output-filename ${EG_DIR}/log-base-lora \
 for nloras in ${NUM_LORAS[@]}; do
     mkdir -p ${EG_DIR}/log-lora-${nloras}
     mpirun -n ${TP} --output-filename "${EG_DIR}/log-lora-${nloras}" \
-        cpp/build_Debug/benchmarks/gptManagerBenchmark \
+        cpp/build/benchmarks/gptManagerBenchmark \
         --engine_dir $LORA_ENGINE \
         --type IFB \
         --dataset "${EG_DIR}/data/token-norm-dist-lora-${nloras}.json" \
         --lora_host_cache_bytes 8589934592 \
         --lora_num_device_mod_layers $(( 16 * $NUM_LAYERS * $NUM_LORA_MODS * $MAX_LORA_RANK )) \
-        --kv_cache_free_gpu_mem_fraction 0.80 \
+        --kv_cache_free_gpu_mem_fraction 0.70 \
         --log_level info \
         --eos_id ${EOS_ID} \
         --lora_dir ${EG_DIR}/loras
 done
 ```
+
+### 3. [DEPRECATED] Launch C++ static batching benchmarking (Fixed BatchSize/InputLen/OutputLen)
+
+#### Prepare TensorRT-LLM engine(s)
+
+Before you launch C++ benchmarking, please make sure that you have already built engine(s) using TensorRT-LLM API, C++ benchmarking code cannot generate engine(s) for you.
+
+Use `trtllm-build` to build the TRT-LLM engine. Alternatively, if you have already benchmarked Python Runtime, you can reuse the engine(s) built previously, please see that [`document`](../python/README.md).
+
+####  Launch benchmarking
+
+For detailed usage, you can do the following
+```
+cd cpp/build
+
+# You can directly execute the binary for help information
+./benchmarks/gptSessionBenchmark --help
+./benchmarks/bertBenchmark --help
+```
+
+Take GPT-350M as an example for single GPU
+
+```
+./benchmarks/gptSessionBenchmark \
+    --engine_dir "../../benchmarks/gpt_350m/" \
+    --batch_size "1" \
+    --input_output_len "60,20"
+
+# Expected output:
+# [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 40.81
+```
+Take GPT-175B as an example for multiple GPUs
+```
+mpirun -n 8 ./benchmarks/gptSessionBenchmark \
+    --engine_dir "../../benchmarks/gpt_175b/" \
+    --batch_size "1" \
+    --input_output_len "60,20"
+
+# Expected output:
+# [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 792.14
+```
+
+If you want to obtain context and generation logits, you could build an enigne with `--gather_context_logits` and `--gather_generation_logits`, respectively. Enable `--gather_all_token_logits` will enable both of them.
+
+If you want to get the logits, you could run gptSessionBenchmark with `--print_all_logits`. This will print a large number of logit values and has a certain impact on performance.
+
+*Please note that the expected outputs in that document are only for reference, specific performance numbers depend on the GPU you're using.*

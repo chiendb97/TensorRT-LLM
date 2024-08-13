@@ -23,10 +23,12 @@ from .dbrx.config import DbrxConfig
 from .dbrx.model import DbrxForCausalLM
 from .dit.model import DiT
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
+from .falcon.config import FalconConfig
 from .falcon.model import FalconForCausalLM, FalconModel
 from .gemma.model import GemmaForCausalLM
 from .gpt.config import GPTConfig
 from .gpt.model import GPTForCausalLM, GPTModel
+from .gptj.config import GPTJConfig
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .grok.model import GrokForCausalLM
@@ -42,8 +44,8 @@ from .opt.model import OPTForCausalLM, OPTModel
 from .phi3.model import Phi3ForCausalLM, Phi3Model
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
-from .kilm.model import KiLMForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
+from .redrafter.model import ReDrafterForCausalLM
 
 __all__ = [
     'BertModel',
@@ -52,6 +54,7 @@ __all__ = [
     'BloomModel',
     'BloomForCausalLM',
     'DiT',
+    'FalconConfig',
     'FalconForCausalLM',
     'FalconModel',
     'GPTConfig',
@@ -64,19 +67,24 @@ __all__ = [
     'LLaMAModel',
     'MedusaConfig',
     'MedusaForCausalLm',
+    'ReDrafterForCausalLM',
+    'GPTJConfig',
     'GPTJModel',
     'GPTJForCausalLM',
     'GPTNeoXModel',
     'GPTNeoXForCausalLM',
     'PhiModel',
+    'PhiConfig',
     'Phi3Model',
+    'Phi3Config',
     'PhiForCausalLM',
     'Phi3ForCausalLM',
     'ChatGLMForCausalLM',
     'ChatGLMModel',
     'BaichuanForCausalLM',
+    'QWenConfig'
     'QWenForCausalLM',
-    'KiLMForCausalLM',
+    'QWenModel',
     'EncoderModel',
     'DecoderModel',
     'PretrainedConfig',
@@ -96,17 +104,28 @@ __all__ = [
 ]
 
 MODEL_MAP = {
+    'GPT2LMHeadModel': GPTForCausalLM,
+    'GPT2LMHeadCustomModel': GPTForCausalLM,
+    'GPTBigCodeForCausalLM': GPTForCausalLM,
+    'Starcoder2ForCausalLM': GPTForCausalLM,
+    'FuyuForCausalLM': GPTForCausalLM,
+    'Kosmos2ForConditionalGeneration': GPTForCausalLM,
+    'JAISLMHeadModel': GPTForCausalLM,
     'GPTForCausalLM': GPTForCausalLM,
     'OPTForCausalLM': OPTForCausalLM,
     'BloomForCausalLM': BloomForCausalLM,
+    'RWForCausalLM': FalconForCausalLM,
     'FalconForCausalLM': FalconForCausalLM,
     'PhiForCausalLM': PhiForCausalLM,
     'Phi3ForCausalLM': Phi3ForCausalLM,
+    'Phi3VForCausalLM': Phi3ForCausalLM,
     'Phi3SmallForCausalLM': Phi3ForCausalLM,
     'MambaForCausalLM': MambaForCausalLM,
     'GPTNeoXForCausalLM': GPTNeoXForCausalLM,
     'GPTJForCausalLM': GPTJForCausalLM,
     'MPTForCausalLM': MPTForCausalLM,
+    'GLMModel': ChatGLMForCausalLM,
+    'ChatGLMModel': ChatGLMForCausalLM,
     'ChatGLMForCausalLM': ChatGLMForCausalLM,
     'LlamaForCausalLM': LLaMAForCausalLM,
     'MistralForCausalLM': LLaMAForCausalLM,
@@ -116,11 +135,15 @@ MODEL_MAP = {
     'InternLMForCausalLM': LLaMAForCausalLM,
     'InternLM2ForCausalLM': LLaMAForCausalLM,
     'MedusaForCausalLM': MedusaForCausalLm,
+    'ReDrafterForCausalLM': ReDrafterForCausalLM,
     'BaichuanForCausalLM': BaichuanForCausalLM,
+    'BaiChuanForCausalLM': BaichuanForCausalLM,
     'SkyworkForCausalLM': LLaMAForCausalLM,
     'GemmaForCausalLM': GemmaForCausalLM,
+    'QWenLMHeadModel': QWenForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
-    'KiLMForCausalLM': KiLMForCausalLM,
+    'Qwen2ForCausalLM': QWenForCausalLM,
+    'Qwen2MoeForCausalLM': QWenForCausalLM,
     'WhisperEncoder': WhisperEncoder,
     'EncoderModel': EncoderModel,
     'DecoderModel': DecoderModel,

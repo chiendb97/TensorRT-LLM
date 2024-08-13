@@ -30,6 +30,7 @@ This document explains how to build the [GPT](https://huggingface.co/gpt2) model
     - [3. Embedding sharing](#3-embedding-sharing)
   - [GPT Variant - SantaCoder](#gpt-variant---santacoder)
   - [GPT Variant - StarCoder (v1 and v2)](#gpt-variant---starcoder-v1-and-v2)
+    - [Run StarCoder2 with LoRA](#run-starcoder2-with-lora)
   - [GPT-Next](#gpt-next)
     - [Prompt-tuning](#prompt-tuning)
     - [MultiLoRA with the Nemo checkpoint](#multilora-with-the-nemo-checkpoint)
@@ -147,7 +148,7 @@ If the engines are built successfully, you will see output like:
 
 `trtllm-build` enables FMHA kernels by default. You may disable it by adding `--context_fmha disable`.
 
-If you find that the default fp16 accumulation cannot meet the requirement, you can try to enable fp32 accumulation by adding `--context_fmha_fp32_acc enable`. However, it is expected to see performance drop.
+If you find that the default fp16 accumulation cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc` to the inference command (`run.py` or `summarize.py`). However, it is expected to see performance drop.
 
 Note that the FMHA kernels have to be used together with `gpt_attention_plugin` enabled.
 
@@ -413,6 +414,21 @@ trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8-sq-ptpc/1-gpu \
 
 Note that GPT attention plugin is required to be enabled for SmoothQuant for now.
 
+User can also use `ModelOpt` to do INT8 quantization. Especially for gpt variant Starcoder2.
+```bash
+python3 example/quantization/quantize.py --model_dir starcoder2 \
+        --dtype float16 \
+        --qformat int8_sq \
+        --output_dir starcoder2/trt_ckpt/int8-sq/
+```
+Then, use `trtllm-build` to build engine(s).
+
+```bash
+trtllm-build --checkpoint_dir starcoder2/trt_ckpt/int8-sq/ \
+             --output_dir starcoder2/trt_engine/int8-sq/ \
+             --builder_opt 4
+```
+
 
 ### INT8 KV Cache
 
@@ -613,6 +629,44 @@ For StarCoder2, you can use almost the same steps as shown above.
  - Add `--max_attention_window_size 4096` when running with run.py or summarization, which enables the sliding window attention.
    - the sliding window size comes from the hf model [config.json](https://huggingface.co/bigcode/starcoder2-15b/blob/main/config.json#L23).
 
+### Run StarCoder2 with LoRA
+
+TensorRT-LLM supports running StarCoder2 models with FP16/BF16/FP32 LoRA. In this section, we use starcoder2-15b as an example to show how to run an FP8 base model with FP16 LoRA module.
+
+* download the base model and lora model from HF
+
+```bash
+git-lfs clone https://huggingface.co/bigcode/starcoder2-15b
+git-lfs clone https://huggingface.co/KaQyn/peft-lora-starcoder2-15b-unity-copilot
+```
+
+* Quantize the StarCoder2 model to fp8 from HF
+```bash
+BASE_STARCODER2_MODEL=./starcoder2-15b
+python ../quantization/quantize.py --model_dir ${BASE_STARCODER2_MODEL} \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir starcoder2-15b/trt_ckpt/fp8/1-gpu \
+                                   --calib_size 512
+```
+
+* Build engine and run inference.
+```
+trtllm-build --checkpoint_dir starcoder2-15b/trt_ckpt/fp8/1-gpu \
+             --output_dir starcoder2-15b/trt_engines/fp8_lora/1-gpu \
+             --gemm_plugin auto \
+             --lora_plugin auto \
+             --lora_dir ./peft-lora-starcoder2-15b-unity-copilot
+
+python ../run.py --engine_dir starcoder2-15b/trt_engines/fp8_lora/1-gpu \
+                 --max_output_len 20 \
+                 --tokenizer_dir ${BASE_STARCODER2_MODEL} \
+                 --input_text "def print_hello_world():" \
+                 --lora_task_uids 0 \
+                 --no_add_special_tokens \
+                 --use_py_session
+```
 
 ## GPT-Next
 

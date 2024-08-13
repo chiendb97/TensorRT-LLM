@@ -18,11 +18,14 @@ from typing import Optional
 
 from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
 
+from tensorrt_llm.bindings import GptJsonConfig
 from tensorrt_llm.builder import get_engine_version
 
 DEFAULT_HF_MODEL_DIRS = {
     'BaichuanForCausalLM': 'baichuan-inc/Baichuan-13B-Chat',
     'BloomForCausalLM': 'bigscience/bloom-560m',
+    'GLMModel': 'THUDM/glm-10b',
+    'ChatGLMModel': 'THUDM/chatglm3-6b',
     'ChatGLMForCausalLM': 'THUDM/chatglm3-6b',
     'FalconForCausalLM': 'tiiuae/falcon-rw-1b',
     'GPTForCausalLM': 'gpt2-medium',
@@ -34,7 +37,10 @@ DEFAULT_HF_MODEL_DIRS = {
     'MPTForCausalLM': 'mosaicml/mpt-7b',
     'PhiForCausalLM': 'microsoft/phi-2',
     'OPTForCausalLM': 'facebook/opt-350m',
+    'QWenLMHeadModel': 'Qwen/Qwen-7B',
     'QWenForCausalLM': 'Qwen/Qwen-7B',
+    'Qwen2ForCausalLM': 'Qwen/Qwen1.5-7B',
+    'Qwen2MoeForCausalLM': 'Qwen/Qwen1.5-MoE-A2.7B',
     'RecurrentGemmaForCausalLM': 'google/recurrentgemma-2b',
 }
 
@@ -43,15 +49,30 @@ INTERNLM_META_INSTRUCTION = """You are an AI assistant whose name is InternLM (�
 - InternLM (书生·浦语) can understand and communicate fluently in the language chosen by the user such as English and 中文.
 """
 
+QWEN_PROMPT_TEMPLATE = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n"
+
 DEFAULT_PROMPT_TEMPLATES = {
-    'InternLMForCausalLM':
-    "<|User|>:{input_text}<eoh>\n<|Bot|>:",
-    'InternLM2ForCausalLM':
-    "<|im_start|>system\n" + INTERNLM_META_INSTRUCTION +
+    'InternLMForCausalLM': "<|User|>:{input_text}<eoh>\n<|Bot|>:",
+    'InternLM2ForCausalLM': "<|im_start|>system\n" + INTERNLM_META_INSTRUCTION +
     "<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n",
-    'QWenForCausalLM':
-    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n",
+    'QWenLMHeadModel': QWEN_PROMPT_TEMPLATE,
+    'QWenForCausalLM': QWEN_PROMPT_TEMPLATE,
+    'Qwen2ForCausalLM': QWEN_PROMPT_TEMPLATE,
+    'Qwen2MoeForCausalLM': QWEN_PROMPT_TEMPLATE,
 }
+
+
+def supports_inflight_batching(engine_dir):
+    config_path = Path(engine_dir) / "config.json"
+    json_config = GptJsonConfig.parse_file(config_path)
+    model_config = json_config.model_config
+    return model_config.supports_inflight_batching
+
+
+def read_decoder_start_token_id(engine_dir):
+    with open(Path(engine_dir) / "config.json", 'r') as f:
+        config = json.load(f)
+    return config['pretrained_config']['decoder_start_token_id']
 
 
 def read_model_name(engine_dir: str):
@@ -65,9 +86,9 @@ def read_model_name(engine_dir: str):
 
     model_arch = config['pretrained_config']['architecture']
     model_version = None
-    if model_arch == 'ChatGLMForCausalLM':
+    if 'GLM' in model_arch:
         model_version = config['pretrained_config']['chatglm_version']
-    if model_arch == 'QWenForCausalLM':
+    if 'qwen' in model_arch.lower():
         model_version = config['pretrained_config']['qwen_type']
     return model_arch, model_version
 
@@ -118,12 +139,12 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
                                 padding_side='left',
                                 truncation_side='left',
                                 legacy=False)
-    if model_name == 'QWenForCausalLM' and model_version == 'qwen':
+    if 'qwen' in model_name.lower() and model_version == 'qwen':
         with open(Path(tokenizer_dir) / "generation_config.json") as f:
             gen_config = json.load(f)
         pad_id = gen_config['pad_token_id']
         end_id = gen_config['eos_token_id']
-    elif model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
+    elif 'GLM' in model_name and model_version == 'glm':
         pad_id = tokenizer.pad_token_id
         end_id = tokenizer.eop_token_id
     else:
@@ -156,6 +177,11 @@ def add_common_args(parser):
                         '1 for early-stopping, 0 for non-early-stopping'
                         'other values for stopping by length',
                         default=1)
+    parser.add_argument(
+        '--end_id',
+        default=None,
+        type=int,
+        help="Override tokenizer end_id to stop on given end_id token.")
     parser.add_argument(
         '--stop_words',
         default=None,
@@ -190,6 +216,15 @@ def add_common_args(parser):
         help=
         'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
     )
+    parser.add_argument(
+        '--multi_block_mode',
+        action='store_true',
+        help=
+        "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
+    )
+    parser.add_argument('--enable_context_fmha_fp32_acc',
+                        action='store_true',
+                        help="Enable FMHA runner FP32 accumulation.")
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument(
         '--no_prompt_template',
@@ -315,4 +350,16 @@ def add_common_args(parser):
         action='store_true',
         help="Use device map 'auto' to load a pretrained HF model. This may "
         "help to test a large model that cannot fit into a singlue GPU.")
+
+    parser.add_argument(
+        "--return_all_generated_tokens",
+        default=False,
+        action="store_true",
+        help="This option changes the token output only for streaming. "
+        "If not specified, return only generated tokens at each step. "
+        "If specified, return the full beams/outputs at each step. "
+        "It is automatically enabled for num_beams>1 (only available with cpp session). "
+        "WARNING: using this option may increase network usage significantly (quadratically w.r.t output length)."
+    )
+
     return parser
