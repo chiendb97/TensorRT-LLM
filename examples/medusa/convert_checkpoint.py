@@ -24,7 +24,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.convert_utils import (dup_kv_weight,
                                                load_calib_dataset,
-                                               split_matrix_tp, split_qkv_tp)
+                                               split, split_matrix_tp, split_qkv_tp)
 from tensorrt_llm.models.llama.convert import load_weights_from_hf_by_shard
 from tensorrt_llm.models.medusa.weight import (get_tllm_linear_weight,
                                                load_medusa_hf)

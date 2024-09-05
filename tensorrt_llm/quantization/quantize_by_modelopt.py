@@ -439,6 +439,11 @@ def quantize_and_export(*,
                     value.update({"num_bits": (4, 3)})  # type: ignore
             quant_cfg["quant_cfg"].update(KV_CACHE_CFG)  # type: ignore
 
+        import os
+        enable_quantize_lm_head = os.getenv("ENABLE_QUANTIZE_LM_HEAD", 'False').lower() in ('true', '1', 't')
+        if enable_quantize_lm_head:
+            quant_cfg["quant_cfg"]["*lm_head*"]["enable"] = True
+
         model = quantize_model(model, quant_cfg, calib_dataloader)
 
     with torch.inference_mode():
