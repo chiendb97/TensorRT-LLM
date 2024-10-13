@@ -54,9 +54,13 @@ def get_all_lora_weights(lora_weights):
         m = pattern.match(key)
         m_moe = moe_pattern.match(key)
         if m:
-            layer_idx = int(m.group(1))
-            hf_module = m.group(3)
-            inout = "in" if m.group(4) == "A" else "out"
+            layer_idx = int(m.group(2))
+            if m.group(3) in ["attn", "self_attn"]:
+                attn_or_bias = "attn"
+            else:
+                attn_or_bias = "mlp"
+            hf_module = attn_or_bias + "." + m.group(4)
+            inout = "in" if m.group(5) == "A" else "out"
             all_weights[layer_idx][hf_module][inout] = weights
         elif m_moe:
             layer_idx = int(m_moe.group(1))
@@ -66,14 +70,6 @@ def get_all_lora_weights(lora_weights):
         else:
             print(f"no match {key}")
             continue
-        layer_idx = int(m.group(2))
-        if m.group(3) in ["attn", "self_attn"]:
-            attn_or_bias = "attn"
-        else:
-            attn_or_bias = "mlp"
-
-        hf_module = attn_or_bias + "." + m.group(4)
-        inout = "in" if m.group(5) == "A" else "out"
 
         all_weights[layer_idx][hf_module][inout] = weights
     return all_weights

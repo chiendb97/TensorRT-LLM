@@ -321,7 +321,7 @@ void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginCon
             ? json.at("pretrained_config").at("moe").at("num_experts").template get<SizeType32>()
             : SizeType32{0};
         modelConfig.setLoraModules(LoraModule::createLoraModules(loraTargetModules.value(), modelConfig.getHiddenSize(),
-            modelConfig.getMlpHiddenSize(), modelConfig.getNbHeads(), numKvHeads, modelConfig.getSizePerHead(),
+            mlp_hidden_size, modelConfig.getNbHeads(), numKvHeads, modelConfig.getSizePerHead(),
             tensorParallelism, numExperts));
     }
 
