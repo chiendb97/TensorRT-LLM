@@ -160,6 +160,8 @@ ModelConfig createModelConfig(
     auto numKvHeadsPerAttentionLayer
         = parseJsonFieldOr<std::vector<SizeType32>>(config, "num_kv_heads_per_layer", std::vector<SizeType32>());
 
+    auto numKvHeadsPerCrossAttentionLayer = parseJsonFieldOr<std::vector<SizeType32>>(
+        config, "num_kv_heads_per_cross_attn_layer", std::vector<SizeType32>());
     auto modelConfig
         = ModelConfig{vocabSize, numLayers, numAttentionLayers, numRnnLayers, numHeads, hiddenSize, dataType};
 
@@ -167,12 +169,26 @@ ModelConfig createModelConfig(
     {
         std::transform(numKvHeadsPerAttentionLayer.cbegin(), numKvHeadsPerAttentionLayer.cend(),
             numKvHeadsPerAttentionLayer.begin(),
-            [tensorParallelism](SizeType32 const numKvHeads) { return std::max(numKvHeads / tensorParallelism, 1); });
+            [tensorParallelism](SizeType32 const numKvHeads)
+            { return ((numKvHeads + tensorParallelism - 1) / tensorParallelism); });
         modelConfig.setNumKvHeadsPerLayer(numKvHeadsPerAttentionLayer);
     }
     else
     {
         modelConfig.setNbKvHeads(numKvHeads);
+    }
+
+    if (!numKvHeadsPerCrossAttentionLayer.empty())
+    {
+        std::transform(numKvHeadsPerCrossAttentionLayer.cbegin(), numKvHeadsPerCrossAttentionLayer.cend(),
+            numKvHeadsPerCrossAttentionLayer.begin(),
+            [tensorParallelism](SizeType32 const numKvHeads)
+            { return ((numKvHeads + tensorParallelism - 1) / tensorParallelism); });
+        modelConfig.setNumKvHeadsPerCrossLayer(numKvHeadsPerCrossAttentionLayer);
+    }
+    else
+    {
+        modelConfig.setNbCrossKvHeads(numKvHeads);
     }
 
     modelConfig.setSizePerHead(sizePerHead);
@@ -190,7 +206,8 @@ ModelConfig createModelConfig(
 
     // only enable cross attention for the decoder in encoder-decoder model
     // TODO: add cross_attention and has_token_type_embedding as fields in pretrained config
-    auto const useCrossAttention = arch == std::string("DecoderModel") ? true : false;
+    auto const useCrossAttention
+        = (arch == std::string("DecoderModel") || parseJsonFieldOr(config, "cross_attention", false)) ? true : false;
     if (useCrossAttention)
     {
         // For an encoder-decoder model, this would be overwritten in executorImpl.cpp with correct encoder config
@@ -198,7 +215,10 @@ ModelConfig createModelConfig(
         TLLM_LOG_INFO("Setting encoder max input length and hidden size for accepting visual features.");
         modelConfig.setMaxEncoderLen(json.at("build_config").at("max_encoder_input_len").template get<SizeType32>());
         modelConfig.setEncoderHiddenSize(hiddenSize * tensorParallelism);
+        auto const maxEncoderLen = parseJsonFieldOr<SizeType32>(json.at("build_config"), "max_encoder_input_len", 0);
+        modelConfig.setMaxEncoderLen(maxEncoderLen);
     }
+
     auto const usePositionEmbedding = parseJsonFieldOr<bool>(config, "has_position_embedding", false);
     auto const useTokenTypeEmbedding = parseJsonFieldOr<bool>(config, "has_token_type_embedding", false);
     modelConfig.setUseCrossAttention(useCrossAttention);
@@ -266,6 +286,7 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     auto const manageWeightsType = parseJsonFieldOr<bool>(pluginConfig, "manage_weights", false)
         ? ModelConfig::ManageWeightsType::kEnabled
         : ModelConfig::ManageWeightsType::kDisabled;
+    auto const ppReduceScatter = parseJsonFieldOr<bool>(pluginConfig, "pp_reduce_scatter", false);
 
     TLLM_CHECK_WITH_INFO(
         !removeInputPadding || modelConfig.getMaxNumTokens(), "Padding removal requires max_num_tokens to be set.");
@@ -283,6 +304,7 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
     modelConfig.useXQA(useXQA);
     modelConfig.setManageWeightsType(manageWeightsType);
+    modelConfig.setPpReduceScatter(ppReduceScatter);
 }
 
 void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginConfig, bool engineVersionNone,

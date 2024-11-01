@@ -5,6 +5,49 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
+## TensorRT-LLM Release 0.14.0
+
+### Key Features and Enhancements
+  - Enhanced the `LLM` class in the [LLM API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html).
+    - Added support for calibration with offline dataset.
+    - Added support for Mamba2.
+    - Added support for `finish_reason` and `stop_reason`.
+  - Added FP8 support for CodeLlama.
+  - Added `__repr__` methods for class `Module`, thanks to the contribution from @1ytic in #2191.
+  - Added BFloat16 support for fused gated MLP.
+  - Updated ReDrafter beam search logic to match Apple ReDrafter v1.1.
+  - Improved `customAllReduce` performance.
+  - Draft model now can copy logits directly over MPI to the target model's process in `orchestrator` mode. This fast logits copy reduces the delay between draft token generation and the beginning of target model inference.
+  - NVIDIA Volta GPU support is deprecated and will be removed in a future release.
+
+### API Changes
+  - [BREAKING CHANGE] The default `max_batch_size` of the `trtllm-build` command is set to `2048`.
+  - [BREAKING CHANGE] Remove `builder_opt` from the `BuildConfig` class and the `trtllm-build` command.
+  - Add logits post-processor support to the `ModelRunnerCpp` class.
+  - Added `isParticipant` method to the C++ `Executor` API to check if the current process is a participant in the executor instance.
+
+### Model Updates
+  - Added support for NemotronNas, see `examples/nemotron_nas/README.md`.
+  - Added support for Deepseek-v1, see `examples/deepseek_v1/README.md`.
+  - Added support for Phi-3.5 models, see `examples/phi/README.md`.
+
+### Fixed Issues
+  - Fixed a typo in `tensorrt_llm/models/model_weights_loader.py`, thanks to the contribution from @wangkuiyi in #2152.
+  - Fixed duplicated import module in `tensorrt_llm/runtime/generation.py`, thanks to the contribution from @lkm2835 in #2182.
+  - Enabled `share_embedding` for the models that have no `lm_head` in legacy  checkpoint conversion path, thanks to the contribution from @lkm2835 in #2232.
+  - Fixed `kv_cache_type` issue in the Python benchmark, thanks to the contribution from @qingquansong in #2219.
+  - Fixed an issue with SmoothQuant calibration with custom datasets. Thanks to the contribution by @Bhuvanesh09 in #2243.
+  - Fixed an issue surrounding `trtllm-build --fast-build` with fake or random weights. Thanks to @ZJLi2013 for flagging it in #2135.
+  - Fixed missing `use_fused_mlp` when constructing `BuildConfig` from dict, thanks for the fix from @ethnzhng in #2081.
+  - Fixed lookahead batch layout for `numNewTokensCumSum`. (#2263)
+
+### Infrastructure Changes
+  - The dependent ModelOpt version is updated to v0.17.
+
+### Documentation
+  - @Sherlock113 added a [tech blog](https://www.bentoml.com/blog/tuning-tensor-rt-llm-for-optimal-serving-with-bentoml) to the latest news in #2169, thanks for the contribution.
+
+
 ## TensorRT-LLM Release 0.13.0
 
 ### Key Features and Enhancements
@@ -179,13 +222,13 @@ All published functionality in the Release Notes has been fully tested and verif
     - Moved the most commonly used options in the explicit arg-list, and hidden the expert options in the kwargs.
     - Exposed `model` to accept either HuggingFace model name or local HuggingFace model/TensorRT-LLM checkpoint/TensorRT-LLM engine.
     - Support downloading model from HuggingFace model hub, currently only Llama variants are supported.
-    - Support build cache to reuse the built TensorRT-LLM engines by setting environment variable `TLLM_HLAPI_BUILD_CACHE=1` or passing `enable_build_cache=True` to `LLM` class.
+    - Support build cache to reuse the built TensorRT-LLM engines by setting environment variable `TLLM_LLMAPI_BUILD_CACHE=1` or passing `enable_build_cache=True` to `LLM` class.
     - Exposed low-level options including `BuildConfig`, `SchedulerConfig` and so on in the kwargs, ideally you should be able to configure details about the build and runtime phase.
   - Refactored `LLM.generate()` and `LLM.generate_async()` API.
     - Removed `SamplingConfig`.
-    - Added `SamplingParams` with more extensive parameters, see `tensorrt_llm/hlapi/utils.py`.
+    - Added `SamplingParams` with more extensive parameters, see `tensorrt_llm/llmapi/utils.py`.
       - The new `SamplingParams` contains and manages fields from Python bindings of `SamplingConfig`, `OutputConfig`, and so on.
-    - Refactored `LLM.generate()` output as `RequestOutput`, see `tensorrt_llm/hlapi/llm.py`.
+    - Refactored `LLM.generate()` output as `RequestOutput`, see `tensorrt_llm/llmapi/llm.py`.
   - Updated the `apps` examples, specially by rewriting both `chat.py` and `fastapi_server.py` using the `LLM` APIs, please refer to the `examples/apps/README.md` for details.
     - Updated the `chat.py` to support multi-turn conversation, allowing users to chat with a model in the terminal.
     - Fixed the `fastapi_server.py` and eliminate the need for `mpirun` in multi-GPU scenarios.
@@ -481,7 +524,7 @@ All published functionality in the Release Notes has been fully tested and verif
 Refer to the {ref}`support-matrix-software` section for a list of supported models.
 
 * API
-  - Add a set of High-level APIs for end-to-end generation tasks (see examples/high-level-api/README.md)
+  - Add a set of LLM APIs for end-to-end generation tasks (see examples/llm-api/README.md)
   - **[BREAKING CHANGES]** Migrate models to the new build workflow, including LLaMA, Mistral, Mixtral, InternLM, ChatGLM, Falcon, GPT-J, GPT-NeoX, Medusa, MPT, Baichuan and Phi (see docs/source/new_workflow.md)
   - **[BREAKING CHANGES]** Deprecate `LayerNorm` and `RMSNorm` plugins and removed corresponding build parameters
   - **[BREAKING CHANGES]** Remove optional parameter `maxNumSequences` for GPT manager

@@ -145,6 +145,7 @@ struct BenchmarkParams
 {
     std::optional<SizeType32> maxTokensInPagedKvCache{std::nullopt};
     std::optional<float> freeGpuMemoryFraction{std::nullopt};
+    std::optional<float> crossKvCacheFraction{std::nullopt};
     bool enableTrtOverlap{false};
     bool enableBlockReuse{false};
     bool enableChunkedContext{false};
@@ -426,11 +427,17 @@ public:
     void initialize()
     {
         mStart = std::chrono::steady_clock::now();
+        mRequestsQueueingLatencies.clear();
     }
 
     void finalize()
     {
         mEnd = std::chrono::steady_clock::now();
+    }
+
+    void recordQueueLatency(std::vector<float> const& latencies)
+    {
+        mRequestsQueueingLatencies.insert(mRequestsQueueingLatencies.end(), latencies.begin(), latencies.end());
     }
 
     void recordStart(std::shared_ptr<InferenceRequest> request, uint64_t requestId)
@@ -677,6 +684,16 @@ public:
                 mMaxGenT2TLatency = genT2TLatencies.back();
                 mMinGenT2TLatency = genT2TLatencies.front();
             }
+
+            mAvgReqQueueingLatency
+                = std::accumulate(mRequestsQueueingLatencies.begin(), mRequestsQueueingLatencies.end(), 0.F)
+                / mRequestsQueueingLatencies.size();
+            std::sort(mRequestsQueueingLatencies.begin(), mRequestsQueueingLatencies.end());
+            mP99ReqQueueingLatency = calcPercentile(mRequestsQueueingLatencies, 99);
+            mP90ReqQueueingLatency = calcPercentile(mRequestsQueueingLatencies, 90);
+            mP50ReqQueueingLatency = calcPercentile(mRequestsQueueingLatencies, 50);
+            mMaxReqQueueingLatency = mRequestsQueueingLatencies.back();
+            mMinReqQueueingLatency = mRequestsQueueingLatencies.front();
         }
     }
 
@@ -713,6 +730,13 @@ public:
             printf("[BENCHMARK] p99_inter_token_latency(ms) %.2f\n", mP99GenT2TLatency);
             printf("[BENCHMARK] p90_inter_token_latency(ms) %.2f\n", mP90GenT2TLatency);
             printf("[BENCHMARK] p50_inter_token_latency(ms) %.2f\n\n", mP50GenT2TLatency);
+
+            printf("[BENCHMARK] avg_request_queueing_latency(ms) %.2f\n", mAvgReqQueueingLatency);
+            printf("[BENCHMARK] max_request_queueing_latency(ms) %.2f\n", mMaxReqQueueingLatency);
+            printf("[BENCHMARK] min_request_queueing_latency(ms) %.2f\n", mMinReqQueueingLatency);
+            printf("[BENCHMARK] p99_request_queueing_latency(ms) %.2f\n", mP99ReqQueueingLatency);
+            printf("[BENCHMARK] p90_request_queueing_latency(ms) %.2f\n", mP90ReqQueueingLatency);
+            printf("[BENCHMARK] p50_request_queueing_latency(ms) %.2f\n\n", mP50ReqQueueingLatency);
         }
     }
 
@@ -820,6 +844,13 @@ private:
     float mP50GenT2TLatency{};
     float mMaxGenT2TLatency{};
     float mMinGenT2TLatency{};
+    float mAvgReqQueueingLatency{};
+    float mP99ReqQueueingLatency{};
+    float mP90ReqQueueingLatency{};
+    float mP50ReqQueueingLatency{};
+    float mMaxReqQueueingLatency{};
+    float mMinReqQueueingLatency{};
+    std::vector<float> mRequestsQueueingLatencies{};
 
     std::string mOpCsvFile;
     bool mStreaming;
@@ -846,12 +877,14 @@ public:
         , mActiveCount(0)
         , mNumFinished(0)
         , mShutdown(false)
+        , mLogIterationData(logIterationData)
     {
 
         texec::SchedulerConfig schedulerConfig(capacitySchedulerPolicy);
         texec::KvCacheConfig kvCacheConfig(benchmarkParams.enableBlockReuse, benchmarkParams.maxTokensInPagedKvCache,
             benchmarkParams.maxAttentionWindowVec, benchmarkParams.sinkTokenLength,
-            benchmarkParams.freeGpuMemoryFraction, benchmarkParams.kvHostCacheSize, benchmarkParams.kvOnboardBlocks);
+            benchmarkParams.freeGpuMemoryFraction, benchmarkParams.kvHostCacheSize, benchmarkParams.kvOnboardBlocks,
+            benchmarkParams.crossKvCacheFraction);
         texec::PeftCacheConfig peftCacheConfig(0, benchmarkParams.loraDeviceNumModLayers, 8, 64, 4, 4, 4, 24, 8,
             std::nullopt, benchmarkParams.loraHostCacheSize);
         texec::ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig(benchmarkParams.multiBlockMode,
@@ -899,7 +932,9 @@ public:
             TLLM_LOG_ERROR("not a supported executor model type in executor server.");
         }
 
-        if (logIterationData)
+        auto const& world = tensorrt_llm::mpi::MpiComm::world();
+        auto worldRank = world.getRank();
+        if (worldRank == 0)
         {
             mCollectStatsThread = std::thread(&ExecutorServer::collectStats, this);
         }
@@ -988,7 +1023,18 @@ public:
             auto iterStats = mExecutor->getLatestIterationStats();
             for (auto const& iterStat : iterStats)
             {
-                TLLM_LOG_INFO(texec::JsonSerialization::toJsonStr(iterStat));
+                SizeType32 numNewActiveRequests = iterStat.numNewActiveRequests;
+                if (numNewActiveRequests > 0)
+                {
+                    float avgQueueingTime
+                        = static_cast<float>(iterStat.newActiveRequestsQueueLatencyMS / numNewActiveRequests);
+                    std::vector<float> requestsQueueLatencyMS(numNewActiveRequests, avgQueueingTime);
+                    mRecorder->recordQueueLatency(requestsQueueLatencyMS);
+                }
+                if (mLogIterationData)
+                {
+                    TLLM_LOG_INFO(texec::JsonSerialization::toJsonStr(iterStat));
+                }
             }
             auto const waitSleep = std::chrono::milliseconds(50);
             std::this_thread::sleep_for(waitSleep);
@@ -1005,6 +1051,7 @@ private:
     std::atomic<uint64_t> mActiveCount;
     std::atomic<uint64_t> mNumFinished;
     std::atomic<bool> mShutdown;
+    bool mLogIterationData;
 }; // class ExecutorServer
 
 class GptServer
@@ -1441,6 +1488,7 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamW
         std::nullopt,    // pTuning
         loraConfig,      // loraConfig
         lookaheadConfig, // lookaheadConfig
+        std::nullopt,    // kvCacheRetentionConfig
         std::nullopt,    // logitsPostProcessorName
         encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt);
 }
@@ -1463,6 +1511,10 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     if (benchmarkParams.freeGpuMemoryFraction)
     {
         optionalParams.kvCacheConfig.freeGpuMemoryFraction = benchmarkParams.freeGpuMemoryFraction;
+    }
+    if (benchmarkParams.crossKvCacheFraction)
+    {
+        optionalParams.kvCacheConfig.crossKvCacheFraction = benchmarkParams.crossKvCacheFraction;
     }
     if (benchmarkParams.maxAttentionWindowVec)
     {
@@ -1908,6 +1960,8 @@ int main(int argc, char* argv[])
         "random_seed", "integer random seed for exponential time delays.", cxxopts::value<int>()->default_value("420"));
     options.add_options()(
         "kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.", cxxopts::value<float>());
+    options.add_options()(
+        "cross_kv_cache_fraction", "Cross K-V Cache Fraction (from 0.0 to 1.0).", cxxopts::value<float>());
     options.add_options()("request_rate",
         "request rate in reqs/sec. Skipping this arg or negative value will trigger offline/0-delay.",
         cxxopts::value<float>());
@@ -2081,6 +2135,20 @@ int main(int argc, char* argv[])
     {
         benchmarkParams.freeGpuMemoryFraction = result["kv_cache_free_gpu_mem_fraction"].as<float>();
     }
+    // Argument: K-V Cache Cross Attention Fraction. Only applicable to enc-dec models.
+    if (result.count("encoder_engine_dir") && result.count("decoder_engine_dir"))
+    {
+        if (result.count("cross_kv_cache_fraction"))
+        {
+            benchmarkParams.crossKvCacheFraction = result["cross_kv_cache_fraction"].as<float>();
+        }
+        else
+        {
+            benchmarkParams.crossKvCacheFraction
+                = 0.5f; // default value if not set. but non enc-dec should not even have this param set
+        }
+    }
+
     // Argument: Enable TRT overlap
     benchmarkParams.enableTrtOverlap = result["enable_trt_overlap"].as<bool>();
 
@@ -2297,14 +2365,14 @@ int main(int argc, char* argv[])
     {
         texec::ModelType executorModelType;
         std::optional<std::string> decoderEngineDir = std::nullopt, encoderEngineDir = std::nullopt;
-        if (result.count("encoder_engine_dir") && result.count("engine_dir"))
+        if (result.count("encoder_engine_dir") && result.count("decoder_engine_dir"))
         {
             TLLM_CHECK_WITH_INFO(api == "executor", "encoder-decoder only support executor api.");
             TLLM_CHECK_WITH_INFO(
                 modelType == TrtGptModelType::InflightFusedBatching, "encoder-decoder only support inflight batching.");
             executorModelType = texec::ModelType::kENCODER_DECODER;
-            decoderEngineDir = result["engine_dir"].as<std::string>();
             encoderEngineDir = result["encoder_engine_dir"].as<std::string>();
+            decoderEngineDir = result["decoder_engine_dir"].as<std::string>();
         }
         else if (result.count("engine_dir"))
         {

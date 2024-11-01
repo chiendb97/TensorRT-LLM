@@ -127,6 +127,7 @@ class QWenDecoderLayer(Module):
         hidden_states: Tensor,
         attention_mask=None,
         use_cache=False,
+        spec_decoding_params=None,
         kv_cache_params=None,
         attention_params=None,
         lora_layer_params=None,
@@ -137,6 +138,7 @@ class QWenDecoderLayer(Module):
             hidden_states,
             attention_mask=attention_mask,
             use_cache=use_cache,
+            spec_decoding_params=spec_decoding_params,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
@@ -198,6 +200,7 @@ class QWenModel(Module):
                 input_ids: Tensor,
                 position_ids=None,
                 use_cache=False,
+                spec_decoding_params=None,
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
@@ -216,12 +219,14 @@ class QWenModel(Module):
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
-        hidden_states = self.layers.forward(hidden_states,
-                                            use_cache=use_cache,
-                                            attention_mask=attention_mask,
-                                            kv_cache_params=kv_cache_params,
-                                            attention_params=attention_params,
-                                            lora_params=lora_params)
+        hidden_states = self.layers.forward(
+            hidden_states,
+            use_cache=use_cache,
+            spec_decoding_params=spec_decoding_params,
+            attention_mask=attention_mask,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+            lora_params=lora_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -245,13 +250,22 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                            config.mapping.tp_size)
 
         if config.mapping.is_last_pp_rank():
-            lm_head = ColumnLinear(config.hidden_size,
-                                   vocab_size_padded,
-                                   bias=False,
-                                   dtype=config.dtype,
-                                   tp_group=config.mapping.tp_group,
-                                   tp_size=config.mapping.tp_size,
-                                   gather_output=True)
+            if config.architecture == 'Qwen2ForSequenceClassification':
+                lm_head = ColumnLinear(config.hidden_size,
+                                       config.num_labels,
+                                       bias=False,
+                                       dtype=config.dtype,
+                                       tp_group=config.mapping.tp_group,
+                                       tp_size=config.mapping.tp_size,
+                                       gather_output=True)
+            else:
+                lm_head = ColumnLinear(config.hidden_size,
+                                       vocab_size_padded,
+                                       bias=False,
+                                       dtype=config.dtype,
+                                       tp_group=config.mapping.tp_group,
+                                       tp_size=config.mapping.tp_size,
+                                       gather_output=True)
         else:
             lm_head = None
         self.quant_mode = config.quant_mode
@@ -342,6 +356,10 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "shared_expert": "mlp.shared_expert",
                     "shared_expert_gate": "mlp.shared_expert_gate",
                     "fc": ["up_proj", "gate_proj"],
+                }
+            elif config.architecture == "Qwen2ForSequenceClassification":
+                custom_dict = {
+                    "lm_head": "score",
                 }
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             if config.share_embedding_table:

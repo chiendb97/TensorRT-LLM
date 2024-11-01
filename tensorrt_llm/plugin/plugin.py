@@ -161,18 +161,19 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _rmsnorm_quantization_plugin: Optional[str] = field(default=None,
                                                         init=False)
     _nccl_plugin: Optional[str] = field(default="auto", init=False)
-    _lookup_plugin: Optional[str] = field(default=None, init=False)
     _lora_plugin: Optional[str] = field(default=None, init=False)
     _weight_only_groupwise_quant_matmul_plugin: Optional[str] = field(
         default=None, init=False)
     _weight_only_quant_matmul_plugin: Optional[str] = field(default=None,
                                                             init=False)
+    _smooth_quant_plugins: bool = field(
+        default=True,
+        init=False)  # Always enable smooth quant plugins for external users
     _quantize_per_token_plugin: bool = field(default=False, init=False)
     _quantize_tensor_plugin: bool = field(default=False, init=False)
     _moe_plugin: Optional[str] = field(default="auto", init=False)
     _mamba_conv1d_plugin: Optional[str] = field(default="auto", init=False)
     _low_latency_gemm_plugin: Optional[str] = field(default=None, init=False)
-
     # Features
     _context_fmha: bool = field(default=True, init=False)
     _bert_context_fmha_fp32_acc: bool = field(
@@ -189,6 +190,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _streamingllm: bool = field(default=False, init=False)
     _manage_weights: bool = field(default=False, init=False)
     _use_fused_mlp: bool = field(default=True, init=False)
+    _pp_reduce_scatter: bool = field(default=False, init=False)
 
     def update_from_dict(self, config: dict):
         for name in config.keys():
@@ -246,6 +248,9 @@ class PluginConfig(metaclass=PluginConfigMeta):
         else:
             return ContextFMHAType.disabled
 
+    def is_context_fmha_enabled(self):
+        return self.context_fmha_type != ContextFMHAType.disabled
+
     @context_fmha_type.setter
     def context_fmha_type(self, value):
         if value == ContextFMHAType.disabled:
@@ -297,7 +302,6 @@ cli_plugin_args = [
     "gemm_plugin",
     "gemm_swiglu_plugin",
     "fp8_rowwise_gemm_plugin",
-    "lookup_plugin",
     "lora_plugin",
     "moe_plugin",
     "mamba_conv1d_plugin",
@@ -317,6 +321,7 @@ cli_plugin_args = [
     "streamingllm",
     "reduce_fusion",
     "use_fused_mlp",
+    "pp_reduce_scatter",
 ]
 
 

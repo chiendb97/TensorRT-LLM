@@ -26,7 +26,8 @@ import numpy as np
 import tensorrt as trt
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
-from ._utils import np_bfloat16, np_float8, str_dtype_to_trt, to_json_file
+from ._utils import (np_bfloat16, np_float8, str_dtype_to_trt, to_json_file,
+                     trt_gte)
 from .auto_parallel import auto_parallel
 from .auto_parallel.config import AutoParallelConfig
 from .bindings import KVCacheType
@@ -223,6 +224,13 @@ class Builder():
         weight_sparsity = kwargs.get("weight_sparsity", False)
         if weight_sparsity:
             config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
+
+        # TODO(Junyi): remove this constraint after trt 10.6 is integrated
+        if trt_gte(10, 6):
+            # set monitor memory
+            monitor_memory = kwargs.get("monitor_memory", False)
+            if monitor_memory:
+                config.set_flag(trt.BuilderFlag.MONITOR_MEMORY)
 
         return BuilderConfig()._init(config,
                                      precision=precision,
@@ -463,12 +471,12 @@ class Builder():
 
 @dataclass
 class BuildConfig:
-    max_input_len: int = 256
-    max_seq_len: int = 512
+    max_input_len: int = 1024
+    max_seq_len: int = None
     opt_batch_size: int = 8
-    max_batch_size: int = 8
+    max_batch_size: int = 2048
     max_beam_width: int = 1
-    max_num_tokens: Optional[int] = None
+    max_num_tokens: int = 8192
     opt_num_tokens: Optional[int] = None
     max_prompt_embedding_table_size: int = 0
     kv_cache_type: KVCacheType = None
@@ -482,7 +490,7 @@ class BuildConfig:
     speculative_decoding_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     use_refit: bool = False
     input_timing_cache: str = None
-    output_timing_cache: str = None
+    output_timing_cache: str = 'model.cache'
     lora_config: LoraConfig = field(default_factory=LoraConfig)
     auto_parallel_config: AutoParallelConfig = field(
         default_factory=AutoParallelConfig)
@@ -490,10 +498,11 @@ class BuildConfig:
     weight_streaming: bool = False
     plugin_config: PluginConfig = field(default_factory=PluginConfig)
     use_strip_plan: bool = False
-    max_encoder_input_len: int = 1  # for enc-dec DecoderModel
-    use_fused_mlp: bool = False
+    max_encoder_input_len: int = 1024  # for enc-dec DecoderModel
+    use_fused_mlp: bool = True
     dry_run: bool = False
     visualize_network: bool = False
+    monitor_memory: bool = False
 
     # Since we have some overlapping between kv_cache_type, paged_kv_cache, and paged_state (later two will be deprecated in the future),
     # we need to handle it given model architecture.
@@ -553,7 +562,7 @@ class BuildConfig:
         max_beam_width = config.pop('max_beam_width')
         max_num_tokens = config.pop('max_num_tokens')
         opt_num_tokens = config.pop('opt_num_tokens')
-        opt_batch_size = config.pop('opt_batch_size', None)
+        opt_batch_size = config.pop('opt_batch_size', 8)
         max_prompt_embedding_table_size = config.pop(
             'max_prompt_embedding_table_size', 0)
 
@@ -578,7 +587,7 @@ class BuildConfig:
             config.get('auto_parallel_config', {}))
         max_encoder_input_len = config.pop('max_encoder_input_len', 1024)
         weight_streaming = config.pop('weight_streaming', False)
-
+        use_fused_mlp = config.pop('use_fused_mlp', True)
         use_strip_plan = config.pop('use_strip_plan', False)
 
         if plugin_config is None:
@@ -588,6 +597,7 @@ class BuildConfig:
 
         dry_run = config.pop('dry_run', False)
         visualize_network = config.pop('visualize_network', False)
+        monitor_memory = config.pop('monitor_memory', False)
 
         return cls(
             max_input_len=max_input_len,
@@ -616,9 +626,11 @@ class BuildConfig:
             max_encoder_input_len=max_encoder_input_len,
             weight_sparsity=weight_sparsity,
             weight_streaming=weight_streaming,
+            use_fused_mlp=use_fused_mlp,
             plugin_config=plugin_config,
             dry_run=dry_run,
-            visualize_network=visualize_network)
+            visualize_network=visualize_network,
+            monitor_memory=monitor_memory)
 
     @classmethod
     def from_json_file(cls, config_file, plugin_config=None):
@@ -659,10 +671,14 @@ class EngineConfig:
     @classmethod
     def from_json_file(cls, config_file):
         with open(config_file) as f:
-            config = json.load(f)
-            return cls(PretrainedConfig.from_dict(config['pretrained_config']),
-                       BuildConfig.from_dict(config['build_config']),
-                       config['version'])
+            return cls.from_json_str(f.read())
+
+    @classmethod
+    def from_json_str(cls, config_str):
+        config = json.loads(config_str)
+        return cls(PretrainedConfig.from_dict(config['pretrained_config']),
+                   BuildConfig.from_dict(config['build_config']),
+                   config['version'])
 
     def to_dict(self):
         build_config = self.build_config.to_dict()
@@ -682,13 +698,11 @@ class Engine:
         self,
         config: EngineConfig,
         engine: Union[trt.IHostMemory, None],
-        managed_weights: dict[str, np.ndarray] = None,
+        managed_weights: dict[str, np.ndarray] = {},
     ):
         self.config = config
         self.engine = engine
         self.managed_weights = managed_weights
-
-    def regularize_managed_weights(self):
         if self.managed_weights is None:
             self.managed_weights = {}
         for name, value in self.managed_weights.items():
@@ -770,6 +784,15 @@ class Engine:
         config.pretrained_config.set_rank(rank)
 
         return cls(config, engine_buffer, managed_weights)
+
+    @classmethod
+    def from_buffer(cls,
+                    engine_buffer: Union[trt.IHostMemory, bytes],
+                    json_config_str: str,
+                    rank: int = 0):
+        config = EngineConfig.from_json_str(json_config_str)
+        config.pretrained_config.set_rank(rank)
+        return cls(config, engine_buffer)
 
 
 def get_engine_version(engine_dir: str) -> Union[None, str]:
@@ -1007,11 +1030,6 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if hasattr(model.config, 'max_draft_len'):
         build_config.max_draft_len = model.config.max_draft_len
-        if build_config.speculative_decoding_mode != SpeculativeDecodingMode.MEDUSA:
-            logger.warning(
-                'speculative_decoding_mode is not Medusa for Medusa model. Overwriting speculative_decoding_mode'
-            )
-        build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
 
     if hasattr(model.config, 'redrafter_num_beams') and hasattr(
             model.config, 'redrafter_draft_len_per_beam'):
@@ -1081,6 +1099,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         use_strip_plan=build_config.use_strip_plan,
         weight_sparsity=build_config.weight_sparsity,
         weight_streaming=build_config.weight_streaming,
+        monitor_memory=build_config.monitor_memory,
     )
 
     network = builder.create_network()
@@ -1099,7 +1118,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             network.plugin_config.weight_only_groupwise_quant_matmul_plugin = model.config.dtype
         else:
             network.plugin_config.weight_only_quant_matmul_plugin = model.config.dtype
-    if use_smooth_quant and model.config.quantization.use_plugin_sq:
+    if use_smooth_quant and model.config.quantization.use_plugin_sq and build_config.plugin_config.smooth_quant_plugins:
         network.plugin_config.set_smooth_quant_plugins(model.config.dtype)
     if use_fp8_rowwise:
         network.plugin_config.set_fp8_rowwise_quant_plugins(model.config.dtype)
@@ -1141,7 +1160,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             build_config.lora_config.lora_target_modules
         }
 
-        if model.config.architecture == "DecoderModel":
+        if model.config.architecture == "DecoderModel" or model.config.architecture == "MllamaForConditionalGeneration":
             prepare_input_args["max_seq_len"] = build_config.max_seq_len
             prepare_input_args[
                 "max_decoder_input_len"] = build_config.max_input_len
@@ -1154,7 +1173,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                 "max_batch_size": build_config.max_batch_size,
             }
 
-        if build_config.speculative_decoding_mode == SpeculativeDecodingMode.LOOKAHEAD_DECODING:
+        if build_config.speculative_decoding_mode == SpeculativeDecodingMode.LOOKAHEAD_DECODING or build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE:
             prepare_input_args[
                 "spec_decoding_is_generation_length_variable"] = True
 
@@ -1179,7 +1198,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if build_config.visualize_network:
         with net_guard(network):
-            network.to_dot(f'rank{model.config.mapping.rank}.dot')
+            network.to_onnx(f'rank{model.config.mapping.rank}.onnx')
 
     # Network -> Engine
     logger.info(

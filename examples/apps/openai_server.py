@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 import asyncio
 import logging
+import signal
+from contextlib import asynccontextmanager
 from http import HTTPStatus
 from pathlib import Path
 from typing import (AsyncGenerator, AsyncIterator, List, Optional, Tuple,
@@ -15,9 +17,10 @@ from openai.types.chat import ChatCompletionMessageParam
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 # yapf: disable
-from tensorrt_llm.hlapi import LLM, BuildConfig, KvCacheConfig
-from tensorrt_llm.hlapi.llm import RequestOutput
-from tensorrt_llm.hlapi.openai_protocol import (
+from tensorrt_llm.executor import CppExecutorError
+from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.llmapi.openai_protocol import (
     ChatCompletionLogProbs, ChatCompletionLogProbsContent,
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionResponseChoice,
@@ -66,10 +69,8 @@ class OpenaiServer:
     def __init__(self,
                  llm: LLM,
                  model: str,
-                 kv_cache_config: KvCacheConfig,
                  hf_tokenizer: PreTrainedTokenizer = None):
         self.llm = llm
-        self.kv_cache_config = kv_cache_config
         self.tokenizer = hf_tokenizer
 
         model_dir = Path(model)
@@ -78,7 +79,13 @@ class OpenaiServer:
         else:
             self.model = model
 
-        self.app = FastAPI()
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            # terminate rank0 worker
+            yield
+            self.llm._shutdown()
+
+        self.app = FastAPI(lifespan=lifespan)
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
@@ -211,7 +218,7 @@ class OpenaiServer:
                     else:
                         delta_message = DeltaMessage(content=delta_text)
 
-                    if delta_text:
+                    if len(output.token_ids_diff) > 0:
                         # Send token-by-token response for each request.n
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
@@ -326,7 +333,9 @@ class OpenaiServer:
             else:
                 response = await create_chat_response(promise)
                 return JSONResponse(content=response.model_dump())
-
+        except CppExecutorError:
+            # If internal executor error is raised, shutdown the server
+            signal.raise_signal(signal.SIGINT)
         except Exception as e:
             return self.create_error_response(str(e))
 
@@ -432,6 +441,9 @@ class OpenaiServer:
             else:
                 response = await create_completion_response(generator, num_choices)
                 return JSONResponse(content=response.model_dump())
+        except CppExecutorError:
+            # If internal executor error is raised, shutdown the server
+            signal.raise_signal(signal.SIGINT)
         except Exception as e:
             return self.create_error_response(str(e))
 
@@ -450,33 +462,38 @@ class OpenaiServer:
 @click.option("--host", type=str, default=None)
 @click.option("--port", type=int, default=8000)
 @click.option("--max_beam_width", type=int, default=1)
+@click.option("--max_seq_len", type=int, default=512)
 @click.option("--tp_size", type=int, default=1)
 @click.option("--pp_size", type=int, default=1)
+@click.option("--kv_cache_free_gpu_memory_fraction", type=float, default=0.8)
 def entrypoint(model_dir: str,
                tokenizer: Optional[str] = None,
                host: Optional[str] = None,
                port: int = 8000,
                max_beam_width: int = 1,
+               max_seq_len: int = 512,
                tp_size: int = 1,
-               pp_size: int = 1):
+               pp_size: int = 1,
+               kv_cache_free_gpu_memory_fraction: float = 0.8):
     host = host or "0.0.0.0"
     port = port or 8000
     logging.info(f"Starting server at {host}:{port}")
 
-    build_config = BuildConfig(max_batch_size=10, max_beam_width=max_beam_width)
+    build_config = BuildConfig(max_batch_size=10, max_beam_width=max_beam_width, max_seq_len=max_seq_len)
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
 
     llm = LLM(model_dir,
               tokenizer,
               tensor_parallel_size=tp_size,
               pipeline_parallel_size=pp_size,
-              build_config=build_config)
+              build_config=build_config,
+              kv_cache_config=kv_cache_config)
 
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
     hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer or model_dir)
 
     server = OpenaiServer(llm=llm,
                           model=model_dir,
-                          kv_cache_config=kv_cache_config,
                           hf_tokenizer=hf_tokenizer)
 
     asyncio.run(server(host, port))

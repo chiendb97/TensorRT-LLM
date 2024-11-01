@@ -68,8 +68,9 @@ public:
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
-        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt, bool returnLogProbs = false,
-        bool returnContextLogits = false, bool returnGenerationLogits = false,
+        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
+        std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
+        bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt,
         bool excludeInputFromOutput = false, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
@@ -77,19 +78,20 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
+        std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, SizeType32 numReturnSequences = 1)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, embeddingBias, badWordsList, stopWordsList,
             positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
                                     : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            promptEmbeddingTable, promptVocabSize, loraTaskId, loraWeights, loraConfig, lookaheadConfig, returnLogProbs,
-            returnContextLogits, returnGenerationLogits,
+            promptEmbeddingTable, promptVocabSize, loraTaskId, loraWeights, loraConfig, lookaheadConfig,
+            kvCacheRetentionConfig, returnLogProbs, returnContextLogits, returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
             draftLogits, excludeInputFromOutput, logitsPostProcessor, applyLogitsPostProcessorBatched,
             encoderInputTokens ? std::make_optional(std::make_shared<VecTokens>(std::move(*encoderInputTokens)))
                                : std::optional<std::shared_ptr<VecTokens>>(std::nullopt),
-            returnEncoderOutput, clientId, priority, encoderInputFeatures, encoderOutputLength,
+            returnEncoderOutput, clientId, priority, encoderInputFeatures, encoderOutputLength, crossAttentionMask,
             tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),

@@ -221,7 +221,7 @@ def add_common_args(parser):
     parser.add_argument('--num_return_sequences',
                         type=int,
                         help="Number of sequences to generate for each input.",
-                        default=1)
+                        default=None)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--top_k', type=int, default=1)
     parser.add_argument('--top_p', type=float, default=0.0)
@@ -415,6 +415,13 @@ def add_common_args(parser):
         default=0.9,
         type=float,
         help='Specify the free gpu memory fraction.',
+    )
+    parser.add_argument(
+        '--cross_kv_cache_fraction',
+        default=0.5,
+        type=float,
+        help=
+        'Specify the kv cache fraction reserved for cross attention. Only applicable for encoder-decoder models. By default 0.5 for self and 0.5 for cross.',
     )
     parser.add_argument(
         '--enable_chunked_context',

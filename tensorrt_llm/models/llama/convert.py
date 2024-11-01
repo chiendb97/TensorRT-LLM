@@ -1605,6 +1605,9 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
     if mapping.is_last_pp_rank():
         v = load(param_name_map["lm_head"], -1, 1) if pad_vocab else load(
             param_name_map["lm_head"], 0, 1)  # lm_head
+        if v is None:
+            v = load(param_name_map["vocab_embedding"], -1 if pad_vocab else 0,
+                     1)
         if pad_vocab:
             v = torch.nn.functional.pad(
                 v, (0, 0, 0, vocab_size_padded - vocab_size), 'constant', 0)
@@ -1711,6 +1714,7 @@ def load_weights_from_gptq(quant_ckpt_path: str, config: LLaMAConfig):
     vocab_size = config.vocab_size
     dtype = config.dtype
     mapping = config.mapping
+    quant_algo = config.quantization.quant_algo
 
     gptq_llama = safetensors.safe_open(quant_ckpt_path,
                                        framework="pt",
@@ -1763,6 +1767,7 @@ def load_weights_from_gptq(quant_ckpt_path: str, config: LLaMAConfig):
 
     def process_and_assign_weight(v: List[torch.Tensor],
                                   tllm_prex: str,
+                                  quant_algo: QuantAlgo,
                                   tp_dim: int = -1):
         if tp_dim == -1:
             qweight_int32, qzeros_int32, scales_fp16 = [
@@ -1774,22 +1779,39 @@ def load_weights_from_gptq(quant_ckpt_path: str, config: LLaMAConfig):
             ]
 
         USE_UINT4_INPUT = 1  # Set to true if checkpoint store UINT4 weights
+        USE_UINT8_INPUT = 1  # Set to true if checkpoint store UINT8 weights
         USE_GPTQ_FOR_LLAMA = 1  # GPTQ-for-LLaMA added 1 to zeros
 
-        qweight_unpacked_int8 = unpack_int32_into_int8(
-            qweight_int32.T).T.contiguous() - 8
-        qweight_interleaved = preprocessor(packer(qweight_unpacked_int8),
-                                           torch.quint4x2,
-                                           torch.float16).view(torch.float16)
-        # zeros = zeros * scales
-        qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
-        if not USE_UINT4_INPUT:
-            # Correcting UINT4 values back to INT4 order
-            mask_negative = qzeros_unpacked_int32[qzeros_unpacked_int32 < 0]
-            mask_positive = qzeros_unpacked_int32[qzeros_unpacked_int32 >= 0]
-            qzeros_unpacked_int32 = qzeros_unpacked_int32 + 16 * mask_negative - 16 * mask_positive
-        zeros_x_scales_fp16 = (-qzeros_unpacked_int32 + 8 * USE_UINT4_INPUT -
-                               USE_GPTQ_FOR_LLAMA) * scales_fp16
+        if quant_algo == QuantAlgo.W4A16_GPTQ:
+            # unpack inputs packed in int32 into int4 and store them in int8 format
+            qweight_unpacked_int8 = unpack_int32_into_int8(
+                qweight_int32.T).T.contiguous() - 8
+            qweight_interleaved = preprocessor(
+                packer(qweight_unpacked_int8), torch.quint4x2,
+                torch.float16).view(torch.float16)
+            # zeros = zeros * scales
+            qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
+            if not USE_UINT4_INPUT:
+                # Correcting UINT4 values back to INT4 order
+                mask_negative = qzeros_unpacked_int32[qzeros_unpacked_int32 < 0]
+                mask_positive = qzeros_unpacked_int32[
+                    qzeros_unpacked_int32 >= 0]
+                qzeros_unpacked_int32 = qzeros_unpacked_int32 + 16 * mask_negative - 16 * mask_positive
+            zeros_x_scales_fp16 = (-qzeros_unpacked_int32 + 8 * USE_UINT4_INPUT
+                                   - USE_GPTQ_FOR_LLAMA) * scales_fp16
+        else:
+            # unpack inputs packed in int32 into int8
+            qweight_unpacked_int8 = (
+                qweight_int32.T.contiguous().view(torch.uint8).T.contiguous() -
+                128).to(torch.int8)
+            qweight_interleaved = preprocessor(qweight_unpacked_int8,
+                                               torch.int8, torch.float16).view(
+                                                   torch.float16)
+            qzeros_unpacked_int32 = qzeros_int32.view(torch.uint8)
+            zeros_x_scales_fp16 = (-qzeros_unpacked_int32 +
+                                   128 * USE_UINT8_INPUT -
+                                   USE_GPTQ_FOR_LLAMA) * scales_fp16
+
         zeros_x_scales_fp16 = zeros_x_scales_fp16.half()
 
         results = {
@@ -1848,29 +1870,39 @@ def load_weights_from_gptq(quant_ckpt_path: str, config: LLaMAConfig):
         # process_and_assign_weight(layer.attention.qkv, qkv_weight_list)
         weights.update(
             process_and_assign_weight(qkv_weight_list,
-                                      f'{tllm_prex}.attention.qkv'))
+                                      f'{tllm_prex}.attention.qkv', quant_algo))
         # 4.2 attention.dense
         v = [load(prefix + gptq_key_list[5] + suf) for suf in gptq_suffix_list]
         # process_and_assign_weight(layer.attention.dense, v, 0)
         weights.update(
             process_and_assign_weight(v,
                                       f'{tllm_prex}.attention.dense',
+                                      quant_algo,
                                       tp_dim=0))
         # 4.3 mlp.gate
         v = [load(prefix + gptq_key_list[6] + suf) for suf in gptq_suffix_list]
         # process_and_assign_weight(layer.mlp.gate, v, 1)
         weights.update(
-            process_and_assign_weight(v, f'{tllm_prex}.mlp.gate', tp_dim=1))
+            process_and_assign_weight(v,
+                                      f'{tllm_prex}.mlp.gate',
+                                      quant_algo,
+                                      tp_dim=1))
         # 4.4 mlp.proj
         v = [load(prefix + gptq_key_list[7] + suf) for suf in gptq_suffix_list]
         # process_and_assign_weight(layer.mlp.proj, v, 0)
         weights.update(
-            process_and_assign_weight(v, f'{tllm_prex}.mlp.proj', tp_dim=0))
+            process_and_assign_weight(v,
+                                      f'{tllm_prex}.mlp.proj',
+                                      quant_algo,
+                                      tp_dim=0))
         # 4.5 mlp.fc
         v = [load(prefix + gptq_key_list[8] + suf) for suf in gptq_suffix_list]
         # process_and_assign_weight(layer.mlp.fc, v, 1)
         weights.update(
-            process_and_assign_weight(v, f'{tllm_prex}.mlp.fc', tp_dim=1))
+            process_and_assign_weight(v,
+                                      f'{tllm_prex}.mlp.fc',
+                                      quant_algo,
+                                      tp_dim=1))
         # 4.6 input_layernorm
         v = load(prefix + gptq_key_list[9])
         # layer.input_layernorm.weight.value = v.to(torch_dtype).cpu().numpy()
@@ -2098,7 +2130,7 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
                                ((0, pad_width), (0, 0)),
                                'constant',
                                constant_values=0))
-                weights['lm_head.weight'] = v
+                weights['lm_head.weight'] = v.detach().clone()
         elif k == "norm.weight":
             if mapping.is_last_pp_rank():
                 weights['transformer.ln_f.weight'] = v

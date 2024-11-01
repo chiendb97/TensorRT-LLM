@@ -114,6 +114,7 @@ setup(
             'libs/libth_common.so',
             'libs/libnvinfer_plugin_tensorrt_llm.so',
             'libs/libtensorrt_llm_nvrtc_wrapper.so',
+            'libs/libtensorrt_llm_ucx_wrapper.so',
             'libs/libdecoder_attention.so',
             'bindings.*.so',
         ]) + [
@@ -129,7 +130,7 @@ setup(
             'trtllm-bench=tensorrt_llm.commands.bench:main',
         ],
     },
-    scripts=['tensorrt_llm/hlapi/trtllm-hlapi-launch'],
+    scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
         "benchmarking": [

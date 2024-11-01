@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::mpi
@@ -64,11 +65,13 @@ public:
         std::optional<FloatType> const& frequencyPenalty = std::nullopt,
         std::optional<FloatType> const& lengthPenalty = std::nullopt,
         std::optional<SizeType32> const& earlyStopping = std::nullopt,
-        std::optional<SizeType32> const& noRepeatNgramSize = std::nullopt);
+        std::optional<SizeType32> const& noRepeatNgramSize = std::nullopt,
+        std::optional<SizeType32> const& numReturnSequences = std::nullopt);
 
     bool operator==(SamplingConfig const& other) const;
 
     [[nodiscard]] SizeType32 getBeamWidth() const;
+    [[nodiscard]] SizeType32 getNumReturnBeams() const;
     [[nodiscard]] std::optional<SizeType32> getTopK() const;
     [[nodiscard]] std::optional<FloatType> getTopP() const;
     [[nodiscard]] std::optional<FloatType> getTopPMin() const;
@@ -86,6 +89,7 @@ public:
     [[nodiscard]] std::optional<FloatType> getLengthPenalty() const;
     [[nodiscard]] std::optional<SizeType32> getEarlyStopping() const;
     [[nodiscard]] std::optional<SizeType32> getNoRepeatNgramSize() const;
+    [[nodiscard]] std::optional<SizeType32> getNumReturnSequences() const;
 
     void setBeamWidth(SizeType32 beamWidth);
     void setTopK(std::optional<SizeType32> const& topK);
@@ -105,6 +109,7 @@ public:
     void setLengthPenalty(std::optional<FloatType> const& lengthPenalty);
     void setEarlyStopping(std::optional<SizeType32> const& earlyStopping);
     void setNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
+    void setNumReturnSequences(std::optional<SizeType32> const& numReturnSequences);
 
 private:
     static SizeType32 checkBeamWidth(SizeType32 beamWidth);
@@ -119,6 +124,10 @@ private:
     static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
     static std::optional<FloatType> const& checkBeamSearchDiversityRate(
         std::optional<FloatType> const& beamSearchDiversityRate);
+    static std::optional<SizeType32> const& checkNumReturnSequences(
+        std::optional<SizeType32> const& numReturnSequences, SizeType32 beamWidth);
+
+    void updateNumReturnBeams();
 
     friend class Serialization;
 
@@ -158,6 +167,12 @@ private:
     std::optional<SizeType32> mEarlyStopping;
     /// @brief Controls how many repeat ngram size are acceptable. Default is 1 << 30.
     std::optional<SizeType32> mNoRepeatNgramSize;
+    /// @brief The number of return sequences or beams. In beam search, the value should be less than or equal to
+    /// mBeamWidth. In sampling, it specifies the total number of independently generated sequences.
+    std::optional<SizeType32> mNumReturnSequences;
+    /// @brief The number of beams to return. It is equal to beamWidth unless numReturnSequences is set.
+    /// If beamWidth > 1 and numReturnSequences is set, then numReturnBeams is equal to numReturnSequences.
+    SizeType32 mNumReturnBeams;
 };
 
 /// @brief Configuration that controls the outputs of a Result
@@ -334,6 +349,71 @@ public:
     bool fastLogits;
 };
 
+using RetentionPriority = SizeType32;
+
+/// @brief Configuration for the request's retention in the KV Cache
+class KvCacheRetentionConfig
+{
+
+public:
+    static constexpr RetentionPriority kMinRetentionPriority = 0;
+    static constexpr RetentionPriority kMaxRetentionPriority = 100;
+    static constexpr RetentionPriority kDefaultRetentionPriority = 35;
+
+    /// @brief A single entry to set block priorities over a token range. Earlier ranges always take priority over later
+    /// ones. For example, with a block size of 16, a range of [0, 17] would be applied to the first two blocks.
+    struct TokenRangeRetentionPriority
+    {
+    public:
+        explicit TokenRangeRetentionPriority(SizeType32 tokenStart, std::optional<SizeType32> tokenEnd = std::nullopt,
+            RetentionPriority priority = KvCacheRetentionConfig::kDefaultRetentionPriority)
+            : tokenStart{tokenStart}
+            , tokenEnd{tokenEnd}
+            , priority{priority}
+        {
+            TLLM_CHECK_WITH_INFO(priority >= KvCacheRetentionConfig::kMinRetentionPriority
+                    && priority <= KvCacheRetentionConfig::kMaxRetentionPriority,
+                "Invalid priority value. Must be between %d and %d", KvCacheRetentionConfig::kMinRetentionPriority,
+                KvCacheRetentionConfig::kMaxRetentionPriority);
+        };
+
+        /// @brief The first token of this range.
+        SizeType32 tokenStart;
+        /// @brief The final token of this range. The end is not included in the range. This can be set to std::nullopt
+        /// to extend the range to the end of the sequence.
+        std::optional<SizeType32> tokenEnd;
+        /// @brief The priority of this token range. Higher priorities are less likely to be evicted or offloaded.
+        RetentionPriority priority;
+
+        bool operator==(TokenRangeRetentionPriority const& other) const
+        {
+            return tokenStart == other.tokenStart && tokenEnd == other.tokenEnd && priority == other.priority;
+        }
+    };
+
+    explicit KvCacheRetentionConfig()
+        : KvCacheRetentionConfig({}, kDefaultRetentionPriority)
+    {
+    }
+
+    KvCacheRetentionConfig(std::vector<TokenRangeRetentionPriority> const& tokenRangeRetentionPriorities,
+        RetentionPriority decodeRetentionPriority);
+
+    [[nodiscard]] std::vector<TokenRangeRetentionPriority> getTokenRangeRetentionPriorities() const;
+    [[nodiscard]] RetentionPriority getDecodeRetentionPriority() const;
+
+    /// @brief Convert the token range data into an entry per kv cache block for a given seqLen
+    std::vector<std::optional<RetentionPriority>> getPerBlockEvictionPolicy(SizeType32 blockSize, SizeType32 seqLen);
+
+private:
+    /// @brief The token ranges and priority levels to update. Ranges must be non-overlapping. For example [(0, 64),
+    /// (100, 128), (70, 80)] is valid, whereas
+    /// [(0, 64), (60, 128)] is not.
+    std::vector<TokenRangeRetentionPriority> mTokenRangeRetentionPriorities;
+    /// @brief The priority level to assign to blocks allocated in the decode phase
+    RetentionPriority mDecodeRetentionPriority;
+};
+
 /// @brief A class that holds information about the request
 class Request
 {
@@ -357,6 +437,7 @@ public:
     /// @param pTuningConfig The prompt tuning configuration
     /// @param loraConfig The LoRA configuration
     /// @param logitsPostProcessorName The logits postprocessor name. Must correspond to one of the logits postprocessor
+    /// @param kvCacheRetentionConfig The configuration used for KV cache block eviction.
     /// name provided to the ExecutorConfig.
     /// @param encoderInputTokenIds The encoder input token ids for encoder-decoder models, or encoder-only models
     /// @param returnAllGeneratedTokens Indicates whether to return the full beams or just the newly generated tokens
@@ -365,6 +446,7 @@ public:
     /// @param encoderInputFeatures Encoder input features for multimodal models.
     /// @param encoderOutputLength Encoder output length if encoder input and output have different lengths (due to
     /// convolution down-sampling, etc.)
+    /// @param crossAttentionMask Cross attention mask.
     /// @param type Indicate the request type for disaggregated serving mode.
     /// @param contextPhaseParams Generated token ID  from context only executor.
     /// @param numReturnSequences The number of returning sequences.
@@ -379,13 +461,15 @@ public:
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
+        std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         std::optional<std::string> logitsPostProcessorName = std::nullopt,
         std::optional<VecTokens> encoderInputTokenIds = std::nullopt, std::optional<IdType> clientId = std::nullopt,
         bool returnAllGeneratedTokens = false, PriorityType priority = kDefaultPriority,
         RequestType type = RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<ContextPhaseParams> contextPhaseParams = std::nullopt,
         std::optional<Tensor> encoderInputFeatures = std::nullopt,
-        std::optional<SizeType32> encoderOutputLength = std::nullopt, SizeType32 numReturnSequences = 1);
+        std::optional<SizeType32> encoderOutputLength = std::nullopt,
+        std::optional<Tensor> crossAttentionMask = std::nullopt, SizeType32 numReturnSequences = 1);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -412,6 +496,7 @@ public:
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
     [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadConfig() const;
+    [[nodiscard]] std::optional<KvCacheRetentionConfig> getKvCacheRetentionConfig() const;
     [[nodiscard]] std::optional<std::string> getLogitsPostProcessorName() const;
     [[nodiscard]] std::optional<VecTokens> getEncoderInputTokenIds() const;
     [[nodiscard]] std::optional<IdType> getClientId() const;
@@ -420,6 +505,7 @@ public:
     [[nodiscard]] std::optional<ContextPhaseParams> const& getContextPhaseParams() const;
     [[nodiscard]] std::optional<Tensor> getEncoderInputFeatures() const;
     [[nodiscard]] std::optional<SizeType32> getEncoderOutputLength() const;
+    [[nodiscard]] std::optional<Tensor> getCrossAttentionMask() const;
     [[nodiscard]] RequestType getRequestType() const;
     [[nodiscard]] SizeType32 getNumReturnSequences() const;
 
@@ -436,6 +522,7 @@ public:
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig);
+    void setKvCacheRetentionConfig(KvCacheRetentionConfig const& kvCacheRetentionConfig);
     void setLogitsPostProcessorName(std::string const& logitsPostProcessorName);
     void setEncoderInputTokenIds(VecTokens const& encoderInputTokenIds);
     void setClientId(IdType clientId);
@@ -445,6 +532,7 @@ public:
     void setContextPhaseParams(ContextPhaseParams contextPhaseParams);
     void setEncoderInputFeatures(Tensor encoderInputFeatures);
     void setEncoderOutputLength(SizeType32 encoderOutputLength);
+    void setCrossAttentionMask(Tensor crossAttentionMask);
     void setNumReturnSequences(SizeType32 numReturnSequences);
 
 private:
@@ -502,10 +590,13 @@ struct Result
     /// @brief The decoding iterations it takes.
     SizeType32 decodingIter{0};
 
-    /// @brief The index of the output sequence where 0 <= sequenceIndex < numReturnSequences
+    /// @brief The index of the output sequence of this result where 0 <= sequenceIndex < numReturnSequences.
+    /// In beam search (beamWidth > 1), this index will be always zero because all beams to be returned are included
+    /// in this result.
     SizeType32 sequenceIndex{0};
 
     /// @brief Indicates if this is the final result for a given sequence in the request
+    /// In beam search (beamWidth > 1), the value will always equal to the value of isFinal.
     bool isSequenceFinal;
 };
 
@@ -577,23 +668,29 @@ public:
         std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> const& sinkTokenLength = std::nullopt,
         std::optional<FloatType> const& freeGpuMemoryFraction = std::nullopt,
-        std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true);
+        std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true,
+        std::optional<FloatType> const& crossKvCacheFraction = std::nullopt,
+        std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] std::optional<SizeType32> getMaxTokens() const;
     [[nodiscard]] std::optional<std::vector<SizeType32>> getMaxAttentionWindowVec() const;
     [[nodiscard]] std::optional<SizeType32> getSinkTokenLength() const;
     [[nodiscard]] std::optional<FloatType> getFreeGpuMemoryFraction() const;
+    [[nodiscard]] std::optional<FloatType> getCrossKvCacheFraction() const;
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
     [[nodiscard]] bool getOnboardBlocks() const;
+    [[nodiscard]] std::optional<RetentionPriority> getSecondaryOffloadMinPriority() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setMaxTokens(SizeType32 maxTokens);
     void setMaxAttentionWindowVec(std::vector<SizeType32> maxAttentionWindowVec);
     void setSinkTokenLength(SizeType32 sinkTokenLength);
     void setFreeGpuMemoryFraction(FloatType freeGpuMemoryFraction);
+    void setCrossKvCacheFraction(FloatType crossKvCacheFraction);
     void setHostCacheSize(size_t hostCacheSize);
     void setOnboardBlocks(bool onboardBlocks);
+    void setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority);
 
 private:
     friend class Serialization;
@@ -620,12 +717,21 @@ private:
     /// allocated.
     std::optional<FloatType> mFreeGpuMemoryFraction;
 
+    /// @brief The fraction of the KV Cache memory should be reserved for cross attention
+    /// If set to p, self attention will use 1-p of KV Cache memory and cross attention
+    /// will use p of KV Cache memory. Default is 50%.
+    /// Should only be set when using encoder-decoder model.
+    std::optional<FloatType> mCrossKvCacheFraction;
+
     /// @brief Size of secondary memory pool in bytes. Default is 0.
     /// Having a secondary memory pool increases KV cache block reuse potential.
     std::optional<size_t> mHostCacheSize;
 
     /// @brief Controls whether offloaded blocks should be onboarded back into primary memory before being reused.
     bool mOnboardBlocks;
+
+    /// @brief Only blocks with priority > mSecondaryOfflineMinPriority can be offloaded to secondary memory.
+    std::optional<RetentionPriority> mSecondaryOffloadMinPriority;
 };
 
 /// @brief Configuration class for the runtime perf knobs

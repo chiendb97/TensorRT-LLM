@@ -34,6 +34,7 @@ extensions = [
     "breathe",
     'sphinx.ext.todo',
     'sphinxarg.ext',
+    'sphinx_copybutton'
 ]
 
 myst_url_schemes = {
@@ -45,7 +46,16 @@ myst_url_schemes = {
     "https://github.com/NVIDIA/TensorRT-LLM/tree/" + branch_name + "/{{path}}",
 }
 
+myst_heading_anchors = 4
+
+myst_enable_extensions = [
+    "deflist",
+]
+
 autosummary_generate = True
+copybutton_exclude = '.linenos, .gp, .go'
+copybutton_prompt_text = ">>> |$ |# "
+copybutton_line_continuation_character = "\\"
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output

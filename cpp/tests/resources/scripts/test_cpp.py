@@ -101,6 +101,9 @@ def add_parallel_info(report, parallel):
     document.write(report, encoding="UTF-8", xml_declaration=True)
 
 
+default_test_parallel = 2
+
+
 def parallel_run_ctest(
     command: _tp.Sequence[str],
     cwd: _pl.Path,
@@ -108,7 +111,7 @@ def parallel_run_ctest(
     shell=False,
     env=None,
     timeout=None,
-    parallel=2,
+    parallel=default_test_parallel,
 ) -> None:
     if parallel == 1:
         return run_command(command,
@@ -136,7 +139,8 @@ def parallel_run_ctest(
             # Some catastrophic fail happened that there's no report generated
             raise
 
-        parallel_report = 'parallel-' + report
+        # Avoid .xml extension to prevent CI from reading failures from it
+        parallel_report = 'parallel-' + report + ".intermediate"
         _os.rename(cwd / report, cwd / parallel_report)
 
         try:
@@ -150,7 +154,7 @@ def parallel_run_ctest(
                 # Use parallel result as final report
                 _os.rename(cwd / parallel_report, cwd / report)
             else:
-                retry_report = 'retry-' + report
+                retry_report = 'retry-' + report + ".intermediate"
                 _os.rename(cwd / report, cwd / retry_report)
                 merge_report(cwd / parallel_report, cwd / retry_report,
                              cwd / report)
@@ -469,6 +473,12 @@ def prepare_multi_gpu_model_tests(python_exe: str,
                         model_cache_arg=model_cache_arg,
                         only_multi_gpu_arg=only_multi_gpu_arg)
 
+    prepare_model_tests(model_name="llama",
+                        python_exe=python_exe,
+                        root_dir=root_dir,
+                        resources_dir=resources_dir,
+                        model_cache_arg=model_cache_arg)
+
     prepare_model_tests(model_name="t5",
                         python_exe=python_exe,
                         root_dir=root_dir,
@@ -576,7 +586,16 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     excluded_tests.append("Encoder")
     excluded_tests.append("EncDec")
     ctest.extend(["-E", "|".join(excluded_tests)])
-    parallel_run_ctest(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
+
+    parallel = default_test_parallel
+    if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE", None):
+        parallel = int(parallel_override)
+
+    parallel_run_ctest(ctest,
+                       cwd=build_dir,
+                       env=cpp_env,
+                       timeout=timeout,
+                       parallel=parallel)
 
 
 def run_single_gpu_tests(build_dir: _pl.Path,
@@ -634,7 +653,17 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         ctest.extend(["-R", "|".join(included_tests)])
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
-        parallel_run_ctest(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
+
+        parallel = default_test_parallel
+        if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE",
+                                                None):
+            parallel = int(parallel_override)
+
+        parallel_run_ctest(ctest,
+                           cwd=build_dir,
+                           env=cpp_env,
+                           timeout=timeout,
+                           parallel=parallel)
     if run_gpt:
         xml_output_file = build_dir / "results-single-gpu-disagg-executor_gpt.xml"
         trt_model_test = produce_mpirun_command(
@@ -681,6 +710,19 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         "batch_manager/cacheTransceiverTest",
     ]
     run_command(cache_trans_test, cwd=tests_dir, env=cpp_env, timeout=300)
+
+    # Cache transceiver tests
+    cache_trans_test_8_proc = [
+        "mpirun",
+        "-n",
+        "8",
+        "--allow-run-as-root",
+        "batch_manager/cacheTransceiverTest",
+    ]
+    run_command(cache_trans_test_8_proc,
+                cwd=tests_dir,
+                env=cpp_env,
+                timeout=600)
 
     # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
     if _os.path.exists(
@@ -814,6 +856,19 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     trt_model_test = produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
         nranks=6,
+        local_commands=[
+            "executor/executorTest",
+            "--gtest_filter=*DisaggAsymmetricExecutorTest*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
+    new_env = copy.copy(cpp_env)
+    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-8-process.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=8,
         local_commands=[
             "executor/executorTest",
             "--gtest_filter=*DisaggAsymmetricExecutorTest*"

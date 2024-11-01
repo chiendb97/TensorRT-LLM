@@ -2552,10 +2552,9 @@ def _lookup_plugin(input: Tensor, weight: Tensor, rank: int,
         'Lookup', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert plg_creator is not None
 
-    p_dtype = default_net().plugin_config.lookup_plugin
-    pf_type = trt.PluginField(
-        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
-        trt.PluginFieldType.INT32)
+    p_dtype = per_token_scale.dtype
+    pf_type = trt.PluginField("type_id", np.array([int(p_dtype)], np.int32),
+                              trt.PluginFieldType.INT32)
 
     rank = trt.PluginField("rank", np.array([int(rank)], np.int32),
                            trt.PluginFieldType.INT32)
@@ -2632,6 +2631,10 @@ def embedding(input: Tensor,
         The tensor produced by the embedding lookup layer.
     '''
 
+    # Per token scale is only supported by lookup plugin so if per_token_scale is not None, we must use lookup plugin
+    # Otherwise, we prefer to use ootb
+    use_lookup_plugin = per_token_scale is not None
+
     # Distribute embedding lookup table across multiple GPU
     if tp_size > 1 and tp_group is not None:
         if sharding_dim == 0:  # TP on vocab_size dimension
@@ -2639,7 +2642,7 @@ def embedding(input: Tensor,
                 raise ValueError(
                     "Rank cannot be none for tensor parallelism on vocab dim")
 
-            if default_net().plugin_config.lookup_plugin:
+            if use_lookup_plugin:
                 x = _lookup_plugin(input, weight, tp_rank, per_token_scale)
                 x = allreduce(x, tp_group)
             else:
@@ -2683,7 +2686,7 @@ def embedding(input: Tensor,
 
     # Store embedding lookup table as a whole
     else:
-        if default_net().plugin_config.lookup_plugin:
+        if use_lookup_plugin:
             x = _lookup_plugin(input,
                                weight,
                                rank=0,
@@ -3920,6 +3923,29 @@ def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
     return x
 
 
+def reduce_scatter(tensor: Tensor, group: List[int]) -> Tensor:
+
+    plg_creater = trt.get_plugin_registry().get_plugin_creator(
+        'ReduceScatter', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creater is not None
+
+    p_dtype = default_net().plugin_config.nccl_plugin
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    group = trt.PluginField("group", np.array(group, dtype=np.int32),
+                            trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection([group, pf_type])
+
+    reduce_scatter_plug = plg_creater.create_plugin("reduce_scatter", pfc)
+    plug_inputs = [tensor.cast(p_dtype).trt_tensor]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, reduce_scatter_plug)
+    _add_plugin_info(layer, plg_creater, "reduce_scatter", pfc)
+
+    return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
+
+
 def send(tensor: Tensor, tgt: int) -> Tensor:
     '''
     Add an operation that performs a send from a rank to another.
@@ -4551,7 +4577,8 @@ def gpt_attention(
     *,
     qkv: Tensor,
     past_key_value: Tensor,
-    context_fmha_custom_mask: Optional[Tensor] = None,
+    attention_mask: Optional[Tensor] = None,
+    attention_packed_mask: Optional[Tensor] = None,
     sequence_length: Tensor,
     host_past_key_value_lengths: Optional[Tensor],
     host_max_attention_window_sizes: Tensor,
@@ -4636,9 +4663,13 @@ def gpt_attention(
             [max_blocks, 2, num_kv_heads, num_tokens_per_block, hidden_dim_per_head]
             in paged mode. See KV Cache in docs/source/advanced/gpt-attention.md,
 
-        context_fmha_custom_mask: Tensor (On GPU)
+        attention_mask: Tensor (On GPU)
+            The tensor that stores the attention mask for unfused MHA or MMHA.
+            Its shape is [num_tokens, max_kv_seqlen].
+
+        attention_packed_mask: Tensor (On GPU)
             The tensor that stores the packed custom mask for fmha.
-            Its shape is [num_tokens, max_kv_seqlen / 32].
+            Its shape is [num_tokens, max_kv_seqlen / 32], where each bit represents one mask position.
 
         sequence_lengths: Tensor (On GPU)
             The tensor that stores the length of each sequence. Its shape is
@@ -4875,6 +4906,10 @@ def gpt_attention(
         is_unfuse_qkv_gemm = 1
     else:
         is_unfuse_qkv_gemm = 0
+
+    default_net().plugin_config.context_fmha_type
+    if do_cross_attention and not paged_kv_cache_flag:
+        pass
     unfuse_qkv_gemm = trt.PluginField(
         "unfuse_qkv_gemm", np.array(np.int8(is_unfuse_qkv_gemm), dtype=np.int8),
         trt.PluginFieldType.INT8)
@@ -4969,11 +5004,14 @@ def gpt_attention(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
         trt.PluginFieldType.INT32)
     # reset mask_type to custom_mask.
-    if context_fmha_custom_mask is not None:
+    if (attention_mask is not None) or (attention_packed_mask is not None):
+        # context fmha needs packed mask.
+        assert attention_packed_mask is not None
         mask_type = AttentionMaskType.custom_mask
-    mask_type = trt.PluginField("mask_type", np.array([int(mask_type)],
-                                                      np.int32),
-                                trt.PluginFieldType.INT32)
+
+    mask_type_filed = trt.PluginField("mask_type",
+                                      np.array([int(mask_type)], np.int32),
+                                      trt.PluginFieldType.INT32)
     block_sparse_block_size = trt.PluginField(
         "block_sparse_block_size", np.array([block_sparse_block_size],
                                             np.int32),
@@ -5045,6 +5083,10 @@ def gpt_attention(
         "use_fp8_context_fmha",
         np.array(np.int8(default_net().plugin_config.use_fp8_context_fmha),
                  dtype=np.int8), trt.PluginFieldType.INT8)
+    has_full_attention_mask_field = trt.PluginField(
+        "has_full_attention_mask",
+        np.array(np.int8(attention_mask is not None), dtype=np.int8),
+        trt.PluginFieldType.INT8)
     use_cache_pf = trt.PluginField("use_cache",
                                    np.array([use_cache], dtype=np.int32),
                                    trt.PluginFieldType.INT32)
@@ -5058,22 +5100,26 @@ def gpt_attention(
         rotary_embedding_long_m_scale, rotary_embedding_max_positions,
         rotary_embedding_original_max_positions, tp_size, tp_rank,
         unfuse_qkv_gemm, context_fmha_type, enable_xqa,
-        kv_cache_quant_mode_field, remove_input_padding, mask_type,
+        kv_cache_quant_mode_field, remove_input_padding, mask_type_filed,
         block_sparse_block_size, block_sparse_homo_head_pattern,
         block_sparse_num_local_blocks, block_sparse_vertical_stride,
         paged_kv_cache, tokens_per_block, pf_type, max_context_length,
         qkv_bias_enabled, do_cross_attention_field, max_distance,
         pos_shift_enabled, dense_context_fmha, use_paged_context_fmha_field,
-        use_fp8_context_fmha_field, use_cache_pf, is_spec_decoding_enabled,
-        spec_decoding_is_generation_length_variable,
+        use_fp8_context_fmha_field, has_full_attention_mask_field, use_cache_pf,
+        is_spec_decoding_enabled, spec_decoding_is_generation_length_variable,
         spec_decoding_max_generation_length
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
     assert attn_plug
     plug_inputs = [*qkv] if is_unfuse_qkv_gemm else [qkv]
-    if context_fmha_custom_mask is not None:
-        plug_inputs += [context_fmha_custom_mask]
+    if attention_mask is not None and mask_type == AttentionMaskType.custom_mask:
+        # useFullCustomMask
+        plug_inputs += [attention_mask]
+    if attention_packed_mask is not None:
+        # usePackedCustomMask
+        plug_inputs += [attention_packed_mask]
     if use_cache:
         plug_inputs += [
             sequence_length,

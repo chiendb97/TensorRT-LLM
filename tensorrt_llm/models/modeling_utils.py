@@ -73,6 +73,7 @@ class SpeculativeDecodingMode(IntFlag):
     MEDUSA = auto()
     LOOKAHEAD_DECODING = auto()
     EXPLICIT_DRAFT_TOKENS = auto()
+    EAGLE = auto()
 
     @staticmethod
     def from_arguments(args: argparse.Namespace):
@@ -86,6 +87,9 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.LOOKAHEAD_DECODING
         elif args.speculative_decoding_mode == "explicit_draft_tokens":
             return SpeculativeDecodingMode.EXPLICIT_DRAFT_TOKENS
+        elif args.speculative_decoding_mode == "eagle":
+            logger.warning(f"EAGLE is not supported yet. Do not use it.")
+            return SpeculativeDecodingMode.EAGLE
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
@@ -703,6 +707,7 @@ class PretrainedModel(Module,
         use_lora_plugin = default_net().plugin_config.lora_plugin
         multiple_profiles = default_net().plugin_config.multiple_profiles
         streamingllm = default_net().plugin_config.streamingllm
+        pp_reduce_scatter = default_net().plugin_config.pp_reduce_scatter
 
         kv_cache_type = None
         if not use_cache:
@@ -746,7 +751,8 @@ class PretrainedModel(Module,
             lora_target_modules=lora_target_modules,
             multiple_profiles=multiple_profiles,
             streamingllm=streamingllm,
-            opt_batch_size=opt_batch_size)
+            opt_batch_size=opt_batch_size,
+            pp_reduce_scatter=pp_reduce_scatter)
 
         result = {
             'input_ids':
@@ -1311,6 +1317,9 @@ def optimize_model(
     if use_parallel_embedding:
         model = parallelize_embedding(model)
     if share_embedding_table:
+        # if share_embedding_table is enabled, only one copy of the embedding table is store in converted ckpt
+        # this pass is required to make lm_head.weight and vocab_embedding.weight point to the same tensor
+        # however even if share_embedding_table is not enabled, trt would still only keep one copy of the table if the weights are identical
         model = share_embedding(model)
 
     # After weight loading
