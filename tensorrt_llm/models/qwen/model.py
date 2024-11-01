@@ -320,7 +320,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                               quant_config=quant_config,
                                               **kwargs)
 
-        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None and not use_preloading:
             custom_dict = {}
             if config.qwen_type == "qwen":
                 custom_dict = {

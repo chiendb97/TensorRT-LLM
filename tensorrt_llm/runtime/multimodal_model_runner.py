@@ -13,6 +13,8 @@ from huggingface_hub import hf_hub_download
 from PIL import Image
 from safetensors import safe_open
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+import torchvision.transforms as T
+from torchvision.transforms.functional import InterpolationMode
 
 from .. import profiler
 from .._utils import (mpi_rank, str_dtype_to_torch, str_dtype_to_trt,
@@ -156,6 +158,87 @@ class LlavaNextUtils:
         return image_feature
 
 
+class InternVLUtils:
+    IMAGENET_MEAN = (0.485, 0.456, 0.406)
+    IMAGENET_STD = (0.229, 0.224, 0.225)
+
+    @staticmethod
+    def build_transform(input_size):
+        MEAN, STD = InternVLUtils.IMAGENET_MEAN, InternVLUtils.IMAGENET_STD
+        transform = T.Compose([
+            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=MEAN, std=STD)
+        ])
+        return transform
+
+    @staticmethod
+    def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+        best_ratio_diff = float('inf')
+        best_ratio = (1, 1)
+        area = width * height
+        for ratio in target_ratios:
+            target_aspect_ratio = ratio[0] / ratio[1]
+            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_ratio = ratio
+            elif ratio_diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                    best_ratio = ratio
+        return best_ratio
+
+    @staticmethod
+    def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+        orig_width, orig_height = image.size
+        aspect_ratio = orig_width / orig_height
+
+        # calculate the existing image aspect ratio
+        target_ratios = set(
+            (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
+            i * j <= max_num and i * j >= min_num)
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+        # find the closest aspect ratio to the target
+        target_aspect_ratio = InternVLUtils.find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+        # calculate the target width and height
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+        blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+        # resize the image
+        resized_img = image.resize((target_width, target_height))
+        processed_images = []
+        for i in range(blocks):
+            box = (
+                (i % (target_width // image_size)) * image_size,
+                (i // (target_width // image_size)) * image_size,
+                ((i % (target_width // image_size)) + 1) * image_size,
+                ((i // (target_width // image_size)) + 1) * image_size
+            )
+            # split the image
+            split_img = resized_img.crop(box)
+            processed_images.append(split_img)
+        assert len(processed_images) == blocks
+        if use_thumbnail and len(processed_images) != 1:
+            thumbnail_img = image.resize((image_size, image_size))
+            processed_images.append(thumbnail_img)
+        return processed_images
+
+    @staticmethod
+    def preprocess(image, input_size=448, max_num=12):
+        # image = Image.open(image_path).convert('RGB')
+        transform = InternVLUtils.build_transform(input_size=input_size)
+        images = InternVLUtils.dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
+        pixel_values = [transform(image) for image in images]
+        pixel_values = torch.stack(pixel_values)
+        print('pixel_values shape: ', pixel_values.shape)
+        return pixel_values
+
+
 class MultimodalModelRunner:
 
     def __init__(self, args):
@@ -272,6 +355,9 @@ class MultimodalModelRunner:
                 self.args.hf_model_dir + "/llm",
                 use_fast=False,
                 use_legacy=False)
+        elif self.model_type == "internvl":
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.args.hf_model_dir, use_fast=False, trust_remote_code=True)
         else:
             use_fast = False if self.model_type != "phi-3-vision" else True
             self.tokenizer = AutoTokenizer.from_pretrained(
@@ -1122,6 +1208,10 @@ class MultimodalModelRunner:
                                       images=raw_image,
                                       return_tensors="pt")['pixel_values']
 
+        elif self.model_type == 'internvl':
+            pre_prompt = '<|im_start|>system\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。<|im_end|><|im_start|>user\n<img>'
+            post_prompt = '</img>\n' + input_text + '<|im_end|><|im_start|>assistant\n'
+            image = InternVLUtils.preprocess(raw_image, max_num=1)#.unsqueeze(0)
         # Repeat inputs to match batch size
         pre_prompt = [pre_prompt] * self.args.batch_size
         post_prompt = [post_prompt] * self.args.batch_size
