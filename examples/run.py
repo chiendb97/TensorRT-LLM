@@ -128,6 +128,23 @@ def parse_input(tokenizer,
             for curr_text in input_text:
                 if prompt_template is not None:
                     curr_text = prompt_template.format(input_text=curr_text)
+                # curr_text = ("Below is an instruction that describes a task. " \
+                #     "Write a response that appropriately completes the request.\n\n" \
+                #     "### Instruction:\n{}\n\n### Response: ")\
+                #     .format("Make a list of 10 useful expressions for a conversation in French.")
+#                 curr_text = """<|im_start|>systemYou are a helpful assistant.<|im_end|>
+# <|im_start|>user
+# Trả lời câu hỏi trắc nghiệm bằng cách đưa ra giải thích sau đó đưa ra đáp án.
+# Theo quy định của pháp luật, một trong những nội dung thể hiện quyền bình đẳng giữa các dân tộc trên phương diện văn hóa, giáo dục là công dân thuộc các dân tộc đều được
+# A. bình đẳng về cơ hội học tập.
+# B. tham gia vào bộ máy nhà nước.
+# C. đóng góp ý về vấn đề chung của xã.
+# D. hưởng chế độ chăm sóc y tế.<|im_end|>
+# <|im_start|>assistant
+# """
+                # curr_text = """<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nViết câu chúc động viên team Kiki Creative làm thiệp AI tốt, có vài emoji pháo bông, ngôi sao, con gà<|im_end|>\n<|im_start|>assistant"""
+                curr_text = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: What are some business etiquette norms when doing business in Japan? ASSISTANT:"
+                
                 input_ids = tokenizer.encode(
                     curr_text,
                     add_special_tokens=add_special_tokens,
@@ -245,6 +262,7 @@ def print_output(tokenizer,
                              if num_return_sequences > 1 else
                              f'Text {batch_idx} Beam {beam}')
                 print(f'Output [{index_str}]: \"{output_text}\"')
+                print("=============")
                 logger.debug(str(outputs))
 
     output_ids = output_ids.reshape((-1, output_ids.size(2)))
@@ -526,17 +544,20 @@ def main(args):
 
     # Receive output, print to screen or save to file
     if args.streaming:
+        import time
+        st = time.time()
         for curr_outputs in throttle_generator(outputs,
                                                args.streaming_interval):
             if runtime_rank == 0:
                 output_ids = curr_outputs['output_ids']
                 sequence_lengths = curr_outputs['sequence_lengths']
+                print("?????", sequence_lengths)
                 cum_log_probs = None
                 log_probs = None
-                if args.output_cum_log_probs_npy is not None:
-                    cum_log_probs = curr_outputs['cum_log_probs']
-                if args.output_log_probs_npy is not None:
-                    log_probs = curr_outputs['log_probs']
+                if args.output_cum_log_probs_npy != None:
+                    cum_log_probs = outputs['cum_log_probs']
+                if args.output_log_probs_npy != None:
+                    log_probs = outputs['log_probs']
                 print_output(
                     tokenizer,
                     output_ids,
@@ -548,6 +569,8 @@ def main(args):
                     log_probs=log_probs,
                     output_cum_log_probs_npy=args.output_cum_log_probs_npy,
                     output_log_probs_npy=args.output_log_probs_npy)
+
+                print("latencyyyy", time.time() - st)
     else:
         if runtime_rank == 0:
             output_ids = outputs['output_ids']

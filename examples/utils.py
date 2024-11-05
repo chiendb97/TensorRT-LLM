@@ -102,8 +102,8 @@ def throttle_generator(generator, stream_interval):
         if not i % stream_interval:
             yield out
 
-    if i % stream_interval:
-        yield out
+        if i % stream_interval:
+            yield out
 
 
 def load_tokenizer(tokenizer_dir: Optional[str] = None,
