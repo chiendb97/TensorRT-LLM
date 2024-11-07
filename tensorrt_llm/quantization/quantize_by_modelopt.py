@@ -213,7 +213,7 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
             device_map="auto" if device != "cpu" else "cpu",
             torch_dtype="auto",
             trust_remote_code=True)
-        if hf_config.model_type == "llava":
+        if hf_config.model_type in ["llava", "internvl_chat"]:
             model = model.language_model
     model.eval()
 
@@ -683,6 +683,11 @@ def quantize_and_export(*,
                 tensorrt_llm_config = json.load(f)
             qwen_config = AutoConfig.from_pretrained(model_dir,
                                                      trust_remote_code=True)
+            # this means the llm is qwen but the multimodal is internvl_chat
+            # need to get qwen config inside internvl config
+            if qwen_config.model_type == "internvl_chat":
+                qwen_config = qwen_config.llm_config
+
             tensorrt_llm_config["qwen_type"] = qwen_config.model_type
             if qwen_config.model_type == "qwen2":
                 tensorrt_llm_config["norm_epsilon"] = qwen_config.rms_norm_eps

@@ -37,6 +37,8 @@ from .config import QWenConfig
 from .convert import (load_hf_qwen, load_weights_from_hf_gptq_model,
                       load_weights_from_hf_model)
 
+from transformers import AutoConfig
+
 
 class QWenDecoderLayer(Module):
 
@@ -504,7 +506,11 @@ class QWenForCausalLM(DecoderModelForCausalLM):
             # non-modelopt quantization flow
             from . import convert
 
-            config = QWenConfig.from_hugging_face(hf_model_dir,
+            hf_config = AutoConfig.from_pretrained(hf_model_dir, trust_remote_code=True)
+            if hf_config.model_type == "internvl_chat":
+                hf_config = hf_config.llm_config
+
+            config = QWenConfig.from_hugging_face(hf_config,
                                                   dtype=dtype,
                                                   mapping=mapping,
                                                   quant_config=quant_config,
