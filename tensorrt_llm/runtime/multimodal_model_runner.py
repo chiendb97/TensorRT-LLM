@@ -1343,7 +1343,7 @@ class MultimodalModelRunner:
             post_prompt = None
             image = inputs["pixel_values"]
 
-        elif self.model_type == 'internvl':
+        elif self.model_type == 'internvl2':
             pre_prompt = '<|im_start|>system\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。<|im_end|><|im_start|>user\n<img>'
             post_prompt = '</img>\n' + input_text + '<|im_end|><|im_start|>assistant\n'
             image = InternVLUtils.preprocess(raw_image, max_num=1)#.unsqueeze(0)

@@ -911,6 +911,9 @@ def quantize(hf_model_dir: str,
         device_map='auto',
         torch_dtype='auto' if not use_smooth_quant else torch.float16,
         trust_remote_code=True).half()
+    if hf_config.model_type == 'internvl_chat':
+        hf_config = hf_config.llm_config
+        hf_model = hf_model.language_model
 
     os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
         "TOKENIZERS_PARALLELISM", "false")
