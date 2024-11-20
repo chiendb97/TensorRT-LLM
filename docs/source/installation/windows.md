@@ -15,7 +15,7 @@ We recommend checking out the [v0.14.0 tag](https://github.com/NVIDIA/TensorRT-L
 
     1. Install all dependencies together.
 
-       1. Run the provided PowerShell script `setup_env.ps1` located under the `/windows/` folder which installs Python and CUDA 12.5.1 automatically with default settings. Run PowerShell as Administrator to use the script.
+       1. Run the provided PowerShell script `setup_env.ps1` located under the `/windows/` folder which installs Python and CUDA 12.6.2 automatically with default settings. Run PowerShell as Administrator to use the script.
 
        ```bash
        ./setup_env.ps1 [-skipCUDA] [-skipPython]
@@ -30,7 +30,7 @@ We recommend checking out the [v0.14.0 tag](https://github.com/NVIDIA/TensorRT-L
             1. Select **Add python.exe to PATH** at the start of the installation. The installation may only add the `python` command, but not the `python3` command.
             2. Navigate to the installation path `%USERPROFILE%\AppData\Local\Programs\Python\Python310` (`AppData` is a hidden folder) and copy `python.exe` to `python3.exe`.
 
-        2. Install [CUDA 12.5.1 Toolkit](https://developer.nvidia.com/cuda-12-5-1-download-archive?target_os=Windows&target_arch=x86_64). Use the Express Installation option. Installation may require a restart.
+        2. Install [CUDA 12.6.2 Toolkit](https://developer.nvidia.com/cuda-12-6-2-download-archive?target_os=Windows&target_arch=x86_64). Use the Express Installation option. Installation may require a restart.
 
   3. If using conda environment, run the following command before installing TensorRT-LLM.
      ```bash
@@ -52,7 +52,7 @@ We recommend checking out the [v0.14.0 tag](https://github.com/NVIDIA/TensorRT-L
   before installing TensorRT-LLM with the following command.
 
   ```bash
-  pip install tensorrt_llm==0.14.0 --extra-index-url https://pypi.nvidia.com --extra-index-url https://download.pytorch.org/whl/
+  pip install tensorrt_llm==0.14.0 --extra-index-url https://download.pytorch.org/whl/
   ```
 
   Run the following command to verify that your TensorRT-LLM installation is working properly.

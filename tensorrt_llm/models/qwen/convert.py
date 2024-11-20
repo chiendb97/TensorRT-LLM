@@ -297,8 +297,8 @@ def get_tllm_linear_sq_weight(vals,
 
         q, k, v = torch.split(data, [local_dim, head_size, head_size], dim=-1)
         q_split = torch.split(q, q.shape[-1] // tp_size, dim=-1)
-        k_split = torch.split(k, q.shape[-1] // tp_size, dim=-1)
-        v_split = torch.split(v, q.shape[-1] // tp_size, dim=-1)
+        k_split = torch.split(k, k.shape[-1] // tp_size, dim=-1)
+        v_split = torch.split(v, v.shape[-1] // tp_size, dim=-1)
         return [
             torch.concat((q_split[ii], k_split[ii], v_split[ii]), dim=-1)
             for ii in range(tp_size)
@@ -318,8 +318,7 @@ def get_tllm_linear_sq_weight(vals,
             cur_weights = multi_query_split(original_weights, local_dim,
                                             head_size, tensor_parallel, rank)
         else:
-            cur_weights = torch.split(original_weights,
-                                      original_weights.shape[-1] //
+            cur_weights = torch.chunk(original_weights,
                                       tensor_parallel,
                                       dim=cat_dim)[rank]
         if is_qkv:
@@ -370,8 +369,7 @@ def get_tllm_linear_sq_weight(vals,
             cur_weights = multi_query_split(original_weights, local_dim,
                                             head_size, tensor_parallel, rank)
         else:
-            cur_weights = torch.split(original_weights,
-                                      original_weights.shape[-1] //
+            cur_weights = torch.chunk(original_weights,
                                       tensor_parallel,
                                       dim=cat_dim)[rank]
         if is_qkv:
@@ -433,6 +431,8 @@ def load_hf_qwen(model_dir: str, load_model_on_cpu: bool = False):
         config = json.load(f)
     if config['architectures'] == ['Qwen2ForSequenceClassification']:
         from transformers import Qwen2ForSequenceClassification as model_cls
+    elif config['architectures'] == ['Qwen2VLForConditionalGeneration']:
+        from transformers import Qwen2VLForConditionalGeneration as model_cls
     else:
         from transformers import AutoModelForCausalLM as model_cls
 
@@ -467,18 +467,37 @@ def convert_hf_qwen(hf_model,
     tik = time.time()
     tensor_parallel = mapping.tp_size
     model_params = dict(hf_model.named_parameters())
+
     dtype = getattr(torch, dtype)
-    num_attention_heads = hf_model.config.num_attention_heads
-    hidden_size = hf_model.config.hidden_size
+    hf_config = hf_model.config
+    if hasattr(hf_config, 'llm_config'):
+        hf_config = hf_config.llm_config
+
+    #This is for InternVL2 - 1B
+    keys_to_rename = [
+        key for key in model_params.keys() if 'language_model.' in key
+    ]
+    keys_to_delete = [
+        key for key in model_params.keys() if 'vision_model.' in key
+    ]
+    for key in keys_to_rename:
+        keys_rename = key.replace('language_model.', '')
+        model_params[keys_rename] = model_params[key]
+        del model_params[key]
+    for key in keys_to_delete:
+        del model_params[key]
+
+    num_attention_heads = hf_config.num_attention_heads
+    hidden_size = hf_config.hidden_size
     head_size = hidden_size // num_attention_heads
     if qwen_type == 'qwen':
-        intermediate_size = hf_model.config.intermediate_size // 2  # Qwen version 1 has actual intermediate_size one half of what's in hf_config
+        intermediate_size = hf_config.intermediate_size // 2  # Qwen version 1 has actual intermediate_size one half of what's in hf_config
     else:
-        intermediate_size = hf_model.config.intermediate_size
-    num_key_value_heads = hf_model.config.num_key_value_heads if hasattr(
-        hf_model.config, "num_key_value_heads") else num_attention_heads
+        intermediate_size = hf_config.intermediate_size
+    num_key_value_heads = hf_config.num_key_value_heads if hasattr(
+        hf_config, "num_key_value_heads") else num_attention_heads
     mha_mode = (num_key_value_heads == num_attention_heads)
-    layers_range = mapping.pp_layers(hf_model.config.num_hidden_layers)
+    layers_range = mapping.pp_layers(hf_config.num_hidden_layers)
 
     layer_prefix = "transformer.h." if qwen_type == 'qwen' else "model.layers."
     key_list = get_qwen_key_list(qwen_type)
@@ -660,16 +679,16 @@ def convert_hf_qwen(hf_model,
             ## mlp.shared_expert.gate_up_proj.weight
             weights.update(
                 get_tllm_linear_weight(shared_expert_gate_up_proj,
-                                       tllm_prex + 'shared_expert.fc.', None,
-                                       use_weight_only,
+                                       tllm_prex + 'mlp.shared_expert.fc.',
+                                       None, use_weight_only,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
             ## mlp.shared_expert.down_proj.weight
             weights.update(
                 get_tllm_linear_weight(shared_expert_down_proj.to(dtype),
-                                       tllm_prex + 'shared_expert.proj.', None,
-                                       use_weight_only,
+                                       tllm_prex + 'mlp.shared_expert.proj.',
+                                       None, use_weight_only,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
@@ -678,7 +697,7 @@ def convert_hf_qwen(hf_model,
             weights.update(
                 get_tllm_linear_weight(
                     moe_shared_expert_gate_weights,
-                    tllm_prex + 'shared_expert_gate.',
+                    tllm_prex + 'mlp.shared_expert_gate.',
                     None,
                     False,  # Router should never be quantized
                     plugin_weight_only_quant_type,
@@ -823,7 +842,7 @@ def convert_hf_qwen(hf_model,
                             1, intermediate_size // tensor_parallel
                         ],
                         rank=mapping.tp_rank,
-                        cat_dim=-1))
+                        cat_dim=0))
             else:
                 weights.update(
                     get_tllm_linear_weight(split_v, tllm_prex + 'mlp.proj.',
@@ -841,7 +860,7 @@ def convert_hf_qwen(hf_model,
     v = get_weight(model_params, key_list[7], dtype)
 
     if mapping.is_last_pp_rank():
-        if hf_model.config.tie_word_embeddings:
+        if hf_config.tie_word_embeddings:
             # lm_head.weight has the same weights as embedding
             lm_head_weights = v.clone()
         else:

@@ -15,8 +15,10 @@
  */
 
 // Ignore CUTLASS warnings about type punning
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#endif
 
 #include "cutlass/array.h"
 #include "cutlass/numeric_conversion.h"
@@ -44,7 +46,9 @@
 #include "cutlass_extensions/gemm/kernel/moe_cutlass_kernel.h"
 #include "cutlass_extensions/gemm/threadblock/default_mma.h"
 
+#ifdef __GNUC__ // Restore GCC-specific diagnostics
 #pragma GCC diagnostic pop
+#endif
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -559,8 +563,9 @@ template <typename T, typename WeightType, typename OutputType, typename ScaleBi
 bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsFusedGatedActivation(
     bool is_gated_activation, int gemm_n, int gemm_k) const
 {
+    constexpr bool ENABLE_FUSED_GATED_ACTIVATION = false; // TODO There is a bug that causes non-determinism
     return is_gated_activation && std::is_same_v<T, WeightType> && !std::is_same_v<T, float> && !use_fp8
-        && (this->getSM() >= 80) && (gemm_k % 64 == 0) && (gemm_n % 64 == 0);
+        && (this->getSM() >= 80) && (gemm_k % 64 == 0) && (gemm_n % 64 == 0) && ENABLE_FUSED_GATED_ACTIVATION;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>

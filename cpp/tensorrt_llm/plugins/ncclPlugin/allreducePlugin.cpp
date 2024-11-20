@@ -143,7 +143,7 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
     {
         if (!isAuto)
         {
-            TLLM_LOG_WARNING("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL");
+            TLLM_LOG_INFO("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL");
         }
         return AllReduceStrategyType::NCCL;
     }
@@ -306,9 +306,11 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         }
 
         int token_num = size / inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
+        int hidden_size = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
 
         auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
-            reinterpret_cast<int64_t*>(const_cast<void*>(inputs[1])), tpSize, tpRank, mType, token_num, mOp);
+            reinterpret_cast<int64_t*>(const_cast<void*>(inputs[1])), tpSize, tpRank, mType, token_num, hidden_size,
+            mOp);
 
         params.local_output_buffer_ptr = outputs[0];
         params.local_input_buffer_ptr = inputs[0];
@@ -320,7 +322,7 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
             params.fusion_params.bias_buffer = mBias ? inputs[fusion_ptr_idx++] : nullptr;
             params.fusion_params.residual_buffer = inputs[fusion_ptr_idx++];
             params.fusion_params.weight_buffer = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
-            params.fusion_params.hidden_size = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
+            params.fusion_params.hidden_size = hidden_size;
             params.fusion_params.eps = mEps;
             params.fusion_params.intermediate_buffer = outputs[1];
             for (int i = 0; i < tpSize; ++i)
@@ -414,34 +416,33 @@ std::set<int> getLocalGroup(std::set<int> const& group)
             ranks.push_back(myRank);
             for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
             {
-                LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
+                COMM_SESSION.recvValue(rank, *it, 0);
                 ranks.push_back(rank);
             }
             for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
             {
-                LOCAL_COMM_SESSION.send(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
+                COMM_SESSION.send(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
             }
 
             localRanks.clear();
             localRanks.push_back(myLocalRank);
             for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
             {
-                LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
+                COMM_SESSION.recvValue(rank, *it, 0);
                 localRanks.push_back(rank);
             }
             for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
             {
-                LOCAL_COMM_SESSION.send(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
+                COMM_SESSION.send(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
             }
         }
         else
         {
-            LOCAL_COMM_SESSION.sendValue(myRank, *group.begin(), 0);
-            LOCAL_COMM_SESSION.recv(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
+            COMM_SESSION.sendValue(myRank, *group.begin(), 0);
+            COMM_SESSION.recv(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
 
-            LOCAL_COMM_SESSION.sendValue(myLocalRank, *group.begin(), 0);
-            LOCAL_COMM_SESSION.recv(
-                localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
+            COMM_SESSION.sendValue(myLocalRank, *group.begin(), 0);
+            COMM_SESSION.recv(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
         }
     }
 
@@ -730,7 +731,6 @@ IPluginV2* AllreducePluginCreator::createPlugin(char const* name, PluginFieldCol
             bias = *static_cast<int8_t const*>(fields[i].data);
         }
     }
-
     try
     {
         auto* obj = new AllreducePlugin(group, type, strategy, config, fusion_op, counter, eps, affine, bias);

@@ -36,6 +36,7 @@ public:
     // users tune that, we can support that by writing and reading the
     // points in `config.json`.
     static constexpr std::array kOPT_PROFILES_SPLIT_POINTS{64, 128, 256, 512, 1024};
+    static constexpr SizeType32 kDEFAULT_NUM_TOKENS_PER_BLOCK = 64;
 
     enum class ModelVariant : std::int32_t
     {
@@ -80,18 +81,16 @@ public:
         {
             return KVCacheType::kCONTINUOUS;
         }
-        else if (value == "PAGED")
+        if (value == "PAGED")
         {
             return KVCacheType::kPAGED;
         }
-        else if (value == "DISABLED")
+        if (value == "DISABLED")
         {
             return KVCacheType::kDISABLED;
         }
-        else
-        {
-            throw std::invalid_argument("Invalid KV cache type: " + value);
-        }
+
+        throw std::invalid_argument("Invalid KV cache type: " + value);
     }
 
     enum class ManageWeightsType : std::int32_t
@@ -113,7 +112,7 @@ public:
         , mUseGptAttentionPlugin(false)
         , mUseMambaConv1dPlugin(false)
         , mInputPacked{false}
-        , mTokensPerBlock{64}
+        , mTokensPerBlock{kDEFAULT_NUM_TOKENS_PER_BLOCK}
         , mQuantMode{common::QuantMode::none()}
         , mMaxBatchSize(0)
         , mMaxBeamWidth(0)
@@ -124,6 +123,9 @@ public:
         , mComputeGenerationLogits(false)
         , mModelVariant(ModelVariant::kGpt)
         , mMaxPromptEmbeddingTableSize(0)
+        , mUseMrope{false}
+        , mMaxPositionEmbeddings(0)
+        , mRotaryEmbeddingDim(0)
         , mContextFMHA(false)
         , mPagedContextFMHA(false)
         , mUseXQA{false}
@@ -137,6 +139,7 @@ public:
         , mLogitsDtype(nvinfer1::DataType::kFLOAT)
         , mUseShapeInference(true)
         , mManageWeightsType(ManageWeightsType::kDisabled)
+        , mSkipCrossAttnBlocks(false)
     {
         TLLM_CHECK_WITH_INFO(mNbLayers >= mNbAttentionLayers + mNbRnnLayers,
             "Number of layers (%d) expected to be >= number of attention (%d) + number of rnn layers (%d)", mNbLayers,
@@ -395,6 +398,36 @@ public:
         return mMaxPromptEmbeddingTableSize > 0;
     }
 
+    [[nodiscard]] bool constexpr useMrope() const noexcept
+    {
+        return mUseMrope;
+    }
+
+    void constexpr setUseMrope(bool useMrope) noexcept
+    {
+        mUseMrope = useMrope;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getMaxPositionEmbeddings() const noexcept
+    {
+        return mMaxPositionEmbeddings;
+    }
+
+    void constexpr setMaxPositionEmbeddings(SizeType32 maxPositionEmbeddings) noexcept
+    {
+        mMaxPositionEmbeddings = maxPositionEmbeddings;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getRotaryEmbeddingDim() const noexcept
+    {
+        return mRotaryEmbeddingDim;
+    }
+
+    void constexpr setRotaryEmbeddingDim(SizeType32 rotaryEmbeddingDim) noexcept
+    {
+        mRotaryEmbeddingDim = rotaryEmbeddingDim;
+    }
+
     [[nodiscard]] SizeType32 constexpr getMaxPromptEmbeddingTableSize() const noexcept
     {
         return mMaxPromptEmbeddingTableSize;
@@ -621,14 +654,12 @@ public:
         {
             return nvinfer1::DataType::kFP8;
         }
-        else if (getQuantMode().hasInt8KvCache())
+        if (getQuantMode().hasInt8KvCache())
         {
             return nvinfer1::DataType::kINT8;
         }
-        else
-        {
-            return getDataType();
-        }
+
+        return getDataType();
     }
 
     [[nodiscard]] bool constexpr isTransformerBased() const noexcept
@@ -732,6 +763,7 @@ public:
             : mNumKvHeadsPerAttentionLayer.cbegin() + numPrevAttnLayers;
         auto const numLocalAttentionLayers
             = countLocalLayers(LayerType::kATTENTION, pipelineParallelism, pipelineParallelismRank);
+        TLLM_LOG_TRACE("%s stop: %d", __PRETTY_FUNCTION__);
         return std::make_pair(firstLocalAttentionLayerIt, firstLocalAttentionLayerIt + numLocalAttentionLayers);
     }
 
@@ -760,6 +792,16 @@ public:
         return sumLocalHeads;
     }
 
+    [[nodiscard]] bool constexpr skipCrossAttnBlocks() const noexcept
+    {
+        return mSkipCrossAttnBlocks;
+    }
+
+    void constexpr setSkipCrossAttnBlocks(bool skipCrossAttnBlocks) noexcept
+    {
+        mSkipCrossAttnBlocks = skipCrossAttnBlocks;
+    }
+
 private:
     SizeType32 mVocabSize;
     SizeType32 mNbLayers;
@@ -786,6 +828,9 @@ private:
     ModelVariant mModelVariant;
 
     SizeType32 mMaxPromptEmbeddingTableSize;
+    bool mUseMrope;
+    SizeType32 mMaxPositionEmbeddings;
+    SizeType32 mRotaryEmbeddingDim;
 
     bool mContextFMHA;
     bool mPagedContextFMHA;
@@ -821,6 +866,7 @@ private:
     std::string mModelName;
     std::vector<SizeType32> mNumKvHeadsPerAttentionLayer;
     std::vector<SizeType32> mNumKvHeadsPerCrossAttentionLayer;
+    bool mSkipCrossAttnBlocks;
 };
 
 } // namespace tensorrt_llm::runtime

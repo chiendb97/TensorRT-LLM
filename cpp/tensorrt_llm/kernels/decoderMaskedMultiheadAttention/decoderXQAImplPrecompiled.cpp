@@ -33,9 +33,7 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 
 class XQAKernelList
@@ -77,13 +75,13 @@ public:
             }
             else
             {
-                cuErrCheck(mDriver->cuModuleLoadData(&hmod, kernelMeta.mCubin), mDriver);
+                TLLM_CU_CHECK(mDriver->cuModuleLoadData(&hmod, kernelMeta.mCubin));
                 mModules.insert(std::make_pair(kernelMeta.mCubin, hmod));
             }
 
             XQAKernelFuncInfo funcInfo{};
             funcInfo.mMetaInfoIndex = i;
-            cuErrCheck(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName), mDriver);
+            TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
             funcInfo.mSharedMemBytes = getGlobalVar<uint32_t>(mDriver, hmod, "smemSize", true).value();
             funcInfo.mKernelType = getGlobalVar<XQAKernelType>(mDriver, hmod, "kernelType", false)
                                        .value_or(XQAKernelType::kAMPERE_WARP_SPECIALIZED);
@@ -91,9 +89,8 @@ public:
             /* Set 46KB threshold here because we have to take static/driver shared memory into consideration. */
             if (funcInfo.mSharedMemBytes >= 46 * 1024)
             {
-                cuErrCheck(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
-                               CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, funcInfo.mSharedMemBytes),
-                    mDriver);
+                TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
+                    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, funcInfo.mSharedMemBytes));
             }
             XQAKernelRuntimeHashKey hash_key{kernelMeta.mKVDataType, kernelMeta.mHeadDim, kernelMeta.mBeamWidth,
                 kernelMeta.mNumQHeadsOverKV, kernelMeta.mMTileSize, kernelMeta.mTokensPerPage, kernelMeta.mPagedKVCache,
@@ -207,9 +204,10 @@ public:
             xqaParams.sequence_lengths, /* encoder_seqlens */ nullptr,
             xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr,
             /* cu_kv_seqlens */ nullptr, launchParams.rotary_inv_freq_buf, (float2 const*) nullptr,
-            xqaParams.kv_scale_orig_quant, xqaParams.spec_decoding_position_offsets, int(batch_beam_size),
-            xqaParams.generation_input_length, xqaParams.timestep, xqaParams.cyclic_attention_window_size,
-            xqaParams.sink_token_length, int(xqaParams.batch_size * beam_width * xqaParams.generation_input_length),
+            xqaParams.kv_scale_orig_quant, xqaParams.spec_decoding_position_offsets, xqaParams.mrope_rotary_sin_cos,
+            xqaParams.mrope_position_deltas, int(batch_beam_size), xqaParams.generation_input_length,
+            xqaParams.timestep, xqaParams.cyclic_attention_window_size, xqaParams.sink_token_length,
+            int(xqaParams.batch_size * beam_width * xqaParams.generation_input_length),
             /*remove_padding*/ true, /*cross_attention*/ false, xqaParams.num_q_heads, xqaParams.num_kv_heads,
             xqaParams.num_q_heads / xqaParams.num_kv_heads, xqaParams.head_size, xqaParams.rotary_embedding_dim,
             xqaParams.rotary_embedding_base, xqaParams.rotary_embedding_scale_type, xqaParams.rotary_embedding_scale,
@@ -256,9 +254,8 @@ public:
                     sizeof(int) * xqaParams.batch_size * qSeqLen * xqaParams.num_kv_heads, stream));
                 sync_check_cuda_error();
             }
-            cuErrCheck(mDriver->cuLaunchKernel(func, multi_block, xqaParams.num_kv_heads * nbTokenBlocksPerGrp,
-                           xqaParams.batch_size, 128, 1, 2, shared_mem_bytes, stream, kernelParams, nullptr),
-                mDriver);
+            TLLM_CU_CHECK(mDriver->cuLaunchKernel(func, multi_block, xqaParams.num_kv_heads * nbTokenBlocksPerGrp,
+                xqaParams.batch_size, 128, 1, 2, shared_mem_bytes, stream, kernelParams, nullptr));
         }
         else
         {
@@ -299,9 +296,8 @@ public:
             {
                 multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
             }
-            cuErrCheck(mDriver->cuLaunchKernel(func, multi_block, xqaParams.num_kv_heads, xqaParams.batch_size, 128, 1,
-                           isGmmaKernel ? 3 : 2, shared_mem_bytes, stream, kernelParams, nullptr),
-                mDriver);
+            TLLM_CU_CHECK(mDriver->cuLaunchKernel(func, multi_block, xqaParams.num_kv_heads, xqaParams.batch_size, 128,
+                1, isGmmaKernel ? 3 : 2, shared_mem_bytes, stream, kernelParams, nullptr));
         }
 
         sync_check_cuda_error();
@@ -417,7 +413,7 @@ bool DecoderXQAImplPrecompiled::shouldUse(XQAParams const& xqaParams, bool forCo
     }
     bool const isGPTJBeam4Kernel = (xqaParams.head_size == 256 && xqaParams.beam_width == 4 && xqaParams.paged_kv_cache
         && (xqaParams.tokens_per_block == 64 || xqaParams.tokens_per_block == 128));
-    if (xqaParams.head_size != 128 && xqaParams.head_size != 256 && !isGPTJBeam4Kernel)
+    if (xqaParams.head_size != 64 && xqaParams.head_size != 128 && xqaParams.head_size != 256 && !isGPTJBeam4Kernel)
     {
         SUPPORT_RETURN_FALSE("head_size");
     }
@@ -512,5 +508,4 @@ void DecoderXQAImplPrecompiled::runWithKVBlockArray(
     runDispatchBuffer<KVBlockArray>(xqa_params, kv_block_array, stream);
 }
 
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels

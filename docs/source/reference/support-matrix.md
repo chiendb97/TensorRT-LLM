@@ -32,6 +32,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [LLaMA/LLaMA 2/LLaMA 3/LLaMA 3.1](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
 - [Mamba](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mamba)
 - [mBART](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
+- [Minitron] (https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/nemotron)
 - [Mistral](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
 - [Mistral NeMo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
 - [Mixtral](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mixtral)
@@ -43,7 +44,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [Qwen/Qwen1.5/Qwen2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen)
 - [Qwen-VL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl)
 - [RecurrentGemma](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/recurrentgemma)
-- [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)
+- [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)[^ReplitCode]
 - [RoBERTa](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert)
 - [SantaCoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
 - [Skywork](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/skywork)
@@ -63,6 +64,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [Kosmos](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [LLaVA-v1.5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [LLaVa-Next](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+- [LLaVa-OneVision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [Nougat](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [Phi-3-vision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
@@ -105,15 +107,16 @@ The following table shows the supported software for TensorRT-LLM.
 * -
   - Software Compatibility
 * - Container
-  - [24.09](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
+  - [24.10](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
 * - TensorRT
-  - [10.5](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+  - [10.6](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision
   -
     - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ada Lovelace (SM89) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ampere (SM80, SM86) - FP32, FP16, BF16, INT8, INT4[^smgte89]
 ```
+[^ReplitCode]：Replit Code is not supported with the transformers 4.45+.
 
 [^smgte89]: INT4 AWQ and GPTQ with FP8 activations require SM >= 89.
 

@@ -7,8 +7,6 @@
 
 ```bash
 pip install -U transformers
-pip uninstall tensorrt
-pip install tensorrt~=10.4.0 # TensorRT 10.5 has a known issue to build the encoder engine.
 ```
 
 * build vision encoder model via onnx
@@ -36,7 +34,7 @@ python3 -m tensorrt_llm.commands.build \
             --max_encoder_input_len 4100 \
             --input_timing_cache model.cache
 
-# Run test on multimodal/run.py with C++ runtime
+# Run image+text test on multimodal/run.py with C++ runtime
 python3 examples/multimodal/run.py --visual_engine_dir /tmp/mllama/trt_engines/encoder/ \
                                    --visual_engine_name visual_encoder.engine \
                                    --llm_engine_dir /tmp/mllama/trt_engines/decoder/ \
@@ -46,5 +44,22 @@ python3 examples/multimodal/run.py --visual_engine_dir /tmp/mllama/trt_engines/e
                                    --max_new_tokens 50 \
                                    --batch_size 2
 
+# Run text only test on multimodal/run.py with C++ runtime
+python3 examples/multimodal/run.py --visual_engine_dir /tmp/mllama/trt_engines/encoder/ \
+                                   --visual_engine_name visual_encoder.engine \
+                                   --llm_engine_dir /tmp/mllama/trt_engines/decoder/ \
+                                   --hf_model_dir Llama-3.2-11B-Vision/ \
+                                   --input_text "The key to life is" \
+                                   --max_new_tokens 50 \
+                                   --batch_size 2
+
 Use model_runner_cpp by default. To switch to model_runner, set `--use_py_session` in the command mentioned above.
+
+python3 examples/multimodal/eval.py --visual_engine_dir /tmp/mllama/trt_engines/encoder/ \
+                                   --visual_engine_name visual_encoder.engine \
+                                   --llm_engine_dir /tmp/mllama/trt_engines/decoder/ \
+                                   --hf_model_dir Llama-3.2-11B-Vision/ \
+                                   --test_trtllm \
+                                   --accuracy_threshold 65 \
+                                   --eval_task lmms-lab/ai2d
 ```

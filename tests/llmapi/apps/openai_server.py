@@ -1,6 +1,5 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/baaedfdb2d3f1d70b7dbcde08b083abfe6017a92/tests/utils.py
-import os
 import subprocess
 import sys
 import time
@@ -8,10 +7,6 @@ from typing import List
 
 import openai
 import requests
-
-LLM_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-SERVER_PATH = os.path.join(LLM_ROOT, "examples", "apps", "openai_server.py")
 
 
 class RemoteOpenAIServer:
@@ -23,11 +18,11 @@ class RemoteOpenAIServer:
         model: str,
         cli_args: List[str],
     ) -> None:
-        self.host = '0.0.0.0'
+        self.host = "localhost"
         self.port = 8000
 
-        self.proc = subprocess.Popen(["python3", SERVER_PATH] + [model] +
-                                     cli_args,
+        cli_args += ["--host", f"{self.host}", "--port", f"{self.port}"]
+        self.proc = subprocess.Popen(["trtllm-serve"] + [model] + cli_args,
                                      stdout=sys.stdout,
                                      stderr=sys.stderr)
         self._wait_for_server(url=self.url_for("health"),
@@ -38,6 +33,11 @@ class RemoteOpenAIServer:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.proc.terminate()
+        try:
+            self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired as e:
+            self.proc.kill()
+            self.proc.wait(timeout=30)
 
     def _wait_for_server(self, *, url: str, timeout: float):
         # run health check

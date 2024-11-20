@@ -20,10 +20,13 @@
 #include "modelConfig.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/eagleModule.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensModule.h"
+#include "tensorrt_llm/runtime/jsonSerialization.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tensorrt_llm/runtime/medusaModule.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
+#include "tensorrt_llm/runtime/runtimeDefaults.h"
 
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -43,7 +46,10 @@ FieldType parseJsonFieldOr(Json const& json, std::string_view name, FieldType de
     auto value = defaultValue;
     try
     {
-        value = json.at(name).template get<FieldType>();
+        if (json.find(name) != json.end() && !json.at(name).is_null())
+        {
+            value = json.at(name).template get<FieldType>();
+        }
     }
     catch (nlohmann::json::out_of_range& e)
     {
@@ -133,7 +139,23 @@ ModelConfig createModelConfig(
     auto const* const mlpHiddenSizeField = engineVersionNone ? "mlp_hidden_size" : "intermediate_size";
 
     auto const arch = engineVersionNone ? std::string("none") : config.at(archField).template get<std::string>();
-    auto const numLayers = config.at(numLayersField).template get<SizeType32>();
+    auto numLayers = config.at(numLayersField).template get<SizeType32>();
+
+    if (!engineVersionNone)
+    {
+        auto const speculativeDecodingModeOpt = parseJsonFieldOptional<SpeculativeDecodingMode::UnderlyingType>(
+            json.at("build_config"), "speculative_decoding_mode");
+
+        if (speculativeDecodingModeOpt.has_value()
+            && SpeculativeDecodingMode(speculativeDecodingModeOpt.value()).isEagle())
+        {
+            auto const& eagleConfig = json.at("pretrained_config").at("eagle_net_config");
+            auto const numEagleNetLayers = eagleConfig.at("num_hidden_layers").template get<SizeType32>();
+
+            numLayers += numEagleNetLayers;
+        }
+    }
+
     auto const numHeads = config.at(numHeadsField).template get<SizeType32>() / tensorParallelism;
     auto const layerStringTypes
         = parseJsonFieldOr<std::vector<std::string>>(config, "layer_types", std::vector<std::string>());
@@ -197,33 +219,50 @@ ModelConfig createModelConfig(
     // Set logits datatype
     auto logitsDtype = nvinfer1::DataType::kFLOAT;
     if (logitsDtypeStr == "float32")
+    {
         logitsDtype = nvinfer1::DataType::kFLOAT;
+    }
     else if (logitsDtypeStr == "float16")
+    {
         logitsDtype = nvinfer1::DataType::kHALF;
+    }
     else
+    {
         TLLM_THROW("Unsupported logits data type");
+    }
     modelConfig.setLogitsDtype(logitsDtype);
 
     // only enable cross attention for the decoder in encoder-decoder model
     // TODO: add cross_attention and has_token_type_embedding as fields in pretrained config
     auto const useCrossAttention
-        = (arch == std::string("DecoderModel") || parseJsonFieldOr(config, "cross_attention", false)) ? true : false;
+        = arch == std::string("DecoderModel") || parseJsonFieldOr(config, "cross_attention", false);
     if (useCrossAttention)
     {
         // For an encoder-decoder model, this would be overwritten in executorImpl.cpp with correct encoder config
         // The parameters set here will only be used when encoder model is skipped for enc-dec models
         TLLM_LOG_INFO("Setting encoder max input length and hidden size for accepting visual features.");
-        modelConfig.setMaxEncoderLen(json.at("build_config").at("max_encoder_input_len").template get<SizeType32>());
-        modelConfig.setEncoderHiddenSize(hiddenSize * tensorParallelism);
         auto const maxEncoderLen = parseJsonFieldOr<SizeType32>(json.at("build_config"), "max_encoder_input_len", 0);
         modelConfig.setMaxEncoderLen(maxEncoderLen);
+        modelConfig.setEncoderHiddenSize(hiddenSize * tensorParallelism);
     }
 
     auto const usePositionEmbedding = parseJsonFieldOr<bool>(config, "has_position_embedding", false);
     auto const useTokenTypeEmbedding = parseJsonFieldOr<bool>(config, "has_token_type_embedding", false);
+    auto const skipCrossAttnBlocks
+        = useCrossAttention && parseJsonFieldOr<bool>(config, "skip_cross_attn_blocks", false);
     modelConfig.setUseCrossAttention(useCrossAttention);
     modelConfig.setUsePositionEmbedding(usePositionEmbedding);
     modelConfig.setUseTokenTypeEmbedding(useTokenTypeEmbedding);
+    if (json.count("pretrained_config"))
+    {
+        auto const maxPositionEmbeddings
+            = parseJsonFieldOr<SizeType32>(json.at("pretrained_config"), "max_position_embeddings", 0);
+        modelConfig.setMaxPositionEmbeddings(maxPositionEmbeddings);
+        auto const rotaryEmbeddingDim
+            = parseJsonFieldOr<SizeType32>(json.at("pretrained_config"), "rotary_embedding_dim", 0);
+        modelConfig.setRotaryEmbeddingDim(rotaryEmbeddingDim);
+    }
+    modelConfig.setSkipCrossAttnBlocks(skipCrossAttnBlocks);
 
     if (mlpHiddenSize.has_value())
     {
@@ -248,6 +287,7 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
         = parseJsonFieldOptional<SpeculativeDecodingMode::UnderlyingType>(builderConfig, "speculative_decoding_mode");
     auto const kvCacheTypeStr = parseJsonFieldOr<std::string>(builderConfig, "kv_cache_type", "continuous");
     auto const kvCacheType = ModelConfig::KVCacheTypeFromString(kvCacheTypeStr);
+    auto const useMrope = parseJsonFieldOr(builderConfig, "use_mrope", false);
 
     auto it = builderConfig.find("kv_cache_type");
     if (it == builderConfig.end())
@@ -269,6 +309,7 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
             ? SpeculativeDecodingMode(speculativeDecodingModeOpt.value())
             : SpeculativeDecodingMode::None());
     modelConfig.setKVCacheType(kvCacheType);
+    modelConfig.setUseMrope(useMrope);
 }
 
 void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
@@ -402,14 +443,19 @@ GptJsonConfig parseJson(InputType&& input)
 
     auto const dataType = [&precision]()
     {
-        if (!precision.compare("float32"))
+        if (precision == "float32")
+        {
             return nvinfer1::DataType::kFLOAT;
-        else if (!precision.compare("float16"))
+        }
+        if (precision == "float16")
+        {
             return nvinfer1::DataType::kHALF;
-        else if (!precision.compare("bfloat16"))
+        }
+        if (precision == "bfloat16")
+        {
             return nvinfer1::DataType::kBF16;
-        else
-            TLLM_THROW("Model data type '%s' not supported", precision.c_str());
+        }
+        TLLM_THROW("Model data type '%s' not supported", precision.c_str());
     }();
 
     auto modelConfig = createModelConfig(json, engineVersionNone, tensorParallelism, dataType);
@@ -421,6 +467,10 @@ GptJsonConfig parseJson(InputType&& input)
     parsePluginConfig(modelConfig, pluginConfig);
 
     parseLora(modelConfig, json, pluginConfig, engineVersionNone, tensorParallelism);
+
+    auto runtimeDefaults = engineVersionNone
+        ? std::nullopt
+        : parseJsonFieldOptional<RuntimeDefaults>(json.at("pretrained_config"), "runtime_defaults");
 
     if (engineVersionNone)
     {
@@ -515,6 +565,24 @@ GptJsonConfig parseJson(InputType&& input)
                     = std::make_shared<SpeculativeDecodingModule>(maxDraftLen, maxDraftLen, 1);
                 modelConfig.setSpeculativeDecodingModule(speculativeDecodingModule);
             }
+            else if (modelConfig.getSpeculativeDecodingMode().isEagle())
+            {
+                auto const& pretrainedConfig = json.at("pretrained_config");
+
+                auto const numEagleLayers = parseJsonFieldOr(pretrainedConfig, "num_eagle_layers", 0);
+                auto const& eagleConfig = pretrainedConfig.at("eagle_net_config");
+                auto const numEagleNetLayers = eagleConfig.at("num_hidden_layers").template get<SizeType32>();
+                auto const maxNonLeafNodesPerLayer
+                    = pretrainedConfig.at("max_non_leaves_per_layer").template get<SizeType32>();
+
+                TLLM_CHECK_WITH_INFO(maxDraftLen > 0, "max_draft_len has to be larger than 0 for eagle decoding");
+                TLLM_CHECK_WITH_INFO(numEagleLayers > 0, "num_eagle_layers has to be larger than 0 for eagle decoding");
+                TLLM_CHECK_WITH_INFO(
+                    maxNonLeafNodesPerLayer > 0, "max_non_leaves_per_layer has to be larger than 0 for eagle decoding");
+                auto eagleModule = std::make_shared<EagleModule>(
+                    numEagleLayers, maxDraftLen, numEagleNetLayers, maxNonLeafNodesPerLayer);
+                modelConfig.setSpeculativeDecodingModule(eagleModule);
+            }
         }
     }
 
@@ -579,8 +647,8 @@ GptJsonConfig parseJson(InputType&& input)
             modelConfig.setRnnConfig(rnnConfig);
         }
     }
-    return GptJsonConfig{
-        name, engineVersion, precision, tensorParallelism, pipelineParallelism, gpusPerNode, modelConfig};
+    return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, gpusPerNode,
+        modelConfig, runtimeDefaults};
 }
 
 } // namespace
@@ -596,10 +664,8 @@ std::string GptJsonConfig::engineFilename(WorldConfig const& worldConfig, std::s
         return model + "_" + getPrecision() + "_tp" + std::to_string(worldConfig.getTensorParallelism()) + pp + "_rank"
             + std::to_string(worldConfig.getRank()) + ".engine";
     }
-    else
-    {
-        return "rank" + std::to_string(worldConfig.getRank()) + ".engine";
-    }
+
+    return "rank" + std::to_string(worldConfig.getRank()) + ".engine";
 }
 
 GptJsonConfig GptJsonConfig::parse(std::string const& json)

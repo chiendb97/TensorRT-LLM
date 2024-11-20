@@ -35,15 +35,21 @@ class IdxEntry(Enum):
     ROTARY_COS_SIN = auto()
     ALIBI_SLOPES = auto()
     RELATIVE_ATTENTION_BIAS = auto()
-    CROSS_QKV = auto()
-    CROSS_QKV_LENGTH = auto()
+    CROSS_KV = auto()
+    CROSS_KV_LENGTH = auto()
     ENCODER_INPUT_LENGTH = auto()
     HOST_CONTEXT_LENGTH = auto()
     QKV_BIAS_TENSOR = auto()
+    SPEC_DECODING_GENERATION_LENGTHS = auto()
     SPEC_DECODING_PACKED_MASK = auto()
     SPEC_DECODING_POSITION_OFFSETS = auto()
-    SPEC_DECODING_GENERATION_LENGTHS = auto()
+    MROPE_ROTARY_SIN_COS = auto()
+    MROPE_POSITION_DELTAS = auto()
     HOST_RUNTIME_PERF_KNOBS = auto()
+    HOST_CONTEXT_PROGRESS = auto()
+    MLA_FUSED_Q_PROJ_TENSOR = auto()
+    MLA_Q_B_PROJ_TENSOR = auto()
+    MLA_KV_B_PROJ_TENSOR = auto()
 
 
 class IdxEntryParser:
@@ -70,6 +76,7 @@ class IdxEntryParser:
             plugin_info.pfc_as_list['position_embedding_type'][0])
         self.is_spec_decoding_enabled = bool(
             plugin_info.pfc_as_list['is_spec_decoding_enabled'][0])
+        self.is_mla_enabled = bool(plugin_info.pfc_as_list['is_mla_enabled'][0])
         self.init_entry_to_index()
 
     # WARNING: Must in sync with GPTAttentionPlugin::isEntryUsed in cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp
@@ -123,9 +130,9 @@ class IdxEntryParser:
             return self.position_embedding_type.is_alibi()
         elif entry == IdxEntry.RELATIVE_ATTENTION_BIAS:
             return self.position_embedding_type == PositionEmbeddingType.relative
-        elif entry == IdxEntry.CROSS_QKV:
+        elif entry == IdxEntry.CROSS_KV:
             return self.do_cross_attention
-        elif entry == IdxEntry.CROSS_QKV_LENGTH:
+        elif entry == IdxEntry.CROSS_KV_LENGTH:
             return self.do_cross_attention
         elif entry == IdxEntry.ENCODER_INPUT_LENGTH:
             return self.do_cross_attention
@@ -139,8 +146,20 @@ class IdxEntryParser:
             return self.is_spec_decoding_enabled
         elif entry == IdxEntry.SPEC_DECODING_GENERATION_LENGTHS:
             return self.is_spec_decoding_enabled
+        elif entry == IdxEntry.MROPE_ROTARY_SIN_COS:
+            return self.position_embedding_type.is_mrope()
+        elif entry == IdxEntry.MROPE_POSITION_DELTAS:
+            return self.position_embedding_type.is_mrope()
         elif entry == IdxEntry.HOST_RUNTIME_PERF_KNOBS:
             return True
+        elif entry == IdxEntry.HOST_CONTEXT_PROGRESS:
+            return True
+        elif entry == IdxEntry.MLA_FUSED_Q_PROJ_TENSOR:
+            return self.is_mla_enabled
+        elif entry == IdxEntry.MLA_Q_B_PROJ_TENSOR:
+            return self.is_mla_enabled
+        elif entry == IdxEntry.MLA_KV_B_PROJ_TENSOR:
+            return self.is_mla_enabled
         else:
             return False
 

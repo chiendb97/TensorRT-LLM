@@ -38,16 +38,20 @@
 #include "tensorrt_llm/plugins/ncclPlugin/reduceScatterPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/sendPlugin.h"
 #endif // ENABLE_MULTI_DEVICE
+#include "tensorrt_llm/plugins/cudaStreamPlugin/cudaStreamPlugin.h"
 #include "tensorrt_llm/plugins/cumsumLastDimPlugin/cumsumLastDimPlugin.h"
 #include "tensorrt_llm/plugins/eaglePlugin/eagleDecodeDraftTokensPlugin.h"
 #include "tensorrt_llm/plugins/eaglePlugin/eaglePrepareDrafterInputsPlugin.h"
 #include "tensorrt_llm/plugins/eaglePlugin/eagleSampleAndAcceptDraftTokensPlugin.h"
 #include "tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.h"
+#include "tensorrt_llm/plugins/lowLatencyGemmSwigluPlugin/lowLatencyGemmSwigluPlugin.h"
+#include "tensorrt_llm/plugins/qserveGemmPlugin/qserveGemmPlugin.h"
 #include "tensorrt_llm/plugins/quantizePerTokenPlugin/quantizePerTokenPlugin.h"
 #include "tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.h"
 #include "tensorrt_llm/plugins/rmsnormQuantizationPlugin/rmsnormQuantizationPlugin.h"
 #include "tensorrt_llm/plugins/selectiveScanPlugin/selectiveScanPlugin.h"
 #include "tensorrt_llm/plugins/smoothQuantGemmPlugin/smoothQuantGemmPlugin.h"
+#include "tensorrt_llm/plugins/topkLastDimPlugin/topkLastDimPlugin.h"
 #include "tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin/weightOnlyGroupwiseQuantMatmulPlugin.h"
 #include "tensorrt_llm/plugins/weightOnlyQuantMatmulPlugin/weightOnlyQuantMatmulPlugin.h"
 
@@ -62,6 +66,11 @@ namespace
 {
 
 nvinfer1::IPluginCreator* creatorPtr(nvinfer1::IPluginCreator& creator)
+{
+    return &creator;
+}
+
+nvinfer1::IPluginCreatorInterface* creatorInterfacePtr(nvinfer1::IPluginCreatorInterface& creator)
 {
     return &creator;
 }
@@ -139,7 +148,9 @@ extern "C"
     bool initTrtLlmPlugins(void* logger, char const* libNamespace)
     {
         if (pluginsInitialized)
+        {
             return true;
+        }
 
         if (logger)
         {
@@ -148,19 +159,33 @@ extern "C"
         setLoggerFinder(&gGlobalLoggerFinder);
 
         auto registry = getPluginRegistry();
-        std::int32_t nbCreators;
-        auto creators = getPluginCreators(nbCreators);
 
-        for (std::int32_t i = 0; i < nbCreators; ++i)
         {
-            auto const creator = creators[i];
-            creator->setPluginNamespace(libNamespace);
-            registry->registerCreator(*creator, libNamespace);
-            if (gLogger)
+            std::int32_t nbCreators;
+            auto creators = getPluginCreators(nbCreators);
+
+            for (std::int32_t i = 0; i < nbCreators; ++i)
             {
-                auto const msg = tc::fmtstr("Registered plugin creator %s version %s in namespace %s",
-                    creator->getPluginName(), creator->getPluginVersion(), libNamespace);
-                gLogger->log(nvinfer1::ILogger::Severity::kVERBOSE, msg.c_str());
+                auto const creator = creators[i];
+                creator->setPluginNamespace(libNamespace);
+                registry->registerCreator(*creator, libNamespace);
+                if (gLogger)
+                {
+                    auto const msg = tc::fmtstr("Registered plugin creator %s version %s in namespace %s",
+                        creator->getPluginName(), creator->getPluginVersion(), libNamespace);
+                    gLogger->log(nvinfer1::ILogger::Severity::kVERBOSE, msg.c_str());
+                }
+            }
+        }
+
+        {
+            std::int32_t nbCreators;
+            auto creators = getCreators(nbCreators);
+
+            for (std::int32_t i = 0; i < nbCreators; ++i)
+            {
+                auto const creator = creators[i];
+                registry->registerCreator(*creator, libNamespace);
             }
         }
 
@@ -190,6 +215,7 @@ extern "C"
         static tensorrt_llm::plugins::ReduceScatterPluginCreator reduceScatterPluginCreator;
 #endif // ENABLE_MULTI_DEVICE
         static tensorrt_llm::plugins::SmoothQuantGemmPluginCreator smoothQuantGemmPluginCreator;
+        static tensorrt_llm::plugins::QServeGemmPluginCreator qserveGemmPluginCreator;
         static tensorrt_llm::plugins::LayernormQuantizationPluginCreator layernormQuantizationPluginCreator;
         static tensorrt_llm::plugins::QuantizePerTokenPluginCreator quantizePerTokenPluginCreator;
         static tensorrt_llm::plugins::QuantizeTensorPluginCreator quantizeTensorPluginCreator;
@@ -203,11 +229,13 @@ extern "C"
         static tensorrt_llm::plugins::MambaConv1dPluginCreator mambaConv1DPluginCreator;
         static tensorrt_llm::plugins::lruPluginCreator lruPluginCreator;
         static tensorrt_llm::plugins::CumsumLastDimPluginCreator cumsumLastDimPluginCreator;
+        static tensorrt_llm::plugins::TopkLastDimPluginCreator topkLastDimPluginCreator;
         static tensorrt_llm::plugins::LowLatencyGemmPluginCreator lowLatencyGemmPluginCreator;
+        static tensorrt_llm::plugins::LowLatencyGemmSwigluPluginCreator lowLatencyGemmSwigluPluginCreator;
         static tensorrt_llm::plugins::EagleDecodeDraftTokensPluginCreator eagleDecodeDraftTokensPluginCreator;
         static tensorrt_llm::plugins::EagleSampleAndAcceptDraftTokensPluginCreator
             eagleSampleAndAcceptDraftTokensPluginCreator;
-        static tensorrt_llm::plugins::EaglePrepareDrafterInputsPluginCreator eaglePrepareDrafterInputsPluginCreator;
+        static tensorrt_llm::plugins::CudaStreamPluginCreator cudaStreamPluginCreator;
 
         static std::array pluginCreators
             = { creatorPtr(identityPluginCreator),
@@ -225,6 +253,7 @@ extern "C"
                   creatorPtr(reduceScatterPluginCreator),
 #endif // ENABLE_MULTI_DEVICE
                   creatorPtr(smoothQuantGemmPluginCreator),
+                  creatorPtr(qserveGemmPluginCreator),
                   creatorPtr(layernormQuantizationPluginCreator),
                   creatorPtr(quantizePerTokenPluginCreator),
                   creatorPtr(quantizeTensorPluginCreator),
@@ -237,10 +266,12 @@ extern "C"
                   creatorPtr(mambaConv1DPluginCreator),
                   creatorPtr(lruPluginCreator),
                   creatorPtr(cumsumLastDimPluginCreator),
+                  creatorPtr(topkLastDimPluginCreator),
                   creatorPtr(lowLatencyGemmPluginCreator),
                   creatorPtr(eagleDecodeDraftTokensPluginCreator),
                   creatorPtr(eagleSampleAndAcceptDraftTokensPluginCreator),
-                  creatorPtr(eaglePrepareDrafterInputsPluginCreator),
+                  creatorPtr(lowLatencyGemmSwigluPluginCreator),
+                  creatorPtr(cudaStreamPluginCreator),
               };
         nbCreators = pluginCreators.size();
         return pluginCreators.data();
@@ -248,6 +279,12 @@ extern "C"
 
     [[maybe_unused]] nvinfer1::IPluginCreatorInterface* const* getCreators(std::int32_t& nbCreators)
     {
-        return reinterpret_cast<nvinfer1::IPluginCreatorInterface* const*>(getPluginCreators(nbCreators));
+        static tensorrt_llm::plugins::EaglePrepareDrafterInputsPluginCreator eaglePrepareDrafterInputsPluginCreator;
+
+        static std::array creators = {
+            creatorInterfacePtr(eaglePrepareDrafterInputsPluginCreator),
+        };
+        nbCreators = creators.size();
+        return creators.data();
     }
 } // extern "C"

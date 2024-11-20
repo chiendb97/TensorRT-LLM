@@ -14,7 +14,9 @@
 # limitations under the License.
 from .baichuan.model import BaichuanForCausalLM
 from .bert.model import (BertForQuestionAnswering,
-                         BertForSequenceClassification, BertModel)
+                         BertForSequenceClassification, BertModel,
+                         RobertaForQuestionAnswering,
+                         RobertaForSequenceClassification, RobertaModel)
 from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.config import ChatGLMConfig
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
@@ -24,6 +26,7 @@ from .commandr.model import CohereForCausalLM
 from .dbrx.config import DbrxConfig
 from .dbrx.model import DbrxForCausalLM
 from .deepseek_v1.model import DeepseekForCausalLM
+from .deepseek_v2.model import DeepseekV2ForCausalLM
 from .dit.model import DiT
 from .eagle.model import EagleForCausalLM
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
@@ -58,11 +61,15 @@ __all__ = [
     'BertModel',
     'BertForQuestionAnswering',
     'BertForSequenceClassification',
+    'RobertaModel',
+    'RobertaForQuestionAnswering',
+    'RobertaForSequenceClassification',
     'BloomModel',
     'BloomForCausalLM',
     'DiT',
     'DeepseekForCausalLM',
     'FalconConfig',
+    'DeepseekV2ForCausalLM',
     'FalconForCausalLM',
     'FalconModel',
     'GPTConfig',
@@ -126,6 +133,7 @@ MODEL_MAP = {
     'Kosmos2ForConditionalGeneration': GPTForCausalLM,
     'JAISLMHeadModel': GPTForCausalLM,
     'GPTForCausalLM': GPTForCausalLM,
+    'NemotronForCausalLM': GPTForCausalLM,
     'OPTForCausalLM': OPTForCausalLM,
     'BloomForCausalLM': BloomForCausalLM,
     'RWForCausalLM': FalconForCausalLM,
@@ -162,6 +170,7 @@ MODEL_MAP = {
     'Qwen2ForCausalLM': QWenForCausalLM,
     'Qwen2MoeForCausalLM': QWenForCausalLM,
     'Qwen2ForSequenceClassification': QWenForCausalLM,
+    'Qwen2VLForConditionalGeneration': QWenForCausalLM,
     'WhisperEncoder': WhisperEncoder,
     'EncoderModel': EncoderModel,
     'DecoderModel': DecoderModel,
@@ -171,7 +180,14 @@ MODEL_MAP = {
     'DiT': DiT,
     'DeepseekForCausalLM': DeepseekForCausalLM,
     'DeciLMForCausalLM': DeciLMForCausalLM,
+    'DeepseekV2ForCausalLM': DeepseekV2ForCausalLM,
     'EagleForCausalLM': EagleForCausalLM,
     'CohereForCausalLM': CohereForCausalLM,
     'MllamaForConditionalGeneration': MLLaMAModel,
+    'BertForQuestionAnswering': BertForQuestionAnswering,
+    'BertForSequenceClassification': BertForSequenceClassification,
+    'BertModel': BertModel,
+    'RobertaModel': RobertaModel,
+    'RobertaForQuestionAnswering': RobertaForQuestionAnswering,
+    'RobertaForSequenceClassification': RobertaForSequenceClassification,
 }

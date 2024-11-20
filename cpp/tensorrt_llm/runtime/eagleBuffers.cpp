@@ -51,6 +51,8 @@ void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, TllmRuntime const&
     draftPaths
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxNumPaths, maxPathLen}), nvinfer1::DataType::kINT32);
     specDecodingGenerationLengths = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+    specDecodingGenerationLengthsHost
+        = manager.pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     specDecodingPackedMasks
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingTokens, common::ceilDiv(maxDecodingTokens, 32)}),
             nvinfer1::DataType::kINT32);
@@ -67,6 +69,8 @@ void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, TllmRuntime const&
         = manager.pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     eagleNetGenPastKeyValueLengthsHost
         = manager.pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+    inputGenTokensHost
+        = manager.pinnedPool(ITensor::makeShape({maxNumSequences * maxDecodingTokens}), nvinfer1::DataType::kINT32);
 }
 
 EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::BufferManager const& manager,
@@ -117,6 +121,7 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
         = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     engineInputs.eagleNetGenPastKeyValueLengthsHost
         = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
+    engineInputs.inputGenTokensHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
 
     // output tensors
     engineOutputs.nextDraftTokens
@@ -185,8 +190,9 @@ void EagleBuffers::reshape(
     engineInputs.eagleNetGenRequestTypesHost->reshape(ITensor::makeShape({numSequences}));
     engineInputs.eagleNetGenContextLengthsHost->reshape(ITensor::makeShape({numSequences}));
     engineInputs.eagleNetGenPastKeyValueLengthsHost->reshape(ITensor::makeShape({numSequences}));
+    engineInputs.inputGenTokensHost->reshape(ITensor::makeShape({numSequences * maxDecodingTokens}));
 
-    cumSumGenerationLengths->reshape(ITensor::makeShape({numSequences}));
+    cumSumGenerationLengths->reshape(ITensor::makeShape({numSequences + 1}));
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -216,7 +222,6 @@ void EagleBuffers::setFromInputs(SizeType32 numCtxSequences, SizeType32 numGenSe
     params.inputRandomDataValidation = bufferCast<float>(*draftBuffers.randomDataValidation);
 
     params.inputNextDraftTokens = bufferCast<runtime::TokenIdType>(*draftBuffers.draftTokens);
-    params.inputNextDraftLens = bufferCast<SizeType32>(*draftBuffers.draftLens);
     params.inputNextDraftPaths = bufferCast<SizeType32>(*draftBuffers.draftPaths);
 
     params.inputSpecDecodingGenerationLengths = bufferCast<SizeType32>(*draftBuffers.specDecodingGenerationLengths);
@@ -258,6 +263,8 @@ void EagleBuffers::setFromInputs(SizeType32 numCtxSequences, SizeType32 numGenSe
     tksd::invokePackEagle(params, stream.get());
 
     // Pack host data.
+    SizeType32 maxGenerationLengthHostValue{-1};
+    SizeType32 numGenerationTokens{0};
     for (SizeType32 bi = 0; bi < params.batchSize; ++bi)
     {
         auto const batchSlot = params.batchSlots[bi];
@@ -273,7 +280,25 @@ void EagleBuffers::setFromInputs(SizeType32 numCtxSequences, SizeType32 numGenSe
             = bufferCast<SizeType32>(*draftBuffers.eagleNetGenContextLengthsHost)[batchSlot];
         bufferCast<SizeType32>(*engineInputs.eagleNetGenPastKeyValueLengthsHost)[bi]
             = bufferCast<SizeType32>(*draftBuffers.eagleNetGenPastKeyValueLengthsHost)[batchSlot];
+
+        auto const generationLength
+            = bufferCast<SizeType32>(*draftBuffers.specDecodingGenerationLengthsHost)[batchSlot];
+        maxGenerationLengthHostValue = std::max(maxGenerationLengthHostValue, generationLength);
+        numGenerationTokens += generationLength;
     }
+
+    if (maxGenerationLengthHostValue <= 0)
+    {
+        maxGenerationLengthHostValue = params.maxDecodingTokens;
+    }
+
+    auto specDecodingPositionOffsetsShape = engineInputs.specDecodingPositionOffsets->getShape();
+    specDecodingPositionOffsetsShape.d[1] = maxGenerationLengthHostValue;
+    engineInputs.specDecodingPositionOffsets->reshape(specDecodingPositionOffsetsShape);
+
+    auto inputGenTokensHostShape = engineInputs.inputGenTokensHost->getShape();
+    inputGenTokensHostShape.d[0] = numGenerationTokens;
+    engineInputs.inputGenTokensHost->reshape(inputGenTokensHostShape);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -336,10 +361,12 @@ void EagleBuffers::insertInputTensors(
     inputBuffers.insert_or_assign("host_gen_eagle_net_context_lengths", engineInputs.eagleNetGenContextLengthsHost);
     inputBuffers.insert_or_assign(
         "host_gen_eagle_net_past_key_value_lengths", engineInputs.eagleNetGenPastKeyValueLengthsHost);
+    inputBuffers.insert_or_assign("input_gen_tokens", engineInputs.inputGenTokensHost);
 
     // outputs
     outputBuffers.insert_or_assign("next_draft_tokens", engineOutputs.nextDraftTokens);
     outputBuffers.insert_or_assign("next_draft_lens", engineOutputs.nextDraftLens);
+    outputBuffers.insert_or_assign("next_draft_paths", engineOutputs.nextDraftPaths);
 
     outputBuffers.insert_or_assign("accepted_tokens", engineOutputs.acceptedTokens);
     outputBuffers.insert_or_assign("num_accepted_tokens", engineOutputs.acceptedLens);

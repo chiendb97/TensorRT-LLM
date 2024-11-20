@@ -17,18 +17,18 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
-#endif // #ifndef _WIN32
+#endif // __GNUC__
 
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/numeric_types.h"
 #include "tensorrt_llm/common/assert.h"
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
-#endif // #ifndef _WIN32
+#endif          // __GNUC
 
 #include <cuda_runtime_api.h>
 #include <set>
@@ -188,6 +188,28 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
             else
             {
                 // no valid ampere style fp8 configs for sm90
+                return {};
+            }
+        }
+        else
+        {
+            if (sm == 89)
+            {
+                return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+                    CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64,
+                    CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
+                    CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
+                    CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
+                    CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64,
+                    CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64,
+                    CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64,
+                    CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
+                    CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64,
+                    CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128,
+                    CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128};
+            }
+            else
+            {
                 return {};
             }
         }

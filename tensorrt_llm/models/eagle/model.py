@@ -18,6 +18,7 @@ from collections import OrderedDict
 import numpy as np
 import tensorrt as trt
 
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM, LLaMAModel
 
@@ -104,6 +105,10 @@ def eagle_sample_and_accept_draft_plugin(lm_logits: Tensor = None,
             [batch_size]
             Empty tensor used to allocate space for lens of the next draft tokens.
 
+        next_draft_paths : Tensor
+            [batch_size, max_decoding_len, max_path_len]
+            For EAGLE-1 just a copy of input path.
+
         hidden_size_batch_level_starts : Tensor
             [max_draft_path_len * batch_size + 1]
             Empty tensor used to allocate space for eagle_prepare_drafter_inputs_plugin.
@@ -141,16 +146,17 @@ def eagle_sample_and_accept_draft_plugin(lm_logits: Tensor = None,
     accepted_paths = _create_tensor(layer.get_output(2), layer)
     next_draft_tokens = _create_tensor(layer.get_output(3), layer)
     next_draft_lens = _create_tensor(layer.get_output(4), layer)
-    hidden_size_batch_level_starts = _create_tensor(layer.get_output(5), layer)
+    next_draft_paths = _create_tensor(layer.get_output(5), layer)
+    hidden_size_batch_level_starts = _create_tensor(layer.get_output(6), layer)
     return tuple([
         accepted_tokens, num_accepted_tokens, accepted_paths, next_draft_tokens,
-        next_draft_lens, hidden_size_batch_level_starts
+        next_draft_lens, next_draft_paths, hidden_size_batch_level_starts
     ])
 
 
 def eagle_draft_decoder_plugin(layer_idx: int, top_k_sampling: bool,
-                               logits: Tensor, rand_sample: Tensor,
-                               tree_params: TreeParams,
+                               logits: Tensor, num_last_token_indices: Tensor,
+                               rand_sample: Tensor, tree_params: TreeParams,
                                input_draft_token_ids: Tensor,
                                input_draft_lens: Tensor):
     '''
@@ -162,11 +168,15 @@ def eagle_draft_decoder_plugin(layer_idx: int, top_k_sampling: bool,
             Whether to use top K sampling. Otherwise, use multinomial sampling.
 
         logits : Tensor
-            [num_input_logits, vocab_size]
+            [num_logits, vocab_size]
             Input logits.
 
+        num_last_token_indices : Tensor
+            [1]
+            Number of valid logits in logits.
+
         rand_sample : Tensor
-            [num_input_logits]
+            [batch_size]
             Used by multinomial sampling.
 
         tree_params : TreeParams
@@ -212,8 +222,8 @@ def eagle_draft_decoder_plugin(layer_idx: int, top_k_sampling: bool,
     plugin = plg_creator.create_plugin("eagle_draft_decoder_plugin", pfc)
 
     plug_inputs = [
-        logits, rand_sample, tree_params.paths, input_draft_token_ids,
-        input_draft_lens
+        logits, rand_sample, tree_params.paths, num_last_token_indices,
+        input_draft_token_ids, input_draft_lens
     ]
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
@@ -225,12 +235,14 @@ def eagle_draft_decoder_plugin(layer_idx: int, top_k_sampling: bool,
 
 
 def eagle_prepare_drafter_inputs_plugin(
-        layer_idx: int, attention_params: AttentionParams, input_ids: Tensor,
+        layer_idx: int, num_layers: int, max_non_leaves_per_layer: int,
+        attention_params: AttentionParams, input_ids: Tensor,
         accepted_token_ids: Tensor, accepted_lens: Tensor,
         accepted_path_ids: Tensor, next_draft_tokens: Tensor,
         next_draft_lens: Tensor, next_draft_paths: Tensor,
         prev_draft_lens: Tensor, prev_draft_paths: Tensor,
-        hidden_size_batch_level_starts: Tensor):
+        hidden_size_batch_level_starts: Tensor, input_gen_tokens: Tensor,
+        input_spec_decoding_generation_lengths: Tensor):
     '''
     Prepares inputs for the EagleNet inference.
 
@@ -240,6 +252,12 @@ def eagle_prepare_drafter_inputs_plugin(
         layer_idx : int
             Index of the EagleNet. 0 means context phase EagleNet or EagleNet0,
             > 0 means EagleNetX or generation phase of EagleNet
+
+        num_layers : int
+            Number of Eagle layers.
+
+        max_non_leaves_per_layer : int
+            Number of nodes that can be non leaf in the tree at each level of the tree.
 
         attention_params : AttentionParams
 
@@ -287,6 +305,14 @@ def eagle_prepare_drafter_inputs_plugin(
             [max_draft_path_len, batch_size, num_output_tokens_i_j], where num_output_tokens_i_j
             depends on the path of request j at level i.
 
+        input_gen_tokens : Tensor
+            [num_gen_tokens]
+            Only needed to infer number of generation tokens from its shape. The content is irrelevant
+
+        input_spec_decoding_generation_lengths : Tensor
+            [num_gen_requests]
+            Number of tokens for the base model. Only used to infer num_gen_requests from its shape, the content is irrelevant.
+
     Return:
         sequence_length : Tensor
             [batch_size]
@@ -317,39 +343,39 @@ def eagle_prepare_drafter_inputs_plugin(
             uint32_t packed masks.
 
         output_ids : Tensor
-            [num_output_tokens]
+            [batch_size * max_non_leaves_per_layer * layer_idx] for layer_idx > 0
+            [num_tokens - num_gen_tokens + num_gen_requests * (num_layers + 1)] for layer_idx == 0
             Token ids selected for the EagleNet iteration.
-            Tensor's actual size is larger than num_output_tokens. Tensor has to be sliced.
+            Tensor's actual size is larger than num_output_tokens.
 
         position_ids : Tensor
-            [num_output_tokens]
+            [batch_size] for layer_idx > 0
+            [num_tokens - num_gen_tokens + num_gen_requests * (num_layers + 1)] for layer_idx == 0
             Position ids of the tokens selected for the EagleNet iteration.
-            Tensor's actual size is larger than num_output_tokens. Tensor has to be sliced.
+            Tensor's actual size is larger than num_output_tokens.
 
         hidden_states_indices : Tensor
-            [num_output_tokens]
+            [batch_size * max_non_leaves_per_layer * layer_idx] for layer_idx > 0
+            [num_tokens - num_gen_tokens + num_gen_requests * (num_layers + 1)] for layer_idx == 0
             Indices of the hidden states to be selected from aggregated hidden states for the next iteration.
-            Tensor's actual size is larger than num_output_tokens. Tensor has to be sliced.
+            Tensor's actual size is larger than num_output_tokens.
 
         last_token_indices : Tensor
-            [num_last_token_indices]
+            [batch_size * max_non_leaves_per_layer]
             Indices of the hidden states to be converted to logits after the next EagleNet iteration.
-            Tensor's actual size is larger than num_output_tokens. Tensor has to be sliced.
-
-        num_output_tokens : Tensor
-            [1]
-            Number of selected tokens for the next iteration.
+            Tensor's actual size is larger than num_output_tokens.
 
         num_last_token_indices : Tensor
-            [1]
+            []
             Number of logits selected after the next EagleNet iteration.
+            Tensors containing size of the outputs of V3 plugins. 0-D tensor.
 
         out_hidden_size_batch_level_starts : Tensor
             [max_draft_path_len * batch_size + 1]
             Same as hidden_size_batch_level_starts, but with updated path lens for the next level.
     '''
 
-    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+    plg_creator = trt.get_plugin_registry().get_creator(
         'EaglePrepareDrafterInputs', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert plg_creator is not None
 
@@ -357,19 +383,31 @@ def eagle_prepare_drafter_inputs_plugin(
                                                       dtype=np.int32),
                                 trt.PluginFieldType.INT32)
 
-    pfc = trt.PluginFieldCollection([layer_idx])
+    num_layers = trt.PluginField("num_layers",
+                                 np.array(num_layers, dtype=np.int32),
+                                 trt.PluginFieldType.INT32)
+
+    max_non_leaves_per_layer = trt.PluginField(
+        "max_non_leaves_per_layer",
+        np.array(max_non_leaves_per_layer, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    pfc = trt.PluginFieldCollection(
+        [layer_idx, num_layers, max_non_leaves_per_layer])
     plugin = plg_creator.create_plugin("eagle_prepare_drafter_inputs_plugin",
-                                       pfc)
+                                       pfc, trt.TensorRTPhase.BUILD)
 
     plug_inputs = [
         attention_params.sequence_length, attention_params.context_lengths,
         input_ids, accepted_token_ids, accepted_lens, accepted_path_ids,
         next_draft_tokens, next_draft_lens, next_draft_paths, prev_draft_lens,
-        prev_draft_paths, hidden_size_batch_level_starts
+        prev_draft_paths, hidden_size_batch_level_starts, input_gen_tokens,
+        input_spec_decoding_generation_lengths
     ]
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
-    layer = default_trtnet().add_plugin_v2(plug_inputs, plugin)
+    shape_inputs = []
+    layer = default_trtnet().add_plugin_v3(plug_inputs, shape_inputs, plugin)
 
     sequence_length = _create_tensor(layer.get_output(0), layer)
     context_length = _create_tensor(layer.get_output(1), layer)
@@ -381,18 +419,14 @@ def eagle_prepare_drafter_inputs_plugin(
     position_ids = _create_tensor(layer.get_output(6), layer)
     hidden_states_indices = _create_tensor(layer.get_output(7), layer)
     last_token_indices = _create_tensor(layer.get_output(8), layer)
-    # TODO we can slice output_ids, position_ids and hidden_states_indices directly inside of the plugin:
-    # Similarly to https://github.com/NVIDIA/TensorRT/tree/release/10.5/samples/sampleNonZeroPlugin.
-    num_output_tokens = _create_tensor(layer.get_output(9), layer)
-    num_last_token_indices = _create_tensor(layer.get_output(10), layer)
-    out_hidden_size_batch_level_starts = _create_tensor(layer.get_output(11),
+    num_last_token_indices = _create_tensor(layer.get_output(9), layer)
+    out_hidden_size_batch_level_starts = _create_tensor(layer.get_output(10),
                                                         layer)
     return tuple([
         sequence_length, context_length, spec_decoding_generation_lengths,
         spec_decoding_position_offsets, spec_decoding_packed_mask, output_ids,
         position_ids, hidden_states_indices, last_token_indices,
-        num_output_tokens, num_last_token_indices,
-        out_hidden_size_batch_level_starts
+        num_last_token_indices, out_hidden_size_batch_level_starts
     ])
 
 
@@ -419,9 +453,14 @@ class EagleNet(Module):
         else:
             self.lm_head = None
 
-    def forward(self, hidden_states, input_ids, position_ids,
-                last_token_indices, spec_decoding_params, kv_cache_params,
-                attention_params):
+    def forward(self,
+                input_ids,
+                position_ids=None,
+                hidden_states=None,
+                last_token_indices=None,
+                spec_decoding_params=None,
+                kv_cache_params=None,
+                attention_params=None):
         hidden_states, cache = self.drafter(
             input_ids,
             position_ids=position_ids,
@@ -447,17 +486,27 @@ class EagleForCausalLM(LLaMAForCausalLM):
 
         super().__init__(config)
         self.num_eagle_layers = config.num_eagle_layers
+        self.max_non_leaves_per_layer = config.max_non_leaves_per_layer
         self.hidden_size = config.hidden_size
         self.vocab_size = config.vocab_size
         vocab_size_padded = pad_vocab_size(self.vocab_size,
                                            config.mapping.tp_size)
         eagle_net_config = config.eagle_net_config
+        eagle_net_config.mapping = Mapping(world_size=config.mapping.world_size,
+                                           rank=config.mapping.rank,
+                                           cp_size=1,
+                                           tp_size=config.mapping.world_size,
+                                           pp_size=1)
+
         eagle_net_config.fc_after_embed = True
         eagle_net_config.use_input_layernorm_in_first_layer = False
-        self.eagle_nets = ModuleList([
-            EagleNet(config=eagle_net_config)
-            for _ in range(self.num_eagle_layers)
-        ])
+        eagle_net_config.use_last_layernorm = False
+        eagle_net_config.layer_idx_offset = config.num_hidden_layers
+        if self.mapping.is_last_pp_rank():
+            self.eagle_nets = ModuleList([
+                EagleNet(config=eagle_net_config)
+                for _ in range(self.num_eagle_layers)
+            ])
         self.max_draft_len = config.max_draft_len
 
     def _prepare_drafter_inputs(
@@ -471,18 +520,21 @@ class EagleForCausalLM(LLaMAForCausalLM):
             host_gen_eagle_net_request_types,
             host_gen_eagle_net_context_lengths,
             host_gen_eagle_net_past_key_value_lengths,
-            hidden_size_batch_level_starts):
+            hidden_size_batch_level_starts, input_gen_tokens,
+            input_spec_decoding_generation_lengths):
 
         drafter_inputs = eagle_prepare_drafter_inputs_plugin(
-            layer_idx, input_attention_params, input_ids, accepted_token_ids,
+            layer_idx, self.num_eagle_layers, self.max_non_leaves_per_layer,
+            input_attention_params, input_ids, accepted_token_ids,
             accepted_lens, accepted_path_ids, next_draft_tokens,
             next_draft_lens, next_draft_paths, prev_draft_lens,
-            prev_draft_paths, hidden_size_batch_level_starts)
+            prev_draft_paths, hidden_size_batch_level_starts, input_gen_tokens,
+            input_spec_decoding_generation_lengths)
 
         sequence_length, context_lengths, \
             spec_decoding_generation_lengths, spec_decoding_position_offsets, \
             spec_decoding_packed_mask, output_ids, position_ids, hidden_states_indices, \
-            last_token_indices, num_output_tokens, num_last_token_indices, out_hidden_size_batch_level_starts \
+            last_token_indices, num_last_token_indices, out_hidden_size_batch_level_starts \
             = drafter_inputs
 
         attention_params = input_attention_params
@@ -505,15 +557,9 @@ class EagleForCausalLM(LLaMAForCausalLM):
                 True, self.max_draft_len, spec_decoding_generation_lengths,
                 spec_decoding_position_offsets, spec_decoding_packed_mask)
 
-        # TODO uncomment, when the issue with shape inference is resolved.
-        # output_ids = slice(output_ids, starts=[0], sizes=num_output_tokens)
-        # position_ids = slice(position_ids, starts=[0], sizes=num_output_tokens)
-        # last_token_indices = slice(last_token_indices, starts=[0], sizes=num_last_token_indices)
-
         # Get hidden states for accepted ids
         hidden_states = self._slice_hidden_states(hidden_states,
-                                                  hidden_states_indices,
-                                                  num_output_tokens)
+                                                  hidden_states_indices)
 
         eagle_net_inputs = {}
         eagle_net_inputs["input_ids"] = output_ids
@@ -523,16 +569,14 @@ class EagleForCausalLM(LLaMAForCausalLM):
         eagle_net_inputs["kv_cache_params"] = kv_cache_params
         eagle_net_inputs["spec_decoding_params"] = spec_decoding_params
         eagle_net_inputs["hidden_states"] = hidden_states
-        return eagle_net_inputs, out_hidden_size_batch_level_starts
+        return eagle_net_inputs, out_hidden_size_batch_level_starts, num_last_token_indices
 
-    def _slice_hidden_states(self, hidden_states, indices, num_indices):
-        # TODO uncomment, when the issue with shape inference is resolved.
-        # indices = slice(indices, starts=[0], sizes=num_indices)
+    def _slice_hidden_states(self, hidden_states, indices):
         hidden_states = index_select(hidden_states, 0, indices)
 
-        hidden_states = hidden_states.view(
-            concat([shape(indices, 0),
-                    shape(hidden_states, 1)]))
+        hidden_states = hidden_states.view(concat(
+            [shape(indices, 0), shape(hidden_states, 1)]),
+                                           zero_is_placeholder=False)
         return hidden_states
 
     def _eagle_fwd_helper(self, lm_logits, hidden_states, *args, **kwargs):
@@ -627,6 +671,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
             'host_gen_eagle_net_context_lengths']
         host_gen_eagle_net_past_key_value_lengths = kwargs[
             'host_gen_eagle_net_past_key_value_lengths']
+        input_gen_tokens = kwargs["input_gen_tokens"]
 
         # Sample target tokens and accept them
         # next_draft_tokens, next_draft_lens, hidden_size_batch_level_starts are outputted here just to
@@ -638,20 +683,18 @@ class EagleForCausalLM(LLaMAForCausalLM):
                                                       rand_data_validation,
                                                       input_tree_params)
         accepted_tokens, num_accepted_tokens, accepted_paths, next_draft_tokens, \
-            next_draft_lens, hidden_size_batch_level_starts = output
+            next_draft_lens, next_draft_paths, hidden_size_batch_level_starts = output
 
         attention_params = kwargs["attention_params"]
         kv_cache_params = kwargs["kv_cache_params"]
+        spec_decoding_params = kwargs["spec_decoding_params"]
 
         input_hidden_states = hidden_states
-
-        # NOTE EAGLE-1 output paths are the same as input path.
-        next_draft_paths = input_tree_params.paths
 
         # Run EAGLE nets
         for li in range(self.num_eagle_layers):
             # Prepare EAGLE Net inputs.
-            eagle_net_inputs, hidden_size_batch_level_starts = self._prepare_drafter_inputs(
+            eagle_net_inputs, hidden_size_batch_level_starts, num_last_token_indices = self._prepare_drafter_inputs(
                 layer_idx=li,
                 input_ids=input_ids,
                 accepted_token_ids=accepted_tokens,
@@ -677,31 +720,44 @@ class EagleForCausalLM(LLaMAForCausalLM):
                 host_gen_eagle_net_context_lengths,
                 host_gen_eagle_net_past_key_value_lengths=
                 host_gen_eagle_net_past_key_value_lengths,
-                hidden_size_batch_level_starts=hidden_size_batch_level_starts)
+                hidden_size_batch_level_starts=hidden_size_batch_level_starts,
+                input_gen_tokens=input_gen_tokens,
+                input_spec_decoding_generation_lengths=spec_decoding_params.
+                spec_decoding_generation_lengths)
 
-            # Run EAGLE Net
-            # TODO: handle base net kv cache and eagle net kv cache in the same tensors, but treat the differently here.
-            logits, hidden_states, _ = self.eagle_nets[li](**eagle_net_inputs)
+            def single_eagle_net_iter(next_draft_tokens, next_draft_lens):
+                # Run EAGLE Net
+                # NOTE: handle base net kv cache and eagle net kv cache are in the same tensor.
+                # EagleNet's kv cache is located starting at numBaseNetHiddenLayers in the kv tensor.
+                logits, hidden_states, _ = self.eagle_nets[li](
+                    **eagle_net_inputs)
 
-            # Decode draft tokens
-            # FIXME We need to take top_k_sampling as an input
-            top_k_sampling = True
-            next_draft_tokens, next_draft_lens = eagle_draft_decoder_plugin(
-                li, top_k_sampling, logits, rand_data_sample, input_tree_params,
-                next_draft_tokens, next_draft_lens)
+                # Decode draft tokens
+                # FIXME We need to take top_k_sampling as an input
+                top_k_sampling = True
+                next_draft_tokens, next_draft_lens = eagle_draft_decoder_plugin(
+                    li, top_k_sampling, logits, num_last_token_indices,
+                    rand_data_sample, input_tree_params, next_draft_tokens,
+                    next_draft_lens)
+
+                return next_draft_tokens, next_draft_lens, hidden_states
+
+            next_draft_tokens, next_draft_lens, hidden_states = \
+                    single_eagle_net_iter(next_draft_tokens, next_draft_lens)
 
             # Update params
             if li == 0:
-                eagle_net_0_attention_params = eagle_net_inputs[
-                    "attention_params"]
+                eagle_net_0_sequence_length = eagle_net_inputs[
+                    "attention_params"].sequence_length
                 input_hidden_states = hidden_states
             else:
-                attention_params = eagle_net_inputs["attention_params"]
-                attention_params.context_lengths = eagle_net_0_attention_params.sequence_length
-                attention_params.sequence_length = eagle_net_0_attention_params.sequence_length
-                kv_cache_params = eagle_net_inputs["kv_cache_params"]
                 input_hidden_states = concat(
                     [input_hidden_states, hidden_states])
+
+            kv_cache_params = eagle_net_inputs["kv_cache_params"]
+            attention_params = eagle_net_inputs["attention_params"]
+            attention_params.context_lengths = eagle_net_0_sequence_length
+            attention_params.sequence_length = eagle_net_0_sequence_length
 
         # Mark tensors as output
         accepted_tokens.mark_output('accepted_tokens')
@@ -709,6 +765,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
         accepted_paths.mark_output('accepted_paths')
         next_draft_tokens.mark_output('next_draft_tokens')
         next_draft_lens.mark_output('next_draft_lens')
+        next_draft_paths.mark_output('next_draft_paths')
 
         return next_draft_tokens
 
@@ -721,7 +778,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
             "host_ctx_eagle_net_past_key_value_lengths",
             "host_gen_eagle_net_request_types",
             "host_gen_eagle_net_context_lengths",
-            "host_gen_eagle_net_past_key_value_lengths"
+            "host_gen_eagle_net_past_key_value_lengths", "input_gen_tokens"
         ]
 
         base_kwargs = {k: v for k, v in kwargs.items() if k not in extra_args}
@@ -729,15 +786,19 @@ class EagleForCausalLM(LLaMAForCausalLM):
         # Base model forward
         hidden_states = super().forward(*args, **base_kwargs)
 
+        if self.mapping.is_last_pp_rank():
+            extra_args = ["hidden_states"]
+            kwargs = {k: v for k, v in kwargs.items() if k not in extra_args}
+
         assert kwargs['use_cache'] and default_net(
         ).plugin_config.paged_kv_cache
 
-        lm_logits, hidden_states = hidden_states
-
         if self.mapping.is_last_pp_rank():
+            lm_logits, hidden_states, all_hidden_states = hidden_states
             # Call eagle logic to accept prev draft tokens and predict next draft tokens
-            next_draft_tokens = self._eagle_fwd_helper(lm_logits, hidden_states,
-                                                       *args, **kwargs)
+            next_draft_tokens = self._eagle_fwd_helper(lm_logits,
+                                                       all_hidden_states, *args,
+                                                       **kwargs)
         else:
             hidden_states.mark_output('hidden_states_output', self.config.dtype)
 
@@ -772,10 +833,15 @@ class EagleForCausalLM(LLaMAForCausalLM):
         assert max_batch_size is not None
         bb_range = default_range(max_batch_size)
         bb0_range = default_range(max_batch_size, min_range=0, opt_offset=1)
+        gt_range = default_range(max_batch_size * (self.max_draft_len + 1),
+                                 min_range=0,
+                                 opt_offset=1)
 
         kwargs['speculative_decoding_draft_tokens_external'] = False
         kwargs['max_draft_len'] = self.max_draft_len
         kwargs['spec_decoding_is_generation_length_variable'] = True
+        kwargs[
+            'num_hidden_layers'] = self.config.num_hidden_layers + self.config.eagle_net_config.num_hidden_layers
 
         # Call base class prepare inputs
         inputs = super().prepare_inputs(*args, **kwargs)
@@ -792,12 +858,16 @@ class EagleForCausalLM(LLaMAForCausalLM):
             bb_range = [bb_range, bb_range]
             bb0_range = [bb0_range, bb0_range]
             draft_len_range = [self.max_draft_len]
+            decoding_len_range = [self.max_draft_len + 1]
             path_len_range = [self.num_eagle_layers + 1]
+            gen_tokens_range = [gt_range, gt_range]
         else:
             bb_range = [bb_range]
             bb0_range = [bb0_range]
             draft_len_range = [self.max_draft_len]
+            decoding_len_range = [self.max_draft_len + 1]
             path_len_range = [self.num_eagle_layers + 1]
+            gen_tokens_range = [gt_range]
 
         draft_tokens = Tensor(name='draft_tokens',
                               dtype=trt.int32,
@@ -820,10 +890,9 @@ class EagleForCausalLM(LLaMAForCausalLM):
                                    ]))
         rand_data_validation = Tensor(name='rand_data_validation',
                                       dtype=trt.float32,
-                                      shape=[-1, self.max_draft_len],
+                                      shape=[-1],
                                       dim_range=OrderedDict([
                                           ('batch_size', bb_range),
-                                          ('draft_len', draft_len_range),
                                       ]))
         rand_data_sample = Tensor(name='rand_data_sample',
                                   dtype=trt.float32,
@@ -831,14 +900,13 @@ class EagleForCausalLM(LLaMAForCausalLM):
                                   dim_range=OrderedDict([
                                       ('batch_size', bb_range),
                                   ]))
-        tree_paths = Tensor(
-            name='tree_paths',
+        draft_paths = Tensor(
+            name='draft_paths',
             dtype=trt.int32,
-            # FIXME max_accepted len is not necessary self.num_eagle_layers + 1. Only True for EAGLE-1
-            shape=[-1, self.max_draft_len, self.num_eagle_layers + 1],
+            shape=[-1, self.max_draft_len + 1, self.num_eagle_layers + 1],
             dim_range=OrderedDict([
                 ('batch_size', bb_range),
-                ('draft_len', draft_len_range),
+                ('decoding_len', decoding_len_range),
                 ('path_len', path_len_range),
             ]))
 
@@ -885,7 +953,14 @@ class EagleForCausalLM(LLaMAForCausalLM):
                 ('batch_size', bb_range),
             ]))
 
-        tree_params = TreeParams(paths=tree_paths)
+        input_gen_tokens = Tensor(name='input_gen_tokens',
+                                  dtype=trt.int32,
+                                  shape=[-1],
+                                  dim_range=OrderedDict([
+                                      ('gen_tokens', gen_tokens_range),
+                                  ]))
+
+        tree_params = TreeParams(paths=draft_paths)
 
         inputs['draft_tokens'] = draft_tokens
         inputs['draft_lens'] = draft_lens
@@ -905,4 +980,5 @@ class EagleForCausalLM(LLaMAForCausalLM):
             'host_gen_eagle_net_context_lengths'] = host_gen_eagle_net_context_lengths
         inputs[
             'host_gen_eagle_net_past_key_value_lengths'] = host_gen_eagle_net_past_key_value_lengths
+        inputs['input_gen_tokens'] = input_gen_tokens
         return inputs

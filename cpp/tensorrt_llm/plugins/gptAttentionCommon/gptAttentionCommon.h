@@ -23,6 +23,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
 #include <set>
@@ -53,7 +54,9 @@ public:
         int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
         bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false, bool has_full_attention_mask = false,
         bool use_cache = true, bool is_spec_decoding_enabled = false,
-        bool spec_decoding_is_generation_length_variable = false, int32_t spec_decoding_max_generation_length = 1);
+        bool spec_decoding_is_generation_length_variable = false, int32_t spec_decoding_max_generation_length = 1,
+        bool is_mla_enabled = false, int q_lora_rank = 0, int kv_lora_rank = 0, int qk_nope_head_dim = 0,
+        int qk_rope_head_dim = 0, int v_head_dim = 0, bool skip_attn = false);
 
     GPTAttentionPluginCommon(void const* data, size_t length);
 
@@ -85,10 +88,13 @@ public:
 protected:
     int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
     size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length,
-        int32_t cross_qkv_length = 0, int32_t max_num_tokens = 0) const noexcept;
+        int32_t cross_kv_length = 0, int32_t max_num_tokens = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
     size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq, int32_t max_kv_cache_length,
         int32_t max_num_tokens) const noexcept;
+
+    size_t getWorkspaceSizeForMLAPreProcess(
+        nvinfer1::DataType type, size_t& remaining_size, int32_t total_token_length, int32_t rope_dim) const noexcept;
 
     template <typename T>
     struct EnqueueContextParams
@@ -129,15 +135,19 @@ protected:
         int32_t max_blocks_per_sequence;
         int32_t const* host_context_lengths;
         void* workspace;
+        float2 const* mrope_rotary_sin_cos = nullptr;
+        int32_t const* mrope_position_deltas = nullptr;
+
         // optional when relative position
         T const* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
         // optional when cross attention
-        T const* cross_qkv = nullptr;
-        int32_t cross_qkv_length = 0;
+        T const* cross_kv = nullptr;
+        int32_t cross_kv_length = 0;
         int32_t const* encoder_input_lengths = nullptr;
         int32_t num_encoder_tokens = 0;
         int64_t const* runtime_perf_knobs = nullptr;
+        kernels::mlaParams<T>* mla_param;
 
         std::string enqueueContextParamsToString() const
         {
@@ -180,8 +190,8 @@ protected:
             ss << "workspace: " << workspace << std::endl;
             ss << "relative_attention_bias: " << relative_attention_bias << std::endl;
             ss << "relative_attention_bias_stride: " << relative_attention_bias_stride << std::endl;
-            ss << "cross_qkv: " << cross_qkv << std::endl;
-            ss << "cross_qkv_length: " << cross_qkv_length << std::endl;
+            ss << "cross_kv: " << cross_kv << std::endl;
+            ss << "cross_kv_length: " << cross_kv_length << std::endl;
             ss << "encoder_input_lengths: " << encoder_input_lengths << std::endl;
             ss << "num_encoder_tokens: " << num_encoder_tokens << std::endl;
             return ss.str();
@@ -230,6 +240,9 @@ protected:
         int32_t* semaphores;
         void* workspace;
         int32_t const* host_past_key_value_lengths;
+        float2 const* mrope_rotary_sin_cos = nullptr;
+        int32_t const* mrope_position_deltas = nullptr;
+
         // optional when relative position
         T const* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
@@ -249,6 +262,14 @@ protected:
 
     template <typename T, typename KVCacheBuffer>
     int enqueueGeneration(EnqueueGenerationParams<T> const& params, cudaStream_t stream);
+
+    template <typename T, typename KVCacheBuffer>
+    int mlaPreContext(
+        kernels::mlaParams<T>& params, EnqueueContextParams<T> const& context_params, cudaStream_t stream);
+
+    template <typename T, typename KVCacheBuffer>
+    int mlaGeneration(
+        kernels::mlaParams<T>& params, EnqueueGenerationParams<T> const& generation_params, cudaStream_t stream);
 
     // Called in configurePlugin().
     template <typename T, typename KVCacheBuffer>
@@ -278,7 +299,8 @@ protected:
     {
         return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPTJ
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX
-            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE;
+            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE
+            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_M;
     }
 
     bool isLongRoPE() const
@@ -289,6 +311,11 @@ protected:
     bool isUnfusedCrossAttention() const
     {
         return !mEnableContextFMHA && mCrossAttention;
+    }
+
+    bool isMRoPE() const
+    {
+        return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_M;
     }
 
     bool isCrossAttention() const
@@ -368,6 +395,8 @@ protected:
     bool mIsSpecDecodingEnabled = false;
     bool mSpecDecodingIsGenerationLengthVariable = false;
     int32_t mSpecDecodingMaxGenerationLength = 1;
+    bool mIsMLAEnabled = false;
+    tensorrt_llm::kernels::mlaMetaParams mMLAParams;
 
     // Speculative decoding packed mask.
     uint4* mSpecDecodingPackedMask;
@@ -383,6 +412,7 @@ protected:
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     std::shared_ptr<CUDADriverWrapper> mDriver;
     UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mFMHARunner;
+    UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mDecoderFMHARunner;
     UniqPtrWNullCopy<tensorrt_llm::kernels::DecoderXQARunner> mDecoderXQARunner;
 
     bool mMultiBlockMode;
@@ -396,6 +426,7 @@ protected:
     // This is implementation details which we want to save when serializing, but not expose as
     // a plugin field or a constructor parameter
     int32_t mNbMultiBlockSemaphores = 0;
+    bool mSkipAttn = false;
 
     struct Deleter
     {
@@ -451,6 +482,7 @@ protected:
         ss << "mDeviceId: " << mDeviceId << std::endl;
         ss << "mUseKVCache: " << std::boolalpha << mUseKVCache << std::endl;
         ss << "mForceMultiBlockWarned: " << mForceMultiBlockWarned << std::endl;
+        ss << "mSkipAttn: " << std::boolalpha << mSkipAttn << std::endl;
 
         return ss.str();
     }

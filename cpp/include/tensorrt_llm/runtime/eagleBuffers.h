@@ -58,6 +58,8 @@ public:
         TensorPtr draftPaths;
         //! [maxBatchSize] or [numGenSequences]
         TensorPtr specDecodingGenerationLengths;
+        //! [maxBatchSize] or [numGenSequences]
+        TensorPtr specDecodingGenerationLengthsHost;
         //! [maxBatchSize, maxDecodingTokens, ceil(maxDecodingTokens / 32)]
         //! or [numGenSequences, maxDecodingTokens, ceil(maxDecodingTokens / 32)]
         TensorPtr specDecodingPackedMasks;
@@ -75,6 +77,8 @@ public:
         TensorPtr eagleNetGenContextLengthsHost;
         //! [maxBatchSize] or [numSequences]
         TensorPtr eagleNetGenPastKeyValueLengthsHost;
+        //! [maxBatchSize * maxDecodingTokens] or [numSequences * maxDecodingTokens]
+        TensorPtr inputGenTokensHost;
 
         void create(SizeType32 maxNumSequences, runtime::TllmRuntime const& runtime,
             runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);

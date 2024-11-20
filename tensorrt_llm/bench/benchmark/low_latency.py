@@ -4,6 +4,7 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
+from random import choices, shuffle
 from time import monotonic_ns, sleep
 from typing import List
 
@@ -11,12 +12,20 @@ import click
 import yaml
 from click_option_group import optgroup
 
+from tensorrt_llm.bench.benchmark.utils.reporting import StatsKeeper
+from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
+
+os.environ["TLLM_LOG_LEVEL"] = "WARNING"
+
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm.bench.benchmark.dataclasses import (BenchmarkStatistics,
                                                       RuntimeConfig)
-from tensorrt_llm.bench.benchmark.utils import (StatsKeeper,
-                                                get_executor_requests,
-                                                get_settings_from_engine)
+
+# isort: off
+from tensorrt_llm.bench.benchmark.utils.general import (get_executor_requests,
+                                                        get_settings_from_engine
+                                                        )
+# isort: on
 from tensorrt_llm.bench.dataclasses import BenchmarkEnvironment
 from tensorrt_llm.bench.enums import IFBSchedulingPolicy
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
@@ -61,6 +70,12 @@ from tensorrt_llm.logger import logger
     default=0,
     help="Number of requests to cap benchmark run at. Minimum between value and"
     "length of dataset.",
+)
+@optgroup.option(
+    "--warmup",
+    type=int,
+    default=0,
+    help="Number of requests warm up benchmark.",
 )
 @optgroup.group("Speculative Decode Options",
                 help="Runtime settings for executing a TensorRT-LLM engine.")
@@ -121,9 +136,13 @@ def latency_command(
 
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
+    warmup_steps = params.get("warmup")
 
     # Initialize the HF tokenizer for the specified model.
+    ignore_eos = True if runtime_config.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
     tokenizer = initialize_tokenizer(bench_env.model)
+    eos_id = tokenizer.eos_token_id if not ignore_eos else -1
+    pad_id = tokenizer.pad_token_id if not ignore_eos else -1
 
     # Dataset Loading and Preparation
     with open(dataset_path, "r") as dataset:
@@ -141,6 +160,8 @@ def latency_command(
     executor_requests = get_executor_requests(
         requests,
         True,
+        eos_id=eos_id,
+        pad_id=pad_id,
     )
     del requests
 
@@ -152,12 +173,12 @@ def latency_command(
 
     try:
         logger.info("Ready to start benchmark.")
+        benchmark.setup_warmup(warmup_steps)
         benchmark.start_benchmark()
         benchmark.report_statistics()
     except KeyboardInterrupt:
         logger.info("Benchmark interrupted! Shutting down...")
     finally:
-        logger.set_level("error")
         benchmark.stop_benchmark()
 
 
@@ -178,6 +199,7 @@ class LatencyBenchmark:
         """
         # Dataset and input properties.
         self.requests = dataset
+        self.warm_up_dataset = None
         self.runtime_config = deepcopy(runtime_cfg)
         self.streaming = True
 
@@ -192,11 +214,19 @@ class LatencyBenchmark:
         logger.info("Executor started.")
 
     def _setup_environment(self) -> None:
+        # TODO: Once passing of variables is fixed, these should work
+        # when using MPI in C++ runtime.
         os.environ["TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG"] = "1"
         os.environ["TRTLLM_MMHA_KERNEL_BLOCK_SIZE"] = "256"
         os.environ["TRTLLM_MMHA_KERNEL_BLOCK_SIZE"] = "32"
         os.environ["FORCE_MULTI_BLOCK_MODE"] = "1"
         os.environ["TRTLLM_ENABLE_PDL"] = "1"
+
+    def setup_warmup(self, steps) -> None:
+        """Warm up the benchmarker."""
+        if steps > 0:
+            self.warm_up_dataset = choices(self.requests, k=steps)
+            shuffle(self.warm_up_dataset)
 
     def start_benchmark(self) -> None:
         """Start the benchmark."""
@@ -212,6 +242,18 @@ class LatencyBenchmark:
             logger.info("Waiting for executor to stand up...")
             sleep(1)
 
+        if self.warm_up_dataset and len(self.warm_up_dataset) > 0:
+            logger.info(f"WARMING UP...")
+            for i, request in enumerate(self.warm_up_dataset, start=1):
+                logger.info(f"Running warm up step {i}...")
+                req_id = self.executor.enqueue_request(request)
+                final = False
+                while not final:
+                    responses = self.executor.await_responses(req_id)
+                    final = any([resp.result.is_final for resp in responses])
+
+            logger.info("WARMUP COMPLETE.")
+
         logger.info("Low latency benchmark started.")
         self.start_time = monotonic_ns()
         while len(self.requests) > 0:
@@ -224,10 +266,12 @@ class LatencyBenchmark:
 
             while not final:
                 responses = self.executor.await_responses(req_id)
+                now = monotonic_ns()
                 for resp in responses:
                     self.statistics.register_response(
-                        req_id, monotonic_ns(), resp.result.is_final,
-                        resp.has_error(), resp.result.output_token_ids[0])
+                        req_id, now, resp.result.is_final, resp.has_error(),
+                        resp.result.decoding_iter,
+                        resp.result.output_token_ids[0])
                     final = resp.result.is_final
 
         self.end_time = monotonic_ns()
@@ -281,14 +325,14 @@ class LatencyBenchmark:
             f"Number of requests:\t\t{stats.num_requests}\n"
             f"Average Input Length (tokens):\t{stats.average_input_length:.4f}\n"
             f"Average Output Length (tokens):\t{stats.average_output_length:.4f}\n"
-            f"Average request latency (ms):\t{stats.request_percentiles.average * 1.0e-6:.4f}\n"
+            f"Average request latency (ms):\t{stats.request_latency_percentiles.average * 1.0e-6:.4f}\n"
             f"\n"
             "===========================================================\n"
             "= THROUGHPUT OVERVIEW \n"
             "===========================================================\n"
             f"Request Throughput (req/sec):\t\t  {stats.request_throughput_ns * 1.0e9:.4f}\n"
             f"Total Token Throughput (tokens/sec):\t  {stats.token_throughput_ns * 1.0e9:.4f}\n"
-            f"Generation Token Throughput (tokens/sec): {stats.generation_token_throughput_ns * 1.0e9:.4f}\n"
+            f"Generation Token Throughput (tokens/sec): {stats.generation_tp_percentiles.average * 1.0e9:.4f}\n"
             f"\n"
             "===========================================================\n"
             "= LATENCY OVERVIEW \n"
@@ -296,14 +340,29 @@ class LatencyBenchmark:
             f"Total Latency (ms):\t\t  {stats.total_latency_ns * 1.0e-6:.4f}\n"
             f"Average time-to-first-token (ms): {stats.ttft_percentiles.average * 1.0e-6:.4f}\n"
             f"Average inter-token latency (ms): {stats.itl_percentiles.average * 1.0e-6:.4f}\n"
+            f"Acceptance Rate (Speculative):\t  {stats.acceptance_rate:.2f}\n"
             f"\n"
             "===========================================================\n"
-            "= GENERATION BREAKDOWN \n"
+            "= GENERATION LATENCY BREAKDOWN \n"
             "===========================================================\n"
-            f"P90 (ms): {stats.generation_percentiles.p50 * 1.0e-6:.4f}\n"
-            f"P95 (ms): {stats.generation_percentiles.p95 * 1.0e-6:.4f}\n"
-            f"P99 (ms): {stats.generation_percentiles.p99 * 1.0e-6:.4f}\n"
-            "\n===========================================================\n")
+            f"MIN (ms): {stats.generation_latency_percentiles.minimum * 1.0e-6:.4f}\n"
+            f"MAX (ms): {stats.generation_latency_percentiles.maximum * 1.0e-6:.4f}\n"
+            f"AVG (ms): {stats.generation_latency_percentiles.average * 1.0e-6:.4f}\n"
+            f"P90 (ms): {stats.generation_latency_percentiles.p50 * 1.0e-6:.4f}\n"
+            f"P95 (ms): {stats.generation_latency_percentiles.p95 * 1.0e-6:.4f}\n"
+            f"P99 (ms): {stats.generation_latency_percentiles.p99 * 1.0e-6:.4f}\n"
+            f"\n"
+            "===========================================================\n"
+            "= ACCEPTANCE BREAKDOWN \n"
+            "===========================================================\n"
+            f"MIN: {stats.acceptance_percentiles.minimum:.2f}\n"
+            f"MAX: {stats.acceptance_percentiles.maximum:.2f}\n"
+            f"AVG: {stats.acceptance_percentiles.average:.2f}\n"
+            f"P90: {stats.acceptance_percentiles.p50:.2f}\n"
+            f"P95: {stats.acceptance_percentiles.p95:.2f}\n"
+            f"P99: {stats.acceptance_percentiles.p99:.2f}\n"
+            f"\n"
+            "===========================================================\n")
 
         logger.info(logging_info)
         return stats

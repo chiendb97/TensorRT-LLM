@@ -26,8 +26,10 @@
 #include <sstream>
 
 // Ignore CUTLASS warnings about type punning
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#endif
 
 #include "cute/tensor.hpp"
 #include "cutlass/conv/convolution.h"
@@ -41,7 +43,9 @@
 
 #include "cutlass_extensions/epilogue/thread/fused_activations.h"
 
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
+#endif
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
@@ -163,8 +167,10 @@ __launch_bounds__(TPB) __global__ void moeTopK(float const* inputs_after_softmax
 
             for (int prior_k = startk; prior_k < k_idx; ++prior_k)
             {
-                int const prior_winning_expert = indices[k * block_row + prior_k];
-
+                int prior_winning_expert = indices[k * block_row + prior_k];
+                // Adjust the selected index to correct for the expert parallel transformation
+                prior_winning_expert = prior_winning_expert >= num_experts ? prior_winning_expert - num_experts
+                                                                           : prior_winning_expert + start_expert;
                 if (prior_winning_expert == expert)
                 {
                     inp_kvp = thread_kvp;
@@ -188,7 +194,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(float const* inputs_after_softmax
             assert(indices[idx] >= 0);
             source_rows[idx] = k_idx * num_rows + block_row;
 
-            if (norm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE)
+            if (moeRoutingNeedsRenorm(norm_mode))
             {
                 renorm_value += result_kvp.value;
             }
@@ -196,7 +202,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(float const* inputs_after_softmax
         __syncthreads();
     }
 
-    if (norm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE && threadIdx.x == 0 && renorm_value != 0.f)
+    if (moeRoutingNeedsRenorm(norm_mode) && threadIdx.x == 0 && renorm_value != 0.f)
     {
         assert(startk == 0 && endk == k);
         renorm_value = 1 / renorm_value;
@@ -405,7 +411,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(fl
             source_rows[idx] = k_idx * num_rows + thread_row;
 
             // Accumulate renorm scalar
-            if (norm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE)
+            if (moeRoutingNeedsRenorm(norm_mode))
             {
                 renorm_value += max_val;
             }
@@ -427,7 +433,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(fl
         }
     }
 
-    if (norm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE && thread_group_idx == 0 && renorm_value != 0.f)
+    if (moeRoutingNeedsRenorm(norm_mode) && thread_group_idx == 0 && renorm_value != 0.f)
     {
         assert(startk == 0 && endk == k);
         renorm_value = 1 / renorm_value;
@@ -477,72 +483,81 @@ void topkGatingSoftmaxKernelLauncher(float const* input, float* output, float* s
     int* source_row, int64_t const num_rows, int const num_experts, int const k, int const startk, int const endk,
     int const start_expert, int const end_expert, MOEExpertScaleNormalizationMode norm_mode, cudaStream_t stream)
 {
-    static constexpr int WARPS_PER_TB = 4;
+    if (moeRoutingNeedsSoftmax(norm_mode))
+    {
+        static constexpr int WARPS_PER_TB = 4;
 
-    switch (num_experts)
-    {
-    case 1:
-    {
-        topkGatingSoftmaxLauncherHelper<1, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
-            startk, endk, start_expert, end_expert, norm_mode, stream);
-        break;
+        switch (num_experts)
+        {
+        case 1:
+        {
+            topkGatingSoftmaxLauncherHelper<1, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+                startk, endk, start_expert, end_expert, norm_mode, stream);
+            break;
+        }
+        case 2:
+        {
+            topkGatingSoftmaxLauncherHelper<2, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+                startk, endk, start_expert, end_expert, norm_mode, stream);
+            break;
+        }
+        case 4:
+        {
+            topkGatingSoftmaxLauncherHelper<4, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+                startk, endk, start_expert, end_expert, norm_mode, stream);
+            break;
+        }
+        case 8:
+        {
+            topkGatingSoftmaxLauncherHelper<8, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+                startk, endk, start_expert, end_expert, norm_mode, stream);
+            break;
+        }
+        case 16:
+        {
+            topkGatingSoftmaxLauncherHelper<16, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+                startk, endk, start_expert, end_expert, norm_mode, stream);
+            break;
+        }
+        case 32:
+        {
+            topkGatingSoftmaxLauncherHelper<32, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+                startk, endk, start_expert, end_expert, norm_mode, stream);
+            break;
+        }
+        case 64:
+        {
+            topkGatingSoftmaxLauncherHelper<64, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+                startk, endk, start_expert, end_expert, norm_mode, stream);
+            break;
+        }
+        case 128:
+        {
+            topkGatingSoftmaxLauncherHelper<128, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+                startk, endk, start_expert, end_expert, norm_mode, stream);
+            break;
+        }
+        case 256:
+        {
+            topkGatingSoftmaxLauncherHelper<256, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+                startk, endk, start_expert, end_expert, norm_mode, stream);
+            break;
+        }
+        default:
+        {
+            static constexpr int TPB = 256;
+            TLLM_CHECK(softmax_temp_output != nullptr);
+            moeSoftmax<TPB><<<num_rows, TPB, 0, stream>>>(input, nullptr, softmax_temp_output, num_experts);
+            moeTopK<TPB><<<num_rows, TPB, 0, stream>>>(softmax_temp_output, nullptr, output, indices, source_row,
+                num_experts, k, startk, endk, start_expert, end_expert, norm_mode);
+        }
+        }
     }
-    case 2:
-    {
-        topkGatingSoftmaxLauncherHelper<2, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
-            startk, endk, start_expert, end_expert, norm_mode, stream);
-        break;
-    }
-    case 4:
-    {
-        topkGatingSoftmaxLauncherHelper<4, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
-            startk, endk, start_expert, end_expert, norm_mode, stream);
-        break;
-    }
-    case 8:
-    {
-        topkGatingSoftmaxLauncherHelper<8, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
-            startk, endk, start_expert, end_expert, norm_mode, stream);
-        break;
-    }
-    case 16:
-    {
-        topkGatingSoftmaxLauncherHelper<16, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
-            startk, endk, start_expert, end_expert, norm_mode, stream);
-        break;
-    }
-    case 32:
-    {
-        topkGatingSoftmaxLauncherHelper<32, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
-            startk, endk, start_expert, end_expert, norm_mode, stream);
-        break;
-    }
-    case 64:
-    {
-        topkGatingSoftmaxLauncherHelper<64, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
-            startk, endk, start_expert, end_expert, norm_mode, stream);
-        break;
-    }
-    case 128:
-    {
-        topkGatingSoftmaxLauncherHelper<128, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
-            startk, endk, start_expert, end_expert, norm_mode, stream);
-        break;
-    }
-    case 256:
-    {
-        topkGatingSoftmaxLauncherHelper<256, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
-            startk, endk, start_expert, end_expert, norm_mode, stream);
-        break;
-    }
-    default:
+    else
     {
         static constexpr int TPB = 256;
-        TLLM_CHECK(softmax_temp_output != nullptr);
-        moeSoftmax<TPB><<<num_rows, TPB, 0, stream>>>(input, nullptr, softmax_temp_output, num_experts);
-        moeTopK<TPB><<<num_rows, TPB, 0, stream>>>(softmax_temp_output, nullptr, output, indices, source_row,
-            num_experts, k, startk, endk, start_expert, end_expert, norm_mode);
-    }
+        moeTopK<TPB><<<num_rows, TPB, 0, stream>>>(input, nullptr, output, indices, source_row, num_experts, k, startk,
+            endk, start_expert, end_expert, norm_mode);
     }
 }
 
@@ -1049,7 +1064,7 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
     bool const check_finished = num_valid_ptr != nullptr;
 
     ScaleMode renorm_scales = ScaleMode::DEFAULT;
-    if (normalization_mode == MOEExpertScaleNormalizationMode::RENORMALIZE)
+    if (moeRoutingNeedsRenorm(normalization_mode))
     {
         renorm_scales = k == 1 ? ScaleMode::NO_SCALE : ScaleMode::RENORM_SCALE;
     }

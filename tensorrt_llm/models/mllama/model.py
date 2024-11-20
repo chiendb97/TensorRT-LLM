@@ -22,11 +22,11 @@ import torch
 from tensorrt_llm._common import default_net
 from tensorrt_llm._utils import numpy_to_torch, str_dtype_to_torch
 from tensorrt_llm.bindings import KVCacheType
-from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
-                                     MLPType, PositionEmbeddingType, Tensor,
-                                     assertion, gather_last_token_logits,
-                                     maximum, minimum, recv, reduce, send,
-                                     shape, tanh)
+from tensorrt_llm.functional import (Conditional, LayerNormPositionType,
+                                     LayerNormType, MLPType,
+                                     PositionEmbeddingType, Tensor, assertion,
+                                     gather_last_token_logits, maximum, minimum,
+                                     recv, reduce, send, shape, tanh)
 from tensorrt_llm.layers import (MLP, Attention, AttentionMaskParams,
                                  AttentionMaskType, AttentionParams,
                                  ColumnLinear, Embedding, FusedGatedMLP,
@@ -37,8 +37,7 @@ from tensorrt_llm.lora_manager import (LoraConfig,
                                        use_lora)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.model_weights_loader import ModelWeightsLoader
-from tensorrt_llm.models.modeling_utils import (PretrainedConfig,
-                                                PretrainedModel, QuantConfig)
+from tensorrt_llm.models.modeling_utils import PretrainedModel, QuantConfig
 from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.parameter import Parameter
 
@@ -86,7 +85,7 @@ class CrossAttentionTransformerBlock(Module):
         max_distance=0,
         num_buckets=0,
         fp16_clamping=False,
-        skip_cross_qkv=False,
+        skip_cross_kv=False,
         use_implicit_relative_attention=False,
         rotary_embedding_base=None,
         rotary_embedding_scaling=None,
@@ -121,7 +120,7 @@ class CrossAttentionTransformerBlock(Module):
             num_buckets=num_buckets,
             position_embedding_type=PositionEmbeddingType.
             learned_absolute,  # we don't use rope for cross attn
-            skip_cross_qkv=skip_cross_qkv,
+            skip_cross_kv=skip_cross_kv,
             qk_layernorm=True,
             layernorm_type=layernorm_type,
             layer_idx_in_cache_pool=layer_idx_in_cache_pool,
@@ -164,8 +163,10 @@ class CrossAttentionTransformerBlock(Module):
                 attention_params=None,
                 lora_layer_params=None,
                 cross_kv_cache_gen: Optional[Tensor] = None,
-                cross_qkv_reuse: Optional[Tensor] = None,
-                full_text_row_masked_out_mask: Tensor = None):
+                cross_kv_reuse: Optional[Tensor] = None,
+                full_text_row_masked_out_mask: Tensor = None,
+                skip_cross_attn_blocks: Tensor = None):
+
         assert isinstance(hidden_states, Tensor)
 
         if encoder_output:
@@ -178,7 +179,17 @@ class CrossAttentionTransformerBlock(Module):
         # cross attention
         residual = hidden_states * self.residual_scaling
 
-        hidden_states = self.input_layernorm(hidden_states)
+        # skip input_layernorm
+        if skip_cross_attn_blocks is not None:
+            input_ln_conditional = Conditional(skip_cross_attn_blocks)
+            skip_result = input_ln_conditional.add_input(hidden_states)
+            hidden_states = input_ln_conditional.add_input(hidden_states)
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = input_ln_conditional.add_output(
+                skip_result, hidden_states)
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
+
         if ADD_DEBUG_TENSOR:
             hidden_states.mark_output(
                 f'{self.local_layer_idx:2d}/2.1: normed_input',
@@ -195,7 +206,9 @@ class CrossAttentionTransformerBlock(Module):
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
             cross_kv_cache_gen=cross_kv_cache_gen,
-            cross_qkv_reuse=cross_qkv_reuse)
+            cross_kv_reuse=cross_kv_reuse,
+            skip_attn=skip_cross_attn_blocks,
+        )
 
         if use_cache:
             attention_output, presents_cross = attention_output
@@ -207,7 +220,20 @@ class CrossAttentionTransformerBlock(Module):
 
         attn_residual_scale = tanh(self.gate_attn.value.cast(trt.float32)).cast(
             attention_output.dtype)
+
+        attention_input = hidden_states
         hidden_states = residual + attn_residual_scale * attention_output
+
+        # use to skip attention_output with residual
+        # Since conditional does not work for gpt_attention_plugin, we replace the
+        # attention_output by hidden_states (input of attention) now.
+        if skip_cross_attn_blocks is not None:
+            attn_conditional = Conditional(skip_cross_attn_blocks)
+            skip_result = attn_conditional.add_input(attention_input)
+            hidden_states = attn_conditional.add_input(hidden_states)
+            hidden_states = attn_conditional.add_output(skip_result,
+                                                        hidden_states)
+
         if ADD_DEBUG_TENSOR:
             hidden_states.mark_output(
                 f'{self.local_layer_idx:2d}/3.2: cross_attn_output_with_residual',
@@ -218,6 +244,12 @@ class CrossAttentionTransformerBlock(Module):
             hidden_states = minimum(64000.0, hidden_states)
 
         # MLP
+        # skip post_layernorm and mlp
+        if skip_cross_attn_blocks is not None:
+            mlp_conditional = Conditional(skip_cross_attn_blocks)
+            skip_case = mlp_conditional.add_input(hidden_states)
+            hidden_states = mlp_conditional.add_input(hidden_states)
+
         residual = hidden_states * self.residual_scaling
 
         hidden_states = self.post_layernorm(hidden_states)
@@ -239,6 +271,9 @@ class CrossAttentionTransformerBlock(Module):
         hidden_states = residual + ffn_residual_scale * hidden_states * float(
             not self.no_ffn)
 
+        if skip_cross_attn_blocks is not None:
+            hidden_states = mlp_conditional.add_output(skip_case, hidden_states)
+
         if self.fp16_clamping:
             hidden_states = maximum(-64000.0, hidden_states)
             hidden_states = minimum(64000.0, hidden_states)
@@ -247,6 +282,7 @@ class CrossAttentionTransformerBlock(Module):
             hidden_states.mark_output(
                 f'{self.local_layer_idx:2d}/4.4: transformer_out',
                 hidden_states.dtype)
+
         if use_cache:
             return (hidden_states, presents_cross)
         return hidden_states
@@ -279,7 +315,7 @@ class TransformerBlock(Module):
         max_distance=0,
         num_buckets=0,
         fp16_clamping=False,
-        skip_cross_qkv=False,
+        skip_cross_kv=False,
         use_implicit_relative_attention=False,
         rotary_embedding_base=None,
         rotary_embedding_scaling=None,
@@ -344,17 +380,18 @@ class TransformerBlock(Module):
         self.fp16_clamping = fp16_clamping
 
     def forward(
-            self,
-            hidden_states: Tensor,
-            encoder_output: Optional[Tensor] = None,  # not used
-            attention_mask_params=None,
-            use_cache=False,
-            kv_cache_params=None,
-            attention_params=None,
-            lora_layer_params=None,
-            cross_kv_cache_gen: Optional[Tensor] = None,
-            cross_qkv_reuse: Optional[Tensor] = None,
-            full_text_row_masked_out_mask: Tensor = None,  # not used
+        self,
+        hidden_states: Tensor,
+        encoder_output: Optional[Tensor] = None,  # not used
+        attention_mask_params=None,
+        use_cache=False,
+        kv_cache_params=None,
+        attention_params=None,
+        lora_layer_params=None,
+        cross_kv_cache_gen: Optional[Tensor] = None,
+        cross_kv_reuse: Optional[Tensor] = None,
+        full_text_row_masked_out_mask: Tensor = None,  # not used
+        skip_cross_attn_blocks=None,
     ):
         assert isinstance(hidden_states, Tensor)
 
@@ -430,10 +467,9 @@ class TransformerBlock(Module):
 
 
 class MLLaMAModel(PretrainedModel):
+    config_class = MLLaMAConfig
 
-    def __init__(self, config: PretrainedConfig):
-        config = MLLaMAConfig(**config.to_dict())
-        self.check_config(config)
+    def __init__(self, config: MLLaMAConfig):
         super().__init__(config)
         Attention.create_attention_const_params(self, config)
         self.position_embedding_type = config.position_embedding_type
@@ -473,7 +509,7 @@ class MLLaMAModel(PretrainedModel):
 
         self.fp16_clamping = False
 
-        self.skip_cross_qkv = self.config.skip_cross_qkv
+        self.skip_cross_kv = self.config.skip_cross_kv
         self.mlp_type = MLPType.MLP if not hasattr(
             self.config, "mlp_type") else self.config.mlp_type
         self.use_implicit_relative_attention = self.config.use_implicit_relative_attention if hasattr(
@@ -494,8 +530,6 @@ class MLLaMAModel(PretrainedModel):
                 tp_rank=self.mapping.tp_rank)
 
         layers_range = self.mapping.pp_layers(self.total_num_layers)
-        nheads_tp = (num_kv_heads + self.mapping.tp_size -
-                     1) // self.mapping.tp_size
         _layers = []
         for layer_idx in layers_range:
             local_layer_idx = layer_idx - layers_range[0]
@@ -518,7 +552,7 @@ class MLLaMAModel(PretrainedModel):
                 "max_distance": self.config.max_distance,
                 "num_buckets": self.config.num_buckets,
                 "fp16_clamping": self.fp16_clamping,
-                "skip_cross_qkv": self.skip_cross_qkv,
+                "skip_cross_kv": self.skip_cross_kv,
                 "rotary_embedding_base": self.config.rotary_base,
                 "rotary_embedding_scaling": self.config.rotary_scaling,
             }
@@ -529,13 +563,13 @@ class MLLaMAModel(PretrainedModel):
                         **args,
                         layer_idx_in_cache_pool=self.config.
                         num_kv_heads_per_cross_attn_layer[:local_layer_idx].
-                        count(nheads_tp)))
+                        count(num_kv_heads)))
             else:
                 _layers.append(
                     TransformerBlock(**args,
                                      layer_idx_in_cache_pool=self.config.
                                      num_kv_heads_per_layer[:local_layer_idx].
-                                     count(nheads_tp)))
+                                     count(num_kv_heads)))
 
         self.decoder_layers = ModuleList(_layers)
         if self.mapping.is_last_pp_rank():
@@ -573,27 +607,6 @@ class MLLaMAModel(PretrainedModel):
                        self.config.num_buckets),
                 dtype=self._dtype)
 
-    def check_config(self, config: PretrainedConfig):
-        config.set_if_not_exist('has_position_embedding', False)
-        config.set_if_not_exist('type_vocab_size', None)
-        config.set_if_not_exist('rescale_before_lm_head', False)
-        config.set_if_not_exist('layernorm_type', LayerNormType.RmsNorm)
-        config.set_if_not_exist('layernorm_position',
-                                LayerNormPositionType.pre_layernorm)
-        config.set_if_not_exist('has_attention_qkvo_bias', False)
-        config.set_if_not_exist('has_mlp_bias', False)
-        config.set_if_not_exist('has_model_final_layernorm', True)
-        config.set_if_not_exist('model_type', 'MLLaMAModel')
-        config.set_if_not_exist('skip_cross_qkv', False)
-        config.set_if_not_exist('mlp_type', MLPType.GatedMLP)
-        config.set_if_not_exist('has_embedding_scale', False)
-        config.set_if_not_exist('residual_scaling', 1.0)
-        config.set_if_not_exist('has_lm_head_bias', False)
-        config.set_if_not_exist('num_buckets', None)
-        config.set_if_not_exist('max_distance', 0)
-        config.set_if_not_exist('relative_attention', False)
-        config.set_if_not_exist('residual_scaling', 1.0)
-
     def forward(
         self,
         decoder_input_ids: Tensor,
@@ -606,10 +619,11 @@ class MLLaMAModel(PretrainedModel):
         hidden_states=None,
         lora_params: LoraParams = None,
         cross_kv_cache_gen: Optional[Tensor] = None,
-        cross_qkv_reuse: Optional[Tensor] = None,
+        cross_kv_reuse: Optional[Tensor] = None,
         prompt_embedding_table: Optional[Tensor] = None,
         prompt_tasks: Optional[Tensor] = None,
         prompt_vocab_size: Optional[Tensor] = None,
+        skip_cross_attn_blocks: Optional[Tensor] = None,
     ):
         if self.mapping.is_first_pp_rank():
             assert isinstance(decoder_input_ids, Tensor)
@@ -681,10 +695,12 @@ class MLLaMAModel(PretrainedModel):
                     host_cross_kv_cache_pool_mapping=kv_cache_params.
                     host_cross_kv_cache_pool_mapping,
                 ),
+                skip_cross_attn_blocks=skip_cross_attn_blocks if isinstance(
+                    decoder_layer, CrossAttentionTransformerBlock) else None,
                 attention_params=attention_params,
                 lora_layer_params=lora_layer_params,
                 cross_kv_cache_gen=cross_kv_cache_gen,
-                cross_qkv_reuse=cross_qkv_reuse,
+                cross_kv_reuse=cross_kv_reuse,
                 full_text_row_masked_out_mask=full_text_row_masked_out_mask,
             )
 
@@ -901,6 +917,7 @@ class MLLaMAModel(PretrainedModel):
         host_context_lengths = None
         host_request_types = None
         host_runtime_perf_knobs = None
+        host_context_progress = None
         if use_gpt_attention_plugin and remove_input_padding:
             host_context_lengths = Tensor(name='host_context_lengths',
                                           dtype=trt.int32,
@@ -947,6 +964,13 @@ class MLLaMAModel(PretrainedModel):
                                              dim_range=OrderedDict([
                                                  ('perf_knob_size', [16])
                                              ]))
+
+            host_context_progress = Tensor(name='host_context_progress',
+                                           dtype=trt.int64,
+                                           shape=[1],
+                                           dim_range=OrderedDict([
+                                               ('context_progress_size', [1])
+                                           ]))
 
         last_token_ids = None
         if self.mapping.is_last_pp_rank() and not gather_context_logits:
@@ -1282,6 +1306,7 @@ class MLLaMAModel(PretrainedModel):
                 max_context_length=max_decoder_input_len,
                 host_request_types=host_request_types,
                 host_runtime_perf_knobs=host_runtime_perf_knobs,
+                host_context_progress=host_context_progress,
                 encoder_input_lengths=encoder_input_lengths,
                 encoder_max_input_length=encoder_max_input_length,
             )
@@ -1292,32 +1317,41 @@ class MLLaMAModel(PretrainedModel):
                                     dim_range=OrderedDict([
                                         ('boolean', [1]),
                                     ]))
-        cross_qkv_reuse = None
+        cross_kv_reuse = None
         num_heads = (self.num_heads + self.mapping.tp_size -
                      1) // self.mapping.tp_size
-        cross_qkv_out_dim = num_heads * self.head_size + 2 * num_kv_heads * self.head_size
-        if self.skip_cross_qkv:
+        cross_kv_out_dim = 2 * num_kv_heads * self.head_size
+        if self.skip_cross_kv:
             if remove_input_padding:
-                cross_qkv_reuse = Tensor(
-                    name="cross_qkv_reuse",
+                cross_kv_reuse = Tensor(
+                    name="cross_kv_reuse",
                     dtype=self._dtype,
-                    shape=[-1, cross_qkv_out_dim],
+                    shape=[-1, cross_kv_out_dim],
                     dim_range=OrderedDict([
                         ("encoder_num_tokens", [encoder_num_tokens_range]),
-                        ("encoder_qkv_size", [cross_qkv_out_dim]),
+                        ("encoder_kv_size", [cross_kv_out_dim]),
                     ]),
                 )
             else:
-                cross_qkv_reuse = Tensor(
-                    name="cross_qkv_reuse",
+                cross_kv_reuse = Tensor(
+                    name="cross_kv_reuse",
                     dtype=self._dtype,
-                    shape=[-1, -1, cross_qkv_out_dim],
+                    shape=[-1, -1, cross_kv_out_dim],
                     dim_range=OrderedDict([
                         ("batch_size_beam_width_encoder", [bb_range]),
                         ("encoder_input_len", [encoder_input_len_range]),
-                        ("encoder_qkv_size", [cross_qkv_out_dim]),
+                        ("encoder_kv_size", [cross_kv_out_dim]),
                     ]),
                 )
+
+        skip_cross_attn_blocks = None
+        if self.config.skip_cross_attn_blocks:
+            skip_cross_attn_blocks = Tensor(name='skip_cross_attn_blocks',
+                                            dtype=trt.bool,
+                                            shape=[1],
+                                            dim_range=OrderedDict([
+                                                ('boolean', [1]),
+                                            ]))
 
         prompt_embedding_table = None
         tasks = None
@@ -1374,10 +1408,11 @@ class MLLaMAModel(PretrainedModel):
             'hidden_states': hidden_states,
             'lora_params': lora_params,
             'cross_kv_cache_gen': cross_kv_cache_gen,
-            'cross_qkv_reuse': cross_qkv_reuse,
+            'cross_kv_reuse': cross_kv_reuse,
             'prompt_embedding_table': prompt_embedding_table,
             'prompt_tasks': tasks,
             'prompt_vocab_size': prompt_vocab_size,
+            'skip_cross_attn_blocks': skip_cross_attn_blocks,
         }
 
         return result
@@ -1441,7 +1476,6 @@ class MLLaMAModel(PretrainedModel):
                                                 quant_config=quant_config,
                                                 **kwargs)
 
-        custom_dict = {}
         custom_dict = {
             "lm_head": "language_model.lm_head",
             "ln_f": "language_model.model.norm",

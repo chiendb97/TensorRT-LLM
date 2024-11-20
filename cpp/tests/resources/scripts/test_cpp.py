@@ -16,6 +16,7 @@
 
 import argparse as _arg
 import copy
+import datetime
 import glob
 import logging as _log
 import os as _os
@@ -69,6 +70,33 @@ def run_command(command: _tp.Sequence[str],
     _sp.check_call(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
 
 
+def run_ctest(command: _tp.Sequence[str],
+              cwd: _pl.Path,
+              *,
+              shell=False,
+              env=None,
+              timeout=None) -> None:
+    override_timeout = int(_os.environ.get("CPP_TEST_TIMEOUT_OVERRIDDEN", "-1"))
+    if override_timeout > 0 and (timeout is None or override_timeout > timeout):
+        _log.info("Overriding the command timeout: %s (before) and %s (after)",
+                  timeout, override_timeout)
+        timeout = override_timeout
+    deadline = None
+    if timeout is not None:
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=timeout)
+        command = list(command)
+        command += ["--stop-time", deadline.strftime("%H:%M:%S")]
+    try:
+        _log.info("Running: cd %s && %s", str(cwd), " ".join(command))
+        _sp.check_call(command, cwd=cwd, shell=shell, env=env)
+    except _sp.CalledProcessError as e:
+        fuzz = datetime.timedelta(seconds=2)
+        if deadline is not None and deadline - fuzz < datetime.datetime.now():
+            # Detect timeout
+            raise _sp.TimeoutExpired(e.cmd, timeout, e.output, e.stderr)
+        raise
+
+
 def merge_report(parallel, retry, output):
     import xml.etree.ElementTree as ElementTree
     base = ElementTree.parse(parallel)
@@ -114,11 +142,11 @@ def parallel_run_ctest(
     parallel=default_test_parallel,
 ) -> None:
     if parallel == 1:
-        return run_command(command,
-                           cwd=cwd,
-                           shell=shell,
-                           env=env,
-                           timeout=timeout)
+        return run_ctest(command,
+                         cwd=cwd,
+                         shell=shell,
+                         env=env,
+                         timeout=timeout)
 
     env = {} if env is None else env
     env['CTEST_PARALLEL_LEVEL'] = str(parallel)
@@ -132,7 +160,9 @@ def parallel_run_ctest(
 
     report = None
     try:
-        run_command(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
+        run_ctest(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
+    # except _sp.TimeoutExpired:
+    # Deliberately let timeout propagate. We don't want to retry on timeout
     except _sp.CalledProcessError:
         report = get_report()
         if report == '':
@@ -147,7 +177,7 @@ def parallel_run_ctest(
             _log.info("Parallel test failed, retry serial on failed tests")
             del env['CTEST_PARALLEL_LEVEL']
             command = [*command, "--rerun-failed"]
-            run_command(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
+            run_ctest(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
         finally:
             if not _os.path.exists(cwd / report):
                 # Some catastrophic fail happened that there's no report generated
@@ -173,6 +203,7 @@ def run_tests(build_dir: _pl.Path,
               run_llama=False,
               run_chatglm=False,
               run_medusa=False,
+              run_eagle=False,
               run_mamba=False,
               run_recurrentgemma=False,
               run_encoder=False,
@@ -208,6 +239,10 @@ def run_tests(build_dir: _pl.Path,
             cwd=root_dir,
             env=_os.environ,
             timeout=300)
+        run_command([python_exe, "-m", "pip", "install", "jaxtyping<=0.2.34"],
+                    cwd=root_dir,
+                    env=_os.environ,
+                    timeout=300)
 
     build_dir = build_dir if build_dir.is_absolute() else root_dir / build_dir
     resources_dir = _pl.Path("cpp") / "tests" / "resources"
@@ -262,6 +297,7 @@ def run_tests(build_dir: _pl.Path,
                                 run_llama=run_llama,
                                 run_chatglm=run_chatglm,
                                 run_medusa=run_medusa,
+                                run_eagle=run_eagle,
                                 run_mamba=run_mamba,
                                 run_recurrentgemma=run_recurrentgemma,
                                 run_encoder=run_encoder,
@@ -279,6 +315,7 @@ def run_tests(build_dir: _pl.Path,
                              run_llama=run_llama,
                              run_chatglm=run_chatglm,
                              run_medusa=run_medusa,
+                             run_eagle=run_eagle,
                              run_mamba=run_mamba,
                              run_recurrentgemma=run_recurrentgemma,
                              run_encoder=run_encoder,
@@ -297,7 +334,7 @@ def run_tests(build_dir: _pl.Path,
                            model_cache=model_cache,
                            test_gpt_session_benchmark=True,
                            batching_types=["IFB", "V1"],
-                           api_types=["gptManager", "executor"])
+                           api_types=["executor"])
         elif run_t5:
             run_benchmarks(model_name="t5",
                            python_exe=python_exe,
@@ -342,6 +379,7 @@ def prepare_all_model_tests(python_exe: str,
                             run_llama=False,
                             run_chatglm=False,
                             run_medusa=False,
+                            run_eagle=False,
                             run_mamba=False,
                             run_recurrentgemma=False,
                             run_encoder=False,
@@ -403,6 +441,15 @@ def prepare_all_model_tests(python_exe: str,
                             model_cache_arg=model_cache_arg)
     else:
         _log.info("Skipping Medusa tests")
+
+    if run_eagle:
+        prepare_model_tests(model_name="eagle",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping Eagle tests")
 
     if run_mamba:
         prepare_model_tests(model_name="mamba",
@@ -580,11 +627,13 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     excluded_tests.append("Llama")
     excluded_tests.append("ChatGlm")
     excluded_tests.append("Medusa")
+    excluded_tests.append("Eagle")
     excluded_tests.append("ExplicitDraftTokensDecoding")
     excluded_tests.append("Mamba")
     excluded_tests.append("RecurrentGemma")
     excluded_tests.append("Encoder")
     excluded_tests.append("EncDec")
+    excluded_tests.append("SpeculativeDecoding")
     ctest.extend(["-E", "|".join(excluded_tests)])
 
     parallel = default_test_parallel
@@ -598,12 +647,27 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
                        parallel=parallel)
 
 
+def run_spec_dec_tests(build_dir: _pl.Path):
+    xml_output_file = build_dir / "results-spec-dec-fast-logits.xml"
+    cpp_env = {**_os.environ}
+    tests_dir = build_dir / "tests"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=3,
+        local_commands=[
+            "executor/executorTest", "--gtest_filter=*SpecDecFastLogits*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=cpp_env, timeout=1500)
+
+
 def run_single_gpu_tests(build_dir: _pl.Path,
                          run_gpt,
                          run_gptj,
                          run_llama,
                          run_chatglm,
                          run_medusa,
+                         run_eagle,
                          run_mamba,
                          run_recurrentgemma,
                          run_encoder,
@@ -615,39 +679,53 @@ def run_single_gpu_tests(build_dir: _pl.Path,
     build_tests(build_dir=build_dir)
 
     cpp_env = {**_os.environ}
-    ctest = [
-        "ctest", "--output-on-failure", "--output-junit",
-        "results-single-gpu.xml"
-    ]
-
+    resultFileName = "results-single-gpu"
     included_tests = []
     if run_gpt:
+        resultFileName = "-".join([resultFileName, "gpt"])
         included_tests.append("Gpt[^j]")
     if run_gptj:
+        resultFileName = "-".join([resultFileName, "gptj"])
         included_tests.append("Gptj")
     if run_llama:
+        resultFileName = "-".join([resultFileName, "llama"])
         included_tests.append("Llama")
     if run_chatglm:
+        resultFileName = "-".join([resultFileName, "chatglm"])
         included_tests.append("ChatGlm")
     if run_medusa:
+        resultFileName = "-".join([resultFileName, "medusa"])
         included_tests.append("Medusa")
+    if run_eagle:
+        included_tests.append("Eagle")
     if run_mamba:
+        resultFileName = "-".join([resultFileName, "mamba"])
         included_tests.append("Mamba")
     if run_recurrentgemma:
+        resultFileName = "-".join([resultFileName, "recurrentgemma"])
         included_tests.append("RecurrentGemma")
     if run_encoder:
+        resultFileName = "-".join([resultFileName, "encoder"])
         included_tests.append("EncoderModelTestSingleGPU")
     if run_bart:
+        resultFileName = "-".join([resultFileName, "bart"])
         included_tests.append("BartBasicTest")
     if run_t5:
+        resultFileName = "-".join([resultFileName, "t5"])
         included_tests.append("T5BasicTest")
         included_tests.append("T5Beam2Test")
     if run_redrafter:
+        resultFileName = "-".join([resultFileName, "redrafter"])
         included_tests.append("ExplicitDraftTokens")
 
     excluded_tests = []
     if not run_fp8:
         excluded_tests.append("FP8")
+    else:
+        resultFileName = "-".join([resultFileName, "fp8"])
+
+    resultFileName += ".xml"
+    ctest = ["ctest", "--output-on-failure", "--output-junit", resultFileName]
 
     if included_tests:
         ctest.extend(["-R", "|".join(included_tests)])
@@ -675,6 +753,8 @@ def run_single_gpu_tests(build_dir: _pl.Path,
             ],
             leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
         run_command(trt_model_test, cwd=build_dir, env=cpp_env, timeout=timeout)
+
+        run_spec_dec_tests(build_dir=build_dir)
 
 
 def produce_mpirun_command(*, global_commands, nranks, local_commands,
@@ -876,6 +956,19 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
+    new_env = copy.copy(cpp_env)
+    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-orchestrator-executor-7-process.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=7,
+        local_commands=[
+            "executor/executorTest",
+            "--gtest_filter=*DisaggOrchestratorParamsTest*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
 
 def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
                    build_dir: _pl.Path, resources_dir: _pl.Path,
@@ -1009,7 +1102,9 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
                     ]
 
                 run_command(benchmark, cwd=root_dir, timeout=600)
-                req_rate_benchmark = benchmark + ["--request_rate", "100"]
+                req_rate_benchmark = benchmark + [
+                    "--request_rate", "100", "--enable_exp_delays"
+                ]
                 run_command(req_rate_benchmark, cwd=root_dir, timeout=600)
                 concurrency_benchmark = benchmark + ["--concurrency", "30"]
                 run_command(concurrency_benchmark, cwd=root_dir, timeout=600)
@@ -1020,34 +1115,6 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
                 str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
                 str(model_engine_path), "--type", "IFB", "--dataset",
                 str(data_dir / tokens_f), "--api", "executor", "--streaming"
-            ]
-            if model_name == "enc_dec":
-                benchmark += [
-                    "--encoder_engine_dir",
-                    str(encoder_model_engine_path)
-                ]
-            run_command(benchmark, cwd=root_dir, timeout=600)
-
-        if "IFB" in batching_type and "gptManager" in api_type:
-            # gptManager streaming test
-            benchmark = [
-                str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
-                str(model_engine_path), "--type", "IFB", "--dataset",
-                str(data_dir / tokens_f), "--api", "gptManager", "--streaming"
-            ]
-            if model_name == "enc_dec":
-                benchmark += [
-                    "--encoder_engine_dir",
-                    str(encoder_model_engine_path)
-                ]
-            run_command(benchmark, cwd=root_dir, timeout=600)
-
-            # gptManager streaming test with delay
-            benchmark = [
-                str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
-                str(model_engine_path), "--type", "IFB", "--dataset",
-                str(data_dir / tokens_f), "--api", "gptManager", "--streaming",
-                "request_rate", "100", "--enable_exp_delays"
             ]
             if model_name == "enc_dec":
                 benchmark += [
@@ -1101,6 +1168,9 @@ if __name__ == "__main__":
     tests_config_parser.add_argument("--run_medusa",
                                      action="store_true",
                                      help="Run the tests for Medusa")
+    tests_config_parser.add_argument("--run_eagle",
+                                     action="store_true",
+                                     help="Run the tests for Eagle")
     tests_config_parser.add_argument("--run_mamba",
                                      action="store_true",
                                      help="Run the tests for Mamba")
@@ -1149,11 +1219,10 @@ if __name__ == "__main__":
                                         build_args.build_type)
     # Make modelSpec module since build engine and generate output scripts will need it.
     make_modelSpec = [
-        "cmake", "--build",
-        test_args.build_dir.__str__(), "--config", build_args.build_type, "-j",
+        "cmake", "--build", ".", "--config", build_args.build_type, "-j",
         "--target", "modelSpec"
     ]
-    run_command(make_modelSpec, cwd=build_args.build_dir, timeout=300)
+    run_command(make_modelSpec, cwd=test_args.build_dir, timeout=300)
 
     from build_engines_utils import init_model_spec_module
 
@@ -1170,6 +1239,7 @@ if __name__ == "__main__":
         test_args.run_bart = True
         test_args.run_t5 = True
         test_args.run_medusa = True
+        test_args.run_eagle = True
         test_args.run_redrafter = True
 
     del test_args.run_all_models

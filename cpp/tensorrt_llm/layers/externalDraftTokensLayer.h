@@ -35,7 +35,7 @@ public:
     using Base = BaseLayer;
 
     ExternalDraftTokensLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
-        std::shared_ptr<runtime::BufferManager> bufferManager);
+        std::shared_ptr<runtime::BufferManager> bufferManager, bool isDeterministic = true, bool isAirTopP = true);
 
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, TensorConstPtr batchSlots,
         std::shared_ptr<BaseSetupParams> const& setupParams,
@@ -47,9 +47,6 @@ public:
 
     //! @returns workspace needed for this layer in bytes
     [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
-
-protected:
-    runtime::SizeType32 mRuntimeMaxTopK{0};
 
 private:
     using Base::mDecoderDomain;
@@ -71,12 +68,17 @@ private:
     TensorPtr mOutputIdsAfterSampling;
     TensorPtr mTargetOutputIds;
     TensorPtr mRuntimeTopKDevice;
-    TensorPtr mRuntimeTopPForTopKDevice;
+    TensorPtr mRuntimeTopKHost;
     TensorPtr mRuntimeTopPDevice;
-    TensorPtr mInitialTopPDevice;
     TensorPtr mMaskBuffer;
 
     TensorPtr mTargetLogits;
+
+    // AirTopP
+    cudaDeviceProp mDeviceProp;
+    runtime::SizeType32 mAirTopPBlockNum{0};
+    bool mIsDeterministic{true};
+    bool mIsAirTopP{false};
 
 private:
     void allocateBuffer(runtime::SizeType32 batchSize);

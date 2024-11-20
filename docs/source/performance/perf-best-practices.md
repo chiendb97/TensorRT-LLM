@@ -113,7 +113,7 @@ argument in `trtllm-build` is used to control it.
 
 When input padding is removed, the different tokens are packed together. It
 reduces both the amount of computations and memory consumption. For more details, see
-this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.md#padded-and-packed-tensors).
+this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#padded-and-packed-tensors).
 
 ### Paged KV Cache
 
@@ -182,6 +182,8 @@ recommended to enable the feature by using the `--use_fused_mlp=enable --gemm_sw
 argument with `trtllm-build`. When the workload is very small, or the accuracy
 after enabling it does not satisfy your requirement, it is not recommended to
 enable that feature.
+
+If your bachsize is small, you can also use `--use_fused_mlp=enable --low_latency_gemm_swiglu_plugin fp8` argument with `trtllm-build` to accelerate the running time.
 
 ### GEMM Plugin
 

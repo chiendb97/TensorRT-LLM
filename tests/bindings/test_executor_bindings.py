@@ -15,8 +15,11 @@ from binding_test_utils import *
 
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.version as trtllm_version
+from tensorrt_llm.models.modeling_utils import PretrainedConfig
 
 _sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
+import inspect
+
 from utils.cpp_paths import *
 from utils.llm_data import llm_models_root
 from utils.util import skip_pre_ampere
@@ -857,17 +860,27 @@ def test_external_draft_tokens_config():
 
     logits = torch.ones(3, 1)
     acceptance_threshold = 1.0
+    fast_logits = False
     config = trtllm.ExternalDraftTokensConfig(tokens, logits,
-                                              acceptance_threshold)
+                                              acceptance_threshold, fast_logits)
     assert config.tokens == tokens
     assert (config.logits == logits).all()
     assert config.acceptance_threshold == acceptance_threshold
+    assert config.fast_logits == fast_logits
 
 
 def test_prompt_tuning_config():
     embedding_table = torch.ones(100, 64)
     config = trtllm.PromptTuningConfig(embedding_table)
     assert (config.embedding_table == embedding_table).all()
+
+
+def test_mrope_config():
+    mrope_rotary_sin_cos = torch.ones(1, 4194304)
+    mrope_position_deltas = torch.tensor([-50])
+    config = trtllm.MropeConfig(mrope_rotary_sin_cos, mrope_position_deltas)
+    assert (config.mrope_rotary_sin_cos == mrope_rotary_sin_cos).all()
+    assert (config.mrope_position_deltas == mrope_position_deltas).all()
 
 
 def test_lora_config():
@@ -962,6 +975,14 @@ def test_request_deprecated_args():
     assert request.max_new_tokens == 30
 
 
+def test_spec_dec_fast_logits_info():
+    fast_logits_info = trtllm.SpeculativeDecodingFastLogitsInfo()
+    fast_logits_info.draft_request_id = 3
+    fast_logits_info.draft_participant_id = 5
+    assert fast_logits_info.draft_request_id == 3
+    assert fast_logits_info.draft_participant_id == 5
+
+
 def test_result():
     result = trtllm.Result()
     result.is_final = True
@@ -1032,6 +1053,15 @@ def test_scheduler_config():
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
     assert config.context_chunking_policy == context_chunking_policy
 
+    dynamic_batch_config = trtllm.DynamicBatchConfig(True, 128)
+    config = trtllm.SchedulerConfig(capacity_scheduler_policy,
+                                    context_chunking_policy,
+                                    dynamic_batch_config)
+    assert config.capacity_scheduler_policy == capacity_scheduler_policy
+    assert config.context_chunking_policy == context_chunking_policy
+    assert config.dynamic_batch_config.enable_batch_size_tuning == True
+    assert config.dynamic_batch_config.dynamic_batch_moving_average_window == 128
+
 
 def test_kv_cache_config():
     config = trtllm.KvCacheConfig()
@@ -1044,6 +1074,7 @@ def test_kv_cache_config():
     assert config.host_cache_size is None
     assert config.onboard_blocks == True
     assert config.secondary_offload_min_priority == None
+    assert config.event_buffer_max_size == 0
 
     config.enable_block_reuse = True
     config.max_tokens = 1
@@ -1054,6 +1085,7 @@ def test_kv_cache_config():
     config.host_cache_size = 4
     config.onboard_blocks = False
     config.secondary_offload_min_priority = 50
+    config.event_buffer_max_size = 1024
     assert config.enable_block_reuse == True
     assert config.max_tokens == 1
     assert config.max_attention_window == [2]
@@ -1063,6 +1095,7 @@ def test_kv_cache_config():
     assert config.host_cache_size == 4
     assert config.onboard_blocks == False
     assert config.secondary_offload_min_priority == 50
+    assert config.event_buffer_max_size == 1024
 
     kwargs = {
         "enable_block_reuse": True,
@@ -1073,10 +1106,80 @@ def test_kv_cache_config():
         "cross_kv_cache_fraction": 0.5,
         "host_cache_size": 1024,
         "onboard_blocks": False,
+        "event_buffer_max_size": 2048
     }
     config = trtllm.KvCacheConfig(**kwargs)
     for k, v in kwargs.items():
         assert getattr(config, k) == v
+
+    config = trtllm.KvCacheConfig(**kwargs)
+    max_attention_window, sink_token_length = config.max_attention_window, config.sink_token_length
+    runtime_defaults = trtllm.RuntimeDefaults(
+        max_attention_window=max_attention_window + [1],
+        sink_token_length=sink_token_length + 1)
+
+    config.fill_empty_fields_from_runtime_defaults(runtime_defaults)
+    assert config.max_attention_window == max_attention_window, "runtime defaults shouldn't override existing values"
+    assert config.sink_token_length == sink_token_length, "runtime defaults shouldn't override existing values"
+
+    config = trtllm.KvCacheConfig(**{
+        **kwargs, "max_attention_window": None,
+        "sink_token_length": None
+    })
+    config.fill_empty_fields_from_runtime_defaults(runtime_defaults)
+    assert config.max_attention_window == runtime_defaults.max_attention_window, "runtime defaults should apply to non existent values"
+    assert config.sink_token_length == runtime_defaults.sink_token_length, "runtime defaults should apply to non existent values"
+
+    config = trtllm.KvCacheConfig(**kwargs, runtime_defaults=runtime_defaults)
+    setter_config = trtllm.KvCacheConfig(**kwargs)
+    setter_config.fill_empty_fields_from_runtime_defaults(runtime_defaults)
+    for k in kwargs.keys():
+        assert getattr(config, k) == getattr(
+            setter_config, k
+        ), "passing runtime_defaults to the constructor or settings it manually should be equivalent"
+
+
+def test_kv_cache_retention_config():
+
+    TokenRangeRetentionConfig = trtllm.KvCacheRetentionConfig.TokenRangeRetentionConfig
+
+    config = trtllm.KvCacheRetentionConfig(
+        [TokenRangeRetentionConfig(0, 2, 30, datetime.timedelta(seconds=30))],
+        80)
+    assert len(config.token_range_retention_configs) == 1
+    assert config.token_range_retention_configs[0].token_start == 0
+    assert config.token_range_retention_configs[0].token_end == 2
+    assert config.token_range_retention_configs[0].priority == 30
+    assert config.token_range_retention_configs[
+        0].duration_ms == datetime.timedelta(seconds=30)
+    assert config.decode_retention_priority == 80
+    assert config.decode_duration_ms is None
+
+    config = trtllm.KvCacheRetentionConfig([
+        TokenRangeRetentionConfig(0, 64, 80),
+        TokenRangeRetentionConfig(64, 100, 10)
+    ], 10, datetime.timedelta(milliseconds=30000))
+
+    assert len(config.token_range_retention_configs) == 2
+    assert config.token_range_retention_configs[0].token_start == 0
+    assert config.token_range_retention_configs[0].token_end == 64
+    assert config.token_range_retention_configs[0].priority == 80
+    assert config.token_range_retention_configs[0].duration_ms is None
+
+    assert config.token_range_retention_configs[1].token_start == 64
+    assert config.token_range_retention_configs[1].token_end == 100
+    assert config.token_range_retention_configs[1].priority == 10
+    assert config.token_range_retention_configs[1].duration_ms is None
+
+    assert config.decode_retention_priority == 10
+    assert config.decode_duration_ms == datetime.timedelta(seconds=30)
+
+    with pytest.raises(Exception):
+        # Invalid token ranges
+        trtllm.KvCacheRetentionConfig([
+            TokenRangeRetentionConfig(0, 64, 10),
+            TokenRangeRetentionConfig(32, 128, 50)
+        ], 50)
 
 
 def test_lookahead_decoding_config():
@@ -1101,39 +1204,18 @@ def test_lookahead_decoding_config():
         assert getattr(config, k) == v
 
 
-def test_kv_cache_retention_config():
+def test_eagle_config():
+    config = trtllm.EagleConfig([[0, 0], [0, 1]])
+    assert config.eagle_choices == [[0, 0], [0, 1]]
 
-    TokenRangeRetentionPriority = trtllm.KvCacheRetentionConfig.TokenRangeRetentionPriority
+    config = trtllm.EagleConfig([[0, 0], [0, 1, 0]])
+    assert config.eagle_choices == [[0, 0], [0, 1, 0]]
 
-    config = trtllm.KvCacheRetentionConfig(
-        [TokenRangeRetentionPriority(0, 2, 30)], 80)
-    assert len(config.token_range_retention_priorities) == 1
-    assert config.token_range_retention_priorities[0].token_start == 0
-    assert config.token_range_retention_priorities[0].token_end == 2
-    assert config.token_range_retention_priorities[0].priority == 30
-    assert config.decode_retention_priority == 80
+    kwargs = {"eagle_choices": [[0, 0], [0, 1], [0, 2]]}
 
-    config = trtllm.KvCacheRetentionConfig([
-        TokenRangeRetentionPriority(0, 64, 80),
-        TokenRangeRetentionPriority(64, 100, 10)
-    ], 10)
-
-    assert len(config.token_range_retention_priorities) == 2
-    assert config.token_range_retention_priorities[0].token_start == 0
-    assert config.token_range_retention_priorities[0].token_end == 64
-    assert config.token_range_retention_priorities[0].priority == 80
-
-    assert config.token_range_retention_priorities[1].token_start == 64
-    assert config.token_range_retention_priorities[1].token_end == 100
-    assert config.token_range_retention_priorities[1].priority == 10
-
-    assert config.decode_retention_priority == 10
-
-    with pytest.raises(Exception):
-        trtllm.KvCacheRetentionConfig([
-            TokenRangeRetentionPriority(0, 64, 10),
-            TokenRangeRetentionPriority(32, 128, 50)
-        ], 50)
+    config = trtllm.EagleConfig(**kwargs)
+    for k, v in kwargs.items():
+        assert getattr(config, k) == v
 
 
 def test_decoding_mode():
@@ -1158,18 +1240,26 @@ def test_decoding_mode():
     mode = trtllm.DecodingMode.Lookahead()
     assert mode.isLookahead()
 
+    mode = trtllm.DecodingMode.ExplicitDraftTokens()
+    assert mode.isExplicitDraftTokens()
+
+    mode = trtllm.DecodingMode.Eagle()
+    assert mode.isEagle()
+
 
 def test_speculative_decoding_config():
     config = trtllm.DecodingConfig()
     assert config.decoding_mode is None
     assert config.lookahead_decoding_config is None
     assert config.medusa_choices is None
+    assert config.eagle_config is None
 
     config = trtllm.DecodingConfig()
     config.decoding_mode = trtllm.DecodingMode.TopKTopP()
     assert config.decoding_mode.isTopKandTopP()
     assert config.lookahead_decoding_config == None
     assert config.medusa_choices == None
+    assert config.eagle_config is None
 
     config = trtllm.DecodingConfig()
     la_decoding_config = trtllm.LookaheadDecodingConfig(3, 5, 7)
@@ -1180,6 +1270,7 @@ def test_speculative_decoding_config():
     assert config.lookahead_decoding_config.max_window_size == la_decoding_config.max_window_size
     assert config.lookahead_decoding_config.max_verification_set_size == la_decoding_config.max_verification_set_size
     assert config.medusa_choices == None
+    assert config.eagle_config is None
 
     config = trtllm.DecodingConfig()
     config.medusa_choices = [[0, 0], [0, 1]]
@@ -1187,6 +1278,16 @@ def test_speculative_decoding_config():
     assert config.decoding_mode.isMedusa()
     assert config.lookahead_decoding_config == None
     assert config.medusa_choices == [[0, 0], [0, 1]]
+    assert config.eagle_config is None
+
+    config = trtllm.DecodingConfig()
+    config.eagle_config = trtllm.EagleConfig([[0, 0], [0, 1]])
+
+    assert config.decoding_mode.isEagle()
+    assert config.lookahead_decoding_config == None
+    assert config.medusa_choices == None
+    assert config.eagle_config is not None
+    assert config.eagle_config.eagle_choices == [[0, 0], [0, 1]]
 
 
 def test_logits_post_processor_config():
@@ -1225,6 +1326,7 @@ def test_executor_config():
     assert config.debug_config is None
     assert config.recv_poll_period_ms == 0
     assert config.max_seq_idle_microseconds == 180000000
+    assert config.spec_dec_config is None
 
     kwargs = {
         "max_beam_width":
@@ -1263,6 +1365,8 @@ def test_executor_config():
         50,
         "max_seq_idle_microseconds":
         240 * 1000 * 1000,
+        "spec_dec_config":
+        trtllm.SpeculativeDecodingConfig(fast_logits=True)
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -1277,6 +1381,7 @@ def test_executor_config():
     assert isinstance(config.debug_config, trtllm.DebugConfig)
     assert isinstance(config.logits_post_processor_config,
                       trtllm.LogitsPostProcessorConfig)
+    assert isinstance(config.spec_dec_config, trtllm.SpeculativeDecodingConfig)
 
 
 def test_parallel_config():
@@ -1294,7 +1399,8 @@ def test_parallel_config():
     comm_mode = trtllm.CommunicationMode.ORCHESTRATOR
     #Dummy path to worker executable
     worker_path = _os.path.abspath(__file__)
-    orchestrator_config = trtllm.OrchestratorConfig(True, str(worker_path))
+    orchestrator_config = trtllm.OrchestratorConfig(True, str(worker_path),
+                                                    None, True)
     parallel_config = trtllm.ParallelConfig(comm_type, comm_mode, device_ids,
                                             participant_ids,
                                             orchestrator_config)
@@ -1302,6 +1408,7 @@ def test_parallel_config():
     assert parallel_config.orchestrator_config.is_orchestrator == True
     assert parallel_config.orchestrator_config.worker_executable_path == str(
         worker_path)
+    assert parallel_config.orchestrator_config.spawn_processes == True
 
 
 def test_peft_cache_config():
@@ -1455,6 +1562,113 @@ def test_logits_post_processor_batched(model_files, model_path):
         assert len(tokens[req_id]) == expected_num_tokens, f"{req_id}"
 
 
+def test_kv_event_stream(model_path):
+
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(True,
+                                             4 * 64,
+                                             event_buffer_max_size=1024,
+                                             host_cache_size=3000000))
+
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    cache_manager = executor.get_kv_cache_event_manager()
+
+    events = cache_manager.get_latest_events()
+
+    assert len(events) == 1
+    assert isinstance(events[0], trtllm.kv_cache.KVCacheEvent)
+    assert events[0].event_id == 0
+    assert isinstance(events[0].data, trtllm.kv_cache.KVCacheCreatedData)
+
+    for req in range(2):
+        input_tokens = list(range(req, req + 127))
+        request = trtllm.Request(input_tokens,
+                                 max_tokens=5,
+                                 streaming=False,
+                                 sampling_config=trtllm.SamplingConfig())
+
+        id = executor.enqueue_request(request)
+
+        responses = executor.await_responses(id)
+
+        for response in responses:
+            assert not response.has_error()
+            if response.result.is_final:
+                time.sleep(0.1)
+                events = cache_manager.get_latest_events(
+                    datetime.timedelta(milliseconds=100))
+
+                if req == 0:
+                    assert events[0].event_id == 1
+                    assert isinstance(events[0].data,
+                                      trtllm.kv_cache.KVCacheStoredData)
+                    assert events[0].data.parent_hash is None
+                    assert len(events[0].data.blocks) == 1
+
+                    assert events[1].data.parent_hash == events[0].data.blocks[
+                        0].block_hash
+                    assert len(events[1].data.blocks) == 2
+                else:
+                    # Swap a block to secondary
+                    assert isinstance(events[0].data,
+                                      trtllm.kv_cache.KVCacheUpdatedData)
+                    assert events[0].data.cache_level.old_value == 0
+                    assert events[0].data.cache_level.new_value == 1
+                    # Store the filled context block
+                    assert isinstance(events[1].data,
+                                      trtllm.kv_cache.KVCacheStoredData)
+                    assert len(events[1].data.blocks) == 1
+                    assert events[1].data.parent_hash is None
+                    # Swap another block to secondary
+                    assert isinstance(events[2].data,
+                                      trtllm.kv_cache.KVCacheUpdatedData)
+                    assert events[2].data.cache_level.old_value == 0
+                    assert events[2].data.cache_level.new_value == 1
+                    assert isinstance(events[2].data.cache_level,
+                                      trtllm.kv_cache.KVCacheEventDiffInt)
+                    # Remove the first block in secondary
+                    assert isinstance(events[3].data,
+                                      trtllm.kv_cache.KVCacheRemovedData)
+                    assert len(events[3].data.block_hashes) == 1
+                    assert events[3].data.block_hashes[0] == events[
+                        0].data.block_hash
+                    # Store the second context block and the decode block
+                    assert isinstance(events[4].data,
+                                      trtllm.kv_cache.KVCacheStoredData)
+                    assert len(events[4].data.blocks) == 2
+                    assert events[4].data.parent_hash == events[1].data.blocks[
+                        0].block_hash
+
+
+def test_kv_event_stream_timeout(model_path):
+
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(True,
+                                             4 * 64,
+                                             event_buffer_max_size=1024))
+
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    cache_manager = executor.get_kv_cache_event_manager()
+
+    events = cache_manager.get_latest_events()
+    assert len(events) == 1
+
+    start = datetime.datetime.now()
+    events = cache_manager.get_latest_events(datetime.timedelta(seconds=1))
+    end = datetime.datetime.now()
+    # Make sure that it actually waited
+    assert abs(end - start) > datetime.timedelta(milliseconds=900)
+    assert len(events) == 0
+
+
 def test_iteration_stats():
     stats = trtllm.IterationStats()
     stats.timestamp = "01:23:56"
@@ -1530,6 +1744,7 @@ def test_kv_cache_config_pickle():
     config.enable_block_reuse = True
     config.free_gpu_memory_fraction = 0.3
     config.cross_kv_cache_fraction = 0.5
+    config.event_buffer_max_size = 1024
     config_copy = pickle.loads(pickle.dumps(config))
     assert config.enable_block_reuse == config_copy.enable_block_reuse
     assert config.max_tokens == config_copy.max_tokens
@@ -1539,6 +1754,7 @@ def test_kv_cache_config_pickle():
     assert config.cross_kv_cache_fraction == config_copy.cross_kv_cache_fraction
     assert config.host_cache_size == config_copy.host_cache_size
     assert config.onboard_blocks == config_copy.onboard_blocks
+    assert config.event_buffer_max_size == config_copy.event_buffer_max_size
 
 
 def test_peft_cache_config_pickle():
@@ -1633,6 +1849,8 @@ def test_executor_config_pickle():
         50,
         "max_seq_idle_microseconds":
         240 * 1000 * 1000,
+        "spec_dec_config":
+        trtllm.SpeculativeDecodingConfig(fast_logits=True)
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -1657,6 +1875,7 @@ def test_executor_config_pickle():
     assert config.extended_runtime_perf_knob_config.multi_block_mode == config_copy.extended_runtime_perf_knob_config.multi_block_mode
     assert config.debug_config.debug_input_tensors == config_copy.debug_config.debug_input_tensors
     assert config.max_seq_idle_microseconds == config_copy.max_seq_idle_microseconds
+    assert config.spec_dec_config.fast_logits == config_copy.spec_dec_config.fast_logits
 
 
 def test_return_full_tokens():
@@ -1674,3 +1893,35 @@ def test_return_full_tokens():
 
 def test_executor_version():
     assert trtllm.__version__ == trtllm_version.__version__
+
+
+def get_all_field_names_of_class(cls: type) -> list[str]:
+    return [
+        name for name, obj in inspect.getmembers(cls)
+        if isinstance(obj, property) or (
+            not callable(obj) and not name.startswith('__'))
+    ]
+
+
+def test_runtime_defaults():
+    full_runtime_defaults: dict[str, tp.Any] = json.loads("""{
+        "max_attention_window": [1, 2],
+        "sink_token_length": 4
+    }""")
+    all_field_names = set(full_runtime_defaults)
+
+    assert set(
+        get_all_field_names_of_class(trtllm.RuntimeDefaults)
+    ) == all_field_names, "Expected fields of runtime_defaults to match actual data"
+
+    msg = """\
+    Rather than create a `from_dict` on top of the bound class, \
+    we rely on being able to directly provide the dict created from raw json as kwargs to `RuntimeDefaults.` \
+    See: `PretrainedConfig.__init__()`"""
+
+    assert PretrainedConfig.create_runtime_defaults(
+        full_runtime_defaults) is not None, msg
+
+    default_runtime_defaults = trtllm.RuntimeDefaults()
+    for key in all_field_names:
+        assert getattr(default_runtime_defaults, key) == None

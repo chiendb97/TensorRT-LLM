@@ -15,13 +15,11 @@
 
 from typing import Optional
 
-import torch
-
-from ..._utils import pad_vocab_size, torch_dtype_to_str
+from ..._utils import pad_vocab_size
 from ...functional import Tensor, non_gated_version, recv, send
-from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                       GatedMLP, MoeConfig, PositionEmbeddingType, RmsNorm,
-                       SharedMoE)
+from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
+                       Embedding, GatedMLP, MoeConfig, PositionEmbeddingType,
+                       RmsNorm, SharedMoE)
 from ...mapping import Mapping
 from ...module import Module
 from ...plugin import init_all_reduce_helper
@@ -63,20 +61,23 @@ class DeepseekDecoderLayer(Module):
             tp_rank=config.mapping.tp_rank,
             quant_mode=config.quant_mode)
 
-        ClsMLP = GatedMLP
         moe_config = MoeConfig.from_dict(config.moe)
-
-        mlp_kwargs = {}
         if moe_config.num_experts > 0 and layer_idx > 0:
-            mlp_hidden_size = moe_config.num_shared_experts * moe_config.moe_intermediate_size
+            mlp_hidden_size = config.moe_intermediate_size
             hidden_act = config.hidden_act
-            ClsMLP = SharedMoE
-            mlp_kwargs = {"moe_config": moe_config, "mapping": config.mapping}
+            mlp_kwargs = {'moe_config': moe_config, 'mapping': config.mapping}
+            if moe_config.shared_expert_intermediate_size > 0:
+                ClsMLP = SharedMoE
+                mlp_kwargs['use_shared_gate'] = False
+                mlp_kwargs['use_side_stream'] = False
+            else:
+                ClsMLP = MOE
         else:
             ClsMLP = GatedMLP
             mlp_hidden_size = config.intermediate_size
             hidden_act = non_gated_version(
                 config.hidden_act)  # back to non gated for dense layers
+            mlp_kwargs = {}
 
         self.mlp = ClsMLP(hidden_size=config.hidden_size,
                           ffn_hidden_size=mlp_hidden_size,
@@ -225,26 +226,12 @@ class DeepseekForCausalLM(DecoderModelForCausalLM):
         pretrained_config = PretrainedConfig.from_dict(config)
         pretrained_config.set_rank(mapping.rank)  # TODO:remove this hack
 
-        if dtype == 'auto':
-            dtype = getattr(config, 'torch_dtype', None)
-        if dtype is None:
-            dtype = 'float16'
-        if isinstance(dtype, torch.dtype):
-            dtype = torch_dtype_to_str(dtype)
-        if dtype == 'float32':  # should remove "float32"
-            dtype = 'float16'
-        if dtype == 'bfloat16' and torch.cuda.get_device_properties(
-                0).major < 8:
-            logger.warning(
-                "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
-            dtype = 'float16'
-
         deepseek = cls.from_config(pretrained_config)
         weights = convert_deepseek(
             hf_model,
             config,
-            mapping,
-            dtype=dtype,
+            mapping=pretrained_config.mapping,
+            dtype=pretrained_config.dtype,
             use_parallel_embedding=config.get('use_parallel_embedding', False),
             sharding_dim=config.get('embedding_sharding_dim', 0),
             share_embedding_table=config.get('share_embedding_table', False))
