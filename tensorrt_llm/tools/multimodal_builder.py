@@ -988,15 +988,7 @@ def build_mllama_engine(args):
 
 
 def build_internvl_engine(args):
-	raw_image = Image.new('RGB', [10, 10])  # Dummy image
-	if 'InternVL2-26B' in args.model_path:
-		image_processor = AutoProcessor.from_pretrained(
-			'OpenGVLab/InternViT-6B-448px-V1-5')
-	else:
-		image_processor = CLIPImageProcessor.from_pretrained(
-			'OpenGVLab/InternViT-300M-448px')
-	image = image_processor(images=raw_image, return_tensors='pt').pixel_values
-	image = image.to(args.device, torch.float16)
+	image = torch.rand([1, 3, 448, 448]).to(args.device, torch.float16)
 
 	class InternvlVisionWrapper(torch.nn.Module):
 
@@ -1035,8 +1027,7 @@ def build_internvl_engine(args):
 
 	model = AutoModelForCausalLM.from_pretrained(args.model_path,
 												 torch_dtype=torch.float16,
-												 trust_remote_code=True,
-												 use_flash_attn=False).to(
+												 trust_remote_code=True).to(
 		args.device)
 	max_num_crops = model.config.max_dynamic_patch
 	wrapper = InternvlVisionWrapper(model, model.config.downsample_ratio,
