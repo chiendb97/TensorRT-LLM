@@ -49,6 +49,7 @@ from .model_config import (
     LinearActConfig,
     LinearConfig,
     MedusaHeadConfig,
+    DrafterConfig,
     MLPConfig,
     MOEConfig,
     QKVConfig,
@@ -188,6 +189,17 @@ def get_transformer_layers(model: nn.Module) -> List[nn.Module]:
         # InternLM2
         elif hasattr(model, "output"):
             modules += [model.output]
+
+        return modules
+    
+    if hasattr(model, "llm"):
+        # Llama
+        modules = [m for m in model.llm.model.children()]
+        if hasattr(model.llm, "lm_head"):
+            modules += [model.llm.lm_head]
+        # Drafter
+        if hasattr(model, "drafter"):
+            modules += [model.drafter]
 
         return modules
 
@@ -1509,6 +1521,41 @@ def build_medusa_heads_config(
         config.medusa_layers = layer_configs
         configs.append(config)
     return configs
+
+
+def build_drafter_config(
+    model: Optional[nn.Module], dtype: torch.dtype
+) -> Optional[DrafterConfig]:
+    def get_drafter(model: nn.Module) -> Optional[nn.Module]:
+        """Return the Drafter if exists."""
+        if hasattr(model, "drafter"):
+            return model.drafter
+        return None
+
+    drafter = get_drafter(model)
+
+    if drafter is None:
+        return None
+
+    config = DrafterConfig()
+    lm_head = drafter.lm_head
+    layer_configs = []
+    if isinstance(lm_head, torch.nn.Sequential):
+        config.lm_head = build_linear_config(lm_head[-1], LINEAR_COLUMN, dtype)
+        for layer in lm_head[0:-1]:
+            layer_config = LinearActConfig()
+            layer_config.linear = build_linear_config(layer.linear, LINEAR_COLUMN, dtype)
+            # NOTE: only silu is supported now.
+            layer_config.hidden_act = "silu"
+            layer_configs.append(layer_config)
+    else:
+        # binhtt4: Megatron support?
+        assert(False)
+    config.layers = layer_configs
+    config.rnn_u = build_linear_config(drafter.rnn_u, LINEAR_COLUMN, dtype)
+    config.rnn_w = build_linear_config(drafter.rnn_w, LINEAR_COLUMN, dtype)
+
+    return config
 
 
 def _split_fused_qkv_weight_and_scaling(

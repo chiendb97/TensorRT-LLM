@@ -530,6 +530,16 @@ class MedusaHeadConfig:
 
 
 @dataclass
+class DrafterConfig:
+    """The decoder layer config."""
+
+    layers: List[LinearActConfig] = None
+    lm_head: LinearConfig = None
+    rnn_u: LinearConfig = None
+    rnn_w: LinearConfig = None
+
+
+@dataclass
 class ModelConfig:
     """The full LLM model config that includes the full information needed for tensorrt_llm engine building.
 
@@ -561,6 +571,7 @@ class ModelConfig:
     share_embedding_table: bool = False
 
     medusa_heads: List[MedusaHeadConfig] = None
+    drafter: DrafterConfig = None
     num_medusa_heads: int = 0
     num_medusa_layers: int = 0
 

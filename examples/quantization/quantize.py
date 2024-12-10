@@ -113,6 +113,13 @@ if __name__ == "__main__":
                         default=False,
                         action='store_true',
                         help="whether to quantize the weights of medusa heads")
+    
+    # Redrafter
+    parser.add_argument('--drafter_model_dir', type=str, default=None)
+    parser.add_argument('--redrafter_num_beams', type=int, default=None)
+    parser.add_argument('--redrafter_draft_len_per_beam', type=int, default=None)
+    parser.add_argument("--redrafter_greedy_search", type=bool, default=True)
+    parser.add_argument("--quant_drafter", type=bool, default=False)
 
     # auto quantization
     parser.add_argument(
@@ -169,7 +176,13 @@ if __name__ == "__main__":
             medusa_hidden_act=args.medusa_hidden_act,
             medusa_model_dir=args.medusa_model_dir,
             quant_medusa_head=args.quant_medusa_head,
-            auto_quantize_bits=args.auto_quantize_bits)
+            auto_quantize_bits=args.auto_quantize_bits,
+            drafter_model_dir=args.drafter_model_dir,
+            redrafter_num_beams=args.redrafter_num_beams,
+            redrafter_draft_len_per_beam=args.redrafter_draft_len_per_beam,
+            redrafter_greedy_search=args.redrafter_greedy_search,
+            quant_drafter=args.quant_drafter,
+        )
     elif args.nemo_ckpt_path is not None:
         quantize_nemo_and_export(nemo_ckpt_path=args.nemo_ckpt_path,
                                  decoder_type=args.decoder_type,

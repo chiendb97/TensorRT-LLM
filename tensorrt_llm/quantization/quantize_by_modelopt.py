@@ -30,7 +30,7 @@ from accelerate.hooks import remove_hook_from_module
 from datasets import load_dataset
 from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel, LlamaForCausalLM
 
 from .._utils import release_gc, str_dtype_to_torch
 from ..logger import logger
@@ -325,6 +325,7 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
 
 def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
                    auto_quantize_bits):
+    print("quant_config:", quant_cfg)
     import modelopt.torch.quantization as mtq
 
     # NOTE: for ModelOpt v0.19 release
@@ -420,6 +421,7 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
                               forward_loop=calibrate_loop)
     else:
         mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
+        mtq.print_quant_summary(model)
     end_time = time.time()
     logger.info(
         "Quantization done. Total time used: {:.2f} s.".format(end_time -
@@ -494,6 +496,40 @@ def combine_medusa_weight(tp_size, pp_size, base_model_output_dir,
     logger.info("Combine medusa heads' weight, done.")
 
 
+def combine_redrafter_config(base_model_output_dir,
+                drafter_model_dir, redrafter_num_beams,
+                redrafter_draft_len_per_beam, redrafter_greedy_search, quant_drafter):
+    with open(f"{drafter_model_dir}/config.json", "r") as fp:
+        redrafter_config = json.load(fp)
+    num_draft_layers = redrafter_config['num_draft_layers']
+    exit_dim = redrafter_config['exit_dim']
+    hidden_size = redrafter_config['hidden_size']
+    rnn = redrafter_config['rnn']
+
+    # Add redrafter config into config.json
+    with open(f"{base_model_output_dir}/config.json", 'r') as f:
+        base_model_config = json.load(f)
+        f.close()
+
+    if not quant_drafter:
+        base_model_config['quantization']['exclude_modules'].append('*drafter*')
+    with open(f"{base_model_output_dir}/config.json", 'w') as f:
+        base_model_config['base_model_architecture'] = base_model_config['architecture']
+        base_model_config['architecture'] = "ReDrafterForCausalLM"
+
+        base_model_config['redrafter_num_layers'] = num_draft_layers
+        base_model_config['redrafter_hidden_size'] = hidden_size
+        base_model_config['redrafter_exit_dim'] = exit_dim
+        base_model_config['redrafter_is_rnn'] = rnn
+        base_model_config['redrafter_num_beams'] = redrafter_num_beams
+        base_model_config['redrafter_draft_len_per_beam'] = redrafter_draft_len_per_beam
+        base_model_config['redrafter_greedy_search'] = redrafter_greedy_search
+        json.dump(base_model_config, f, indent=4)
+
+    torch.cuda.empty_cache()
+    logger.info("Combine redrafter config, done.")
+
+
 def quantize_and_export(*,
                         model_dir,
                         device,
@@ -516,7 +552,12 @@ def quantize_and_export(*,
                         medusa_hidden_act=None,
                         medusa_model_dir=None,
                         quant_medusa_head=None,
-                        auto_quantize_bits=None):
+                        auto_quantize_bits=None,
+                        drafter_model_dir=None,
+                        redrafter_num_beams=None,
+                        redrafter_draft_len_per_beam=None,
+                        redrafter_greedy_search=None,
+                        quant_drafter=False):
     '''
         Load model from the model_dir, call Modelopt to quantize the model, and then export
         the quantized model as TRT-LLM checkpoint
@@ -529,7 +570,8 @@ def quantize_and_export(*,
         )
         raise e
 
-    from modelopt.torch.export import export_tensorrt_llm_checkpoint
+    # binhtt4: use custom export to add support for drafter model quantization
+    from .modelopt_custom.torch.export import export_tensorrt_llm_checkpoint
 
     from tensorrt_llm.models.convert_utils import infer_dtype
 
@@ -547,7 +589,13 @@ def quantize_and_export(*,
     hf_config = get_hf_config(model_dir)
     dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
-    model = get_model(model_dir, dtype, device=device)
+    if drafter_model_dir is not None:
+        # from tensorrt_llm.models.redrafter.weight import load_redrafter_hf
+        # model = load_redrafter_hf(model_dir, drafter_model_dir, dtype, device)
+        from recurrent_drafting.train.model import ReDrafter # type: ignore
+        model = ReDrafter.from_pretrained(model_dir, drafter_model_dir, device=device, torch_dtype=dtype)
+    else:
+        model = get_model(model_dir, dtype, device=device)
     model_type = get_model_type(model)
     if "vila" in model_dir:
         tokenizer = get_tokenizer(model_dir + "/llm",
@@ -619,8 +667,16 @@ def quantize_and_export(*,
         import os
         enable_quantize_lm_head = os.getenv("ENABLE_QUANTIZE_LM_HEAD", 'False').lower() in ('true', '1', 't')
         if enable_quantize_lm_head:
-            quant_cfg["quant_cfg"]["*lm_head*"]["enable"] = True
-
+            if qformat == "fp8":
+                quant_cfg["quant_cfg"]["*lm_head*"] = {"num_bits": (4, 3), "axis": None}
+            elif qformat == "int8_sq":
+                quant_cfg["quant_cfg"]["*lm_head*"]["enable"] = True
+            else:
+                print("lm_head quantization type not supported:", qformat)
+                assert(False)
+        if not quant_drafter:
+            quant_cfg["quant_cfg"]["*drafter*"] = {"enable" : False}
+        quant_cfg["quant_cfg"]["*output_quantizer"] = {"enable": False}
 
         model = quantize_model(model, quant_cfg, calib_dataloader, batch_size,
                                qformat, auto_quantize_bits)
@@ -637,14 +693,6 @@ def quantize_and_export(*,
 
         # Move meta tensor back to device before exporting.
         remove_hook_from_module(model, recurse=True)
-
-        QUANT_ALGO = {
-            "int8": "INT8",
-            "int8_sq": "W8A8_SQ_PER_CHANNEL",
-            "fp8": "FP8",
-            "int4_awq": "W4A16_AWQ",
-            "w4a8_awq": "W4A8_AWQ",
-        }
 
         export_tensorrt_llm_checkpoint(
             model,
@@ -760,6 +808,11 @@ def quantize_and_export(*,
                                   num_medusa_heads, num_medusa_layers,
                                   max_draft_len, medusa_hidden_act,
                                   medusa_model_dir, quant_medusa_head)
+        if drafter_model_dir is not None:
+            combine_redrafter_config(export_path,
+                drafter_model_dir, redrafter_num_beams,
+                redrafter_draft_len_per_beam, redrafter_greedy_search, quant_drafter)
+
         end_time = time.time()
         logger.info(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(

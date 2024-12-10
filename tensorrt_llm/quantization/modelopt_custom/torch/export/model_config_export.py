@@ -38,6 +38,7 @@ from .layer_utils import (
     build_layernorm_config,
     build_linear_config,
     build_medusa_heads_config,
+    build_drafter_config,
     check_model_compatibility,
     get_dtype,
     get_transformer_layers,
@@ -339,6 +340,7 @@ def torch_to_tensorrt_llm_checkpoint(
         # Handle Medusa Heads
         # TODO (chenhany): post-processing is not implemented yet
         config.medusa_heads = build_medusa_heads_config(model, dtype)
+        config.drafter = build_drafter_config(model, dtype)
 
         config.quantization = QUANTIZATION_NONE
         for layer in config.layers:
@@ -401,8 +403,12 @@ def torch_to_tensorrt_llm_checkpoint(
             # It also holds awq_block_size information for applicable layers.
             layer_config_dict = {}
             model_config_dict = model_config_to_dict(model_config)
+            print(model_config_dict.keys())
             # We split the weights from model_config and save them separately as two files.
             split_config_and_weights(model_config_dict, weights, "transformer", layer_config_dict)
+            # # binhtt4: for debugging
+            # for k in weights.keys():
+            #     print(k, weights[k].dtype, weights[k].shape)
             # Process per layer quantization config dict
             per_layer_quantization = process_layer_quant_config(layer_config_dict)
             # We only export the json once across ranks as all jsons should be the same except for the rank.

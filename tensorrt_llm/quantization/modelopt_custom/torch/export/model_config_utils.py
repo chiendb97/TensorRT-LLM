@@ -14,6 +14,7 @@ import dataclasses
 import math
 import re
 from typing import Dict, Optional, Union, get_args, get_origin
+from dataclasses import asdict
 
 import numpy as np
 import torch
@@ -73,7 +74,7 @@ def split_config_and_weights(
 
     if isinstance(config, dict):
         for k, v in config.items():
-            if k == "lm_head" and "medusa_heads" not in prefix:
+            if k == "lm_head" and "medusa_heads" not in prefix and "drafter" not in prefix:
                 # lm_head is not part of the transformer.
                 array_key = k
             elif k == "experts":
@@ -81,6 +82,8 @@ def split_config_and_weights(
                 array_key = prefix
             elif k == "medusa_heads":
                 # medusa_heads is not part of the transformer
+                array_key = k
+            elif k == "drafter":
                 array_key = k
             else:
                 array_key = f"{prefix}.{k}"
@@ -97,6 +100,8 @@ def split_config_and_weights(
                 weights[array_key] = v
                 config[k] = f"{array_key}"
             else:
+                if dataclasses.is_dataclass(v):
+                    v = asdict(v)
                 split_config_and_weights(v, weights, array_key, layer_config_dict)
     elif isinstance(config, list):
         for i, v in enumerate(config):
@@ -404,6 +409,15 @@ def pack_linear_weights(model_config: ModelConfig):
             linear_layers.append(head.lm_head)
             for layer in head.medusa_layers:
                 linear_layers.append(layer.linear)
+
+        _linear_layer_to_quantized_weight(linear_layers)
+
+    # binhtt4
+    if model_config.drafter is not None:
+        linear_layers = [model_config.drafter.rnn_u, model_config.drafter.rnn_w, model_config.drafter.lm_head]
+
+        for layer in model_config.drafter.layers:
+            linear_layers.append(layer.linear)
 
         _linear_layer_to_quantized_weight(linear_layers)
 

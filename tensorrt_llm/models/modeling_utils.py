@@ -667,6 +667,7 @@ class PretrainedModel(Module,
                 required_names.add(name)
 
         provided_names = set(weights.keys())
+        print("provided_names:", provided_names)
         if not required_names.issubset(provided_names):
             raise RuntimeError(
                 f"Required but not provided tensors:{required_names.difference(provided_names)}"
