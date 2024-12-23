@@ -8,7 +8,6 @@ from pathlib import Path
 import click
 from click_option_group import optgroup
 
-from tensorrt_llm.bench.benchmark.dataclasses import RuntimeConfig
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 
 # isort: off
@@ -17,9 +16,9 @@ from tensorrt_llm.bench.benchmark.utils.general import (get_executor_requests,
                                                         )
 # isort: on
 from tensorrt_llm.bench.benchmark.utils.multiproc import ThroughputBenchmark
-from tensorrt_llm.bench.benchmark.utils.reporting import report_statistics
-from tensorrt_llm.bench.dataclasses import BenchmarkEnvironment
-from tensorrt_llm.bench.enums import IFBSchedulingPolicy
+from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
+from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
+from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer)
 from tensorrt_llm.logger import logger
@@ -92,6 +91,16 @@ from tensorrt_llm.logger import logger
     default=False,
     help="Enable streaming mode for requests.",
 )
+@click.option(
+    "--iteration_log",
+    type=click.Path(dir_okay=False,
+                    writable=True,
+                    readable=False,
+                    path_type=Path,
+                    resolve_path=True),
+    required=False,
+    help="Path where iteration stats should be written to.",
+)
 @click.pass_obj
 def throughput_command(
     bench_env: BenchmarkEnvironment,
@@ -109,7 +118,9 @@ def throughput_command(
     request_rate: int = params.pop("request_rate")
     num_requests: int = params.pop("num_requests")
     model: str = bench_env.model
+    checkpoint_path: Path = bench_env.model_path or bench_env.model
     engine_dir: Path = params.pop("engine_dir")
+    iteration_log: Path = params.pop("iteration_log")
 
     # Engine configuration parsing
     exec_settings, build_cfg = get_settings_from_engine(engine_dir)
@@ -141,11 +152,15 @@ def throughput_command(
     exec_settings["settings_config"]["beam_width"] = beam_width
     exec_settings["settings_config"][
         "scheduler_policy"] = IFBSchedulingPolicy.NO_EVICT
+
+    # Dynamic runtime features.
+    exec_settings["settings_config"]["dynamic_max_batch_size"] = True
+
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
 
     # Initialize the HF tokenizer for the specified model.
-    tokenizer = initialize_tokenizer(bench_env.model)
+    tokenizer = initialize_tokenizer(checkpoint_path)
 
     # Dataset Loading and Preparation
     with open(dataset_path, "r") as dataset:
@@ -160,7 +175,6 @@ def throughput_command(
             "support this dataset.")
 
     if TRTLLM_BENCH_EXPERIMENTAL:
-        assert runtime_config.settings_config.max_num_tokens >= metadata.max_isl, "Max tokens is not large enough to handle max input length. Chunking currently not supported."
         asyncio.run(async_benchmark(runtime_config, requests, streaming))
     else:
         # Dataset Loading and Preparation
@@ -182,6 +196,7 @@ def throughput_command(
             request_queue=new_request_queue,
             response_queue=response_queue,
             streaming=streaming,
+            iteration_log=iteration_log,
         )
 
         try:
@@ -189,8 +204,8 @@ def throughput_command(
             benchmark.start_benchmark()
             benchmark.wait()
             benchmark.stop_benchmark()
-            report_statistics(benchmark.statistics, runtime_config, logger,
-                              streaming)
+            benchmark.dump_extra_stats()
+            benchmark.report_statistics()
         except KeyboardInterrupt:
             benchmark.stop_benchmark()
         finally:

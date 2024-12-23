@@ -18,9 +18,9 @@
 
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tensorrt_llm/runtime/loraModule.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
-#include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 
 #include <NvInferRuntime.h>
 #include <array>
@@ -498,16 +498,6 @@ public:
         return mPagedContextFMHA;
     }
 
-    void constexpr useXQA(bool useXQA) noexcept
-    {
-        mUseXQA = useXQA;
-    }
-
-    [[nodiscard]] bool constexpr useXQA() const noexcept
-    {
-        return mUseXQA;
-    }
-
     void constexpr setPpReduceScatter(bool ppReduceScatter) noexcept
     {
         mPpReduceScatter = ppReduceScatter;
@@ -646,6 +636,23 @@ public:
         std::shared_ptr<SpeculativeDecodingModule> const& speculativeDecodingModule) noexcept
     {
         mSpeculativeDecodingModule = speculativeDecodingModule;
+    }
+
+    void resetSpeculativeDecodingModule() noexcept
+    {
+        mSpeculativeDecodingModule.reset();
+    }
+
+    void enableSeamlessLookaheadDecoding(SizeType32 maxDraftTokens) noexcept
+    {
+        setSpeculativeDecodingMode(SpeculativeDecodingMode::LookaheadDecoding());
+        setSpeculativeDecodingModule(std::make_shared<LookaheadModule>(maxDraftTokens, maxDraftTokens));
+    }
+
+    void disableSeamlessLookaheadDecoding() noexcept
+    {
+        setSpeculativeDecodingMode(SpeculativeDecodingMode::None());
+        resetSpeculativeDecodingModule();
     }
 
     [[nodiscard]] nvinfer1::DataType getKvDataType() const noexcept

@@ -414,8 +414,8 @@ def main(args):
         ppls = [[] for _ in range(batch_size)]
         if eval_ppl and batch_size == 1:
             # Only for batch size of 1
-            seq_lens = (output_ids != end_id).logical_and(
-                output_ids != pad_id).sum(dim=-1)
+            seq_lens = (output_ids
+                        != end_id).logical_and(output_ids != pad_id).sum(dim=-1)
             context_logits = context_outputs['logits']
             # Remove the first generation logits which are same to last context logits
             generation_logits = outputs['scores'][1:]
@@ -480,10 +480,12 @@ def main(args):
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
             assert args.num_beams == 1, "Medusa should use num_beams == 1"
             runner_kwargs.update(medusa_choices=args.medusa_choices)
-        if args.eagle_choices is not None:
+        if args.eagle_choices is not None or args.eagle_posterior_threshold is not None:
             args.eagle_choices = ast.literal_eval(args.eagle_choices)
             assert args.num_beams == 1, "Eagle should use num_beams == 1"
             runner_kwargs.update(eagle_choices=args.eagle_choices)
+            runner_kwargs.update(
+                eagle_posterior_threshold=args.eagle_posterior_threshold)
         if args.lookahead_config is not None:
             args.lookahead_config = ast.literal_eval(args.lookahead_config)
             assert len(

@@ -43,13 +43,14 @@ class IdxEntry(Enum):
     SPEC_DECODING_GENERATION_LENGTHS = auto()
     SPEC_DECODING_PACKED_MASK = auto()
     SPEC_DECODING_POSITION_OFFSETS = auto()
-    MROPE_ROTARY_SIN_COS = auto()
+    MROPE_ROTARY_COS_SIN = auto()
     MROPE_POSITION_DELTAS = auto()
     HOST_RUNTIME_PERF_KNOBS = auto()
     HOST_CONTEXT_PROGRESS = auto()
     MLA_FUSED_Q_PROJ_TENSOR = auto()
     MLA_Q_B_PROJ_TENSOR = auto()
     MLA_KV_B_PROJ_TENSOR = auto()
+    LOGN_SCALING = auto()
 
 
 class IdxEntryParser:
@@ -77,6 +78,8 @@ class IdxEntryParser:
         self.is_spec_decoding_enabled = bool(
             plugin_info.pfc_as_list['is_spec_decoding_enabled'][0])
         self.is_mla_enabled = bool(plugin_info.pfc_as_list['is_mla_enabled'][0])
+        self.use_logn_scaling = bool(
+            plugin_info.pfc_as_list['use_logn_scaling'][0])
         self.init_entry_to_index()
 
     # WARNING: Must in sync with GPTAttentionPlugin::isEntryUsed in cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp
@@ -146,7 +149,7 @@ class IdxEntryParser:
             return self.is_spec_decoding_enabled
         elif entry == IdxEntry.SPEC_DECODING_GENERATION_LENGTHS:
             return self.is_spec_decoding_enabled
-        elif entry == IdxEntry.MROPE_ROTARY_SIN_COS:
+        elif entry == IdxEntry.MROPE_ROTARY_COS_SIN:
             return self.position_embedding_type.is_mrope()
         elif entry == IdxEntry.MROPE_POSITION_DELTAS:
             return self.position_embedding_type.is_mrope()
@@ -160,6 +163,8 @@ class IdxEntryParser:
             return self.is_mla_enabled
         elif entry == IdxEntry.MLA_KV_B_PROJ_TENSOR:
             return self.is_mla_enabled
+        elif entry == IdxEntry.LOGN_SCALING:
+            return self.use_logn_scaling
         else:
             return False
 

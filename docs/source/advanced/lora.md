@@ -37,7 +37,7 @@ python3 tensorrt_llm/examples/hf_lora_convert.py -i Japanese-Alpaca-LoRA-7b-v0 -
 python3 tensorrt_llm/examples/hf_lora_convert.py -i luotuo-lora-7b-0.1 -o luotuo-lora-7b-0.1-weights --storage-type float16
 ```
 
-Refer to the [tensorrtllm_backend documentation](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/inflight_batcher_llm/README.md) for a Multi-LoRA example using Triton.
+Refer to the [tensorrtllm_backend documentation](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/lora.md) for a Multi-LoRA example using Triton.
 
 ### LoRA tensor format details
 
@@ -120,7 +120,7 @@ The core idea is that we will have a fixed size, 2-level LoRA cache in TRT-LLM. 
 
 The CPU cache is configured to be a max size.  The GPU cache is configured to a percentage of free GPU memory after engine load. As requests come in LoRAs are stored in the host cache.
 
-As requests are scheduled for execution LoRAs are loaded into the GPU cache. Refer to the {ref}`batch-manager` section for more information.
+As requests are scheduled for execution LoRAs are loaded into the GPU cache.
 
 #### LoRA with tensor parallel
 

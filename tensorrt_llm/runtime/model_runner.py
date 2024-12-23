@@ -130,6 +130,9 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     max_medusa_token_len = builder_config.get('max_draft_len', 0)
     num_medusa_heads = builder_config.get('num_medusa_heads', 0)
 
+    skip_cross_attn_blocks = bool(config['pretrained_config'].get(
+        'skip_cross_attn_blocks', False))
+
     # ReDrafter
     redrafter_num_beams = config['pretrained_config'].get(
         'redrafter_num_beams', 0)
@@ -143,8 +146,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     paged_state = plugin_config['paged_state']
     tokens_per_block = plugin_config['tokens_per_block']
     lora_plugin = plugin_config.get('lora_plugin')
-    skip_cross_attn_blocks = bool(
-        pretrained_config.get('skip_cross_attn_blocks', False))
 
     model_config = ModelConfig(
         max_batch_size=max_batch_size,
@@ -464,10 +465,9 @@ class ModelRunnerMixin:
             task_vocab_size = torch.tensor([task_vocab_size], dtype=torch.int32)
             prompt_table_data = prompt_table_data.view(-1, hidden_size)
         else:
-            prompt_table_data = torch.empty([1, self.hidden_size],
-                                            dtype=self.dtype)
+            prompt_table_data = torch.empty(
+                [1, self.hidden_size * self.mapping.tp_size], dtype=self.dtype)
             task_vocab_size = torch.zeros([1], dtype=torch.int32)
-
         if tasks is not None:
             tasks = torch.tensor([int(t) for t in tasks.split(',')],
                                  dtype=torch.int32)
@@ -495,14 +495,16 @@ class ModelRunner(ModelRunnerMixin):
     An interface class that wraps GenerationSession and provides generation methods.
     """
 
-    def __init__(self,
-                 session: GenerationSession,
-                 max_batch_size: int,
-                 max_input_len: int,
-                 max_seq_len: int,
-                 max_beam_width: int,
-                 kv_cache_type: KVCacheType,
-                 lora_manager: Optional[LoraManager] = None) -> None:
+    def __init__(
+        self,
+        session: GenerationSession,
+        max_batch_size: int,
+        max_input_len: int,
+        max_seq_len: int,
+        max_beam_width: int,
+        kv_cache_type: KVCacheType,
+        lora_manager: Optional[LoraManager] = None,
+    ) -> None:
         """
         Create a ModelRunner instance.
         You are recommended to use the from_dir method to load the engine and create a ModelRunner instance.
@@ -529,20 +531,23 @@ class ModelRunner(ModelRunnerMixin):
         self.lora_manager = lora_manager
         self.kv_cache_type = kv_cache_type
         self.enable_context_fmha_fp32_acc = False
+        self.multi_block_mode = True
 
     @classmethod
     def from_engine(
-            cls,
-            engine: Engine,
-            max_output_len: Optional[int] = None,
-            lora_dir: Optional[List[str]] = None,
-            rank: int = 0,
-            debug_mode: bool = False,
-            lora_ckpt_source: str = "hf",
-            medusa_choices: List[List[int]] = None,
-            stream: torch.cuda.Stream = None,
-            gpu_weights_percent: float = 1,
-            enable_context_fmha_fp32_acc: Optional[bool] = None
+        cls,
+        engine: Engine,
+        *,
+        max_output_len: Optional[int],
+        lora_dir: Optional[List[str]],
+        rank: int,
+        debug_mode: bool,
+        lora_ckpt_source: str,
+        medusa_choices: List[List[int]],
+        stream: torch.cuda.Stream,
+        gpu_weights_percent: float,
+        enable_context_fmha_fp32_acc: Optional[bool],
+        multi_block_mode: Optional[bool],
     ) -> 'ModelRunner':
         model_config = _engine_config_to_model_config(
             engine.config, gpu_weights_percent=gpu_weights_percent)
@@ -601,21 +606,24 @@ class ModelRunner(ModelRunnerMixin):
                      kv_cache_type=model_config.kv_cache_type,
                      lora_manager=lora_manager)
         runner.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
+        runner.multi_block_mode = multi_block_mode
         return runner
 
     @classmethod
     def from_dir(
-            cls,
-            engine_dir: str,
-            max_output_len: Optional[int] = None,
-            lora_dir: Optional[List[str]] = None,
-            rank: int = 0,
-            debug_mode: bool = False,
-            lora_ckpt_source: str = "hf",
-            medusa_choices: List[List[int]] = None,
-            stream: torch.cuda.Stream = None,
-            gpu_weights_percent: float = 1,
-            enable_context_fmha_fp32_acc: Optional[bool] = None
+        cls,
+        engine_dir: str,
+        *,
+        max_output_len: Optional[int] = None,
+        lora_dir: Optional[List[str]] = None,
+        rank: int = 0,
+        debug_mode: bool = False,
+        lora_ckpt_source: str = "hf",
+        medusa_choices: List[List[int]] = None,
+        stream: torch.cuda.Stream = None,
+        gpu_weights_percent: float = 1,
+        enable_context_fmha_fp32_acc: Optional[bool] = None,
+        multi_block_mode: Optional[bool] = None,
     ) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
@@ -635,6 +643,8 @@ class ModelRunner(ModelRunnerMixin):
                 Medusa choices to use when in Medusa decoding
             stream (torch.cuda.Stream):
                 Stream to use.
+            multi_block_mode (bool):
+                Whether to distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel.
         Returns:
             ModelRunner: An instance of ModelRunner.
         """
@@ -709,6 +719,7 @@ class ModelRunner(ModelRunnerMixin):
                          kv_cache_type=KVCacheType.CONTINUOUS,
                          lora_manager=lora_manager)
             runner.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
+            runner.multi_block_mode = multi_block_mode
             return runner
         else:
             # the new engine format
@@ -721,10 +732,19 @@ class ModelRunner(ModelRunnerMixin):
                     ]
                     lora_ckpt_source = engine.config.build_config.lora_config.lora_ckpt_source
 
-            runner = ModelRunner.from_engine(engine, max_output_len, lora_dir,
-                                             rank, debug_mode, lora_ckpt_source,
-                                             medusa_choices, stream,
-                                             gpu_weights_percent)
+            runner = ModelRunner.from_engine(
+                engine=engine,
+                max_output_len=max_output_len,
+                lora_dir=lora_dir,
+                rank=rank,
+                debug_mode=debug_mode,
+                lora_ckpt_source=lora_ckpt_source,
+                medusa_choices=medusa_choices,
+                stream=stream,
+                gpu_weights_percent=gpu_weights_percent,
+                enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc,
+                multi_block_mode=multi_block_mode,
+            )
             profiler.stop('load tensorrt_llm engine')
             loading_time = profiler.elapsed_time_in_sec(
                 "load tensorrt_llm engine")
@@ -903,6 +923,7 @@ class ModelRunner(ModelRunnerMixin):
             lora_uids=lora_uids,
             medusa_choices=medusa_choices,
             enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc,
+            multi_block_mode=self.multi_block_mode,
             encoder_max_input_length=encoder_max_input_length,
         )
 

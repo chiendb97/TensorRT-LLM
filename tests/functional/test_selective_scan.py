@@ -271,7 +271,11 @@ class TestFunctional(unittest.TestCase):
         # long sequence tests to cover the int overflow issue
         list(
             product([5120], [64], [1], ['context'], ['float16'], [2], [131072],
-                    [True, False], [True, False])),
+                    [True, False], [True, False])) +
+        # P=8x and H=2x
+        list(
+            product([144], [72], [1], ['context', 'generation'], ['float16'],
+                    [16], [131072], [True, False], [True, False])),
         name_func=unittest_name_func)
     def test_selective_scan_v2(self, dim, headdim, ngroups, req_type, dtype,
                                batch_size, max_seq_len, has_z, remove_padding):
@@ -297,6 +301,7 @@ class TestFunctional(unittest.TestCase):
         dstate = 128
         chunk_size = 256
         nheads = dim // headdim
+        nheads_pad0 = (nheads + 7) // 8 * 8 - nheads
         delta_softplus = True
         mean = 0.0
         if long_context:
@@ -339,6 +344,11 @@ class TestFunctional(unittest.TestCase):
                          nheads,
                          device=device,
                          dtype=str_dtype_to_torch(dtype))
+        if nheads_pad0:
+            dt_pad0 = torch.randn(total_num_tokens,
+                                  nheads_pad0,
+                                  device=device,
+                                  dtype=str_dtype_to_torch(dtype))
         dt_bias = torch.rand(nheads, device=device) - 4.0
         A = -torch.rand(nheads, device=device) - 1.0
         BC = torch.randn(total_num_tokens,
@@ -354,15 +364,21 @@ class TestFunctional(unittest.TestCase):
         if not remove_padding or req_type == 'generation':
             x = x.view(-1, seq_len, dim)
             dt = dt.view(-1, seq_len, nheads)
+            if nheads_pad0:
+                dt_pad0 = dt_pad0.view(-1, seq_len, nheads_pad0)
             BC = BC.view(-1, seq_len, ngroups * dstate * 2)
             if has_z:
                 z = z.view(-1, seq_len, dim)
         xBC = torch.concat([x, BC], dim=-1).contiguous()
         if has_z:
-            zxBCdt = torch.concat([z, torch.randn_like(xBC), dt],
+            zxBCdt = torch.concat([z, torch.randn_like(xBC), dt] + ([
+                dt_pad0,
+            ] if nheads_pad0 else []),
                                   dim=-1).contiguous()
         else:
-            zxBCdt = torch.concat([torch.randn_like(xBC), dt],
+            zxBCdt = torch.concat([torch.randn_like(xBC), dt] + ([
+                dt_pad0,
+            ] if nheads_pad0 else []),
                                   dim=-1).contiguous()
         output = torch.zeros(x.shape,
                              device=device,
@@ -512,26 +528,39 @@ class TestFunctional(unittest.TestCase):
                         dt_softplus=delta_softplus)
                     part_out_ref = rearrange(part_out_ref,
                                              "b l h p -> b l (h p)")
-                    out_ref[start:end, ] = part_out_ref.squeeze(0)
-                    state_ref[i, ] = part_state_ref.squeeze(0)
+                    out_ref[
+                        start:end,
+                    ] = part_out_ref.squeeze(0)
+                    state_ref[
+                        i,
+                    ] = part_state_ref.squeeze(0)
             elif long_context:
                 # to save memory
                 for i in range(batch_size):
-                    x_reshaped = rearrange(x_ref[i:i + 1, ],
+                    x_reshaped = rearrange(x_ref[
+                        i:i + 1,
+                    ],
                                            "b l (h p) -> b l h p",
                                            p=headdim)
-                    B_ref_reshaped = rearrange(B_ref[i:i + 1, ],
+                    B_ref_reshaped = rearrange(B_ref[
+                        i:i + 1,
+                    ],
                                                "b l (g n) -> b l g n",
                                                g=ngroups)
-                    C_ref_reshaped = rearrange(C_ref[i:i + 1, ],
+                    C_ref_reshaped = rearrange(C_ref[
+                        i:i + 1,
+                    ],
                                                "b l (g n) -> b l g n",
                                                g=ngroups)
-                    z_ref_reshaped = rearrange(z_ref[i:i + 1, ],
-                                               "b l (h p) -> b l h p",
-                                               p=headdim) if has_z else None
+                    z_ref_reshaped = rearrange(
+                        z_ref[
+                            i:i + 1,
+                        ], "b l (h p) -> b l h p", p=headdim) if has_z else None
                     part_out_ref, part_state_ref = ssd_chunk_scan_combined_ref(
                         x_reshaped,
-                        dt_ref[i:i + 1, ],
+                        dt_ref[
+                            i:i + 1,
+                        ],
                         A_ref,
                         B_ref_reshaped,
                         C_ref_reshaped,
@@ -542,8 +571,12 @@ class TestFunctional(unittest.TestCase):
                         dt_softplus=delta_softplus)
                     part_out_ref = rearrange(part_out_ref,
                                              "b l h p -> b l (h p)")
-                    out_ref[i, ] = part_out_ref.squeeze(0)
-                    state_ref[i, ] = part_state_ref.squeeze(0)
+                    out_ref[
+                        i,
+                    ] = part_out_ref.squeeze(0)
+                    state_ref[
+                        i,
+                    ] = part_state_ref.squeeze(0)
             else:
                 x_reshaped = rearrange(x_ref, "b l (h p) -> b l h p", p=headdim)
                 B_ref_reshaped = rearrange(B_ref,

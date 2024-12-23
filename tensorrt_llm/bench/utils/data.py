@@ -1,10 +1,12 @@
 import json
+import math
 from functools import partial
 from typing import List, TextIO, Tuple
 
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
-from tensorrt_llm.bench.dataclasses import DatasetMetadata, InferenceRequest
+from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
+                                                    InferenceRequest)
 
 
 def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
@@ -19,7 +21,9 @@ def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
     """
     # Initialize the tokenizer specific to the model that we are planning
     # to benchmark.
-    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained(model_name,
+                                              padding_side="left",
+                                              trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
@@ -50,7 +54,6 @@ def create_dataset_from_stream(
     dataset = []
     max_isl = 0
     max_osl = 0
-    max_sequence = 0
     max_requests = num_requests if num_requests > 0 else float("inf")
 
     # If we're limiting the input length to a certain size, then set up
@@ -71,6 +74,9 @@ def create_dataset_from_stream(
     # For each line in the standard input, parse out the JSON string we expect
     # to see.
     # Note the := walrus -- we're assigning and checking the condition.
+    all_isl = []
+    all_osl = []
+    all_seq_len = []
     while (line := stream.readline()) and len(dataset) < max_requests:
         # We expect the data to come in as a JSON string.
         # For example:
@@ -93,17 +99,27 @@ def create_dataset_from_stream(
             output_tokens=output_limiter(osl),
             input_ids=logits,
         )
-        max_isl = max(max_isl, len(logits))
-        max_osl = max(max_osl, osl)
-        max_sequence = max(max_sequence, len(logits) + osl)
+        all_isl.append(len(logits))
+        all_osl.append(osl)
+        all_seq_len.append(len(logits) + osl)
         dataset.append(request)
+
+    max_isl = max(all_isl)
+    max_osl = max(all_osl)
+    max_seq_len = max(all_seq_len)
+    avg_isl = math.ceil(sum(all_isl) / len(all_isl))
+    avg_osl = math.ceil(sum(all_osl) / len(all_osl))
+    avg_seq_len = math.ceil(sum(all_seq_len) / len(all_seq_len))
 
     # Fill in basic dataset metrics here
     # TODO: Maybe fill this out to be more complete?
     metadata = DatasetMetadata(
+        avg_isl=avg_isl,
+        avg_osl=avg_osl,
         max_isl=max_isl,
         max_osl=max_osl,
-        max_sequence_length=max_sequence,
+        avg_sequence_length=avg_seq_len,
+        max_sequence_length=max_seq_len,
         num_requests=len(dataset),
     )
 

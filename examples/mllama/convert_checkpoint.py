@@ -12,7 +12,7 @@ from tensorrt_llm._utils import release_gc
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import MLLaMAModel
+from tensorrt_llm.models import MLLaMAForCausalLM
 from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -189,13 +189,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
@@ -305,7 +298,7 @@ def update_quant_config_from_hf(quant_config, hf_config) -> QuantConfig:
 #                       moe_tp_size=args.moe_tp_size,
 #                       moe_ep_size=args.moe_ep_size,
 #                       rank=rank)
-#     llama = MLLaMAModel.from_meta_ckpt(
+#     llama = MLLaMAForCausalLM.from_meta_ckpt(
 #         args.meta_ckpt_dir,
 #         args.dtype,
 #         quant_config=args_to_quant_config(args),
@@ -319,7 +312,6 @@ def args_to_build_options(args):
     return {
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'disable_weight_only_quant_plugin':
         args.disable_weight_only_quant_plugin,
         'quant_ckpt_path': args.quant_ckpt_path,
@@ -330,7 +322,7 @@ def args_to_build_options(args):
 def from_cli_args(args):
     n_kv_head = args.n_kv_head if args.n_kv_head is not None else args.n_head
     config = {
-        'architecture': "MLLaMAModel",
+        'architecture': "MLLaMAForCausalLM",
         'dtype': infer_dtype(args.dtype),
         'logits_dtype': 'float32',
         'num_hidden_layers': args.n_layer,
@@ -368,7 +360,7 @@ def convert_and_save_hf(args):
     model_dir = args.model_dir
     load_by_shard = args.load_by_shard
     world_size = args.tp_size * args.pp_size
-    # Need to convert the cli args to the kay-value pairs and override them in the generate config dict.
+    # Need to convert the cli args to the key-value pairs and override them in the generate config dict.
     # Ideally these fields will be moved out of the config and pass them into build API, keep them here for compatibility purpose for now,
     # before the refactor is done.
     override_fields = {}
@@ -392,14 +384,15 @@ def convert_and_save_hf(args):
                           moe_tp_size=args.moe_tp_size,
                           moe_ep_size=args.moe_ep_size)
         # TODO: support moe quantization for tp + ep
-        MLLaMAModel.quantize(args.model_dir,
-                             args.output_dir,
-                             dtype=args.dtype,
-                             mapping=mapping,
-                             quant_config=quant_config,
-                             device='cpu' if args.load_model_on_cpu else 'cuda',
-                             calib_dataset=args.calib_dataset,
-                             **override_fields)
+        MLLaMAForCausalLM.quantize(
+            args.model_dir,
+            args.output_dir,
+            dtype=args.dtype,
+            mapping=mapping,
+            quant_config=quant_config,
+            device='cpu' if args.load_model_on_cpu else 'cuda',
+            calib_dataset=args.calib_dataset,
+            **override_fields)
     else:
         # When not loading by shard, preload one complete model and then slice per rank weights from this
         # this saves the disk reloading time
@@ -411,7 +404,7 @@ def convert_and_save_hf(args):
                               moe_tp_size=args.moe_tp_size,
                               moe_ep_size=args.moe_ep_size)
             tik = time.time()
-            llama = MLLaMAModel.from_hugging_face(
+            llama = MLLaMAForCausalLM.from_hugging_face(
                 model_dir,
                 args.dtype,
                 mapping=mapping,

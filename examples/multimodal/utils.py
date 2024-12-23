@@ -1,5 +1,5 @@
 def add_common_args(parser):
-    parser.add_argument('--max_new_tokens', type=int, default=30)
+    parser.add_argument('--max_new_tokens', type=int, default=128)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--visual_engine_dir',
@@ -20,6 +20,7 @@ def add_common_args(parser):
                         help="Directory containing tokenizer")
     parser.add_argument('--input_text',
                         type=str,
+                        nargs='+',
                         default=None,
                         help='Text prompt to LLM')
     parser.add_argument('--num_beams',
@@ -40,10 +41,13 @@ def add_common_args(parser):
     parser.add_argument('--check_accuracy',
                         action='store_true',
                         help='Check correctness of text output')
-    parser.add_argument('--video_path',
-                        type=str,
-                        default=None,
-                        help='Path to your local video file')
+    parser.add_argument(
+        '--video_path',
+        type=str,
+        default=None,
+        help=
+        'Path to your local video file, using \'llava-onevision-accuracy\' to check the Llava-OneVision model accuracy'
+    )
     parser.add_argument(
         '--video_num_frames',
         type=int,
@@ -52,6 +56,7 @@ def add_common_args(parser):
         default=None)
     parser.add_argument("--image_path",
                         type=str,
+                        nargs='+',
                         default=None,
                         help='List of input image paths, separated by symbol')
     parser.add_argument("--path_sep",
@@ -86,5 +91,14 @@ def add_common_args(parser):
         type=float,
         help=
         'Specify the kv cache fraction reserved for cross attention. Only applicable for encoder-decoder models. By default 0.5 for self and 0.5 for cross.',
+    )
+    parser.add_argument(
+        '--multi_block_mode',
+        type=lambda s: s.lower() in
+        ("yes", "true", "t", "1"
+         ),  # custom boolean function to convert input string to boolean
+        default=True,
+        help=
+        "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
     )
     return parser

@@ -812,8 +812,6 @@ class GenerationSession(object):
         self.top_p_reset_ids = None
         # TODO: in tensorrt_llm/cpp/tensorrt_llm/thop/dynamicDecodeOp.cpp it's T, can be float or half?
         self.embedding_bias_opt = None
-        # use one more block in paged kv cache.
-        self.use_one_more_block = False
 
         self.buffer = None
         self.buffer_allocated = False
@@ -1019,7 +1017,7 @@ class GenerationSession(object):
             expected_tensor_names += [
                 'spec_decoding_generation_lengths',
                 'spec_decoding_position_offsets', 'spec_decoding_packed_mask',
-                'medusa_logits'
+                'spec_decoding_use', 'medusa_logits'
             ]
 
         if self.is_redrafter_mode:
@@ -1029,6 +1027,9 @@ class GenerationSession(object):
             self.runtime.engine.get_tensor_name(i)
             for i in range(self.runtime.engine.num_io_tensors)
         ]
+        for name in found_tensor_names:
+            if name.startswith("allreduce_ub_"):
+                expected_tensor_names += [name]
         if not self.debug_mode and set(expected_tensor_names) != set(
                 found_tensor_names):
             logger.error(
@@ -1599,6 +1600,7 @@ class GenerationSession(object):
         # Note: spec_decoding_packed_mask has no paddings in the first dimension.
         self.spec_decoding_packed_mask = medusa_info.medusa_packed_mask.unsqueeze(
             0).expand(target_shape).reshape(-1, target_shape[-1]).cuda()
+        self.spec_decoding_use = medusa_info.medusa_spec_decoding_use
 
         self.medusa_paths = medusa_info.medusa_paths
         self.medusa_tree_ids = medusa_info.medusa_tree_ids
@@ -1622,15 +1624,13 @@ class GenerationSession(object):
         return
 
     def _get_num_paged_blocks(self, max_attention_window_size,
-                              sink_token_length, use_one_more_block):
+                              sink_token_length):
         bubble_len = 0
         if sink_token_length % self.tokens_per_block > 0:
             bubble_len += (self.tokens_per_block -
                            sink_token_length % self.tokens_per_block)
         max_blocks_per_seq = math.ceil(
             (max_attention_window_size + bubble_len) / self.tokens_per_block)
-        if use_one_more_block:
-            max_blocks_per_seq += 1
         num_blocks = self.batch_size * self.beam_width * max_blocks_per_seq
 
         return num_blocks, max_blocks_per_seq
@@ -1734,9 +1734,6 @@ class GenerationSession(object):
         else:
             assert False, "invalid sink_token_length!"
 
-        self.use_one_more_block = (
-            self.paged_kv_cache and beam_width > 1
-            and self.max_seq_length > self.max_attention_window_size)
         self.lora_manager = lora_manager
         if medusa_choices is not None:
             self._init_medusa(medusa_choices)
@@ -1805,8 +1802,7 @@ class GenerationSession(object):
         if self.use_kv_cache:
             if self.paged_kv_cache and self.has_attn_layers:
                 num_blocks, _ = self._get_num_paged_blocks(
-                    self.max_attention_window_size, self.sink_token_length,
-                    self.use_one_more_block)
+                    self.max_attention_window_size, self.sink_token_length)
                 self._memory_pool_allocator = MemoryPoolsAllocator(
                     num_blocks=num_blocks,
                     tokens_per_block=self.tokens_per_block,
@@ -1822,9 +1818,7 @@ class GenerationSession(object):
 
                 if self.cross_attention:  # As for now we enable cross paged kv and self paged kv to share the same tokens_per_block
                     cross_num_blocks, _ = self._get_num_paged_blocks(
-                        self.encoder_max_input_length,
-                        sink_token_length=0,
-                        use_one_more_block=False)
+                        self.encoder_max_input_length, sink_token_length=0)
 
                     num_kv_heads_per_layer = MemoryPoolsAllocator.prepare_num_kv_heads_per_layer(
                         self.get_num_heads_kv(), self.num_attn_layers)
@@ -1960,6 +1954,7 @@ class GenerationSession(object):
                 'spec_decoding_position_offsets'] = self.spec_decoding_position_offsets
             self.buffer[
                 'spec_decoding_generation_lengths'] = self.spec_decoding_generation_lengths
+            self.buffer['spec_decoding_use'] = self.spec_decoding_use
         self.buffer_allocated = True
         if self.is_medusa_mode:
             return self.num_draft_tokens
@@ -2313,6 +2308,7 @@ class GenerationSession(object):
                        'spec_decoding_position_offsets')
             add_tensor(self.buffer['spec_decoding_generation_lengths'],
                        'spec_decoding_generation_lengths')
+            add_tensor(self.buffer['spec_decoding_use'], 'spec_decoding_use')
 
         return tensors
 
@@ -2655,6 +2651,7 @@ class GenerationSession(object):
                        'spec_decoding_position_offsets')
             add_tensor(self.buffer['spec_decoding_generation_lengths'],
                        'spec_decoding_generation_lengths')
+            add_tensor(self.buffer['spec_decoding_use'], 'spec_decoding_use')
 
         if self.is_redrafter_mode:
             set_redrafter_gen_tensors(self, batch_size, add_tensor,
@@ -3094,11 +3091,11 @@ class GenerationSession(object):
                 b, :self.accept_lengths[b]] == self.end_ids[b]
             should_stop_with_end_id = torch.any(end_id_mask)
             self.medusa_should_stop[b] = self.medusa_should_stop[b] or (
-                prev_total_output_length + self.accept_lengths[b] >=
-                self.max_new_tokens) or should_stop_with_end_id
+                prev_total_output_length + self.accept_lengths[b]
+                >= self.max_new_tokens) or should_stop_with_end_id
             # update accept lengths for the current step.
-            if (prev_total_output_length + self.accept_lengths[b] >=
-                    self.max_new_tokens):
+            if (prev_total_output_length + self.accept_lengths[b]
+                    >= self.max_new_tokens):
                 self.accept_lengths[b] = min(
                     self.max_new_tokens - prev_total_output_length,
                     self.accept_lengths[b])
@@ -3250,28 +3247,41 @@ class GenerationSession(object):
 
         return should_stop
 
-    def handle_per_step(self, cache_indirections: list, step: int,
-                        batch_size: int, max_context_length: int,
-                        beam_width: int, input_ids: torch.Tensor,
-                        hidden_states: torch.Tensor, scfg: SamplingConfig,
-                        kv_cache_block_offsets: torch.Tensor,
-                        host_kv_cache_block_offsets: torch.Tensor,
-                        cross_kv_cache_block_offsets: torch.Tensor,
-                        host_cross_kv_cache_block_offsets: torch.Tensor,
-                        prompt_embedding_table: torch.Tensor,
-                        tasks: torch.Tensor, context_lengths: torch.Tensor,
-                        host_context_lengths, attention_mask: torch.Tensor,
-                        cross_attention_mask_for_context: torch.Tensor,
-                        cross_attention_mask_for_gen: torch.Tensor,
-                        prompt_vocab_size: torch.Tensor, ite: int,
-                        sequence_limit_lengths: torch.Tensor,
-                        sequence_lengths: torch.Tensor,
-                        next_step_tensors: Dict[str,
-                                                RuntimeTensor], stop_words_data,
-                        bad_words_data, encoder_output: torch.Tensor,
-                        encoder_input_lengths: torch.Tensor,
-                        stopping_criteria: StoppingCriteria,
-                        logits_processor: LogitsProcessor, **kwargs):
+    def handle_per_step(
+        self,
+        *,
+        cache_indirections: list,
+        step: int,
+        batch_size: int,
+        max_context_length: int,
+        beam_width: int,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        scfg: SamplingConfig,
+        kv_cache_block_offsets: torch.Tensor,
+        host_kv_cache_block_offsets: torch.Tensor,
+        cross_kv_cache_block_offsets: torch.Tensor,
+        host_cross_kv_cache_block_offsets: torch.Tensor,
+        prompt_embedding_table: torch.Tensor,
+        tasks: torch.Tensor,
+        context_lengths: torch.Tensor,
+        host_context_lengths,
+        attention_mask: torch.Tensor,
+        cross_attention_mask_for_context: torch.Tensor,
+        cross_attention_mask_for_gen: torch.Tensor,
+        prompt_vocab_size: torch.Tensor,
+        ite: int,
+        sequence_limit_lengths: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        next_step_tensors: Dict[str, RuntimeTensor],
+        stop_words_data,
+        bad_words_data,
+        encoder_output: torch.Tensor,
+        encoder_input_lengths: torch.Tensor,
+        stopping_criteria: StoppingCriteria,
+        logits_processor: LogitsProcessor,
+        **kwargs,
+    ):
         if self.debug_mode:
             print(
                 f"=================================== STEP {step} =================================="
@@ -3693,7 +3703,8 @@ class GenerationSession(object):
                     self.debug_buffer.pop(k)
 
         debug_dir = Path(
-            f"tllm_debug/PP_{self.mapping.pp_rank}/TP_{self.mapping.tp_rank}")
+            f"tllm_debug/PP_{self.mapping.pp_rank}/TP_{self.mapping.tp_rank}/CP_{self.mapping.cp_rank}"
+        )
         debug_dir.mkdir(parents=True, exist_ok=True)
 
         for name, t in self.debug_buffer.items():
@@ -3710,6 +3721,7 @@ class GenerationSession(object):
                 fmt=txt_format)
 
     def decode_regular(self,
+                       *,
                        batch_size: int,
                        scfg: SamplingConfig,
                        sequence_lengths: torch.Tensor,
@@ -3799,17 +3811,40 @@ class GenerationSession(object):
         for step in range(0, self.max_new_tokens):
 
             should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths = self.handle_per_step(
-                cache_indirections, step, batch_size, max_context_length,
-                beam_width, input_ids, hidden_states, scfg,
-                kv_cache_block_offsets, host_kv_cache_block_offsets,
-                cross_kv_cache_block_offsets, host_cross_kv_cache_block_offsets,
-                prompt_embedding_table, tasks, context_lengths,
-                host_context_lengths, attention_mask,
-                cross_attention_mask_for_context, cross_attention_mask_for_gen,
-                prompt_vocab_size, ite, sequence_limit_lengths,
-                sequence_lengths, next_step_tensors, stop_words_data,
-                bad_words_data, encoder_output, encoder_input_lengths,
-                stopping_criteria, logits_processor, **kwargs)
+                cache_indirections=cache_indirections,
+                step=step,
+                batch_size=batch_size,
+                max_context_length=max_context_length,
+                beam_width=beam_width,
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                scfg=scfg,
+                kv_cache_block_offsets=kv_cache_block_offsets,
+                host_kv_cache_block_offsets=host_kv_cache_block_offsets,
+                cross_kv_cache_block_offsets=cross_kv_cache_block_offsets,
+                host_cross_kv_cache_block_offsets=
+                host_cross_kv_cache_block_offsets,
+                prompt_embedding_table=prompt_embedding_table,
+                tasks=tasks,
+                context_lengths=context_lengths,
+                host_context_lengths=host_context_lengths,
+                attention_mask=attention_mask,
+                cross_attention_mask_for_context=
+                cross_attention_mask_for_context,
+                cross_attention_mask_for_gen=cross_attention_mask_for_gen,
+                prompt_vocab_size=prompt_vocab_size,
+                ite=ite,
+                sequence_limit_lengths=sequence_limit_lengths,
+                sequence_lengths=sequence_lengths,
+                next_step_tensors=next_step_tensors,
+                stop_words_data=stop_words_data,
+                bad_words_data=bad_words_data,
+                encoder_output=encoder_output,
+                encoder_input_lengths=encoder_input_lengths,
+                stopping_criteria=stopping_criteria,
+                logits_processor=logits_processor,
+                **kwargs,
+            )
             if step == 0:
                 if benchmark_profiler is not None:
                     benchmark_profiler.record_cuda_event('first_token')
@@ -3871,6 +3906,7 @@ class GenerationSession(object):
             return None
 
     def decode_stream(self,
+                      *,
                       batch_size: int,
                       scfg: SamplingConfig,
                       sequence_lengths: torch.Tensor,
@@ -3925,17 +3961,39 @@ class GenerationSession(object):
         for step in range(0, self.max_new_tokens):
 
             should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths = self.handle_per_step(
-                cache_indirections, step, batch_size, max_context_length,
-                beam_width, input_ids, hidden_states, scfg,
-                kv_cache_block_offsets, host_kv_cache_block_offsets,
-                cross_kv_cache_block_offsets, host_cross_kv_cache_block_offsets,
-                prompt_embedding_table, tasks, context_lengths,
-                host_context_lengths, attention_mask,
-                cross_attention_mask_for_context, cross_attention_mask_for_gen,
-                prompt_vocab_size, ite, sequence_limit_lengths,
-                sequence_lengths, next_step_tensors, stop_words_data,
-                bad_words_data, encoder_output, encoder_input_lengths,
-                stopping_criteria, logits_processor)
+                cache_indirections=cache_indirections,
+                step=step,
+                batch_size=batch_size,
+                max_context_length=max_context_length,
+                beam_width=beam_width,
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                scfg=scfg,
+                kv_cache_block_offsets=kv_cache_block_offsets,
+                host_kv_cache_block_offsets=host_kv_cache_block_offsets,
+                cross_kv_cache_block_offsets=cross_kv_cache_block_offsets,
+                host_cross_kv_cache_block_offsets=
+                host_cross_kv_cache_block_offsets,
+                prompt_embedding_table=prompt_embedding_table,
+                tasks=tasks,
+                context_lengths=context_lengths,
+                host_context_lengths=host_context_lengths,
+                attention_mask=attention_mask,
+                cross_attention_mask_for_context=
+                cross_attention_mask_for_context,
+                cross_attention_mask_for_gen=cross_attention_mask_for_gen,
+                prompt_vocab_size=prompt_vocab_size,
+                ite=ite,
+                sequence_limit_lengths=sequence_limit_lengths,
+                sequence_lengths=sequence_lengths,
+                next_step_tensors=next_step_tensors,
+                stop_words_data=stop_words_data,
+                bad_words_data=bad_words_data,
+                encoder_output=encoder_output,
+                encoder_input_lengths=encoder_input_lengths,
+                stopping_criteria=stopping_criteria,
+                logits_processor=logits_processor,
+            )
             if step == 0:
                 outputs_context_logits = context_logits
             if should_stop is not None:
@@ -4068,8 +4126,7 @@ class GenerationSession(object):
         # Init KV cache block manager
         if self.paged_kv_cache and self.has_attn_layers:
             num_blocks, max_blocks_per_seq = self._get_num_paged_blocks(
-                self.max_attention_window_size, self.sink_token_length,
-                self.use_one_more_block)
+                self.max_attention_window_size, self.sink_token_length)
 
             self.buffer[
                 f'host_kv_cache_pool_pointers'] = self._memory_pool_allocator.get_kv_cache_pool_pointers(
@@ -4085,14 +4142,11 @@ class GenerationSession(object):
                 self.head_size,
                 max_attention_window_size=self.max_attention_window_size,
                 beam_width=beam_width,
-                use_one_more_block=self.use_one_more_block,
                 sink_token_len=self.sink_token_length)
 
             if self.cross_attention:
                 cross_num_blocks, max_cross_blocks_per_seq = self._get_num_paged_blocks(
-                    self.encoder_max_input_length,
-                    sink_token_length=0,
-                    use_one_more_block=False)
+                    self.encoder_max_input_length, sink_token_length=0)
                 self.buffer[
                     f'host_cross_kv_cache_pool_pointers'] = self._cross_memory_pool_allocator.get_kv_cache_pool_pointers(
                     )
@@ -4107,7 +4161,6 @@ class GenerationSession(object):
                     self.head_size,
                     max_attention_window_size=self.encoder_max_input_length,
                     beam_width=beam_width,
-                    use_one_more_block=False,
                     sink_token_len=self.sink_token_length)
 
             # Add sequences to the manager
@@ -4192,24 +4245,60 @@ class GenerationSession(object):
         # start context phase
         if streaming:
             return self.decode_stream(
-                batch_size, scfg, sequence_lengths, context_lengths,
-                host_context_lengths, max_context_length, beam_width,
-                cache_indirections, input_ids, hidden_states,
-                prompt_embedding_table, tasks, prompt_vocab_size, ite,
-                sequence_limit_lengths, stop_words_data, bad_words_data,
-                output_sequence_lengths, return_dict, encoder_output,
-                encoder_input_lengths, stopping_criteria, logits_processor,
-                cross_attention_mask, **kwargs)
+                batch_size=batch_size,
+                scfg=scfg,
+                sequence_lengths=sequence_lengths,
+                context_lengths=context_lengths,
+                host_context_lengths=host_context_lengths,
+                max_context_length=max_context_length,
+                beam_width=beam_width,
+                cache_indirections=cache_indirections,
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                prompt_embedding_table=prompt_embedding_table,
+                tasks=tasks,
+                prompt_vocab_size=prompt_vocab_size,
+                ite=ite,
+                sequence_limit_lengths=sequence_limit_lengths,
+                stop_words_data=stop_words_data,
+                bad_words_data=bad_words_data,
+                output_sequence_lengths=output_sequence_lengths,
+                return_dict=return_dict,
+                encoder_output=encoder_output,
+                encoder_input_lengths=encoder_input_lengths,
+                stopping_criteria=stopping_criteria,
+                logits_processor=logits_processor,
+                cross_attention_mask=cross_attention_mask,
+                **kwargs,
+            )
         else:
             return self.decode_regular(
-                batch_size, scfg, sequence_lengths, context_lengths,
-                host_context_lengths, max_context_length, beam_width,
-                cache_indirections, input_ids, hidden_states,
-                prompt_embedding_table, tasks, prompt_vocab_size, ite,
-                sequence_limit_lengths, stop_words_data, bad_words_data,
-                output_sequence_lengths, return_dict, encoder_output,
-                encoder_input_lengths, stopping_criteria, logits_processor,
-                cross_attention_mask, **kwargs)
+                batch_size=batch_size,
+                scfg=scfg,
+                sequence_lengths=sequence_lengths,
+                context_lengths=context_lengths,
+                host_context_lengths=host_context_lengths,
+                max_context_length=max_context_length,
+                beam_width=beam_width,
+                cache_indirections=cache_indirections,
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                prompt_embedding_table=prompt_embedding_table,
+                tasks=tasks,
+                prompt_vocab_size=prompt_vocab_size,
+                ite=ite,
+                sequence_limit_lengths=sequence_limit_lengths,
+                stop_words_data=stop_words_data,
+                bad_words_data=bad_words_data,
+                output_sequence_lengths=output_sequence_lengths,
+                return_dict=return_dict,
+                encoder_output=encoder_output,
+                encoder_input_lengths=encoder_input_lengths,
+                stopping_criteria=stopping_criteria,
+                logits_processor=logits_processor,
+                cross_attention_mask=cross_attention_mask,
+                **kwargs,
+            )
 
 
 class ChatGLMGenerationSession(GenerationSession):

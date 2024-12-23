@@ -48,7 +48,8 @@ enum class AllReduceStrategyType : int8_t
     NCCL = 0,
     ONESHOT = 1,
     TWOSHOT = 2,
-    AUTO = 3,
+    UB = 3,
+    AUTO = 4,
 };
 
 enum class AllReduceStrategyConfig : int8_t
@@ -61,6 +62,8 @@ enum class AllReduceFusionOp : int8_t
 {
     NONE = 0,
     RESIDUAL_RMS_NORM = 1,
+    LAST_PROCESS_FOR_UB = 2,
+    RESIDUAL_RMS_PREPOST_NORM = 3,
 };
 
 struct AllReduceFusionParams
@@ -69,6 +72,7 @@ struct AllReduceFusionParams
         : bias_buffer(nullptr)
         , residual_buffer(nullptr)
         , weight_buffer(nullptr)
+        , weight_buffer_pre_residual_norm(nullptr)
         , intermediate_buffer(nullptr)
     {
     }
@@ -78,8 +82,9 @@ struct AllReduceFusionParams
     // residuial add
     void const* residual_buffer;
     // rms norm
-    int hidden_size;           // equal to normalized_shape
-    void const* weight_buffer; // norm elem-wise affine gamma
+    int hidden_size;                             // equal to normalized_shape
+    void const* weight_buffer;                   // norm elem-wise affine gamma
+    void const* weight_buffer_pre_residual_norm; // for gemma norm before residual
     float eps;
     // new residual
     void* intermediate_buffer;
@@ -112,7 +117,8 @@ bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t 
 void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataType, AllReduceStrategyType strat,
     AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream);
 
-void residualRmsNorm(kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream);
+void residualRmsNorm(
+    kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp);
 
 void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream);
 

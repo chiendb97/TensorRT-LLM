@@ -121,11 +121,7 @@ LayoutDetails getLayoutDetailsForArch(QuantType quant_type)
 
 LayoutDetails getLayoutDetailsForTransform(QuantType quant_type, int arch)
 {
-    if (arch >= 70 && arch < 75)
-    {
-        return getLayoutDetailsForArch<cutlass::arch::Sm70>(quant_type);
-    }
-    else if (arch >= 75 && arch < 80)
+    if (arch >= 75 && arch < 80)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm75>(quant_type);
     }

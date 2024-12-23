@@ -739,14 +739,13 @@ def load_gemma_weights(
                                    trt_llm_config.dtype)
         elif "embedder.input_embedding" in name or "reversible_embedding" in name or "embedder.weight" in name \
                 or "embed_tokens.weight" in name:
-            if not trt_llm_config.share_embedding_table:
-                # TODO: safetensor doesn't allow to save a shared tensor.
-                # Currently, we clone the weight but to save the disk, it
-                # would be better to skip saving lm_head weights and
-                # handle it at the loading phase.
-                lm_head = split_matrix_tp(param, tp_size, tp_rank, dim=0)
-                add_trt_llm_weight(weights, "lm_head.weight", np.copy(lm_head),
-                                   trt_llm_config.dtype)
+            # TODO: safetensor doesn't allow to save a shared tensor.
+            # Currently, we clone the weight but to save the disk, it
+            # would be better to skip saving lm_head weights and
+            # handle it at the loading phase.
+            lm_head = split_matrix_tp(param, tp_size, tp_rank, dim=0)
+            add_trt_llm_weight(weights, "lm_head.weight", np.copy(lm_head),
+                               trt_llm_config.dtype)
 
             if trt_llm_config.use_parallel_embedding:
                 assert trt_llm_config.vocab_size % tp_size == 0
@@ -829,9 +828,10 @@ class QuantizeModifiers:
 
     @classmethod
     def from_args(cls, args: Namespace) -> "QuantizeModifiers":
-        return cls(
-            **{k: v
-               for k, v in vars(args).items() if k in cls.__annotations__})
+        return cls(**{
+            k: v
+            for k, v in vars(args).items() if k in cls.__annotations__
+        })
 
 
 def non_modelopt_quantize_if_needed(

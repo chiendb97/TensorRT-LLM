@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/kernels/math.h"
 #include <assert.h>
 #include <float.h>
 #include <type_traits>
@@ -1286,8 +1287,8 @@ template <
     bool BLOCK_SPARSE_ATTN = false,
     // Whether compute implicit relative attention bias on the fly.
     bool IMPLICIT_REL_ATTN_BIAS = false,
-    // Whether apply tanh scale to the qk product.
-    bool QK_TANH_SCALE = false,
+    // Whether enable attention logit softcapping scale.
+    bool ATTN_LOGIT_SOFTCAPPING = false,
     // The number of threads per key.
     unsigned THREADS_PER_KEY = threads_per_key<T, dh_max(Dh)>(),
     // The number of threads per value.
@@ -1470,6 +1471,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
     // Do we have a relative attention bias?
     bool has_relative_attention_bias = params.relative_attention_bias != nullptr;
+    // Do we have a logn scale ptr?
+    bool has_logn_scaling = params.logn_scaling_ptr != nullptr;
     // IMPLICIT_REL_ATTN_BIAS:
     // Compute relative attention bias on the fly, with relative attention table [head_num/TP, num_buckets] passed in.
     // num_buckets passed as relative_attention_bias_stride, max_distance passed as params.max_distance
@@ -1839,10 +1842,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         // Normalize qk.
         qk = qk * params.inv_sqrt_dh + relative_attention_bias;
 
-        // Grok tanh scale for qk product.
-        if constexpr (QK_TANH_SCALE)
+        // Apply attention logit softcapping scale.
+        if constexpr (ATTN_LOGIT_SOFTCAPPING)
         {
-            qk = params.qk_tanh_scale * tanhf(qk * params.qk_tanh_inverse_scale);
+            qk = params.attn_logit_softcapping_scale * __tanhf(qk * params.attn_logit_softcapping_inverse_scale);
         }
 
         // We don't need to apply the linear position bias here since qi - ki = 0 yields the position bias 0.
@@ -1874,6 +1877,12 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     constexpr unsigned K_VECS_PER_THREAD{Dh_MAX / K_ELTS_PER_CHUNK};
     static_assert(Dh_MAX == K_ELTS_PER_CHUNK * K_VECS_PER_THREAD);
 
+    float logn_scale = 1.f;
+    if (has_logn_scaling)
+    {
+        logn_scale = params.logn_scaling_ptr[tlength];
+    }
+
     // Load the Q values from shared memory. The values are reused during the loop on K.
     K_vec_accum q_vec[K_VECS_PER_THREAD];
 #pragma unroll
@@ -1881,6 +1890,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     {
         q_vec[ii] = vec_conversion<K_vec_accum, K_vec_k>(*reinterpret_cast<K_vec_k const*>(
             &q_smem[tensorrt_llm::common::flat_index2(ii, k_idx.y, K_ELTS_PER_CHUNK)]));
+        if (has_logn_scaling)
+        {
+            q_vec[ii] = mmha::mul<K_vec_accum, float, K_vec_accum>(logn_scale, q_vec[ii]);
+        }
     }
 
     // The number of timesteps loaded per iteration, i.e., (THREADS_PER_BLOCK * THREADS_PER_BLOCK) / 256 <= 256
@@ -2051,10 +2064,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 }
             }
 
-            // Grok tanh scale for qk product.
-            if constexpr (QK_TANH_SCALE)
+            // Apply attention logit softcapping scale.
+            if constexpr (ATTN_LOGIT_SOFTCAPPING)
             {
-                qk_ = params.qk_tanh_scale * tanhf(qk_ * params.qk_tanh_inverse_scale);
+                qk_ = params.attn_logit_softcapping_scale * __tanhf(qk_ * params.attn_logit_softcapping_inverse_scale);
             }
 
             // For multi-block mode, we need to make sure it will not be OOB.

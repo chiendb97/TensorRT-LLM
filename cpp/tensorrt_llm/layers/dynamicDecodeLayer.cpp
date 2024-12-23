@@ -15,6 +15,7 @@
  */
 
 #include "dynamicDecodeLayer.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/layers/layerUtils.h"
 #include "tensorrt_llm/layers/layersFactory.h"
@@ -104,6 +105,24 @@ void DynamicDecodeLayer<T>::initializeLayers()
 }
 
 template <typename T>
+void DynamicDecodeLayer<T>::disableLookahead(DecoderDomain const& decoderDomain, SizeType32 batchSize,
+    TensorConstPtr batchSlots, std::shared_ptr<BaseSetupParams> const& baseSetupParams,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    mDecodingMode = executor::DecodingMode::TopKTopP();
+    mDecoderDomain = std::move(decoderDomain);
+    initializeLayers();
+    if (batchSize > 0)
+    {
+        setup(batchSize, 1, batchSlots, baseSetupParams, workspace);
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
 void DynamicDecodeLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorConstPtr batchSlots,
     std::shared_ptr<BaseSetupParams> const& baseSetupParams,
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
@@ -157,6 +176,7 @@ void DynamicDecodeLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> co
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(DynamicDecodeLayer_forwardAsync);
 
     auto params = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
 
@@ -212,6 +232,8 @@ void DynamicDecodeLayer<T>::forwardSync(std::shared_ptr<BaseDecodingOutputs> con
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(DynamicDecodeLayer_forwardSync);
+
     for (auto& layer : mLayers)
     {
         layer->forwardSync(baseOutputs, baseInputs, workspace);

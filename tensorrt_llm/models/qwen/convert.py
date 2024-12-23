@@ -33,10 +33,11 @@ from ..._utils import pad_vocab_size, str_dtype_to_torch
 from ...logger import logger
 from ...mapping import Mapping
 from ...quantization import QuantAlgo
-from ..convert_utils import (dup_kv_weight, generate_int8, get_weight,
-                             get_weight_and_bias, load_calib_dataset,
-                             smooth_gemm, smooth_gemm_fc1_gate, split,
-                             split_matrix_tp, split_qkv_bias_tp, split_qkv_tp)
+from ..convert_utils import (dup_kv_bias, dup_kv_weight, generate_int8,
+                             get_weight, get_weight_and_bias,
+                             load_calib_dataset, smooth_gemm,
+                             smooth_gemm_fc1_gate, split, split_matrix_tp,
+                             split_qkv_bias_tp, split_qkv_tp)
 from .config import QWenConfig
 from .utils import get_qwen_key_list, make_context
 
@@ -452,7 +453,6 @@ def convert_hf_qwen(hf_model,
                     use_parallel_embedding=False,
                     sharding_dim=0,
                     use_weight_only=False,
-                    share_embedding_table=False,
                     use_gemm_woq_plugin=False,
                     plugin_weight_only_quant_type=torch.int8,
                     use_smooth_quant=False,
@@ -528,10 +528,10 @@ def convert_hf_qwen(hf_model,
                                              tensor_parallel)
                     v_weight = dup_kv_weight(v_weight, num_key_value_heads,
                                              tensor_parallel)
-                    k_bias = dup_kv_weight(k_bias, num_key_value_heads,
-                                           tensor_parallel)
-                    v_bias = dup_kv_weight(v_bias, num_key_value_heads,
-                                           tensor_parallel)
+                    k_bias = dup_kv_bias(k_bias, num_key_value_heads,
+                                         tensor_parallel)
+                    v_bias = dup_kv_bias(v_bias, num_key_value_heads,
+                                         tensor_parallel)
                 assert (k_weight.shape[0] % (mapping.tp_size * head_size)) == 0
                 assert (v_weight.shape[0] % (mapping.tp_size * head_size)) == 0
                 assert (k_bias.shape[0] % (mapping.tp_size * head_size)) == 0
@@ -1012,7 +1012,6 @@ def load_weights_from_hf_model(hf_model,
         plugin_weight_only_quant_type=plugin_weight_only_quant_type,
         use_parallel_embedding=config.use_parallel_embedding,
         sharding_dim=config.embedding_sharding_dim,
-        share_embedding_table=config.share_embedding_table,
         use_smooth_quant=use_smooth_quant,
         per_channel=per_channel,
         per_token=per_token,
@@ -1036,7 +1035,7 @@ def load_weights_from_hf_gptq_model(hf_model, config: QWenConfig):
 
     model_params = {k: v for k, v in hf_model.state_dict().items()}
     torch.cuda.empty_cache()
-    valid_types = ('qwen', 'qwen2')
+    valid_types = ('qwen', 'qwen2', 'qwen2_vl')
     assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are supported for GPTQ."
     layer_prefix = "transformer.h." if qwen_type == 'qwen' else "model.layers."
     key_list = get_qwen_key_list(qwen_type)

@@ -24,17 +24,18 @@ import sys
 import time
 
 import numpy as np
-import safetensors
 import torch
 from accelerate.hooks import remove_hook_from_module
 from datasets import load_dataset
 from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
+                          AutoTokenizer)
 
 from .._utils import release_gc, str_dtype_to_torch
 from ..logger import logger
 from ..mapping import Mapping
+from .image_processing import MllamaImageProcessor
 from .mode import QuantAlgo
 
 EMPTY_CFG = {
@@ -109,7 +110,9 @@ def quant_cfg_choices():
 MODEL_NAME_PATTERN_MAP = {
     "GPT2": "gpt2",
     "Xverse": "llama",
+    "MllamaForConditionalGeneration": "mllama",
     "Llama": "llama",
+    "MllamaForCausalLM": "mllama",
     "Mistral": "llama",
     "GPTJ": "gptj",
     "FalconForCausalLM": "falcon",
@@ -119,6 +122,7 @@ MODEL_NAME_PATTERN_MAP = {
     "Bloom": "bloom",
     "ChatGLM": "chatglm",
     "QWen": "qwen",
+    "RecurrentGemma": "recurrentgemma",
     "Gemma2": "gemma2",
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
@@ -134,6 +138,8 @@ MODEL_NAME_PATTERN_MAP = {
     "DeciLMForCausalLM": "deci",
     "DeepseekForCausalLM": "deepseek",
 }
+
+MULTIMODAL_DATASETS = ['scienceqa']
 
 
 class _CustomDataset(torch.utils.data.Dataset):
@@ -171,6 +177,31 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
     assert tokenizer.pad_token is not None, f"Pad token for {model_type} cannot be set!"
 
     return tokenizer
+
+
+def get_processor(ckpt_path, max_seq_length=2048, model_type=None, device=None):
+    logger.info(f"Initializing tokenizer from {ckpt_path}")
+    processor = AutoProcessor.from_pretrained(
+        ckpt_path,
+        model_max_length=max_seq_length,
+        padding_side="left",
+        trust_remote_code=True,
+    )
+
+    if processor.tokenizer.pad_token is None:
+        if model_type and model_type == "qwen":
+            # qwen use token id 151643 as pad and eos tokens
+            processor.tokenizer.eos_token = processor.tokenizer.convert_ids_to_tokens(
+                151643)
+            processor.tokenizer.pad_token = processor.tokenizer.convert_ids_to_tokens(
+                151643)
+        else:
+            processor.tokenizer.pad_token = processor.tokenizer.eos_token
+    assert processor.tokenizer.pad_token is not None, f"Pad token for {model_type} cannot be set!"
+
+    if model_type == 'mllama':
+        processor = MllamaImageProcessor(processor, device)
+    return processor
 
 
 def _get_vila_model(model_dir):
@@ -223,6 +254,10 @@ def get_model(ckpt_path: str, dtype: str = 'bfloat16', device: str = 'cuda'):
     elif hf_config.model_type == "mpt":
         from transformers import MptForCausalLM
         model_cls = MptForCausalLM
+    elif hf_config.model_type == 'mllama':
+        from transformers import MllamaForConditionalGeneration
+        model_cls = MllamaForConditionalGeneration
+
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
     elif "llava-onevision-qwen2" in ckpt_path:
@@ -241,6 +276,7 @@ def get_model(ckpt_path: str, dtype: str = 'bfloat16', device: str = 'cuda'):
             trust_remote_code=True)
         if hf_config.model_type in ["llava", "internvl_chat"]:
             model = model.language_model
+
     model.eval()
 
     model_dtype = next(model.parameters()).dtype
@@ -253,6 +289,8 @@ def get_model(ckpt_path: str, dtype: str = 'bfloat16', device: str = 'cuda'):
 
 
 def get_model_type(model):
+    if type(model).__name__ in MODEL_NAME_PATTERN_MAP:
+        return MODEL_NAME_PATTERN_MAP[type(model).__name__]
     for k, v in MODEL_NAME_PATTERN_MAP.items():
         if k.lower() in type(model).__name__.lower():
             return v
@@ -273,6 +311,9 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
             data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
             split="train")
         dataset = dataset["text"][:calib_size]
+    elif dataset_name_or_dir == "scienceqa":
+        dataset = load_dataset("derek-thomas/ScienceQA", split="train")
+        dataset = dataset.select(range(calib_size))
     elif "cnn_dailymail" in dataset_name_or_dir:
         dataset = load_dataset(
             dataset_name_or_dir,
@@ -292,33 +333,44 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
             f"Unsupported dataset name or local repo directory: {dataset_name_or_dir}."
         )
 
-    batch_encoded = tokenizer.batch_encode_plus(dataset,
-                                                return_tensors="pt",
-                                                padding=True,
-                                                truncation=True,
-                                                max_length=block_size)
+    if dataset_name_or_dir in MULTIMODAL_DATASETS:
+        # Apply the preprocessing function to the dataset
+        processed_dataset = dataset.map(tokenizer.preprocess_function,
+                                        batched=False,
+                                        remove_columns=dataset.column_names)
 
-    if device:
-        batch_encoded = batch_encoded.to(device)
-
-    if include_labels:
-        # Labels are needed when backward is called in the model.
-        # The labels should be a shifted version of the input_ids.
-        # However, we should not shift the input_ids here since the labels are shifted by
-        # Huggingface models during loss calculation as shown here -
-        # https://github.com/huggingface/transformers/blob/7f79a97399bb52aad8460e1da2f36577d5dccfed/src/transformers/models/llama/modeling_llama.py#L1093-L1095
-        batch_encoded["labels"] = torch.where(
-            batch_encoded["attention_mask"] > 0.5, batch_encoded["input_ids"],
-            -100)
-        batch_encoded = _CustomDataset(batch_encoded)
+        # Create DataLoader with the custom collate function
+        calib_dataloader = DataLoader(processed_dataset,
+                                      batch_size=batch_size,
+                                      shuffle=False,
+                                      collate_fn=tokenizer.collate_function)
     else:
-        # For backward compatibility, if labels are not needed, we only return input_ids.
-        batch_encoded = _CustomDataset(
-            {"input_ids": batch_encoded["input_ids"]})
+        batch_encoded = tokenizer.batch_encode_plus(dataset,
+                                                    return_tensors="pt",
+                                                    padding=True,
+                                                    truncation=True,
+                                                    max_length=block_size)
+        if device:
+            batch_encoded = batch_encoded.to(device)
 
-    calib_dataloader = DataLoader(batch_encoded,
-                                  batch_size=batch_size,
-                                  shuffle=False)
+        if include_labels:
+            # Labels are needed when backward is called in the model.
+            # The labels should be a shifted version of the input_ids.
+            # However, we should not shift the input_ids here since the labels are shifted by
+            # Huggingface models during loss calculation as shown here -
+            # https://github.com/huggingface/transformers/blob/7f79a97399bb52aad8460e1da2f36577d5dccfed/src/transformers/models/llama/modeling_llama.py#L1093-L1095
+            batch_encoded["labels"] = torch.where(
+                batch_encoded["attention_mask"] > 0.5,
+                batch_encoded["input_ids"], -100)
+            batch_encoded = _CustomDataset(batch_encoded)
+        else:
+            # For backward compatibility, if labels are not needed, we only return input_ids.
+            batch_encoded = _CustomDataset(
+                {"input_ids": batch_encoded["input_ids"]})
+
+        calib_dataloader = DataLoader(batch_encoded,
+                                      batch_size=batch_size,
+                                      shuffle=False)
 
     return calib_dataloader
 
@@ -336,7 +388,8 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
             return
         with torch.no_grad():
             low_mem_mode = False
-            for _, data in enumerate(calib_dataloader):
+            for idx, data in enumerate(calib_dataloader):
+                logger.debug(f"Calibrating batch {idx}")
                 batch_size = data[list(data.keys())[0]].shape[0]
                 if batch_size == 1:
                     model(**data)
@@ -508,6 +561,7 @@ def quantize_and_export(*,
                         output_dir,
                         tp_size,
                         pp_size,
+                        cp_size,
                         seed,
                         tokenizer_max_seq_length,
                         num_medusa_heads=None,
@@ -553,6 +607,11 @@ def quantize_and_export(*,
         tokenizer = get_tokenizer(model_dir + "/llm",
                                   max_seq_length=tokenizer_max_seq_length,
                                   model_type=model_type)
+    elif model_type == "mllama":
+        tokenizer = get_processor(model_dir,
+                                  max_seq_length=tokenizer_max_seq_length,
+                                  model_type=model_type,
+                                  device=device)
     else:
         tokenizer = get_tokenizer(model_dir,
                                   max_seq_length=tokenizer_max_seq_length,
@@ -612,7 +671,7 @@ def quantize_and_export(*,
             batch_size=batch_size,
             calib_size=calib_size,
             block_size=calib_max_seq_length,
-            device=device,
+            device=model.device,
             include_labels=auto_quantize_bits is not None,
         )
 
@@ -646,6 +705,8 @@ def quantize_and_export(*,
             "w4a8_awq": "W4A8_AWQ",
         }
 
+        if model_type == 'mllama':
+            model = model.language_model
         export_tensorrt_llm_checkpoint(
             model,
             model_type,
@@ -687,19 +748,6 @@ def quantize_and_export(*,
             tensorrt_llm_config["quantization"]["kv_cache_quant_algo"] = None
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
-
-        # Workaround for share_embedding_table
-        if pp_size == 1:
-            with safetensors.safe_open(f"{export_path}/rank0.safetensors",
-                                       framework='pt',
-                                       device='cpu') as f:
-                share_embedding_table = 'lm_head.weight' not in f.keys()
-            if share_embedding_table:
-                with open(f"{export_path}/config.json", "r") as f:
-                    tensorrt_llm_config = json.load(f)
-                tensorrt_llm_config["share_embedding_table"] = True
-                with open(f"{export_path}/config.json", "w") as f:
-                    json.dump(tensorrt_llm_config, f, indent=4)
 
         # Workaround for qwen version
         if model_type == 'qwen':
@@ -753,6 +801,24 @@ def quantize_and_export(*,
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
+        # context parallel
+        if cp_size > 1:
+            with open(f"{export_path}/config.json", "r") as f:
+                tensorrt_llm_config = json.load(f)
+            tensorrt_llm_config["mapping"]["cp_size"] = cp_size
+            tensorrt_llm_config["mapping"]["world_size"] *= cp_size
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
+
+        if model_type == 'gptnext':
+            with open(f"{export_path}/config.json", "r") as f:
+                tensorrt_llm_config = json.load(f)
+            if tensorrt_llm_config['max_position_embeddings'] is None:
+                tensorrt_llm_config['max_position_embeddings'] = getattr(
+                    model.config, "n_positions", None)
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
+
         # Workaround for combining medusa head
         # TODO: move these integration into modelopt to avoid redundant reading and writing
         if medusa_model_dir is not None:
@@ -760,6 +826,21 @@ def quantize_and_export(*,
                                   num_medusa_heads, num_medusa_layers,
                                   max_draft_len, medusa_hidden_act,
                                   medusa_model_dir, quant_medusa_head)
+
+        # Workaround for mllama
+        if model_type == 'mllama':
+            from tensorrt_llm.models.mllama.config import MLLaMAConfig
+            config = MLLaMAConfig.from_hugging_face(
+                model_dir,
+                dtype=dtype,
+            )
+            for key, value in config.to_dict().items():
+                if key not in tensorrt_llm_config:
+                    tensorrt_llm_config[key] = value
+
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
+
         end_time = time.time()
         logger.info(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(
@@ -835,7 +916,7 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
                              calib_tp_size, calib_pp_size, dtype, qformat,
                              kv_cache_dtype, calib_size, batch_size,
                              calib_max_seq_length, awq_block_size, output_dir,
-                             tp_size, pp_size, seed):
+                             tp_size, pp_size, cp_size, seed):
     try:
         import modelopt  # noqa
     except ImportError as e:
@@ -1045,6 +1126,15 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
         inference_tensor_parallel=tp_size,
         inference_pipeline_parallel=pp_size,
     )
+
+    # context parallel
+    if cp_size > 1:
+        with open(f"{export_path}/config.json", "r") as f:
+            tensorrt_llm_config = json.load(f)
+        tensorrt_llm_config["mapping"]["cp_size"] = cp_size
+        tensorrt_llm_config["mapping"]["world_size"] *= cp_size
+        with open(f"{export_path}/config.json", "w") as f:
+            json.dump(tensorrt_llm_config, f, indent=4)
 
     end_time = time.time()
     print_rank_0(

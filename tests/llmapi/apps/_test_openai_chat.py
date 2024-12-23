@@ -94,11 +94,12 @@ def test_single_chat_session(client: openai.OpenAI, model_name: str):
         extra_body=dict(use_beam_search=True),
     )
     assert len(chat_completion.choices) == 2
-    assert chat_completion.choices[0].message.content != chat_completion.choices[
-        1].message.content, "beam search should be different"
+    assert chat_completion.choices[
+        0].message.content != chat_completion.choices[
+            1].message.content, "beam search should be different"
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_chat_streaming(async_client: openai.AsyncOpenAI,
                               model_name: str):
     messages = [{
@@ -173,7 +174,7 @@ async def test_chat_streaming(async_client: openai.AsyncOpenAI,
         raise RuntimeError("finish_reason not in [length, stop]")
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_chat_completion_stream_options(async_client: openai.AsyncOpenAI,
                                               model_name: str):
     messages = [{
@@ -259,12 +260,11 @@ async def test_chat_completion_stream_options(async_client: openai.AsyncOpenAI,
                                             chunk.usage.completion_tokens)
 
 
-@pytest.mark.asyncio
-async def test_custom_role(async_client: openai.AsyncOpenAI, model_name: str):
+def test_custom_role(client: openai.OpenAI, model_name: str):
     # Not sure how the model handles custom roles so we just check that
     # both string and complex message content are handled in the same way
 
-    resp1 = await async_client.chat.completions.create(
+    resp1 = client.chat.completions.create(
         model=model_name,
         messages=[{
             "role": "my-custom-role",
@@ -273,7 +273,7 @@ async def test_custom_role(async_client: openai.AsyncOpenAI, model_name: str):
         temperature=0.0,
         seed=0)
 
-    resp2 = await async_client.chat.completions.create(
+    resp2 = client.chat.completions.create(
         model=model_name,
         messages=[{
             "role": "my-custom-role",

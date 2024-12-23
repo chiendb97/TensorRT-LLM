@@ -14,14 +14,14 @@ from ..builder import EngineConfig
 from ..executor import (GenerationExecutor, GenerationResult, LoRARequest,
                         PromptAdapterRequest)
 from ..logger import logger
+from ..sampling_params import SamplingParams
 from .llm_utils import (LLMARGS_DOCSTRING, CachedModelLoader, LlmArgs,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                           external_mpi_comm_available)
-from .tokenizer import TokenizerBase
+from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
-from .utils import (SamplingParams, append_docstring, exception_handler,
-                    get_device_count)
+from .utils import append_docstring, exception_handler, get_device_count
 
 
 class RequestOutput(GenerationResult):
@@ -76,7 +76,7 @@ class RequestOutput(GenerationResult):
 
     def _repr_fields(self):
         return [
-            'request_id', 'prompt', 'prompt_token_ids', 'outputs', 'finished'
+            "request_id", "prompt", "prompt_token_ids", "outputs", "finished"
         ]
 
 
@@ -101,6 +101,7 @@ class LLM:
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
+                 speculative_model: Optional[str] = None,
                  **kwargs: Any):
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
@@ -117,6 +118,7 @@ class LLM:
                 dtype=dtype,
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
+                speculative_model=speculative_model,
                 **kwargs)
         except Exception as e:
             logger.error(
@@ -144,15 +146,16 @@ class LLM:
             # Due to the Executor can only accept a engine path, we need to save the engine to a directory
             self._engine_dir: Optional[Path] = None
             self._executor: Optional[GenerationExecutor] = None
-
             self._workspace = tempfile.TemporaryDirectory(
                 suffix="-llm-workspace", dir=self.args.workspace)
+
+            self._hf_model_dir: Optional[Path] = None
 
             self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
 
             self._build_model()
-            self._tokenizer = self._try_load_tokenizer()
+
         except Exception as e:
             if self.mpi_session is not None:
                 self.mpi_session.shutdown()
@@ -174,8 +177,9 @@ class LLM:
                                      Sequence[LoRARequest]]] = None,
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, Sequence[PromptAdapterRequest]]] = None,
+        queries: Optional[Union[PromptInputs, Sequence[PromptInputs]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
-        ''' Generate output for the given prompts in the synchronous mode.
+        """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
 
         Args:
@@ -188,10 +192,11 @@ class LLM:
                 if any. Defaults to None.
             prompt_adapter_request (PromptAdapterRequest, Sequence[PromptAdapterRequest], optional):
                 Prompt Adapter request to use for generation, if any. Defaults to None.
-
+            queries (PromptInputs or Sequence[PromptInputs]): The query text or token ids.
+                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.
         Returns:
             Union[RequestOutput, List[RequestOutput]]: The output data of the completion request to the LLM.
-        '''
+        """
         if isinstance(inputs, str) or isinstance(inputs[0], str):
             unbatched = isinstance(inputs, str)
         else:
@@ -199,6 +204,8 @@ class LLM:
 
         if unbatched:
             inputs = [inputs]
+            if queries:
+                queries = [queries]
 
         futures = []
         for i, request_inputs in enumerate(inputs):
@@ -214,7 +221,9 @@ class LLM:
                 pa_req = prompt_adapter_request[i]
             else:
                 pa_req = prompt_adapter_request
+            request_queries = None if queries is None else queries[i]
             future = self.generate_async(request_inputs,
+                                         queries=request_queries,
                                          sampling_params=sp,
                                          lora_request=lora_req,
                                          prompt_adapter_request=pa_req,
@@ -239,8 +248,9 @@ class LLM:
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
+        queries: Optional[PromptInputs] = None,
     ) -> RequestOutput:
-        ''' Generate output for the given prompt in the asynchronous mode.
+        """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
 
         Args:
@@ -253,27 +263,40 @@ class LLM:
                 use for generation, if any. Defaults to None.
             streaming (bool): Whether to use the streaming mode for the generation. Defaults to
                 False.
+            queries (PromptInputs or Sequence[PromptInputs]): The query text or token ids.
+                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.
 
         Returns:
             RequestOutput: The output data of the completion request to the LLM.
-        '''
+        """
         sampling_params = self._prepare_sampling_params(sampling_params)
-
+        query_token_ids = None
         if isinstance(inputs, str):
             prompt_token_ids = self._prepare_prompt_token_ids(
                 inputs, sampling_params)
             prompt = inputs
+            if queries is not None:
+                query_token_ids = self._prepare_prompt_token_ids(
+                    queries, sampling_params)
+
         elif isinstance(inputs, list) and isinstance(inputs[0], int):
             prompt_token_ids = inputs
             prompt = None
+            if queries is not None:
+                query_token_ids = queries
+
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
 
-        self._check_arguments(prompt_token_ids, sampling_params)
+        self._check_arguments(
+            len(prompt_token_ids),
+            len(query_token_ids) if query_token_ids is not None else 0,
+            sampling_params)
         result = self._executor.generate_async(
             prompt_token_ids,
+            query_token_ids=query_token_ids,
             sampling_params=sampling_params,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
@@ -346,23 +369,24 @@ class LLM:
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
 
-    def _check_arguments(self, prompt_token_ids: List[int],
+    def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams) -> None:
 
         build_config = self.args.build_config
 
-        built_enging_cfg_file = self.args.model / 'config.json'
+        built_enging_cfg_file = Path(self.args.model) / 'config.json'
         with open(built_enging_cfg_file) as f:
             built_enging_cfg = json.load(f)
-
-        prompt_len = len(prompt_token_ids)
-
+        max_seq_len = built_enging_cfg['build_config'][
+            'max_seq_len'] if 'build_config' in built_enging_cfg else build_config.max_seq_len
         # TODO: Remove this check and left the request verification to cpp runtime
-        if (not self.args.enable_chunked_prefill
-            ) and prompt_len + sampling_params.max_tokens > built_enging_cfg[
-                'build_config']['max_seq_len']:
+
+        # NOTE: [yuhangh] the meaning of max_seq_len should be for the all sequence. It's about position embedding.
+        if (not self.args.enable_chunked_prefill) and (
+                prompt_len / self.args.parallel_config.cp_size + query_len +
+                sampling_params.max_tokens > max_seq_len):
             raise ValueError(
-                f"The sum of prompt length ({prompt_len}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
+                f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({build_config.max_seq_len})")
 
         if sampling_params.beam_width > build_config.max_beam_width:
@@ -375,15 +399,23 @@ class LLM:
                                          mpi_session=self.mpi_session,
                                          workspace=self.workspace,
                                          llm_build_stats=self.llm_build_stats)
-        self._engine_dir = model_loader()
+        self._engine_dir, self._hf_model_dir = model_loader()
         # update the model_dir to a local dir for the runtime, such as tokenizer loading.
-        self.args.model = self._engine_dir
-        assert self.args.is_local_model
+        if self._engine_dir is not None:
+            self.args.model = self._engine_dir
 
+        # Tokenizer loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
+        # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
+        self._tokenizer = self._try_load_tokenizer()
+
+        max_batch_size = self.args.max_batch_size or self.args.build_config.max_batch_size
+        max_num_tokens = self.args.max_num_tokens or self.args.build_config.max_num_tokens
         executor_config = tllm.ExecutorConfig(
             max_beam_width=self.args.build_config.max_beam_width,
             scheduler_config=self.args.scheduler_config,
-            batching_type=tllm.BatchingType.INFLIGHT)
+            batching_type=tllm.BatchingType.INFLIGHT,
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens)
         if self.args.kv_cache_config is not None:
             executor_config.kv_cache_config = self.args.kv_cache_config
         if self.args.peft_cache_config is not None:
@@ -406,17 +438,32 @@ class LLM:
         if self.args.logits_post_processor_map:
             executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
                 processor_map=self.args.logits_post_processor_map)
+        if self.args.guided_decoding_backend == 'xgrammar':
+            executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
+                backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
+                XGRAMMAR,
+                **_xgrammar_tokenizer_info(self.tokenizer))
+        elif self.args.guided_decoding_backend is not None:
+            raise ValueError(
+                f"Unrecognized guided decoding backend {self.args.guided_decoding_backend}"
+            )
+
         executor_config.normalize_log_probs = self.args.normalize_log_probs
         executor_config.enable_chunked_context = self.args.enable_chunked_prefill
         executor_config.max_beam_width = self.args.build_config.max_beam_width
+        if self.args.extended_runtime_perf_knob_config is not None:
+            executor_config.extended_runtime_perf_knob_config = self.args.extended_runtime_perf_knob_config
 
+        trt_engine_dir = (self._engine_dir
+                          if self._engine_dir is not None else None)
         self._executor = self._executor_cls.create(
             self._engine_dir,
             executor_config=executor_config,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
-                self.args.parallel_config.world_size))
+                self.args.parallel_config.world_size),
+        )
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
@@ -430,7 +477,7 @@ class LLM:
             return self.runtime_context.tokenizer
 
         return ModelLoader.load_hf_tokenizer(
-            self.args.model_dir,
+            self.args.model,
             trust_remote_code=self.args.trust_remote_code,
             use_fast=self.args.tokenizer_mode != 'slow')
 
@@ -439,14 +486,14 @@ class LLM:
         return self._tokenizer
 
     def save(self, engine_dir: str):
-        ''' Save the built engine to the given path.
+        """Save the built engine to the given path.
 
         Args:
             engine_dir (str): The path to save the engine.
 
         Returns:
             None
-        '''
+        """
         logger.info(f"Save model to {engine_dir}")
         if self._engine_dir is None:
             raise RuntimeError("The engine is not built yet.")

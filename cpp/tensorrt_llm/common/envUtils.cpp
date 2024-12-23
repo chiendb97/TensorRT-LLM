@@ -23,7 +23,7 @@
 namespace tensorrt_llm::common
 {
 
-static std::optional<int32_t> getIntEnv(char const* name)
+std::optional<int32_t> getIntEnv(char const* name)
 {
     char const* const env = std::getenv(name);
     if (env == nullptr)
@@ -185,6 +185,30 @@ bool getEnvDisaggLayerwise()
 {
     static bool const disaggLayerwise = getBoolEnv("TRTLLM_DISAGG_LAYERWISE");
     return disaggLayerwise;
+}
+
+bool getEnvParallelCacheSend()
+{
+    static bool const parallelCacheSend = getBoolEnv("TRTLLM_PARALLEL_CACHE_SEND");
+    return parallelCacheSend;
+}
+
+bool getEnvRequestKVCacheSerial()
+{
+    static bool const requestKVCacheSerial = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_SERIAL");
+    return requestKVCacheSerial;
+}
+
+bool getEnvDisableKVCacheTransferOverlap()
+{
+    static bool const disableKVCacheTransferOverlap = getBoolEnv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP");
+    return disableKVCacheTransferOverlap;
+}
+
+bool getEnvDisableReceiveKVCacheParallel()
+{
+    static bool const disableReceiveParallel = getBoolEnv("TRTLLM_DISABLE_KVCACHE_RECEIVE_PARALLEL");
+    return disableReceiveParallel;
 }
 
 } // namespace tensorrt_llm::common

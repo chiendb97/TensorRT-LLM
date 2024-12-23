@@ -61,13 +61,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
 
     parser.add_argument(
         '--calib_dataset',
@@ -105,8 +98,8 @@ def parse_arguments():
         type=float,
         default=None,
         help="Set the α parameter (see https://arxiv.org/pdf/2211.10438.pdf)"
-        " to Smoothquant the model, and output int8 weights."
-        " A good first try is 0.5. Must be in [0, 1]")
+             " to Smoothquant the model, and output int8 weights."
+             " A good first try is 0.5. Must be in [0, 1]")
     parser.add_argument("--dataset_cache_dir",
                         type=str,
                         default=None,
@@ -116,7 +109,7 @@ def parse_arguments():
         default=False,
         action="store_true",
         help='Quantize weights for the various GEMMs to INT4/INT8.'
-        'See --weight_only_precision to set the precision')
+             'See --weight_only_precision to set the precision')
     parser.add_argument(
         '--weight_only_precision',
         const='int8',
@@ -417,11 +410,11 @@ def split_matrix(weight: torch.Tensor, tp_size: int, rank: int,
 
 
 def get_tllm_linear_weight(
-    weight: torch.Tensor,
-    prefix: str,
-    bias: Optional[torch.Tensor] = None,
-    use_weight_only: bool = False,
-    plugin_weight_only_quant_type: torch.dtype = torch.int8
+        weight: torch.Tensor,
+        prefix: str,
+        bias: Optional[torch.Tensor] = None,
+        use_weight_only: bool = False,
+        plugin_weight_only_quant_type: torch.dtype = torch.int8
 ) -> Dict[str, torch.Tensor]:
     results = {}
     if use_weight_only:
@@ -441,10 +434,10 @@ def get_tllm_linear_weight(
 
 
 def get_tllm_param(
-    param: torch.Tensor,
-    name: str,
-    use_weight_only: bool = False,
-    plugin_weight_only_quant_type: torch.dtype = torch.int8
+        param: torch.Tensor,
+        name: str,
+        use_weight_only: bool = False,
+        plugin_weight_only_quant_type: torch.dtype = torch.int8
 ) -> Dict[str, torch.Tensor]:
     results = {}
     if name.endswith('.weight') and use_weight_only:
@@ -468,7 +461,6 @@ def convert_hf_mpt_legacy(hf_model,
                           dtype='float32',
                           use_parallel_embedding: bool = False,
                           sharding_dim: int = 0,
-                          share_embedding_table: bool = False,
                           use_weight_only=False,
                           plugin_weight_only_quant_type='int8',
                           use_smooth_quant=False,
@@ -515,7 +507,7 @@ def convert_hf_mpt_legacy(hf_model,
                                           per_token=per_token,
                                           per_channel=per_channel,
                                           last_prefix=tllm_prex +
-                                          'input_layernorm.scale_to_int',
+                                                      'input_layernorm.scale_to_int',
                                           smoother_value=None,
                                           smoother_shape=None,
                                           rank=rank,
@@ -541,8 +533,8 @@ def convert_hf_mpt_legacy(hf_model,
                                          multi_query_mode=multi_query_mode)
             weights[tllm_prex +
                     'attention.kv_cache_scaling_factor'] = torch.from_numpy(
-                        np.array([int8_weights['scale_y_quant_orig']],
-                                 dtype=np.float32)).contiguous()
+                np.array([int8_weights['scale_y_quant_orig']],
+                         dtype=np.float32)).contiguous()
 
         # attn.out_proj -> attention.dense
         attn_dense_weight = get_weight(model_params, prefix + 'attn.out_proj',
@@ -560,7 +552,7 @@ def convert_hf_mpt_legacy(hf_model,
                     per_token=per_token,
                     per_channel=per_channel,
                     last_prefix=tllm_prex +
-                    'attention.quantization_scaling_factor',
+                                'attention.quantization_scaling_factor',
                     smoother_value=smoother[(prefix + 'attn.out_proj')],
                     smoother_shape=[1, hidden_size // tensor_parallel],
                     rank=rank,
@@ -658,11 +650,10 @@ def convert_hf_mpt_legacy(hf_model,
                 embed_w, mapping.tp_size, mapping.tp_rank, sharding_dim)
     if mapping.is_last_pp_rank():
         # lm_head weight and bias
-        if not share_embedding_table:
-            weights['lm_head.weight'] = split_matrix(embed_w.clone(),
-                                                     mapping.tp_size,
-                                                     mapping.tp_rank,
-                                                     dim=0)
+        weights['lm_head.weight'] = split_matrix(embed_w.clone(),
+                                                 mapping.tp_size,
+                                                 mapping.tp_rank,
+                                                 dim=0)
         ln_f_w = get_weight(model_params, 'transformer.norm_f', dtype)
         # ln_f weight and bias
         weights['transformer.ln_f.weight'] = ln_f_w
@@ -679,7 +670,6 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
                    dtype: str = 'float32',
                    use_parallel_embedding: bool = False,
                    sharding_dim: int = 0,
-                   share_embedding_table: bool = False,
                    use_weight_only: bool = False,
                    plugin_weight_only_quant_type: torch.dtype = torch.int8):
 
@@ -700,15 +690,15 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
         prefix = f'transformer.blocks.{l}'
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
         # Attention QKV (no bias)
-        qkv_w, qkv_b = get_weight_and_bias(model_params, f'{prefix}.attn.Wqkv', dtype)
+        qkv_w = get_weight(model_params, f'{prefix}.attn.Wqkv', dtype)
         qkv_w = split_qkv_tp(qkv_w, num_head, num_kv_heads, hidden_size,
                              mapping.tp_size, mapping.tp_rank)
         weights.update(
-            get_tllm_linear_weight(qkv_w, f'{tllm_prex}.attention.qkv', qkv_b,
+            get_tllm_linear_weight(qkv_w, f'{tllm_prex}.attention.qkv', None,
                                    use_weight_only,
                                    plugin_weight_only_quant_type))
         # Attention dense (no bias)
-        attn_dense_weight, attn_dense_bias = get_weight_and_bias(model_params, f'{prefix}.attn.out_proj',
+        attn_dense_weight = get_weight(model_params, f'{prefix}.attn.out_proj',
                                        dtype)
         attn_dense_w = split_matrix(attn_dense_weight,
                                     mapping.tp_size,
@@ -716,38 +706,36 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
                                     dim=1)
         weights.update(
             get_tllm_linear_weight(attn_dense_w, f'{tllm_prex}.attention.dense',
-                                   attn_dense_bias, use_weight_only,
+                                   None, use_weight_only,
                                    plugin_weight_only_quant_type))
         # MLP fc_in (no bias)
-        mlp_fc_weight, mlp_fc_bias = get_weight_and_bias(model_params, f'{prefix}.ffn.up_proj', dtype)
+        mlp_fc_weight = get_weight(model_params, f'{prefix}.ffn.up_proj', dtype)
         mlp_fc_w = split_matrix(mlp_fc_weight,
                                 mapping.tp_size,
                                 mapping.tp_rank,
                                 dim=0)
         weights.update(
-            get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.fc', mlp_fc_bias,
+            get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.fc', None,
                                    use_weight_only,
                                    plugin_weight_only_quant_type))
         # MLP fc_out (no bias)
-        mlp_proj_weight, mlp_proj_bias = get_weight_and_bias(model_params, f'{prefix}.ffn.down_proj',
+        mlp_proj_weight = get_weight(model_params, f'{prefix}.ffn.down_proj',
                                      dtype)
         mlp_proj_w = split_matrix(mlp_proj_weight,
                                   mapping.tp_size,
                                   mapping.tp_rank,
                                   dim=1)
         weights.update(
-            get_tllm_linear_weight(mlp_proj_w, f'{tllm_prex}.mlp.proj', mlp_proj_bias,
+            get_tllm_linear_weight(mlp_proj_w, f'{tllm_prex}.mlp.proj', None,
                                    use_weight_only,
                                    plugin_weight_only_quant_type))
         # input layer_norm
-        input_ln_weight, input_ln_bias = get_weight_and_bias(model_params, f'{prefix}.norm_1', dtype)
+        input_ln_weight = get_weight(model_params, f'{prefix}.norm_1', dtype)
         weights[f'{tllm_prex}.input_layernorm.weight'] = input_ln_weight
-        weights[f'{tllm_prex}.input_layernorm.bias'] = input_ln_bias
 
         # post layer_norm
-        post_ln_weight, post_ln_bias = get_weight_and_bias(model_params, f'{prefix}.norm_2', dtype)
+        post_ln_weight = get_weight(model_params, f'{prefix}.norm_2', dtype)
         weights[f'{tllm_prex}.post_layernorm.weight'] = post_ln_weight
-        weights[f'{tllm_prex}.post_layernorm.bias'] = post_ln_bias
 
     embed_w = get_weight(model_params, 'transformer.wte', dtype)
     if mapping.is_first_pp_rank():
@@ -763,15 +751,13 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
                 embed_w, mapping.tp_size, mapping.tp_rank, sharding_dim)
     if mapping.is_last_pp_rank():
         # lm_head weight and bias
-        if not share_embedding_table:
-            weights['lm_head.weight'] = split_matrix(embed_w.clone(),
-                                                     mapping.tp_size,
-                                                     mapping.tp_rank,
-                                                     dim=0)
-        ln_f_w, ln_f_b = get_weight_and_bias(model_params, 'transformer.norm_f', dtype)
+        weights['lm_head.weight'] = split_matrix(embed_w.clone(),
+                                                 mapping.tp_size,
+                                                 mapping.tp_rank,
+                                                 dim=0)
+        ln_f_w = get_weight(model_params, 'transformer.norm_f', dtype)
         # ln_f weight and bias
         weights['transformer.ln_f.weight'] = ln_f_w
-        weights['transformer.ln_f.bias'] = ln_f_b
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -836,7 +822,6 @@ if __name__ == '__main__':
         'hidden_act': 'gelu',
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'quantization': {
             'quant_algo': quant_algo,
             'kv_cache_quant_algo': kv_cache_quant_algo,
@@ -889,7 +874,6 @@ if __name__ == '__main__':
                 dtype=args.dtype,
                 use_parallel_embedding=args.use_parallel_embedding,
                 sharding_dim=args.embedding_sharding_dim,
-                share_embedding_table=args.use_embedding_sharing,
                 use_weight_only=args.use_weight_only,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type,
                 use_smooth_quant=(args.smoothquant is not None),
@@ -907,7 +891,6 @@ if __name__ == '__main__':
                 dtype=args.dtype,
                 use_parallel_embedding=args.use_parallel_embedding,
                 sharding_dim=args.embedding_sharding_dim,
-                share_embedding_table=args.use_embedding_sharing,
                 use_weight_only=args.use_weight_only,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type)
 

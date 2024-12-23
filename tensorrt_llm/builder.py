@@ -146,6 +146,7 @@ class Builder():
                               profiling_verbosity: str = "layer_names_only",
                               use_strip_plan: bool = False,
                               weight_streaming: bool = False,
+                              precision_constraints: Optional[str] = "obey",
                               **kwargs) -> BuilderConfig:
         ''' @brief Create a builder config with given precisions and timing cache
             @param precision: one of allowed precisions, defined in Builder._ALLOWED_PRECISIONS
@@ -170,16 +171,18 @@ class Builder():
             fp8 = quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache()
             if precision == 'float16' or precision == trt.DataType.HALF:
                 config.set_flag(trt.BuilderFlag.FP16)
-                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+                if precision_constraints == 'obey':
+                    config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
             elif precision == 'bfloat16' or precision == trt.DataType.BF16:
                 config.set_flag(trt.BuilderFlag.BF16)
-                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+                if precision_constraints == 'obey':
+                    config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
             if int8:
                 config.set_flag(trt.BuilderFlag.INT8)
-
             if fp8:
                 config.set_flag(trt.BuilderFlag.FP8)
-                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+                if precision_constraints == 'obey':
+                    config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
 
         if use_refit:
             config.set_flag(trt.BuilderFlag.REFIT)
@@ -838,6 +841,7 @@ def optimize_model_with_config(model: PretrainedModel,
     is_fp8 = model.config.quantization.quant_algo == QuantAlgo.FP8
     model = optimize_model(
         model,
+        share_embedding_table=True,
         use_ootb_moe=build_config.plugin_config.moe_plugin is None,
         use_fused_mlp=(build_config.use_fused_mlp and not is_enc_dec
                        and not (is_recurrent_gemma and is_fp8)
@@ -852,6 +856,7 @@ def optimize_model_with_config(model: PretrainedModel,
         use_fp8_context_fmha=(
             QuantAlgo.FP8 == model.config.quantization.quant_algo
             and build_config.plugin_config.use_fp8_context_fmha),
+        use_optimize_cross_qkv=True,
     )
 
     if is_enc_dec:
@@ -869,8 +874,9 @@ def _init_max_seq_len(model_config, build_config):
     if rotary_scaling is not None:
         rotary_type = rotary_scaling.get('type',
                                          rotary_scaling.get('rope_type'))
-        rotary_factor = rotary_scaling.get('factor',
-                                           1.0) if rotary_type != 'su' else 1
+        rotary_factor = rotary_scaling.get(
+            'factor', 1.0) if rotary_type not in ("su", "longrope",
+                                                  "llama3") else 1
     else:
         rotary_factor = 1
 
@@ -1021,7 +1027,7 @@ def deserialize_managed_weights(path: str | Path) -> dict[str, np.ndarray]:
 
 def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     '''Build engine from given model and optimization options specified in the build_config
-       WARNING: this function may change the given \p model object state in some optimization passes
+       WARNING: this function may change the given model object state in some optimization passes
        to avoid cloning a model since normally the LLM models consumes large memory.
        Create a new fresh model object if you need to build with different options.
     '''
@@ -1035,10 +1041,15 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if build_config.plugin_config.reduce_fusion and (
             model.config.mapping.tp_size == 1
-            or model.config.mapping.pp_size != 1
-            or model.config.architecture != "LlamaForCausalLM"):
+            or model.config.mapping.pp_size != 1 or
+        (model.config.architecture != "LlamaForCausalLM"
+         and model.config.architecture != "Gemma2ForCausalLM"
+         and model.config.architecture != "MedusaForCausalLM")):
         logger.warning('Overriding reduce_fusion to False')
         build_config.plugin_config.reduce_fusion = False
+    if build_config.plugin_config.user_buffer and not build_config.plugin_config.reduce_fusion:
+        logger.warning('Overriding user_buffer to False')
+        build_config.plugin_config.user_buffer = False
 
     if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
             model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
@@ -1065,6 +1076,18 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             f'New max_seq_len is set to {build_config.max_seq_len + build_config.max_draft_len}'
         )
         build_config.max_seq_len += build_config.max_draft_len
+
+    if build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE:
+        assert hasattr(model.config, 'num_eagle_layers')
+        num_eagle_layers = model.config.num_eagle_layers
+        logger.info(
+            f'Increasing max_seq_len ({build_config.max_seq_len}) '
+            f'by num_eagle_layers ({num_eagle_layers}) '
+            'to account for EAGLE implementation specifics. '
+            'Maximum number of generated tokens remains the same. '
+            f'New max_seq_len is set to {build_config.max_seq_len + num_eagle_layers}'
+        )
+        build_config.max_seq_len += num_eagle_layers
 
     if build_config.speculative_decoding_mode != SpeculativeDecodingMode.NONE:
         num_tokens = build_config.max_batch_size * (build_config.max_draft_len +
@@ -1182,7 +1205,8 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             build_config.lora_config.lora_target_modules
         }
 
-        if model.config.architecture == "DecoderModel" or model.config.architecture == "MllamaForConditionalGeneration":
+        if model.config.architecture == "DecoderModel" or "mllama" in model.config.architecture.lower(
+        ):
             prepare_input_args["max_seq_len"] = build_config.max_seq_len
             prepare_input_args[
                 "max_decoder_input_len"] = build_config.max_input_len
@@ -1206,7 +1230,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                 "spec_decoding_is_generation_length_variable"] = True
         if model.config.architecture == "Qwen2VLForConditionalGeneration":
             prepare_input_args[
-                'mrope_rotary_sin_cos_size'] = model.config.max_position_embeddings * model.config.rotary_embedding_dim
+                'mrope_rotary_cos_sin_size'] = model.config.max_position_embeddings * model.config.rotary_embedding_dim
         if build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE and not build_config.plugin_config.use_paged_context_fmha:
             logger.warning(
                 "Paged Context FMHA is required for EAGLE. Turning it on")

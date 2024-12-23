@@ -165,13 +165,9 @@ public:
             : (xqaParams.kv_cache_quant_mode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
 
         XQALaunchParam<KVCacheBuffer> launchParams;
-        void* ioScratch = nullptr;
-        buildXQALaunchParams(launchParams, ioScratch, xqaParams, kv_cache_buffer);
         bool const needOutputCvt = (xqaParams.fp8_out_scale != nullptr);
-        if (needOutputCvt)
-        {
-            launchParams.output = ioScratch;
-        }
+        void* inputScratch = nullptr;
+        buildXQALaunchParams(launchParams, inputScratch, needOutputCvt, xqaParams, kv_cache_buffer);
 
         // Build cu_seqlens, padding_offset, and rotary inv freq tensors
         BuildDecoderInfoParams<T> decoder_params;
@@ -197,14 +193,14 @@ public:
 
         // IDEA: Store rotary_processed Q buffer to output buffer.
         // NOTE: MHA kernels should read kv cache that has already been appended with new tokens' kv cache.
-        void* xqa_q_input_ptr = ioScratch;
+        void* xqa_q_input_ptr = inputScratch;
         QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParms{static_cast<T*>(const_cast<void*>(xqaParams.qkv)),
             nullptr, nullptr, static_cast<T*>(xqa_q_input_ptr), kv_cache_buffer,
-            static_cast<T const*>(xqaParams.qkv_bias), xqaParams.spec_decoding_generation_lengths,
-            xqaParams.sequence_lengths, /* encoder_seqlens */ nullptr,
+            static_cast<T const*>(xqaParams.qkv_bias), xqaParams.logn_scaling_ptr,
+            xqaParams.spec_decoding_generation_lengths, xqaParams.sequence_lengths, /* encoder_seqlens */ nullptr,
             xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr,
             /* cu_kv_seqlens */ nullptr, launchParams.rotary_inv_freq_buf, (float2 const*) nullptr,
-            xqaParams.kv_scale_orig_quant, xqaParams.spec_decoding_position_offsets, xqaParams.mrope_rotary_sin_cos,
+            xqaParams.kv_scale_orig_quant, xqaParams.spec_decoding_position_offsets, (float2 const*) nullptr,
             xqaParams.mrope_position_deltas, int(batch_beam_size), xqaParams.generation_input_length,
             xqaParams.timestep, xqaParams.cyclic_attention_window_size, xqaParams.sink_token_length,
             int(xqaParams.batch_size * beam_width * xqaParams.generation_input_length),
