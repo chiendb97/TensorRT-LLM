@@ -56,6 +56,15 @@ def get_build_dir(build_dir, build_type):
     return build_dir
 
 
+def clear_folder(folder_path):
+    for item in os.listdir(folder_path):
+        item_path = os.path.join(folder_path, item)
+        if os.path.isdir(item_path):
+            rmtree(item_path)
+        else:
+            os.remove(item_path)
+
+
 def main(*,
          build_type: str = "Release",
          build_dir: Path = None,
@@ -67,6 +76,8 @@ def main(*,
          trt_root: str = None,
          nccl_root: str = None,
          clean: bool = False,
+         clean_wheel: bool = False,
+         configure_cmake: bool = False,
          use_ccache: bool = False,
          fast_build: bool = False,
          cpp_only: bool = False,
@@ -76,11 +87,23 @@ def main(*,
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False):
+
+    if clean:
+        clean_wheel = True
+
     project_dir = get_project_dir()
     os.chdir(project_dir)
     build_run = partial(run, shell=True, check=True)
 
-    if not (project_dir / "3rdparty/cutlass/.git").exists():
+    # Get all submodules and check their folder exists. If not,
+    # invoke git submodule update
+    with open(project_dir / ".gitmodules", "r") as submodules_f:
+        submodules = [
+            l.split("=")[1].strip() for l in submodules_f.readlines()
+            if "path = " in l
+        ]
+    if any(not (project_dir / submodule / ".git").exists()
+           for submodule in submodules):
         build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
@@ -99,6 +122,10 @@ def main(*,
         else:
             error_msg += " Please run `pip install tensorrt` manually and relaunch build_wheel.py"
         raise RuntimeError(error_msg)
+
+    if cuda_architectures is not None:
+        if "70-real" in cuda_architectures:
+            raise RuntimeError("Volta architecture is deprecated support.")
 
     cmake_cuda_architectures = (
         f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
@@ -152,7 +179,7 @@ def main(*,
     first_build = not build_dir.exists()
 
     if clean and build_dir.exists():
-        rmtree(build_dir)
+        clear_folder(build_dir)  # Keep the folder in case it is mounted.
     build_dir.mkdir(parents=True, exist_ok=True)
 
     if use_ccache:
@@ -176,7 +203,7 @@ def main(*,
     source_dir = get_source_dir()
     with working_directory(build_dir):
         cmake_def_args = " ".join(cmake_def_args)
-        if clean or first_build:
+        if clean or first_build or configure_cmake:
             build_run(
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
@@ -196,8 +223,8 @@ def main(*,
     assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
     lib_dir = pkg_dir / "libs"
     if lib_dir.exists():
-        rmtree(lib_dir)
-    lib_dir.mkdir(parents=True)
+        clear_folder(lib_dir)
+    lib_dir.mkdir(parents=True, exist_ok=True)
     if on_windows:
         copy(build_dir / "tensorrt_llm/tensorrt_llm.dll",
              lib_dir / "tensorrt_llm.dll")
@@ -225,13 +252,17 @@ def main(*,
             lib_dir / "libtensorrt_llm_nvrtc_wrapper.so")
         copy(
             build_dir /
+            "tensorrt_llm/batch_manager/libtensorrt_llm_ucx_wrapper.so",
+            lib_dir / "libtensorrt_llm_ucx_wrapper.so")
+        copy(
+            build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention.so",
             lib_dir / "libdecoder_attention.so")
 
     bin_dir = pkg_dir / "bin"
     if bin_dir.exists():
-        rmtree(bin_dir)
-    bin_dir.mkdir(parents=True)
+        clear_folder(bin_dir)
+    bin_dir.mkdir(parents=True, exist_ok=True)
 
     if not on_windows:
         copy(build_dir / "tensorrt_llm/executor_worker/executorWorker",
@@ -287,20 +318,30 @@ def main(*,
                 env_ld["LD_LIBRARY_PATH"] = new_library_path
                 try:
                     build_run(
-                        f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings",
+                        f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings --exit-code",
                         env=env_ld)
                 except CalledProcessError as ex:
                     print(f"Failed to build pybind11 stubgen: {ex}",
                           file=sys.stderr)
+                    exit(1)
 
-    if dist_dir is None:
-        dist_dir = project_dir / "build"
-    else:
-        dist_dir = Path(dist_dir)
-
-    if not dist_dir.exists():
-        dist_dir.mkdir(parents=True)
     if not skip_building_wheel:
+        if dist_dir is None:
+            dist_dir = project_dir / "build"
+        else:
+            dist_dir = Path(dist_dir)
+
+        if not dist_dir.exists():
+            dist_dir.mkdir(parents=True)
+
+        if clean_wheel:
+            # For incremental build, the python build module adds
+            # the new files but does not remove the deleted files.
+            #
+            # This breaks the Windows CI/CD pipeline when building
+            # and validating python changes in the whl.
+            clear_folder(dist_dir)
+
         build_run(
             f'\"{sys.executable}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
         )
@@ -317,6 +358,12 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--cuda_architectures", "-a")
     parser.add_argument("--install", "-i", action="store_true")
     parser.add_argument("--clean", "-c", action="store_true")
+    parser.add_argument("--clean_wheel",
+                        action="store_true",
+                        help="Clear dist_dir folder creating wheel")
+    parser.add_argument("--configure_cmake",
+                        action="store_true",
+                        help="Always configure cmake before building")
     parser.add_argument("--use_ccache",
                         "-ccache",
                         default=False,

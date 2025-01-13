@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 import tensorrt_llm
 from tensorrt_llm import BuildConfig, build
 from tensorrt_llm.executor import GenerationExecutor
-from tensorrt_llm.hlapi import SamplingParams
+from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.models import LLaMAForCausalLM
 
 
@@ -43,8 +43,6 @@ def main():
     build_config = BuildConfig(max_input_len=256,
                                max_seq_len=276,
                                max_batch_size=1)
-    # just for fast build, not best for production
-    build_config.builder_opt = 0
     build_config.plugin_config.gemm_plugin = 'auto'
 
     if args.clean_build or not args.engine_dir.exists():
@@ -55,14 +53,14 @@ def main():
         engine.save(args.engine_dir)
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model_dir)
-    executor = GenerationExecutor.create(args.engine_dir)
-    sampling_params = SamplingParams(max_new_tokens=5)
+    with GenerationExecutor.create(args.engine_dir) as executor:
+        sampling_params = SamplingParams(max_tokens=5)
 
-    input_str = "What should you say when someone gives you a gift? You should say:"
-    output = executor.generate(tokenizer.encode(input_str),
-                               sampling_params=sampling_params)
-    output_str = tokenizer.decode(output.outputs[0].token_ids)
-    print(f"{input_str} {output_str}")
+        input_str = "What should you say when someone gives you a gift? You should say:"
+        output = executor.generate(tokenizer.encode(input_str),
+                                   sampling_params=sampling_params)
+        output_str = tokenizer.decode(output.outputs[0].token_ids)
+        print(f"{input_str} {output_str}")
 
 
 if __name__ == "__main__":

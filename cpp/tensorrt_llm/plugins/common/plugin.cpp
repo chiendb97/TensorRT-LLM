@@ -26,6 +26,7 @@
 #include <cuda_fp8.h>
 #include <functional>
 #include <mutex>
+#include <thread>
 
 #ifdef _MSC_VER
 #define FN_NAME __FUNCTION__
@@ -114,6 +115,8 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
             ncclCommDestroy(*comm);
             delete comm;
         });
+    // Need static connection initialization for accurate KV cache size estimation
+    setenv("NCCL_RUNTIME_CONNECT", "0", 0);
     NCCLCHECK(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
     commMap[group] = ncclComm;
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
@@ -212,11 +215,75 @@ private:
     // CUDA resources are per-context.
     std::unordered_map<CUcontext, std::weak_ptr<T>> mObservers;
 };
+
+template <typename T>
+class PerThreadSingletonCreator
+{
+public:
+    using CreatorFunc = std::function<std::unique_ptr<T>()>;
+    using DeleterFunc = std::function<void(T*)>;
+
+    // creator returning std::unique_ptr is by design.
+    // It forces separation of memory for T and memory for control blocks.
+    // So when T is released, but we still have observer weak_ptr in mObservers, the T mem block can be released.
+    // creator itself must not own CUDA resources. Only the object it creates can.
+    PerThreadSingletonCreator(CreatorFunc creator, DeleterFunc deleter)
+        : mCreator{std::move(creator)}
+        , mDeleter{std::move(deleter)}
+    {
+    }
+
+    std::shared_ptr<T> operator()()
+    {
+        std::lock_guard<std::mutex> lk{mMutex};
+
+        std::thread::id thread = std::this_thread::get_id();
+        std::shared_ptr<T> result = mObservers[thread].lock();
+
+        if (result == nullptr)
+        {
+            // Create the resource and register with an observer.
+            result = std::shared_ptr<T>{mCreator().release(),
+                [this, thread](T* obj)
+                {
+                    if (obj == nullptr)
+                    {
+                        return;
+                    }
+                    mDeleter(obj);
+
+                    // Clears observer to avoid growth of mObservers, in case users creates/destroys cuda contexts
+                    // frequently.
+                    std::shared_ptr<T> observedObjHolder; // Delay destroy to avoid dead lock.
+                    std::lock_guard<std::mutex> lk{mMutex};
+                    // Must check observer again because another thread may created new instance for this ctx just
+                    // before we lock mMutex. We can't infer that the observer is stale from the fact that obj is
+                    // destroyed, because shared_ptr ref-count checking and observer removing are not in one atomic
+                    // operation, and the observer may be changed to observe another instance.
+                    observedObjHolder = mObservers.at(thread).lock();
+                    if (observedObjHolder == nullptr)
+                    {
+                        mObservers.erase(thread);
+                    }
+                }};
+            mObservers.at(thread) = result;
+        }
+        return result;
+    }
+
+private:
+    CreatorFunc mCreator;
+    DeleterFunc mDeleter;
+    mutable std::mutex mMutex;
+    // CUDA resources are per-thread.
+    std::unordered_map<std::thread::id, std::weak_ptr<T>> mObservers;
+};
+
 } // namespace
 
 std::shared_ptr<cublasHandle_t> getCublasHandle()
 {
-    static PerCudaCtxSingletonCreator<cublasHandle_t> creator(
+    static PerThreadSingletonCreator<cublasHandle_t> creator(
         []() -> auto
         {
             auto handle = std::unique_ptr<cublasHandle_t>(new cublasHandle_t);
@@ -233,7 +300,7 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
 
 std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
 {
-    static PerCudaCtxSingletonCreator<cublasLtHandle_t> creator(
+    static PerThreadSingletonCreator<cublasLtHandle_t> creator(
         []() -> auto
         {
             auto handle = std::unique_ptr<cublasLtHandle_t>(new cublasLtHandle_t);
@@ -245,6 +312,20 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
             TLLM_CUDA_CHECK(cublasLtDestroy(*handle));
             delete handle;
         });
+    return creator();
+}
+
+std::shared_ptr<tensorrt_llm::common::CublasMMWrapper> getCublasMMWrapper(std::shared_ptr<cublasHandle_t> cublasHandle,
+    std::shared_ptr<cublasLtHandle_t> cublasltHandle, cudaStream_t stream, void* workspace)
+{
+    static PerThreadSingletonCreator<tensorrt_llm::common::CublasMMWrapper> creator(
+        [cublasHandle, cublasltHandle, stream, workspace]() -> auto
+        {
+            auto wrapper = std::unique_ptr<tensorrt_llm::common::CublasMMWrapper>(
+                new tensorrt_llm::common::CublasMMWrapper(cublasHandle, cublasltHandle, stream, workspace));
+            return wrapper;
+        },
+        [](tensorrt_llm::common::CublasMMWrapper* wrapper) { delete wrapper; });
     return creator();
 }
 
@@ -315,3 +396,31 @@ INSTANTIATE_PluginFieldParser_getScalar(int32_t);
 INSTANTIATE_PluginFieldParser_getScalar(char);
 INSTANTIATE_PluginFieldParser_getScalar(nvinfer1::Dims);
 #undef INSTANTIATE_PluginFieldParser_getScalar
+
+template <typename T>
+std::optional<std::set<T>> PluginFieldParser::getSet(std::string_view const& name)
+{
+    auto const iter = mMap.find(name);
+    if (iter == mMap.end())
+    {
+        return std::nullopt;
+    }
+    auto& record = mMap.at(name);
+    auto const& f = mFields[record.index];
+    TLLM_CHECK(toFieldType<T>() == f.type);
+    std::set<T> group;
+    auto const* r = static_cast<T const*>(f.data);
+    for (int j = 0; j < f.length; ++j)
+    {
+        group.insert(*r);
+        ++r;
+    }
+
+    record.retrieved = true;
+    return std::optional{group};
+}
+
+#define INSTANTIATE_PluginFieldParser_getVector(T)                                                                     \
+    template std::optional<std::set<T>> PluginFieldParser::getSet(std::string_view const&)
+INSTANTIATE_PluginFieldParser_getVector(int32_t);
+#undef INSTANTIATE_PluginFieldParser_getVector

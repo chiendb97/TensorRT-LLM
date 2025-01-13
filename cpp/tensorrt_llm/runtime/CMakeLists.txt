@@ -18,8 +18,13 @@ set(SRCS
     utils/numpyUtils.cpp
     utils/sessionUtils.cpp
     utils/debugUtils.cu
+    utils/speculativeChoicesUtils.cpp
     bufferManager.cpp
+    cudaMemPool.cpp
+    decodingLayerWorkspace.cpp
+    eagleBuffers.cpp
     explicitDraftTokensBuffers.cpp
+    lookaheadBuffers.cpp
     layerProfiler.cpp
     loraManager.cpp
     loraUtils.cpp
@@ -35,7 +40,6 @@ set(SRCS
     iTensor.cpp
     ipcUtils.cpp
     memoryCounters.cpp
-    medusaModule.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp
     runtimeBuffers.cpp
@@ -46,13 +50,17 @@ set(SRCS
     tllmRuntime.cpp
     tllmLogger.cpp
     transformerBuffers.cpp
+    workerPool.cpp
     worldConfig.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 
 if(NOT WIN32)
   # additional warnings
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
+  #
+  # Ignore overloaded-virtual warning. We intentionally change parameters of
+  # some methods in derived class.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-overloaded-virtual")
   if(WARNING_IS_ERROR)
     message(STATUS "Treating warnings as errors in GCC compilation")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
@@ -68,6 +76,6 @@ set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 
-if(ENABLE_MULTI_DEVICE EQUAL 1)
+if(ENABLE_MULTI_DEVICE)
   target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})
 endif()

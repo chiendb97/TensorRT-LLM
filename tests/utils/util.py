@@ -1,6 +1,7 @@
 import os
 import unittest
 from difflib import SequenceMatcher
+from pathlib import Path
 
 import pytest
 import tensorrt as trt
@@ -10,9 +11,10 @@ from parameterized import parameterized
 
 import tensorrt_llm
 from tensorrt_llm._utils import torch_dtype_to_trt, trt_dtype_to_torch
+from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
-from tensorrt_llm.runtime import TensorInfo
+from tensorrt_llm.runtime import Session, TensorInfo
 
 
 def ASSERT_DRV(err):
@@ -122,6 +124,28 @@ def skip_bf16_fp32_accum(dtype, context_fmha_type):
         )
 
 
+def skip_num_gpus_less_than(num_gpus: int):
+    return pytest.mark.skipif(
+        torch.cuda.device_count() < num_gpus,
+        reason=f"The test needs at least {num_gpus} GPUs, skipping")
+
+
+skip_single_gpu = skip_num_gpus_less_than(2)
+
+
+def skip_gpu_memory_less_than(required_memory: int):
+    memory = get_total_gpu_memory(0)
+    return pytest.mark.skipif(
+        required_memory > memory,
+        reason=
+        f'Not enough GPU memory for this test (wanted {required_memory}, have {memory})'
+    )
+
+
+skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1024 * 1024 *
+                                                           1024)
+
+
 def modelopt_installed():
     try:
         # isort: off
@@ -181,7 +205,6 @@ def create_session(builder,
                    precision="float32",
                    int8=False,
                    fp8=False,
-                   opt_level=None,
                    memory_pool_limit=None,
                    optimization_profiles=[],
                    quant_mode=QuantMode(0)):
@@ -190,14 +213,13 @@ def create_session(builder,
     Args:
         network: a tensorrt_llm.Network object
         precision: the precision of the network, choose from ["float32", "float16", "bfloat16"]
-        **kwargs: builder flags such as int8, fp8, builder_opt, etc.
+        **kwargs: builder flags such as int8, fp8, etc.
     Returns:
         session: a tensorrt_llm.runtime.Session
     """
     builder_config = builder.create_builder_config(precision=precision,
                                                    int8=int8,
                                                    fp8=fp8,
-                                                   opt_level=opt_level,
                                                    quant_mode=quant_mode)
     # Some tests require to set mem pool limit to avoid OOM
     if memory_pool_limit is not None:
@@ -211,11 +233,15 @@ def create_session(builder,
     builder_config.trt_builder_config.clear_flag(trt.BuilderFlag.TF32)
     engine = builder.build_engine(network, builder_config)
     assert engine is not None, "Failed to build engine"
-    session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
+    session = Session.from_serialized_engine(engine)
     return session
 
 
-def run_session(session, inputs, outputs={}, override_shapes={}):
+def run_session(session: Session,
+                inputs,
+                outputs={},
+                override_shapes={},
+                override_types={}):
     """
     The current session object needs to pass in both inputs and outputs bindings.
     For test convenience, create a function that infers output shapes automatically,
@@ -226,12 +252,17 @@ def run_session(session, inputs, outputs={}, override_shapes={}):
            This function will prioritize to use the tensor in this dictionary.
         2. `override_shapes` can be used to force some input tensors' shape to be different than the passed tensor.
            Required for zero-volume tensors since torch.Tensor.data_ptr() is nullptr for such tensors.
+        3. `override_types` can be used to force some input tensors' type to be different than the passed tensor.
+           Required for zero-volume tensors since torch.Tensor.data_ptr() is nullptr for such tensors.
     """
 
     # Prepare output tensors.
     output_info = session.infer_shapes([
         TensorInfo(
-            name, torch_dtype_to_trt(tensor.dtype), tensor.shape
+            name,
+            torch_dtype_to_trt(tensor.dtype if name not in
+                               override_types else override_types[name]),
+            tensor.shape
             if name not in override_shapes else override_shapes[name])
         for name, tensor in inputs.items()
     ])
@@ -261,3 +292,8 @@ def similarity_score(a, b):
 def similar(a, b, threshold=0.8):
     "similar compare a and b "
     return similarity_score(a, b) >= threshold
+
+
+def get_project_root(test_file: str) -> Path:
+    return next(p for p in Path(test_file).resolve().parents
+                if (p / 'tests').is_dir() and (p / "tensorrt_llm").is_dir())

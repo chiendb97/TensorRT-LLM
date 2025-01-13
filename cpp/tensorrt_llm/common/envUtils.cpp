@@ -23,7 +23,7 @@
 namespace tensorrt_llm::common
 {
 
-static std::optional<int32_t> getIntEnv(char const* name)
+std::optional<int32_t> getIntEnv(char const* name)
 {
     char const* const env = std::getenv(name);
     if (env == nullptr)
@@ -37,6 +37,13 @@ static std::optional<int32_t> getIntEnv(char const* name)
     }
     return {val};
 };
+
+// Returns true if the env variable exists and is set to "1"
+static bool getBoolEnv(char const* name)
+{
+    char const* env = std::getenv(name);
+    return env && env[0] == '1' && env[1] == '\0';
+}
 
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels()
@@ -133,28 +140,75 @@ int getEnvMmhaKernelBlockSize()
     return mmhaKernelBlockSize;
 }
 
-bool getEnvEnableFDL()
+bool getEnvEnablePDL()
 {
     static bool init = false;
-    static bool enableFDL = false;
+    static bool enablePDL = false;
     if (!init)
     {
         init = true;
-        // FDL only available when arch >= 90
+        // PDL only available when arch >= 90
         if (getSMVersion() >= 90)
         {
-            char const* enable_fdl = std::getenv("TRTLLM_ENABLE_FDL");
-            if (enable_fdl)
+            // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
+            enablePDL = getBoolEnv("TRTLLM_ENABLE_PDL");
+        }
+    }
+    return enablePDL;
+}
+
+bool getEnvUseUCXKvCache()
+{
+    static bool const useUCXKVCache = getBoolEnv("TRTLLM_USE_UCX_KVCACHE");
+    return useUCXKVCache;
+}
+
+std::string getEnvUCXInterface()
+{
+    static bool init = false;
+    static std::string ucxInterface;
+    if (!init)
+    {
+        init = true;
+        {
+            char const* ucx_interface = std::getenv("TRTLLM_UCX_INTERFACE");
+            if (ucx_interface)
             {
-                // FDL will be enabled by setting the env variables `TRTLLM_ENABLE_FDL` to `1`
-                if (enable_fdl[0] == '1' && enable_fdl[1] == '\0')
-                {
-                    enableFDL = true;
-                }
+                ucxInterface = ucx_interface;
             }
         }
     }
-    return enableFDL;
+    return ucxInterface;
+}
+
+bool getEnvDisaggLayerwise()
+{
+    static bool const disaggLayerwise = getBoolEnv("TRTLLM_DISAGG_LAYERWISE");
+    return disaggLayerwise;
+}
+
+bool getEnvParallelCacheSend()
+{
+    static bool const parallelCacheSend = getBoolEnv("TRTLLM_PARALLEL_CACHE_SEND");
+    return parallelCacheSend;
+}
+
+bool getEnvRequestKVCacheSerial()
+{
+    static bool const requestKVCacheSerial = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_SERIAL");
+    return requestKVCacheSerial;
+}
+
+bool getEnvDisableKVCacheTransferOverlap()
+{
+    static bool const disableKVCacheTransferOverlap = getBoolEnv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP");
+    return disableKVCacheTransferOverlap;
+}
+
+bool getEnvDisableReceiveKVCacheParallel()
+{
+    static bool const disableReceiveParallel = getBoolEnv("TRTLLM_DISABLE_KVCACHE_RECEIVE_PARALLEL");
+    return disableReceiveParallel;
 }
 
 } // namespace tensorrt_llm::common

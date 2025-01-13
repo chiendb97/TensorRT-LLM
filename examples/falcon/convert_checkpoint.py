@@ -23,10 +23,15 @@ def parse_arguments():
                         type=int,
                         default=1,
                         help='N-way pipeline parallelism size')
-    parser.add_argument('--dtype',
-                        type=str,
-                        default='float16',
-                        choices=['float32', 'bfloat16', 'float16'])
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float16', 'bfloat16', 'float32'],
+        help=
+        "The data type for the model weights and activations if not quantized. "
+        "If 'auto', the data type is automatically inferred from the source model; "
+        "however, if the source dtype is float32, it is converted to float16.")
     parser.add_argument(
         '--use_parallel_embedding',
         action="store_true",
@@ -44,13 +49,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
 
     parser.add_argument(
         '--use_weight_only',
@@ -102,7 +100,6 @@ def args_to_build_options(args):
     return {
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
     }
 
 

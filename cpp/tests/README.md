@@ -58,6 +58,7 @@ PYTHONPATH=examples/gptj:$PYTHONPATH python3 cpp/tests/resources/scripts/build_g
 PYTHONPATH=examples/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/build_llama_engines.py
 PYTHONPATH=examples/chatglm:$PYTHONPATH python3 cpp/tests/resources/scripts/build_chatglm_engines.py
 PYTHONPATH=examples/medusa:$PYTHONPATH python3 cpp/tests/resources/scripts/build_medusa_engines.py
+PYTHONPATH=examples/eagle:$PYTHONPATH python3 cpp/tests/resources/scripts/build_eagle_engines.py
 PYTHONPATH=examples/redrafter:$PYTHONPATH python3 cpp/tests/resources/scripts/build_redrafter_engines.py --has_tllm_checkpoint
 ```
 
@@ -65,6 +66,12 @@ It is possible to build engines with tensor and pipeline parallelism for LLaMA u
 
 ```bash
 PYTHONPATH=examples/llama python3 cpp/tests/resources/scripts/build_llama_engines.py --only_multi_gpu
+```
+
+If there is an issue finding model_spec.so in engine building, manually build model_spec.so by
+
+```bash
+make -C cpp/build/ modelSpec
 ```
 
 #### Generate expected output
@@ -77,6 +84,7 @@ PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_exp
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_llama_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_chatglm_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_medusa_output.py
+PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_eagle_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_redrafter_output.py
 ```
 

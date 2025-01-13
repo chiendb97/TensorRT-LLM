@@ -12,25 +12,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Optional, Union
 
 import transformers
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size
-from ...functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
-                           non_gated_version, recv, send)
+from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor,
+                           allgather, concat, non_gated_version, recv, send)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, GatedMLP, PositionEmbeddingType, RmsNorm)
+                       Embedding, FusedGatedMLP, GatedMLP,
+                       PositionEmbeddingType, RmsNorm)
 from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
-from ...quantization import W8A8_SQ_PLUGIN_LIST, QuantAlgo
 from ..convert_utils import has_safetensors
+from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, check_share_embedding)
+                              QuantConfig)
 from .config import LLaMAConfig
-from .convert import (load_hf_llama, load_weights_from_hf_by_shard,
+from .convert import (load_hf_llama, load_weights_from_deepcompressor,
+                      load_weights_from_gptq, load_weights_from_hf_by_shard,
                       load_weights_from_hf_model,
                       load_weights_from_hf_safetensors,
                       load_weights_from_meta_ckpt)
@@ -41,14 +44,19 @@ class LLaMADecoderLayer(Module):
     def __init__(self, config: LLaMAConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        layer_idx += config.layer_idx_offset
         self.config = config
+        self.mapping = config.mapping
 
-        self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
-                                       eps=config.norm_epsilon,
-                                       dtype=config.dtype)
+        if (self.config.use_input_layernorm_in_first_layer
+                and self.layer_idx == 0) or self.layer_idx > 0:
+            self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
+                                           eps=config.norm_epsilon,
+                                           dtype=config.dtype)
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
         self.local_layer_idx = layer_idx - layers_range[0]
+        self.is_last_local_layer = layer_idx == layers_range[-1]
         self.attention = Attention(
             local_layer_idx=self.local_layer_idx,
             hidden_size=config.hidden_size,
@@ -66,7 +74,10 @@ class LLaMADecoderLayer(Module):
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
             tp_rank=config.mapping.tp_rank,
-            quant_mode=config.quant_mode)
+            quant_mode=config.quant_mode,
+            cp_group=config.mapping.cp_group,
+            cp_size=config.mapping.cp_size,
+            cp_rank=config.mapping.cp_rank)
 
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
@@ -129,13 +140,27 @@ class LLaMADecoderLayer(Module):
         assert not (
             default_net().plugin_config.reduce_fusion and self.has_residual_mlp
         ), "Custom all reduce and residual mlp can't be enabled at the same time."
+        assert not (
+            default_net().plugin_config.reduce_fusion
+            and default_net().plugin_config.user_buffer
+            and default_net().plugin_config.pp_reduce_scatter
+        ), "User buffer reduce fusion enabled with PP reduce scatter is not supported now."
         if default_net(
         ).plugin_config.reduce_fusion and self.local_layer_idx > 0:
             hidden_states, residual = hidden_states
         else:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            if (self.config.use_input_layernorm_in_first_layer
+                    and self.layer_idx == 0) or self.layer_idx > 0:
+                hidden_states = self.input_layernorm(hidden_states)
 
+        reduce_fusion_scale = None
+        if default_net().plugin_config.reduce_fusion and default_net(
+        ).plugin_config.user_buffer and self.config.quant_mode.has_fp8_qdq:
+            if isinstance(self.mlp, FusedGatedMLP):
+                reduce_fusion_scale = self.mlp.fused_fc.activation_scaling_factor.value
+            else:
+                reduce_fusion_scale = self.mlp.fc.activation_scaling_factor.value
         attention_output = self.attention(
             hidden_states,
             attention_mask=attention_mask,
@@ -144,12 +169,13 @@ class LLaMADecoderLayer(Module):
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
-            reduce_fusion_params=AllReduceFusionParams(
+            all_reduce_params=AllReduceParams(
                 fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM
                 if default_net().plugin_config.reduce_fusion else
                 AllReduceFusionOp.NONE,
                 residual=residual,
                 norm_weight=self.post_layernorm.weight.value,
+                scale=reduce_fusion_scale,
                 eps=self.post_layernorm.eps))
 
         if use_cache:
@@ -182,17 +208,36 @@ class LLaMADecoderLayer(Module):
                 hidden_states = self.mlp(
                     hidden_states,
                     lora_layer_params=lora_layer_params,
-                    reduce_fusion_params=AllReduceFusionParams(
+                    all_reduce_params=AllReduceParams(
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM
                         if default_net().plugin_config.reduce_fusion else
                         AllReduceFusionOp.NONE,
                         residual=residual,
                         norm_weight=next_layer_input_layernorm_args[0],
+                        scale=next_layer_input_layernorm_args[2],
                         eps=next_layer_input_layernorm_args[1]))
             else:
-                hidden_states = self.mlp(hidden_states,
-                                         lora_layer_params=lora_layer_params)
-                hidden_states = residual + hidden_states
+                if default_net(
+                ).plugin_config.pp_reduce_scatter and self.is_last_local_layer and not self.mapping.is_last_pp_rank(
+                ):
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        lora_layer_params=lora_layer_params,
+                        last_local_layer_residual=residual)
+                else:
+                    if (default_net().plugin_config.reduce_fusion
+                            and default_net().plugin_config.user_buffer):
+                        hidden_states, residual = self.mlp(
+                            hidden_states,
+                            lora_layer_params=lora_layer_params,
+                            all_reduce_params=AllReduceParams(
+                                fusion_op=AllReduceFusionOp.LAST_PROCESS_FOR_UB,
+                                residual=residual))
+                    else:
+                        hidden_states = self.mlp(
+                            hidden_states, lora_layer_params=lora_layer_params)
+                    hidden_states = residual + hidden_states
+
         if use_cache:
             return (hidden_states, presents)
         return hidden_states
@@ -204,6 +249,7 @@ class LLaMAModel(Module):
         super().__init__()
 
         self.mapping = config.mapping
+        self.hidden_size = config.hidden_size
         if self.mapping.is_first_pp_rank():
             self.vocab_embedding = Embedding(config.vocab_size,
                                              config.hidden_size,
@@ -211,10 +257,21 @@ class LLaMAModel(Module):
 
         self.layers = DecoderLayerList(LLaMADecoderLayer, config)
 
+        if config.fc_after_embed:
+            self.fc = ColumnLinear(2 * config.hidden_size,
+                                   config.hidden_size,
+                                   bias=True,
+                                   dtype=config.dtype,
+                                   tp_group=config.mapping.tp_group,
+                                   tp_size=config.mapping.tp_size,
+                                   gather_output=True)
+
         if self.mapping.is_last_pp_rank():
-            self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
-                                eps=config.norm_epsilon,
-                                dtype=config.dtype)
+            self.ln_f = None
+            if config.use_last_layernorm:
+                self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
+                                    eps=config.norm_epsilon,
+                                    dtype=config.dtype)
 
     def forward(self,
                 input_ids,
@@ -225,6 +282,7 @@ class LLaMAModel(Module):
                 kv_cache_params=None,
                 attention_params=None,
                 hidden_states=None,
+                hidden_states_for_embed=None,
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
                 prompt_vocab_size: Optional[Tensor] = None,
@@ -238,6 +296,18 @@ class LLaMAModel(Module):
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
+            if default_net().plugin_config.pp_reduce_scatter:
+                hidden_states = allgather(hidden_states,
+                                          self.mapping.tp_group,
+                                          gather_dim=0)
+                # reshape to (-1, hidden_size)
+                hidden_states = hidden_states.view(
+                    concat([-1, self.hidden_size]))
+
+        if hidden_states_for_embed is not None:
+            hidden_states = concat([hidden_states, hidden_states_for_embed],
+                                   dim=-1)
+            hidden_states = self.fc(hidden_states)
 
         hidden_states = self.layers.forward(
             hidden_states,
@@ -252,7 +322,8 @@ class LLaMAModel(Module):
             hidden_states, presents = hidden_states
 
         if self.mapping.is_last_pp_rank():
-            hidden_states = self.ln_f(hidden_states)
+            if self.ln_f:
+                hidden_states = self.ln_f(hidden_states)
         else:
             hidden_states = send(hidden_states, self.mapping.next_pp_rank())
 
@@ -296,6 +367,19 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
 
         load_by_shard = kwargs.pop('load_by_shard', False)
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+        quant_ckpt_path = kwargs.pop('quant_ckpt_path', None)
+        use_autoawq = kwargs.pop('use_autoawq', None)
+        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER"
+                          ) is not None and not isinstance(
+                              hf_model_or_dir, transformers.PreTrainedModel):
+            if "vila" in hf_model_or_dir or "llava" in hf_model_or_dir:
+                hf_model_or_dir = load_hf_llama(hf_model_or_dir,
+                                                load_model_on_cpu)
+            elif not load_by_shard and not has_safetensors(
+                    hf_model_or_dir
+            ) and not quant_config.quant_mode.has_any_quant():
+                hf_model_or_dir = load_hf_llama(hf_model_or_dir,
+                                                load_model_on_cpu)
 
         assert hf_model_or_dir is not None
         use_preloading = isinstance(hf_model_or_dir,
@@ -314,21 +398,65 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                                **kwargs)
         if config.remove_duplicated_kv_heads:
             config.num_key_value_heads = config.num_key_value_heads // 2
-        if use_preloading:
-            assert not load_by_shard
-            weights = load_weights_from_hf_model(hf_model, config)
-        elif load_by_shard:
-            weights = load_weights_from_hf_by_shard(hf_model_dir, config)
-        elif has_safetensors(
-                hf_model_dir) and not config.quant_mode.has_any_quant():
-            weights = load_weights_from_hf_safetensors(hf_model_dir, config)
-        else:
-            hf_model = load_hf_llama(hf_model_dir, load_model_on_cpu)
-            weights = load_weights_from_hf_model(hf_model, config)
+        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+            custom_dict = {}
+            model_name = hf_model.config.model_type if use_preloading else hf_model_or_dir
+            if "llava" in model_name:
+                custom_dict = {
+                    "transformer": "language_model.model",
+                    "lm_head": "language_model.lm_head"
+                }
+            elif "vila" in model_name:
+                hf_model_dir += "/llm"
+            elif "exaone" in model_name:
+                custom_dict = {
+                    "transformer": "transformer",
+                    "layers": "h",
+                    "vocab_embedding": "wte",
+                    "lm_head": "lm_head",
+                    "ln_f": "ln_f",
+                    "attention": "attn.attention",
+                    "dense": "out_proj",
+                    "gate": "c_fc_1",
+                    "proj": "c_proj",
+                    "fc": "c_fc_0",
+                    "input_layernorm": "ln_1",
+                    "post_layernorm": "ln_2",
+                }
+            elif config.tie_word_embeddings:
+                custom_dict = {"lm_head": "model.embed_tokens"}
 
-        check_share_embedding(weights, config)
-        model = cls(config)
-        model.load(weights)
+            if quant_ckpt_path is not None:
+                hf_model_dir = quant_ckpt_path
+            arg_dict = {"use_autoawq": True} if use_autoawq else {}
+
+            loader = ModelWeightsLoader(hf_model_dir, custom_dict)
+            model = cls(config)
+            loader.generate_tllm_weights(model, arg_dict)
+        else:
+            if use_preloading:
+                assert not load_by_shard
+                weights = load_weights_from_hf_model(hf_model, config)
+            elif load_by_shard:
+                weights = load_weights_from_hf_by_shard(hf_model_dir, config)
+            elif has_safetensors(
+                    hf_model_dir) and not config.quant_mode.has_any_quant():
+                weights = load_weights_from_hf_safetensors(hf_model_dir, config)
+            elif quant_ckpt_path is not None:
+                if quant_config.quant_mode.is_int4_weight_only():
+                    weights = load_weights_from_gptq(quant_ckpt_path, config)
+                elif quant_config.quant_mode.is_qserve_w4a8():
+                    weights = load_weights_from_deepcompressor(
+                        quant_ckpt_path, config)
+                else:
+                    raise ValueError(
+                        "quant_ckpt_path should be specified only for GPTQ or QServe"
+                    )
+            else:
+                hf_model = load_hf_llama(hf_model_dir, load_model_on_cpu)
+                weights = load_weights_from_hf_model(hf_model, config)
+            model = cls(config)
+            model.load(weights)
         return model
 
     def default_plugin_config(self, **kwargs):
@@ -352,7 +480,6 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
 
         weights = load_weights_from_meta_ckpt(meta_ckpt_dir, config)
 
-        check_share_embedding(weights, config)
         model = cls(config)
         model.load(weights)
         return model
@@ -375,22 +502,13 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         tokenizer_max_seq_length: int = 2048,
         **kwargs,
     ):
-        DEFAULT_MODELOPT_FLOW = [
-            QuantAlgo.W4A16_AWQ, QuantAlgo.FP8, QuantAlgo.W8A8_SQ_PER_CHANNEL,
-            QuantAlgo.W4A8_AWQ
-        ]
-        config = LLaMAConfig.from_hugging_face(hf_model_dir,
-                                               dtype=dtype,
-                                               mapping=mapping,
-                                               quant_config=quant_config,
-                                               **kwargs)
-
-        if quant_config.quant_algo in DEFAULT_MODELOPT_FLOW:
+        if quant_config.requires_modelopt_quantization:
+            # modelopt quantization flow
             super().quantize(hf_model_dir,
                              output_dir,
-                             dtype=config.dtype,
-                             mapping=config.mapping,
-                             quant_config=config.quantization,
+                             dtype=dtype,
+                             mapping=mapping,
+                             quant_config=quant_config,
                              device=device,
                              calib_dataset=calib_dataset,
                              calib_batches=calib_batches,
@@ -398,25 +516,29 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                              calib_max_seq_length=calib_max_seq_length,
                              random_seed=random_seed,
                              tokenizer_max_seq_length=tokenizer_max_seq_length)
-        else:
-            # non-modelopt, the legacy TRT-LLM native quantization algorithm:
-            # sq, int4/int8 weights only, int8 kv cache
-            NATIVE_QUANT_FLOW = [
-                QuantAlgo.W4A16, QuantAlgo.W8A16,
-                QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN, None
-            ] + W8A8_SQ_PLUGIN_LIST
-            is_valid_native_quant = (quant_config.quant_algo in NATIVE_QUANT_FLOW) and \
-                (quant_config.kv_cache_quant_algo in [QuantAlgo.INT8, None])
-            assert quant_config.quant_algo is not None or quant_config.kv_cache_quant_algo is not None, \
-                "There is no point to call the quantize function if both quant_algo and kv_cache_quant_algo is None"
-            assert is_valid_native_quant, f"Internal error: shall call Modelopt for this quantization {quant_config}"
-
+        elif quant_config.requires_calibration:
+            # non-modelopt quantization flow
             from . import convert
+
+            config = LLaMAConfig.from_hugging_face(hf_model_dir,
+                                                   dtype=dtype,
+                                                   mapping=mapping,
+                                                   quant_config=quant_config,
+                                                   **kwargs)
+            trust_remote_code = kwargs.pop("trust_remote_code", True)
+
             convert.quantize(hf_model_dir,
                              output_dir,
                              config=config,
                              device=device,
-                             calib_dataset=calib_dataset)
+                             calib_dataset=calib_dataset,
+                             trust_remote_code=trust_remote_code,
+                             calib_batches=calib_batches,
+                             calib_max_seq_length=calib_max_seq_length)
+        else:
+            raise ValueError(
+                f"The quant_config ({quant_config}) does not require calibration, try {cls.__name__}.from_hugging_face instead."
+            )
 
     def use_lora(self, lora_config: LoraConfig):
         use_lora(self, lora_config)

@@ -27,7 +27,7 @@ def parse_arguments():
         default=None,
         choices=[
             None, 'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon',
-            'kosmos-2'
+            'kosmos-2', 'nemotron'
         ],
         help=
         "By default the script will try to infer the gpt_variant from model_dir. "
@@ -40,10 +40,15 @@ def parse_arguments():
                         type=int,
                         default=1,
                         help='N-way pipeline parallelism size')
-    parser.add_argument('--dtype',
-                        type=str,
-                        default='float16',
-                        choices=['float32', 'bfloat16', 'float16'])
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float16', 'bfloat16', 'float32'],
+        help=
+        "The data type for the model weights and activations if not quantized. "
+        "If 'auto', the data type is automatically inferred from the source model; "
+        "however, if the source dtype is float32, it is converted to float16.")
     parser.add_argument("--load_model_on_cpu", action="store_true")
     parser.add_argument(
         '--use_parallel_embedding',
@@ -62,13 +67,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
 
     parser.add_argument(
         '--use_weight_only',
@@ -191,17 +189,15 @@ def convert_and_save_hf(args):
     override_fields = {
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
+        'gpt_variant': args.gpt_variant,
     }
 
     quant_config = args_to_quant_config(args)
 
     if args.smoothquant is not None or args.int8_kv_cache:
-        mapping = Mapping(
-            world_size=world_size,
-            rank=-1,  #intentinoally make -1 to avoid mistake
-            tp_size=args.tp_size,
-            pp_size=args.pp_size)
+        mapping = Mapping(world_size=world_size,
+                          tp_size=args.tp_size,
+                          pp_size=args.pp_size)
         GPTForCausalLM.quantize(
             args.model_dir,
             args.output_dir,
@@ -257,7 +253,6 @@ def convert_and_save_nemo(args):
     override_fields = {
         'use_parallel_embedding': True,
         'embedding_sharding_dim': 0,
-        'share_embedding_table': args.use_embedding_sharing,
     }
 
     nemo_ckpt_dir = os.path.join(args.output_dir, "unpacked")

@@ -42,10 +42,11 @@ public:
         mTransB = transposeB;
     }
 
-    void setPadLd(int padLda, int padLdb)
+    void setPadLd(int padLda, int padLdb, int padLdc)
     {
         mPadLda = padLda;
         mPadLdb = padLdb;
+        mPadLdc = padLdc;
     }
 
     void setOutputType(nvinfer1::DataType type)
@@ -67,6 +68,7 @@ private:
     bool mTransB;
     int mPadLda;
     int mPadLdb;
+    int mPadLdc;
     nvinfer1::DataType mOutputType;
 
     static constexpr size_t ALIGNMENT = 256;
@@ -79,8 +81,8 @@ public:
 
     GemmPlugin() = delete;
 
-    GemmPlugin(int transA, int transB, int padLda, int padLdb, nvinfer1::DataType type, bool useFp8, float alpha,
-        PluginProfilerPtr const& profiler);
+    GemmPlugin(int transA, int transB, int padLda, int padLdb, int padLdc, nvinfer1::DataType type, bool useFp8,
+        float alpha, PluginProfilerPtr const& profiler);
 
     GemmPlugin(void const* data, size_t length, PluginProfilerPtr const& profiler);
 
@@ -125,12 +127,15 @@ private:
     int mTransB;
     int mPadLda;
     int mPadLdb;
+    int mPadLdc;
     nvinfer1::DataType mType;
     nvinfer1::DataType mOutputType;
 
     // @fixme: seems this is shared across multiple clones.
     // If we deep copy the wrapper inside clone(), then we may avoid the mutex inside the wrapper?
     CublasGemmWrapperPtr mCublasWrapper;
+    std::shared_ptr<cublasHandle_t> mcublasHandle;
+    std::shared_ptr<cublasLtHandle_t> mcublasLtHandle;
 
     GemmDims mDims{};
     GemmIdCublas mGemmId{};

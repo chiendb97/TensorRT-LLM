@@ -35,11 +35,13 @@ def generate_output(engine: str,
                     output_logits: bool = False):
     tp_size = 1
     pp_size = 1
+    cp_size = 1
     model = 'mamba-2.8b-hf'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    tp_pp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-gpu/'
-    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_dir
+    tp_pp_cp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-cp' + str(
+        cp_size) + '-gpu/'
+    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_cp_dir
 
     data_dir = resources_dir / 'data'
     input_file = data_dir / input_name
@@ -74,7 +76,7 @@ def generate_outputs(num_beams):
     print('Generating Mamba FP16 outputs')
     input_name = 'input_tokens.npy'
     model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
 
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
@@ -96,7 +98,7 @@ def generate_outputs(num_beams):
                     model_spec_obj=model_spec_obj)
 
     print('Generating Mamba FP16-plugin-packed-paged outputs')
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
                     input_name=input_name,

@@ -96,6 +96,23 @@ else()
   message(STATUS "Importing nvrtc wrapper")
 endif()
 
+if(EXISTS
+   "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/internal_cutlass_kernels/CMakeLists.txt"
+)
+  set(BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT ON)
+else()
+  set(BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT OFF)
+endif()
+option(BUILD_INTERNAL_CUTLASS_KERNELS
+       "Build internal cutlass kernels from source"
+       ${BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT})
+
+if(BUILD_INTERNAL_CUTLASS_KERNELS)
+  message(STATUS "Building internal cutlass kernels")
+else()
+  message(STATUS "Importing internal cutlass kernels")
+endif()
+
 if(BUILD_PYT)
   message(STATUS "Building PyTorch")
 else()
@@ -197,9 +214,9 @@ endif()
 # Initialize CMAKE_CUDA_ARCHITECTURES before enabling CUDA
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.8")
-    set(CMAKE_CUDA_ARCHITECTURES 70-real 80-real 86-real 89-real 90-real)
+    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89-real 90-real)
   else()
-    set(CMAKE_CUDA_ARCHITECTURES 70-real 80-real 86-real)
+    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real)
   endif()
 endif()
 
@@ -289,7 +306,7 @@ set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 find_library(RT_LIB rt)
 
 set_ifndef(ENABLE_MULTI_DEVICE 1)
-if(ENABLE_MULTI_DEVICE EQUAL 1)
+if(ENABLE_MULTI_DEVICE)
   # NCCL dependencies
   set_ifndef(NCCL_LIB_DIR /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu/)
   set_ifndef(NCCL_INCLUDE_DIR /usr/include/)
@@ -299,6 +316,8 @@ endif()
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
+add_subdirectory(${3RDPARTY_DIR}/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
+
 include_directories(
   ${CUDAToolkit_INCLUDE_DIRS}
   ${CUDNN_ROOT_DIR}/include
@@ -306,7 +325,8 @@ include_directories(
   ${3RDPARTY_DIR}/cutlass/include
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
-  ${3RDPARTY_DIR}/json/include)
+  ${3RDPARTY_DIR}/json/include
+  ${3RDPARTY_DIR}/pybind11/include)
 
 # TRT dependencies
 set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
@@ -520,6 +540,31 @@ elseif(NOT WIN32)
   endif()
   message(STATUS "Build without PyTorch, USE_CXX11_ABI=${USE_CXX11_ABI}")
 endif()
+
+# Defer UCX/UCXX setup until after USE_CXX11_ABI is well defined, as UCXX will
+# need to be built to have aligned symbols
+set_ifndef(ENABLE_UCX 1)
+if(ENABLE_UCX)
+  # Only enable UCX related features if the system has UCX library
+  find_package(ucx)
+  if(NOT ${ucx_FOUND})
+    set(ENABLE_UCX 0)
+  else()
+    # installing ucxx via add_subdirectory results in strange cudart linking
+    # error, thus using their installation script to isolate the installation
+    # process until the issue is understood. And always trigger the build so
+    # that change in USE_CXX11_ABI will not be ignored.
+    execute_process(
+      COMMAND
+        ${3RDPARTY_DIR}/ucxx/build.sh libucxx -n
+        --cmake-args=\"-DBUILD_SHARED_LIBS=OFF
+        -DCMAKE_CXX_FLAGS=-D_GLIBCXX_USE_CXX11_ABI=${USE_CXX11_ABI}\"
+        COMMAND_ECHO STDOUT)
+    find_package(ucxx REQUIRED PATHS ${3RDPARTY_DIR}/ucxx/cpp/build
+                 NO_DEFAULT_PATH)
+  endif()
+endif()
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=${ENABLE_UCX}")
 
 file(STRINGS "${TRT_INCLUDE_DIR}/NvInferVersion.h" VERSION_STRINGS
      REGEX "#define NV_TENSORRT_.*")

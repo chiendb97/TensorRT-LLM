@@ -19,10 +19,7 @@
 
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
-#include <filesystem>
 #include <optional>
-
-namespace fs = std::filesystem;
 
 namespace tensorrt_llm::batch_manager
 {
@@ -32,7 +29,7 @@ using runtime::SizeType32;
 struct PeftCacheManagerConfig
 {
 
-    static float constexpr kDefaultDeviceCachePercent = 0.05;
+    static float constexpr kDefaultDeviceCachePercent = 0.02;
     static size_t constexpr kDefaultHostCacheSize = 1024 * 1024 * 1024;
 
     explicit PeftCacheManagerConfig(SizeType32 numHostModuleLayer = 0, SizeType32 numDeviceModuleLayer = 0,
@@ -54,7 +51,7 @@ struct PeftCacheManagerConfig
     {
     }
 
-    PeftCacheManagerConfig(executor::PeftCacheConfig cfg)
+    explicit PeftCacheManagerConfig(executor::PeftCacheConfig cfg)
         : numHostModuleLayer(cfg.getNumHostModuleLayer())
         , numDeviceModuleLayer(cfg.getNumDeviceModuleLayer())
         , optimalAdapterSize(cfg.getOptimalAdapterSize())

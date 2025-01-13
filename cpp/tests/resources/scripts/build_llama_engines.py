@@ -27,17 +27,18 @@ import model_spec
 import tensorrt_llm.bindings as _tb
 
 
-def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
+def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, convert_extra_args,
+                 build_extra_args):
 
     ckpt_dir = engine_dir / 'ckpt'
 
-    covert_cmd = [_sys.executable, "examples/llama/convert_checkpoint.py"
-                  ] + ([f'--model_dir={weight_dir}'] if weight_dir else []) + [
-                      f'--output_dir={ckpt_dir}',
-                      '--dtype=float16',
-                  ] + list(args)
+    convert_cmd = [_sys.executable, "examples/llama/convert_checkpoint.py"
+                   ] + ([f'--model_dir={weight_dir}'] if weight_dir else []) + [
+                       f'--output_dir={ckpt_dir}',
+                       '--dtype=float16',
+                   ] + convert_extra_args
 
-    run_command(covert_cmd)
+    run_command(convert_cmd)
 
     build_args = [
         'trtllm-build',
@@ -52,7 +53,7 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
         '--log_level=error',
         '--paged_kv_cache=enable',
         '--remove_input_padding=enable',
-    ]
+    ] + build_extra_args
 
     run_command(build_args)
 
@@ -73,8 +74,9 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
                     isdir=True,
                     cwd=models_dir)
         else:
-            run_command(
-                ["rsync", "-av", str(model_cache_dir), "."], cwd=models_dir)
+            run_command(["rsync", "-rlptD",
+                         str(model_cache_dir), "."],
+                        cwd=models_dir)
 
     hf_dir = models_dir / model_name
     assert hf_dir.is_dir()
@@ -83,21 +85,40 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
 
     model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
 
-    tp_pp_sizes = [(1, 1)]
+    tp_pp_cp_sizes = [(1, 1, 1)]
     if only_multi_gpu:
-        tp_pp_sizes = [(1, 4), (4, 1), (1, 2), (2, 2)]
-    for tp_size, pp_size in tp_pp_sizes:
-        tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
-        print(f"\nBuilding fp16 tp{tp_size} pp{pp_size} engine")
+        tp_pp_cp_sizes = [(1, 4, 1), (4, 1, 1), (1, 2, 1), (2, 2, 1), (2, 1, 1),
+                          (1, 1, 2), (2, 1, 2)]
+    for tp_size, pp_size, cp_size in tp_pp_cp_sizes:
+        tp_pp_cp_dir = f"tp{tp_size}-pp{pp_size}-cp{cp_size}-gpu"
+        print(f"\nBuilding fp16 tp{tp_size} pp{pp_size} cp{cp_size} engine")
         model_spec_obj.use_tensor_parallelism(tp_size)
         model_spec_obj.use_pipeline_parallelism(pp_size)
+        model_spec_obj.use_context_parallelism(cp_size)
 
-        build_engine(hf_dir,
-                     engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
-                     f'--tp_size={tp_size}', f'--pp_size={pp_size}')
+        build_engine(
+            hf_dir, engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
+            [
+                f'--tp_size={tp_size}', f'--pp_size={pp_size}',
+                f'--cp_size={cp_size}'
+            ], [])
+
+    if not only_multi_gpu:
+        print(f"\nBuilding lookahead engine")
+        model_spec_obj.use_tensor_parallelism(1)
+        model_spec_obj.use_pipeline_parallelism(1)
+        model_spec_obj.use_context_parallelism(1)
+        model_spec_obj.use_lookahead_decoding()
+        build_engine(
+            hf_dir,
+            engine_dir / model_spec_obj.get_model_path() / 'tp1-pp1-cp1-gpu',
+            [], [
+                '--max_draft_len=39',
+                '--speculative_decoding_mode=lookahead_decoding'
+            ])
 
     print("Done.")
 

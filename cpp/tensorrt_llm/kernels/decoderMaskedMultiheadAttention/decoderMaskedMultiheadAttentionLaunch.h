@@ -75,7 +75,8 @@ inline size_t smem_size_in_bytes(Multihead_attention_params<T, DO_CROSS_ATTENTIO
 
     size_t transpose_rotary_size = 0;
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
-        || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE)
+        || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+        || params.position_embedding_type == PositionEmbeddingType::kROPE_M)
     {
         assert(params.rotary_embedding_dim > 0);
         transpose_rotary_size = 2 * params.rotary_embedding_dim * sizeof(Tk);
@@ -146,7 +147,7 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
     grid.z = params.seq_len_tile;
 }
 
-#define MMHA_LAUNCH_CHECK(DYNAMIC_THDS_PER_BLOCK)                                                                      \
+#define MMHA_LAUNCH_CHECK(DYNAMIC_THDS_PER_BLOCK, DO_MULTI_BLOCK)                                                      \
     std::size_t const dynamic_smem_sz{                                                                                 \
         mmha::smem_size_in_bytes<T, Dh, DO_MULTI_BLOCK>(params, DYNAMIC_THDS_PER_BLOCK)};                              \
     /* Set 46KB threshold here because we have to take static/driver shared memory into consideration. */              \
@@ -155,7 +156,7 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
         cudaError_t res = cudaFuncSetAttribute(                                                                        \
             mmha::masked_multihead_attention_kernel<T, T_cache, TKcache, KVCacheBuffer, KCacheBuffer, Dh,              \
                 DYNAMIC_THDS_PER_BLOCK, KernelParamsType::DO_CROSS_ATTENTION, HAS_BEAMS, DO_MULTI_BLOCK, POS_SHIFT,    \
-                BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>,                                             \
+                BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>,                                    \
             cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_smem_sz);                                             \
         TLLM_CHECK_WITH_INFO(                                                                                          \
             res == cudaSuccess, "Sequence Length is too long for the MMHA kernel (not enough shared memory).");        \
@@ -163,7 +164,7 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
     TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&available_blocks,                                   \
         mmha::masked_multihead_attention_kernel<T, T_cache, TKcache, KVCacheBuffer, KCacheBuffer, Dh,                  \
             DYNAMIC_THDS_PER_BLOCK, KernelParamsType::DO_CROSS_ATTENTION, HAS_BEAMS, DO_MULTI_BLOCK, POS_SHIFT,        \
-            BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>,                                                 \
+            BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>,                                        \
         DYNAMIC_THDS_PER_BLOCK, dynamic_smem_sz));
 
 #define MMHA_KERNEL(DYNAMIC_THDS_PER_BLOCK, ENABLE_MULTI_BLOCK)                                                        \
@@ -175,17 +176,17 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
         cudaError_t res = cudaFuncSetAttribute(                                                                        \
             mmha::masked_multihead_attention_kernel<T, T_cache, TKcache, KVCacheBuffer, KCacheBuffer, Dh,              \
                 DYNAMIC_THDS_PER_BLOCK, KernelParamsType::DO_CROSS_ATTENTION, HAS_BEAMS, ENABLE_MULTI_BLOCK,           \
-                POS_SHIFT, BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>,                                  \
+                POS_SHIFT, BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>,                         \
             cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_smem_sz);                                             \
         TLLM_CHECK_WITH_INFO(                                                                                          \
             res == cudaSuccess, "Sequence Length is too long for the MMHA kernel (not enough shared memory).");        \
     }                                                                                                                  \
     const auto mmhaFunc = mmha::masked_multihead_attention_kernel<T, T_cache, TKcache, KVCacheBuffer, KCacheBuffer,    \
         Dh, DYNAMIC_THDS_PER_BLOCK, KernelParamsType::DO_CROSS_ATTENTION, HAS_BEAMS, ENABLE_MULTI_BLOCK, POS_SHIFT,    \
-        BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>;                                                     \
-    if (tensorrt_llm::common::getEnvEnableFDL())                                                                       \
+        BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>;                                            \
+    if (tensorrt_llm::common::getEnvEnablePDL())                                                                       \
     {                                                                                                                  \
-        TLLM_LOG_DEBUG("Enable FDL in MMHA");                                                                          \
+        TLLM_LOG_DEBUG("Enable PDL in MMHA");                                                                          \
         cudaLaunchConfig_t kernelConfig = {0};                                                                         \
         kernelConfig.gridDim = grid;                                                                                   \
         kernelConfig.blockDim = DYNAMIC_THDS_PER_BLOCK;                                                                \
@@ -205,11 +206,11 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
     }
 
 // if resources are not enough to launch 512 threads per block, we will fallback to 256.
-#define MMHA_512_BLOCKSIZE_CHECK()                                                                                     \
-    MMHA_LAUNCH_CHECK(512);                                                                                            \
+#define MMHA_512_BLOCKSIZE_CHECK(DO_MULTI_BLOCK)                                                                       \
+    MMHA_LAUNCH_CHECK(512, DO_MULTI_BLOCK);                                                                            \
     if (available_blocks <= 0)                                                                                         \
     {                                                                                                                  \
-        MMHA_LAUNCH_CHECK(256);                                                                                        \
+        MMHA_LAUNCH_CHECK(256, DO_MULTI_BLOCK);                                                                        \
         dynamic_block_size = 256;                                                                                      \
     }                                                                                                                  \
     else                                                                                                               \
@@ -218,22 +219,39 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
     }
 
 // if resources are not enough to launch 1024 threads per block, we will fallback to 512.
-#define MMHA_1024_BLOCKSIZE_CHECK()                                                                                    \
-    MMHA_LAUNCH_CHECK(1024);                                                                                           \
+#define MMHA_1024_BLOCKSIZE_CHECK(DO_MULTI_BLOCK)                                                                      \
+    MMHA_LAUNCH_CHECK(1024, DO_MULTI_BLOCK);                                                                           \
     if (available_blocks > 0)                                                                                          \
     {                                                                                                                  \
         dynamic_block_size = 1024;                                                                                     \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        MMHA_512_BLOCKSIZE_CHECK();                                                                                    \
+        MMHA_512_BLOCKSIZE_CHECK(DO_MULTI_BLOCK);                                                                      \
+    }
+
+// The previous dynamic_block_size might be calculated based on muli-block-mode enabled,
+// while the final launch set it disabled, so we need to fallback to smaller kernel block size
+// if there are not enough resources.
+#define MMHA_DYNAMIC_LAUNCH(DO_MULTI_BLOCK)                                                                            \
+    if (dynamic_block_size == 256)                                                                                     \
+    {                                                                                                                  \
+        MMHA_KERNEL(256, DO_MULTI_BLOCK);                                                                              \
+    }                                                                                                                  \
+    else if (dynamic_block_size == 512)                                                                                \
+    {                                                                                                                  \
+        MMHA_KERNEL(512, DO_MULTI_BLOCK);                                                                              \
+    }                                                                                                                  \
+    else if (dynamic_block_size == 1024)                                                                               \
+    {                                                                                                                  \
+        MMHA_KERNEL(1024, DO_MULTI_BLOCK);                                                                             \
     }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T, typename T_cache, typename TKcache, typename KVCacheBuffer, typename KCacheBuffer,
     typename KernelParamsType, int Dh, int THDS_PER_BLOCK, bool HAS_BEAMS, bool DO_MULTI_BLOCK, bool POS_SHIFT,
-    bool BLOCK_SPARSE_ATTN, bool IMPLICIT_REL_ATTN_BIAS, bool QK_TANH_SCALE>
+    bool BLOCK_SPARSE_ATTN, bool IMPLICIT_REL_ATTN_BIAS, bool ATTN_LOGIT_SOFTCAPPING>
 void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& kv_cache_buffer,
     KCacheBuffer const& k_cache_buffer, cudaStream_t const& stream, int tlength)
 {
@@ -255,7 +273,7 @@ void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& 
     TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm,
         mmha::masked_multihead_attention_kernel<T, T_cache, TKcache, KVCacheBuffer, KCacheBuffer, Dh, THDS_PER_BLOCK,
             KernelParamsType::DO_CROSS_ATTENTION, HAS_BEAMS, DO_MULTI_BLOCK, POS_SHIFT, BLOCK_SPARSE_ATTN,
-            IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>,
+            IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>,
         THDS_PER_BLOCK, 0));
 
     int block_size_factor
@@ -268,16 +286,16 @@ void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& 
     int available_blocks = -1;
     if (dynamic_block_size < 512)
     {
-        MMHA_LAUNCH_CHECK(256);
+        MMHA_LAUNCH_CHECK(256, DO_MULTI_BLOCK);
         dynamic_block_size = 256;
     }
     else if (dynamic_block_size < 1024)
     {
-        MMHA_512_BLOCKSIZE_CHECK();
+        MMHA_512_BLOCKSIZE_CHECK(DO_MULTI_BLOCK);
     }
     else if (dynamic_block_size == 1024)
     {
-        MMHA_1024_BLOCKSIZE_CHECK();
+        MMHA_1024_BLOCKSIZE_CHECK(DO_MULTI_BLOCK);
     }
 
     // Block size can be finetuned by TRTLLM_MMHA_KERNEL_BLOCK_SIZE.
@@ -306,7 +324,8 @@ void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& 
         }
         else
         {
-            MMHA_KERNEL(512, false);
+            MMHA_512_BLOCKSIZE_CHECK(false);
+            MMHA_DYNAMIC_LAUNCH(false);
         }
         break;
     case 1024:
@@ -316,7 +335,8 @@ void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& 
         }
         else
         {
-            MMHA_KERNEL(1024, false);
+            MMHA_1024_BLOCKSIZE_CHECK(false);
+            MMHA_DYNAMIC_LAUNCH(false);
         }
         break;
     default: TLLM_CHECK_WITH_INFO(false, "Wrong kernel block size for launching the MMHA kernel.");
@@ -324,53 +344,54 @@ void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& 
 }
 
 template <typename T, typename T_cache, typename KVCacheBuffer, typename KernelParamsType, int Dh, int THDS_PER_BLOCK,
-    bool HAS_BEAMS, bool DO_MULTI_BLOCK, bool BLOCK_SPARSE_ATTN, bool IMPLICIT_REL_ATTN_BIAS, bool QK_TANH_SCALE>
+    bool HAS_BEAMS, bool DO_MULTI_BLOCK, bool BLOCK_SPARSE_ATTN, bool IMPLICIT_REL_ATTN_BIAS,
+    bool ATTN_LOGIT_SOFTCAPPING>
 void mmha_launch_kernel_dispatch_pos_shift(KernelParamsType const& params, KVCacheBuffer const& kv_cache_buffer,
     KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream, int tlength)
 {
     if (params.position_shift_enabled && !KernelParamsType::DO_CROSS_ATTENTION)
     {
         mmha_launch_kernel_ex<T, T_cache, T, KVCacheBuffer, KVLinearBuffer, KernelParamsType, Dh, THDS_PER_BLOCK,
-            HAS_BEAMS, DO_MULTI_BLOCK, true, BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>(
+            HAS_BEAMS, DO_MULTI_BLOCK, true, BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>(
             params, kv_cache_buffer, shift_k_cache, stream, tlength);
     }
     else
     {
         mmha_launch_kernel_ex<T, T_cache, T_cache, KVCacheBuffer, KVCacheBuffer, KernelParamsType, Dh, THDS_PER_BLOCK,
-            HAS_BEAMS, DO_MULTI_BLOCK, false, BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>(
+            HAS_BEAMS, DO_MULTI_BLOCK, false, BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>(
             params, kv_cache_buffer, kv_cache_buffer, stream, tlength);
     }
 }
 
 template <typename T, typename KVCacheBuffer, typename KernelParamsType, int Dh, int THDS_PER_BLOCK, bool HAS_BEAMS,
-    bool DO_MULTI_BLOCK, bool BLOCK_SPARSE_ATTN, bool IMPLICIT_REL_ATTN_BIAS, bool QK_TANH_SCALE>
+    bool DO_MULTI_BLOCK, bool BLOCK_SPARSE_ATTN, bool IMPLICIT_REL_ATTN_BIAS, bool ATTN_LOGIT_SOFTCAPPING>
 void mmha_launch_kernel_dispatch_8bits_kv_cache(KernelParamsType const& params, KVCacheBuffer const& kv_cache_buffer,
     KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream, int tlength)
 {
     if (params.int8_kv_cache)
     {
         mmha_launch_kernel_dispatch_pos_shift<T, int8_t, KVCacheBuffer, KernelParamsType, Dh, THDS_PER_BLOCK, HAS_BEAMS,
-            DO_MULTI_BLOCK, BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>(
+            DO_MULTI_BLOCK, BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>(
             params, kv_cache_buffer, shift_k_cache, stream, tlength);
     }
 #ifdef ENABLE_FP8
     else if (params.fp8_kv_cache)
     {
         mmha_launch_kernel_dispatch_pos_shift<T, __nv_fp8_e4m3, KVCacheBuffer, KernelParamsType, Dh, THDS_PER_BLOCK,
-            HAS_BEAMS, DO_MULTI_BLOCK, BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>(
+            HAS_BEAMS, DO_MULTI_BLOCK, BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>(
             params, kv_cache_buffer, shift_k_cache, stream, tlength);
     }
 #endif // ENABLE_FP8
     else
     {
         mmha_launch_kernel_dispatch_pos_shift<T, T, KVCacheBuffer, KernelParamsType, Dh, THDS_PER_BLOCK, HAS_BEAMS,
-            DO_MULTI_BLOCK, BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>(
+            DO_MULTI_BLOCK, BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>(
             params, kv_cache_buffer, shift_k_cache, stream, tlength);
     }
 }
 
 template <typename T, typename KVCacheBuffer, typename KernelParamsType, int Dh, bool HAS_BEAMS, bool BLOCK_SPARSE_ATTN,
-    bool IMPLICIT_REL_ATTN_BIAS, bool QK_TANH_SCALE>
+    bool IMPLICIT_REL_ATTN_BIAS, bool ATTN_LOGIT_SOFTCAPPING>
 void mmha_launch_kernel_dispatch(KernelParamsType const& params, KVCacheBuffer const& kv_cache_buffer,
     KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream)
 {
@@ -378,35 +399,36 @@ void mmha_launch_kernel_dispatch(KernelParamsType const& params, KVCacheBuffer c
     if (params.multi_block_mode)
     {
         mmha_launch_kernel_dispatch_8bits_kv_cache<T, KVCacheBuffer, KernelParamsType, Dh, 256, HAS_BEAMS, true,
-            BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>(
+            BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>(
             params, kv_cache_buffer, shift_k_cache, stream, tlength);
     }
     else
     {
         mmha_launch_kernel_dispatch_8bits_kv_cache<T, KVCacheBuffer, KernelParamsType, Dh, 256, HAS_BEAMS, false,
-            BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>(
+            BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>(
             params, kv_cache_buffer, shift_k_cache, stream, tlength);
     }
 }
 
 template <typename T, typename KVCacheBuffer, typename KernelParamsType, int Dh, bool BLOCK_SPARSE_ATTN,
-    bool IMPLICIT_REL_ATTN_BIAS, bool QK_TANH_SCALE>
+    bool IMPLICIT_REL_ATTN_BIAS, bool ATTN_LOGIT_SOFTCAPPING>
 void mmha_launch_kernel(KernelParamsType const& params, KVCacheBuffer const& kv_cache_buffer,
     KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream)
 {
     assert((params.rotary_embedding_dim != 0)
         == (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
             || params.position_embedding_type == PositionEmbeddingType::kROPE_GPTJ
-            || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE));
+            || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+            || params.position_embedding_type == PositionEmbeddingType::kROPE_M));
     if (params.beam_width == 1)
     {
         mmha_launch_kernel_dispatch<T, KVCacheBuffer, KernelParamsType, Dh, false, BLOCK_SPARSE_ATTN,
-            IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>(params, kv_cache_buffer, shift_k_cache, stream);
+            IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>(params, kv_cache_buffer, shift_k_cache, stream);
     }
     else
     {
         mmha_launch_kernel_dispatch<T, KVCacheBuffer, KernelParamsType, Dh, true, BLOCK_SPARSE_ATTN,
-            IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>(params, kv_cache_buffer, shift_k_cache, stream);
+            IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>(params, kv_cache_buffer, shift_k_cache, stream);
     }
 }
 
@@ -440,7 +462,7 @@ void mmha_launch_kernel(KernelParamsType const& params, KVCacheBuffer const& kv_
         const Cross_multihead_attention_params<T>& params, const KVBlockArray& kv_cache_buffer,                        \
         const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream);
 
-#define INSTANTIATE_MMHA_LAUNCHERS_WITH_QK_TANH_SCALE(T, Dh)                                                           \
+#define INSTANTIATE_MMHA_LAUNCHERS_WITH_ATTN_LOGIT_SOFTCAPPING_SCALE(T, Dh)                                            \
     template void mmha_launch_kernel<T, KVLinearBuffer, Masked_multihead_attention_params<T>, Dh, false, false, true>( \
         const Masked_multihead_attention_params<T>& params, const KVLinearBuffer& kv_cache_buffer,                     \
         const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream);                                              \

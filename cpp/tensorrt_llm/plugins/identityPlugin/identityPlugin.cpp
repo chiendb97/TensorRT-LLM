@@ -16,6 +16,7 @@
  */
 #include "identityPlugin.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 
 using namespace nvinfer1;
 using tensorrt_llm::plugins::IdentityPluginCreator;
@@ -90,6 +91,7 @@ int IdentityPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer
 
     cudaMemcpyAsync(outputs[0], inputs[0], count, cudaMemcpyDeviceToDevice, stream);
 
+    sync_check_cuda_error();
     return 0;
 }
 

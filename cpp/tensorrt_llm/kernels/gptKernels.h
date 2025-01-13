@@ -57,6 +57,9 @@ enum class PositionEmbeddingType : int8_t
     // Workflow: (bmm1_output + alibi) * scale_bmm1.
     kALIBI_WITH_SCALE = 5,
     kRELATIVE = 6,
+    kCHATGLM = 7,
+    kYARN = 8,
+    kROPE_M = 9,
 };
 
 enum class RotaryScalingType : int8_t
@@ -75,9 +78,10 @@ struct BlockSparseParams
     int num_local_blocks; // Sliding window blocks
     int vertical_stride;
 
-    __device__ bool computeMask(int row_idx, int col_idx, int seq_length, int num_heads, int head_idx) const
+    __device__ bool computeMask(
+        int row_idx, int col_idx, int q_seq_length, int kv_seq_length, int num_heads, int head_idx) const
     {
-        bool causal_mask = row_idx < seq_length && col_idx < seq_length && col_idx <= row_idx;
+        bool causal_mask = row_idx < q_seq_length && col_idx < kv_seq_length && col_idx <= row_idx;
 
         // Mask 1/0 decision is made at block_size granularity
         int block_row_idx = row_idx / block_size;
@@ -91,6 +95,11 @@ struct BlockSparseParams
         bool is_valid = causal_mask && (block_local_mask || block_vertical_stride_mask);
         return is_valid;
     }
+
+    __device__ bool computeMask(int row_idx, int col_idx, int seq_length, int num_heads, int head_idx) const
+    {
+        return computeMask(row_idx, col_idx, seq_length, seq_length, num_heads, head_idx);
+    }
 };
 
 template <typename AttentionMaskDataType>
@@ -100,10 +109,16 @@ struct BuildDecoderInfoParams
     int* seqQOffsets;
     // The offsets to the 1st token in each sequence of KV buffer. Shape: [batchSize+1].
     int* seqKVOffsets;
-    // The number of padded tokens in the corresponding padded tensor before the current token. Shape: [numTokens].
+    // The number of padded tokens in the corresponding padded tensor before the current token, for Decoder. Shape:
+    // [numTokens].
     int* paddingOffsets;
+    // The number of padded tokens in the corresponding padded tensor before the current token, for Encoder. Shape:
+    // [numTokens].
+    int* encoderPaddingOffsets;
     // The offsets to the 1st row in each sequence of packed mask buffer. Shape: [batchSize+1].
     int* packedMaskRowOffsets;
+    // The cumulative average partial sequence lengths for context parallel. Shape: [batchSize+1].
+    int* seqCpPartialOffsets;
 
     // The mask to mark invalid tokens in Attention - that's not used by the plugins as it can be
     // computed on-the-fly. When it's not needed, simply use nullptr.
@@ -114,16 +129,30 @@ struct BuildDecoderInfoParams
     int const* seqQLengths;
     // The KV length of each sequence in the batch. Shape: [batchSize].
     int const* seqKVLengths;
+    // context parallel size
+    int cpSize;
 
     // The fmha tile counter ptr (set to 0 before fmha).
     uint32_t* fmhaTileCounter;
 
+    // Scales for fmha only.
+    // The scale to dequant Qkv input.
+    float const* dequantScaleQkv;
+    // The scale to quant O output.
+    float const* quantScaleO;
+    // The fmha bmm1 host scale (1.0f / sqrt(headSize) by default).
+    float fmhaHostBmm1Scale;
+    // The scale after fmha bmm1.
+    float* fmhaBmm1Scale;
+    // The scale after fmha bmm2.
+    float* fmhaBmm2Scale;
+
     // The number of sequences in the batch.
     int batchSize;
-    // The maximum query length of a sequence; it includes input and output.
+    // The maximum query length of a sequence for Decoder (max_input_length), N for ctx phase, 1 for gen phase.
     int maxQSeqLength;
-    // Whether remove the input padding or not.
-    bool removePadding;
+    // The maximum query length of a sequence for Encoder, for cross attention (cross_qkv_length).
+    int maxEncoderQSeqLength;
     // The kv cache capacity.
     // We will apply the limited_length_causal mask when there are not enough kv cache.
     int attentionWindowSize;
@@ -164,13 +193,20 @@ struct BuildDecoderInfoParams
            << *(runtime::ITensor::wrap(
                   (void*) paddingOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
            << std::endl;
+        if (encoderPaddingOffsets != nullptr)
+        {
+            ss << "encoderPaddingOffsets: "
+               << *(runtime::ITensor::wrap((void*) encoderPaddingOffsets, nvinfer1::DataType::kINT32,
+                      runtime::ITensor::makeShape({batchSize})))
+               << std::endl;
+        }
         ss << "attentionMask: " << static_cast<void*>(attentionMask) << std::endl;
         ss << "seqQLengths: " << seqQLengths << std::endl;
         ss << "seqKVLengths: " << seqKVLengths << std::endl;
         ss << "fmhaTileCounter: " << fmhaTileCounter << std::endl;
         ss << "batchSize: " << batchSize << std::endl;
         ss << "maxQSeqLength: " << maxQSeqLength << std::endl;
-        ss << "removePadding: " << std::boolalpha << removePadding << std::endl;
+        ss << "maxEncoderQSeqLength: " << maxEncoderQSeqLength << std::endl;
         ss << "attentionWindowSize: " << attentionWindowSize << std::endl;
         ss << "sinkTokenLength: " << sinkTokenLength << std::endl;
         ss << "numTokens: " << numTokens << std::endl;

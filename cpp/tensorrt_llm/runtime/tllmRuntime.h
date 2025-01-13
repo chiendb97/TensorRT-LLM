@@ -20,10 +20,13 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/layerProfiler.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntime.h>
 
 #include <cstdint>
 #include <memory>
+#include <set>
+#include <string>
 #include <vector>
 
 namespace tensorrt_llm::runtime
@@ -71,8 +74,20 @@ public:
 
     void clearContexts();
 
+    /// @brief Set input tensors from tensorMap for all contexts.
+    /// @details The function can be used to set static input tensors for all iterations. If a tensor was set this way,
+    /// it doesn't need to included in calls to setInputTensors anymore.
+    void setStaticInputTensors(TensorMap const& tensorMap);
+
+    /// @brief Set input tensors from tensorMap for context at contextIndex.
+    /// @details The function expects that all input tensors (excluding the ones set by setStaticInputTensors) are
+    /// contained in the tensorMap. If a tensor is missing, has a bad shape or type, it will throw.
     void setInputTensors(SizeType32 contextIndex, TensorMap const& tensorMap);
 
+    /// @brief Set output tensors from tensorMap for context at contextIndex.
+    /// @details The function expects that all output tensors are contained in the tensorMap. If a tensor is missing and
+    /// shape inference is enabled, it will allocate the tensor on GPU and insert it into the tensorMap. Otherwise it
+    /// will throw.
     void setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap);
 
     bool executeContext(SizeType32 contextIndex) const;
@@ -118,8 +133,76 @@ public:
     bool hasLayerProfiler(SizeType32 contextId) const;
     std::string getLayerProfileInfo() const;
     void reportToProfiler(SizeType32 contextId);
+    void loadManagedWeights(RawEngine const& rawEngine, int localRank);
+    void printEngineInfo();
+    void initializeUserBuffer(SizeType32 tpSize, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+        SizeType32 maxSequenceLength, SizeType32 hiddenSize, std::optional<SizeType32> maxNumTokens);
+
+    bool isUserBufferEnabled() const
+    {
+        return mUserBufferEnabled;
+    }
 
 private:
+    void cacheTensorNames();
+
+    void setInputTensorsImpl(SizeType32 contextIndex, TensorMap const& tensorMap, bool throwOnMiss);
+
+    void setUserBufferTensors(SizeType32 contextIndex, TensorMap& tensorMap);
+
+    // Tool functions for `printEngineInfo()`.
+    static std::string shapeToString(nvinfer1::Dims64 const& dim)
+    {
+        std::string output("(");
+        if (dim.nbDims == 0)
+        {
+            return output + ")";
+        }
+        for (int i = 0; i < dim.nbDims - 1; ++i)
+        {
+            output += std::to_string(dim.d[i]) + ", ";
+        }
+        output += std::to_string(dim.d[dim.nbDims - 1]) + ")";
+        return output;
+    }
+
+    static std::string dataTypeToString(nvinfer1::DataType type)
+    {
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch"
+#endif
+        switch (type)
+        {
+        case nvinfer1::DataType::kINT64: return "INT64";
+        case nvinfer1::DataType::kINT32: return "INT32";
+        case nvinfer1::DataType::kFLOAT: return "FP32";
+        case nvinfer1::DataType::kBF16: return "BF16";
+        case nvinfer1::DataType::kHALF: return "FP16";
+        case nvinfer1::DataType::kBOOL: return "BOOL";
+        case nvinfer1::DataType::kUINT8: return "UINT8";
+        case nvinfer1::DataType::kINT8: return "INT8";
+        case nvinfer1::DataType::kFP8: return "FP8";
+        case nvinfer1::DataType::kINT4: return "INT4";
+        default: return "UNKNOWN";
+        }
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+        return "";
+    }
+
+    static std::string alignText(
+        std::string const& text, int const width, bool const bCenter = true, char const blank = ' ')
+    {
+        int textLen = text.size();
+        int padLeft = 0;
+        int padRight = 0;
+        padLeft = bCenter ? (width - textLen) / 2 : 0;
+        padRight = width - padLeft - textLen;
+        return std::string(padLeft, blank) + text + std::string(padRight, blank);
+    }
+
     BufferManager::CudaStreamPtr mStream;
     BufferManager mBufferManager;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
@@ -130,5 +213,12 @@ private:
     std::unique_ptr<nvinfer1::IEngineInspector> mEngineInspector;
     std::unique_ptr<LayerProfiler> mLayerProfiler;
     bool mUseShapeInference;
+    TensorMap mManagedWeightsMap;
+    // List of input tensor names.
+    // Names of static tensors are removed from this list when setStaticInputTensors is called.
+    std::vector<std::string> mInputTensorNames;
+    std::vector<std::string> mOutputTensorNames;
+
+    bool mUserBufferEnabled;
 };
 } // namespace tensorrt_llm::runtime

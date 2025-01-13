@@ -78,7 +78,6 @@ class TestBloom(unittest.TestCase):
             },
             'use_parallel_embedding': False,
             'embedding_sharding_dim': 0,
-            'share_embedding_table': False,
         }
         config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         # config.set_rank(rank)
@@ -229,6 +228,8 @@ class TestBloom(unittest.TestCase):
         if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
             context_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
+        host_context_progress = torch.tensor([0], dtype=torch.int64)
+
         cache_indirections = [
             torch.full((
                 batch_size,
@@ -267,6 +268,7 @@ class TestBloom(unittest.TestCase):
                 ctx_host_context_lengths = ctx_context_lengths.cpu()
                 ctx_buffer["host_context_lengths"] = ctx_host_context_lengths
             ctx_buffer['host_runtime_perf_knobs'] = context_runtime_perf_knobs
+            ctx_buffer['host_context_progress'] = host_context_progress
         else:
             ctx_buffer['attention_mask'] = ctx_attention_mask
 
@@ -418,6 +420,8 @@ class TestBloom(unittest.TestCase):
 
         bloom_config, hf_bloom = self._gen_hf_bloom(hidden_act, n_layer,
                                                     max_new_tokens, dtype)
+        if bloom_config.hidden_size // bloom_config.n_head < 32 and use_gpt_attention_plugin:
+            pytest.skip("unsupported head_size")
         runtime, engine_buffer = self._gen_tensorrt_llm_runtime(
             log_level,
             dtype,

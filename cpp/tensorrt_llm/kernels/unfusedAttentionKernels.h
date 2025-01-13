@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <cuda_runtime_api.h>
 
@@ -43,8 +44,8 @@ struct MaskedSoftmaxParam
     int num_heads = 0;
     T qk_scale = T(0.0f);
     // always float compute data type.
-    float qk_tanh_scale = 0.f;
-    float qk_tanh_inverse_scale = 0.f;
+    float attn_logit_softcapping_scale = 0.f;
+    float attn_logit_softcapping_inverse_scale = 0.f;
     bool block_sparse_attn = false;
     BlockSparseParams block_sparse_params;
     int const* q_seq_lengths = nullptr; // (batch_size)
@@ -73,21 +74,32 @@ struct QKVPreprocessingParams
 {
     // Buffers.
     // source buffer
-    // also acts as a dst buffer based on if !params.enable_paged_kv_fmha
-    T* QKV{nullptr};
+    // also acts as a dst buffer based on if separate_q_kv_output
+    T* qkv_input{nullptr};
+    // The cross attention kv (= qkv_project(encoder_output), and only slice the kv part).
+    T* cross_kv_input{nullptr};
     // Only used by fp8 quantized output currently.
-    void* QuantizedQKV{nullptr};
-    T* Q{nullptr};
+    void* quantized_qkv_output{nullptr};
+    // The separate q output.
+    T* q_output{nullptr};
     // the classes used for this template are either KVLinearBuffer, KVBlockArray
     // for more details, refer to kvCacheUtils.h
     KVCacheBuffer kv_cache_buffer{};
     T const* qkv_bias{nullptr};
+
+    // Logn scaling pointer, of shape {max_position_embedding_length}
+    float const* logn_scaling{nullptr};
     // list of sequence lengths, of shape {batch_size + 1}
     int const* seq_lens{nullptr};
     // list sequence lengths for the cache, of shape {batch_size + 1}
+    // this is normally used to indicate if chunked context is used (i.e. cache_seqlen > input_seqlen).
     int const* cache_seq_lens{nullptr};
+    // list sequence lengths for the encoder, of shape {batch_size + 1}
+    int const* encoder_seq_lens{nullptr};
     // list of cumulative sequence lengths, of shape {batch_size + 1}
     int const* cu_seq_lens{nullptr};
+    // list of cumulative KV sequence lengths, of shape {batch_size + 1}, used by cross attention only.
+    int const* cu_kv_seq_lens{nullptr};
     // inverse frequencies (angle raised at various powers) from the RoPE formula
     // shape of {batch_size , rotaryEmbeddingDim / 2}
     float const* rotary_embedding_inv_freq{nullptr};
@@ -97,6 +109,9 @@ struct QKVPreprocessingParams
     float const* kvScaleOrigQuant{nullptr};
     int const* spec_decoding_position_offsets{nullptr};
 
+    float2 const* mrope_rotary_cos_sin{nullptr};
+    int32_t const* mrope_position_deltas{nullptr};
+
     // Scalars.
     int batch_size{0};
     int max_input_seq_len{0};
@@ -104,6 +119,8 @@ struct QKVPreprocessingParams
     int cyclic_kv_cache_len{0};
     int sink_token_len{0};
     int token_num{0};
+    bool remove_padding{true};
+    bool cross_attention{false};
     int head_num{0};
     int kv_head_num{0};
     int qheads_per_kv_head{0};
@@ -117,7 +134,7 @@ struct QKVPreprocessingParams
     PositionEmbeddingType position_embedding_type{};
     bool position_shift_enabled{false};
     KvCacheDataType cache_type{};
-    bool enable_paged_kv_fmha{false};
+    bool separate_q_kv_output{false};
     bool quantized_fp8_output{false};
     int multi_processor_count{0};
     int rotary_vision_start{0};
@@ -141,9 +158,10 @@ struct QKVPreprocessingParams
         std::stringstream ss;
 
         ss << "QKVPreprocessingParams ====================" << std::endl;
-        ss << "QKV: " << QKV << std::endl;
-        ss << "QuantizedQKV: " << QuantizedQKV << std::endl;
-        ss << "Q: " << Q << std::endl;
+        ss << "qkv_input: " << qkv_input << std::endl;
+        ss << "cross_kv_input: " << cross_kv_input << std::endl;
+        ss << "quantized_qkv_output: " << quantized_qkv_output << std::endl;
+        ss << "q_output: " << q_output << std::endl;
         ss << "kv_cache_buffer: " << kv_cache_buffer.data << std::endl;
         ss << "qkv_bias: " << qkv_bias << std::endl;
         ss << "seq_lens: "
@@ -152,9 +170,15 @@ struct QKVPreprocessingParams
         ss << "cache_seq_lens: "
            << *(runtime::ITensor::wrap(
                   (void*) cache_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+        ss << "encoder_seq_lens: "
+           << *(runtime::ITensor::wrap(
+                  (void*) encoder_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
         ss << "cu_seq_lens: "
            << *(runtime::ITensor::wrap(
                   (void*) cu_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+        ss << "cu_kv_seq_lens: "
+           << *(runtime::ITensor::wrap(
+                  (void*) cu_kv_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
         ss << "rotary_embedding_inv_freq: "
            << *(runtime::ITensor::wrap((void*) rotary_embedding_inv_freq, nvinfer1::DataType::kFLOAT,
                   runtime::ITensor::makeShape({batch_size, rotary_embedding_dim / 2})));
@@ -167,6 +191,8 @@ struct QKVPreprocessingParams
         ss << "cyclic_kv_cache_len: " << cyclic_kv_cache_len << std::endl;
         ss << "sink_token_len: " << sink_token_len << std::endl;
         ss << "token_num: " << token_num << std::endl;
+        ss << "remove_padding: " << remove_padding << std::endl;
+        ss << "cross_attention: " << cross_attention << std::endl;
         ss << "head_num: " << head_num << std::endl;
         ss << "kv_head_num: " << kv_head_num << std::endl;
         ss << "qheads_per_kv_head: " << qheads_per_kv_head << std::endl;
@@ -179,7 +205,7 @@ struct QKVPreprocessingParams
         ss << "position_embedding_type: " << static_cast<int>(position_embedding_type) << std::endl;
         ss << "position_shift_enabled: " << std::boolalpha << position_shift_enabled << std::endl;
         ss << "cache_type: " << static_cast<int>(cache_type) << std::endl;
-        ss << "enable_paged_kv_fmha: " << std::boolalpha << enable_paged_kv_fmha << std::endl;
+        ss << "separate_q_kv_output: " << std::boolalpha << separate_q_kv_output << std::endl;
         ss << "quantized_fp8_output: " << quantized_fp8_output << std::endl;
         ss << "multi_processor_count: " << multi_processor_count << std::endl;
 
@@ -263,6 +289,29 @@ void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cud
     }
 }
 
+template <typename T, typename T_cache, typename KVCacheBuffer>
+void invokeUpdateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
+
+template <typename T, typename KVCacheBuffer>
+void invokeKvCachePostprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
+{
+    params.setCommonParameters();
+    if (params.cache_type == KvCacheDataType::INT8)
+    {
+        invokeUpdateCyclicKvCacheAfterFmha<T, int8_t, KVCacheBuffer>(params, stream);
+    }
+#ifdef ENABLE_FP8
+    else if (params.cache_type == KvCacheDataType::FP8)
+    {
+        invokeUpdateCyclicKvCacheAfterFmha<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
+    }
+#endif // ENABLE_FP8
+    else
+    {
+        invokeUpdateCyclicKvCacheAfterFmha<T, T, KVCacheBuffer>(params, stream);
+    }
+}
+
 template <typename T, typename BT>
 void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, int const batch_size,
     int const head_num, int const seq_len, int const max_seq_len, cudaStream_t stream, bool implicit = false,
@@ -279,5 +328,25 @@ void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const&
 // compute src[x] * scale[0] and write into dst[x]
 template <typename Dst, typename Src>
 void invokeConversion(Dst* dst, Src const* src, int64_t size, float const* __restrict__ scale, cudaStream_t stream);
+
+template <typename T>
+void invokeCpTranspose(T* dst, T* dst2, T const* src, int64_t partialLength, int64_t cpSize, int64_t partialQHeads,
+    int64_t partialKVHeads, int64_t headSize, int64_t rank, cudaStream_t stream);
+
+template <typename T>
+void invokeCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* srcOtherRank, int64_t partialLength,
+    int64_t cpSize, int64_t newPartialHeads, int64_t headSize, int64_t rank, cudaStream_t stream);
+
+template <typename T>
+void invokeCpTranspose2(T* dst, T const* src, int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens,
+    int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength, int64_t batchSize,
+    int64_t partialHeads, int64_t headSize, cudaStream_t stream);
+
+template <typename T>
+void invokeCpTransposeToSeqMajor2(T* dst, T const* src, int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens,
+    int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength, int64_t batchSize,
+    int64_t partialHeads, int64_t headSize, cudaStream_t stream);
+
 } // namespace kernels
+
 } // namespace tensorrt_llm

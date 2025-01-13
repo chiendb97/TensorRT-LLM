@@ -1,5 +1,8 @@
 sphinx>=7.0
+sphinx-argparse
+sphinx-click
 sphinx-rtd-theme
 myst_parser
 breathe
 pygit2
+sphinx_copybutton

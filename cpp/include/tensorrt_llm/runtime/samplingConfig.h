@@ -115,9 +115,13 @@ public:
     {
         TLLM_CHECK(configs.size() > 0);
         beamWidth = configs.front().beamWidth;
+        numReturnSequences = configs.front().numReturnSequences;
         normalizeLogProbs = configs.front().normalizeLogProbs;
         temperature = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].temperature; },
+            layers::DefaultDecodingParams::getTemperature());
+        originalTemperature = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].originalTemperature; },
             layers::DefaultDecodingParams::getTemperature());
         minLength = fuseValues<SizeType32>(
             configs, [&configs](size_t ci) { return configs[ci].minLength; },
@@ -174,6 +178,7 @@ public:
     explicit SamplingConfig(executor::SamplingConfig const& samplingConfig,
         std::optional<executor::ExternalDraftTokensConfig> const& externalDraftTokensConfig)
         : beamWidth{samplingConfig.getBeamWidth()}
+        , numReturnSequences(samplingConfig.getNumReturnSequences())
     {
 
         if (externalDraftTokensConfig && externalDraftTokensConfig.value().getAcceptanceThreshold())
@@ -194,9 +199,10 @@ public:
         SET_FROM_OPTIONAL(topPMin, TopPMin, FloatType)
         SET_FROM_OPTIONAL(topPResetIds, TopPResetIds, TokenIdType)
         SET_FROM_OPTIONAL(topPDecay, TopPDecay, FloatType)
-        SET_FROM_OPTIONAL(randomSeed, RandomSeed, uint64_t)
+        SET_FROM_OPTIONAL(randomSeed, Seed, uint64_t)
         SET_FROM_OPTIONAL(temperature, Temperature, FloatType)
-        SET_FROM_OPTIONAL(minLength, MinLength, SizeType32)
+        SET_FROM_OPTIONAL(originalTemperature, Temperature, FloatType)
+        SET_FROM_OPTIONAL(minLength, MinTokens, SizeType32)
         SET_FROM_OPTIONAL(beamSearchDiversityRate, BeamSearchDiversityRate, FloatType)
         SET_FROM_OPTIONAL(repetitionPenalty, RepetitionPenalty, FloatType)
         SET_FROM_OPTIONAL(presencePenalty, PresencePenalty, FloatType)
@@ -220,6 +226,25 @@ public:
                 "Requested beam width %d is incorrect. Must be > 0. To de-activate beam searching set beamWidth to 1.",
                 beamWidth);
         }
+
+        if (numReturnSequences)
+        {
+            valid &= (numReturnSequences.value() > 0);
+            if (!valid)
+            {
+                TLLM_LOG_WARNING(
+                    "Requested numReturnSequences %d is incorrect. Must be > 0.", numReturnSequences.value());
+            }
+            valid &= (beamWidth == 1 || numReturnSequences.value() <= beamWidth);
+            if (!valid)
+            {
+                TLLM_LOG_WARNING(
+                    "Requested numReturnSequences %d is incorrect. In beam search, numReturnSequences should not "
+                    "exceed the beam width %d.",
+                    numReturnSequences.value(), beamWidth);
+            }
+        }
+
         valid &= validateVec("topK", topK, -1);
         valid &= validateVec("topP", topP, -fltEpsilon, {1.f});
         valid &= validateVec("topPMin", topPMin, 0.f, {1.f});
@@ -236,10 +261,22 @@ public:
         // Detect greedy sampling and overwrite params.
         if (temperature)
         {
+            // Keep original temperature for Eagle.
+            bool saveOriginalTemperature{false};
+            if (!originalTemperature)
+            {
+                saveOriginalTemperature = true;
+                originalTemperature = std::vector<FloatType>(temperature->size());
+            }
+
             for (size_t ti = 0; ti < temperature->size(); ++ti)
             {
                 if (temperature->at(ti) == 0.f)
                 {
+                    if (saveOriginalTemperature)
+                    {
+                        originalTemperature->at(ti) = 0.f;
+                    }
                     temperature->at(ti) = 1.0f;
 
                     if (topK)
@@ -251,22 +288,39 @@ public:
                         topP->at(ti) = 1.f;
                     }
                 }
+                else if (saveOriginalTemperature)
+                {
+                    originalTemperature->at(ti) = temperature->at(ti);
+                }
             }
         }
 
         return valid;
     }
 
+    template <typename T>
+    bool useDefaultValues(OptVec<T> const& vec, T defaultValue)
+    {
+        bool useDefault{true};
+        if (vec)
+        {
+            useDefault = std::all_of(vec->begin(), vec->end(), [defaultValue](T elem) { return elem == defaultValue; });
+        }
+        return useDefault;
+    }
+
 public:
     SizeType32 beamWidth;
+    std::optional<SizeType32> numReturnSequences;
 
     // penalties
-    OptVec<FloatType> temperature;        // [1] or [batch_size] on cpu
-    OptVec<SizeType32> minLength;         // [1] or [batch_size] on cpu
-    OptVec<FloatType> repetitionPenalty;  // [1] or [batch_size] on cpu
-    OptVec<FloatType> presencePenalty;    // [1] or [batch_size] on cpu
-    OptVec<FloatType> frequencyPenalty;   // [1] or [batch_size] on cpu
-    OptVec<SizeType32> noRepeatNgramSize; // [1] or [batch_size] on cpu
+    OptVec<FloatType> temperature;         // [1] or [batch_size] on cpu
+    OptVec<FloatType> originalTemperature; // [1] or [batch_size] on cpu
+    OptVec<SizeType32> minLength;          // [1] or [batch_size] on cpu
+    OptVec<FloatType> repetitionPenalty;   // [1] or [batch_size] on cpu
+    OptVec<FloatType> presencePenalty;     // [1] or [batch_size] on cpu
+    OptVec<FloatType> frequencyPenalty;    // [1] or [batch_size] on cpu
+    OptVec<SizeType32> noRepeatNgramSize;  // [1] or [batch_size] on cpu
 
     // probs
     OptVec<bool> outputLogProbs;
@@ -295,15 +349,26 @@ public:
 
     bool operator==(SamplingConfig const& other) const
     {
-        return beamWidth == other.beamWidth && temperature == other.temperature && minLength == other.minLength
-            && repetitionPenalty == other.repetitionPenalty && presencePenalty == other.presencePenalty
-            && frequencyPenalty == other.frequencyPenalty && noRepeatNgramSize == other.noRepeatNgramSize
-            && topK == other.topK && topP == other.topP && randomSeed == other.randomSeed
-            && topPDecay == other.topPDecay && topPMin == other.topPMin && topPResetIds == other.topPResetIds
-            && beamSearchDiversityRate == other.beamSearchDiversityRate && lengthPenalty == other.lengthPenalty
-            && earlyStopping == other.earlyStopping && draftAcceptanceThreshold == other.draftAcceptanceThreshold
-            && topKMedusaHeads == other.topKMedusaHeads && normalizeLogProbs == other.normalizeLogProbs
-            && outputLogProbs == other.outputLogProbs && cumLogProbs == other.cumLogProbs;
+        return beamWidth == other.beamWidth && numReturnSequences == other.numReturnSequences
+            && temperature == other.temperature && originalTemperature == other.originalTemperature
+            && minLength == other.minLength && repetitionPenalty == other.repetitionPenalty
+            && presencePenalty == other.presencePenalty && frequencyPenalty == other.frequencyPenalty
+            && noRepeatNgramSize == other.noRepeatNgramSize && topK == other.topK && topP == other.topP
+            && randomSeed == other.randomSeed && topPDecay == other.topPDecay && topPMin == other.topPMin
+            && topPResetIds == other.topPResetIds && beamSearchDiversityRate == other.beamSearchDiversityRate
+            && lengthPenalty == other.lengthPenalty && earlyStopping == other.earlyStopping
+            && draftAcceptanceThreshold == other.draftAcceptanceThreshold && topKMedusaHeads == other.topKMedusaHeads
+            && normalizeLogProbs == other.normalizeLogProbs && outputLogProbs == other.outputLogProbs
+            && cumLogProbs == other.cumLogProbs;
+    }
+
+    SizeType32 getNumReturnBeams() const
+    {
+        if (numReturnSequences && beamWidth > 1)
+        {
+            return std::min(numReturnSequences.value(), beamWidth);
+        }
+        return beamWidth;
     }
 };
 

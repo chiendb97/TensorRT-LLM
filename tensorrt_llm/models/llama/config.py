@@ -17,11 +17,9 @@ import sys
 from pathlib import Path
 from typing import Optional, Union
 
-import torch
-
-from ..._utils import torch_dtype_to_str
 from ...layers import MoeConfig
 from ...mapping import Mapping
+from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 
@@ -57,6 +55,10 @@ class LLaMAConfig(PretrainedConfig):
         assert isinstance(moe, MoeConfig)
         self.moe = moe.validate()
         self.remove_duplicated_kv_heads = remove_duplicated_kv_heads
+        self.fc_after_embed = False
+        self.use_input_layernorm_in_first_layer = True
+        self.use_last_layernorm = True
+        self.layer_idx_offset = 0
 
         super().__init__(**kwargs)
 
@@ -70,6 +72,11 @@ class LLaMAConfig(PretrainedConfig):
         output['residual_mlp'] = self.residual_mlp
         output[
             'disable_weight_only_quant_plugin'] = self.disable_weight_only_quant_plugin
+        output['fc_after_embed'] = self.fc_after_embed
+        output[
+            'use_input_layernorm_in_first_layer'] = self.use_input_layernorm_in_first_layer
+        output['use_last_layernorm'] = self.use_last_layernorm
+        output['layer_idx_offset'] = self.layer_idx_offset
         output['moe'] = self.moe.to_dict()
         return output
 
@@ -83,19 +90,23 @@ class LLaMAConfig(PretrainedConfig):
             **kwargs):
         import transformers
 
+        trust_remote_code = kwargs.pop('trust_remote_code', True)
+
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
         else:
             hf_config_dir = str(hf_config_or_dir)
             if "vila" in hf_config_dir:
                 sys.path.append(hf_config_dir + "/../VILA")
-                from llava.model import LlavaConfig, LlavaLlamaForCausalLM
-                transformers.AutoConfig.register("llava_llama", LlavaConfig)
+                from llava.model import LlavaLlamaConfig  # noqa
+                from llava.model import LlavaLlamaModel
+                transformers.AutoConfig.register("llava_llama",
+                                                 LlavaLlamaConfig)
                 transformers.AutoModelForCausalLM.register(
-                    LlavaConfig, LlavaLlamaForCausalLM)
+                    LlavaLlamaConfig, LlavaLlamaModel)
 
             hf_config = transformers.AutoConfig.from_pretrained(
-                hf_config_dir, trust_remote_code=True)
+                hf_config_dir, trust_remote_code=trust_remote_code)
             if hf_config.model_type == "llava":
                 # LLaVA = Vision model + Llama LLM
                 # We load a llava config and use its' text config as llama config
@@ -108,17 +119,24 @@ class LLaMAConfig(PretrainedConfig):
                     hf_config_dir).text_config
             if hf_config.model_type == "llava_llama":
                 hf_config.llm_cfg["architecture"] = hf_config.llm_cfg[
-                    "architectures"]
+                    "architectures"][0]
                 hf_config.llm_cfg["dtype"] = hf_config.llm_cfg["torch_dtype"]
                 hf_config = PretrainedConfig.from_dict(hf_config.llm_cfg)
 
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
+        if hf_config.model_type == "exaone":
+            hidden_act = hf_config.activation_function
+            # NOTE
+            # EXAONE also uses RMS norm but they represent as layer_norm_epsilon.
+            norm_epsilon = getattr(hf_config, "layer_norm_epsilon", 1e-5)
+        else:
+            hidden_act = hf_config.hidden_act
+            norm_epsilon = hf_config.rms_norm_eps
         head_dim = getattr(
             hf_config, "head_dim",
             hf_config.hidden_size // hf_config.num_attention_heads)
         head_size = getattr(hf_config, "kv_channels", head_dim)
-        hidden_act = hf_config.hidden_act
         attn_bias = getattr(hf_config, 'bias', False) or getattr(
             hf_config, 'attention_bias', False)
         rotary_scaling = getattr(hf_config, "rope_scaling", None)
@@ -143,14 +161,8 @@ class LLaMAConfig(PretrainedConfig):
                                normalization_mode=moe_normalization_mode)
         moe_config.validate()
 
-        if dtype == 'auto':
-            dtype = getattr(hf_config, 'torch_dtype', None)
-            if dtype is None:
-                dtype = 'float16'
-            if isinstance(dtype, torch.dtype):
-                dtype = torch_dtype_to_str(dtype)
-            if dtype == 'float32':
-                dtype = 'float16'
+        dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
+        tie_word_embeddings = getattr(hf_config, 'tie_word_embeddings', False)
 
         return cls(
             architecture=hf_config.architectures[0],
@@ -165,7 +177,7 @@ class LLaMAConfig(PretrainedConfig):
             position_embedding_type='rope_gpt_neox',
             max_position_embeddings=hf_config.max_position_embeddings,
             hidden_act=hidden_act,
-            norm_epsilon=hf_config.rms_norm_eps,
+            norm_epsilon=norm_epsilon,
             attn_bias=attn_bias,
             rotary_base=rotary_base,
             rotary_scaling=rotary_scaling,
@@ -175,6 +187,7 @@ class LLaMAConfig(PretrainedConfig):
             mapping=mapping,
             quantization=quant_config,
             remove_duplicated_kv_heads=remove_duplicated_kv_heads,
+            tie_word_embeddings=tie_word_embeddings,
             **kwargs)
 
     @classmethod
@@ -207,8 +220,7 @@ class LLaMAConfig(PretrainedConfig):
                 (int(n_embd_ * ffn_dim_multiplier) + multiple_of - 1) //
                 multiple_of)
 
-        if dtype == 'auto':
-            dtype = 'bfloat16'
+        dtype = infer_dtype(dtype, 'bfloat16')
 
         if meta_config.get('use_scaled_rope'):
             rotary_scaling = {"type": "llama3"}

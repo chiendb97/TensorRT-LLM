@@ -14,6 +14,7 @@
 # limitations under the License.
 import argparse
 import json
+import math
 import re
 import time
 from collections import OrderedDict
@@ -25,15 +26,19 @@ from datasets import load_dataset
 from tokenizer import get_tokenizer
 from torch.utils.data import DataLoader
 from whisper.normalizers import EnglishTextNormalizer
-from whisper_utils import (N_SAMPLES, log_mel_spectrogram, pad_or_trim,
-                           store_transcripts, write_error_stats)
+from whisper_utils import (log_mel_spectrogram, store_transcripts,
+                           write_error_stats)
 
 import tensorrt_llm
 import tensorrt_llm.logger as logger
 from tensorrt_llm._utils import (str_dtype_to_torch, str_dtype_to_trt,
                                  trt_dtype_to_torch)
-from tensorrt_llm.runtime import ModelConfig, SamplingConfig
+from tensorrt_llm.bindings import GptJsonConfig, KVCacheType
+from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.session import Session, TensorInfo
+
+if PYTHON_BINDINGS:
+    from tensorrt_llm.runtime import ModelRunnerCpp
 
 
 def parse_arguments():
@@ -46,6 +51,14 @@ def parse_arguments():
     parser.add_argument('--dataset',
                         type=str,
                         default="hf-internal-testing/librispeech_asr_dummy")
+    parser.add_argument(
+        '--dataset_name',
+        type=str,
+        default="clean",
+        help=
+        "dataset configuration name in the dataset, see https://huggingface.co/docs/datasets/v3.0.0/en/package_reference/loading_methods#datasets.load_dataset"
+    )
+    parser.add_argument('--dataset_split', type=str, default="validation")
     parser.add_argument('--name',
                         type=str,
                         default="librispeech_dummy_benchmark")
@@ -60,15 +73,44 @@ def parse_arguments():
     parser.add_argument('--accuracy_check',
                         action='store_true',
                         help="only for CI test")
+    parser.add_argument('--use_py_session',
+                        action='store_true',
+                        help="use python session or cpp session")
+    parser.add_argument(
+        "--compute_cer",
+        action="store_true",
+        default=False,
+        help="""True to compute character error rate (CER), e.g., for Chinese.
+        False to compute word error rate (WER), e.g., for English words.
+        """,
+    )
+    parser.add_argument(
+        "--text_prefix",
+        default="<|startoftranscript|><|en|><|transcribe|><|notimestamps|>",
+        help="""Text prefix to be used for decoding. Default is for English ASR.
+        """,
+    )
+    parser.add_argument(
+        "--padding_strategy",
+        default="max",
+        help=
+        """1. max: pad to the 30s, using the option if the model is trained with max padding e.g. openai official models,
+           2. longest: pad to the longest sequence in the batch,
+           3. nopad: no padding, only works with cpp session,
+        """,
+    )
     return parser.parse_args()
 
 
-def remove_tensor_padding(input_tensor, input_tensor_lengths=None, pad_value=0):
-    if input_tensor.dim() == 2:
+def remove_tensor_padding(input_tensor,
+                          input_tensor_lengths=None,
+                          pad_value=None):
+    if pad_value:
+        assert input_tensor_lengths is None, "input_tensor_lengths should be None when pad_value is provided"
         # Text tensor case: batch, seq_len
         assert torch.all(
-            input_tensor[:, 0] != pad_value
-        ), "First token in each sequence should not be pad_value"
+            input_tensor[:, 0] !=
+            pad_value), "First token in each sequence should not be pad_value"
         assert input_tensor_lengths is None
 
         # Create a mask for all non-pad tokens
@@ -77,24 +119,20 @@ def remove_tensor_padding(input_tensor, input_tensor_lengths=None, pad_value=0):
         # Apply the mask to input_tensor to remove pad tokens
         output_tensor = input_tensor[mask].view(1, -1)
 
-    elif input_tensor.dim() == 3:
+    else:
         # Audio tensor case: batch, seq_len, feature_len
+        # position_ids case: batch, seq_len
         assert input_tensor_lengths is not None, "input_tensor_lengths must be provided for 3D input_tensor"
-        batch_size, seq_len, feature_len = input_tensor.shape
 
         # Initialize a list to collect valid sequences
         valid_sequences = []
 
-        for i in range(batch_size):
+        for i in range(input_tensor.shape[0]):
             valid_length = input_tensor_lengths[i]
-            valid_sequences.append(input_tensor[i, :valid_length, :])
+            valid_sequences.append(input_tensor[i, :valid_length])
 
         # Concatenate all valid sequences along the batch dimension
         output_tensor = torch.cat(valid_sequences, dim=0)
-
-    else:
-        raise ValueError("Input tensor must have 2 or 3 dimensions")
-
     return output_tensor
 
 
@@ -124,41 +162,51 @@ class WhisperEncoding:
             session = Session.from_serialized_engine(f.read())
         return session
 
-    def get_audio_features(self, mel):
-        # Input_lengths here are actually encoder_output_lengths for whisper.
-        # Since the conv subsampling layer in the whisper decoder, seq_len would divide by 2.
-        input_lengths = torch.tensor(
-            [mel.shape[2] // 2 for _ in range(mel.shape[0])],
+    def get_audio_features(self,
+                           mel,
+                           mel_input_lengths,
+                           encoder_downsampling_factor=2):
+        if isinstance(mel, list):
+            longest_mel = max([f.shape[-1] for f in mel])
+            mel = [
+                torch.nn.functional.pad(f, (0, longest_mel - f.shape[-1]),
+                                        mode='constant') for f in mel
+            ]
+            mel = torch.cat(mel, dim=0).type(
+                str_dtype_to_torch("float16")).contiguous()
+        bsz, seq_len = mel.shape[0], mel.shape[2]
+        position_ids = torch.arange(
+            math.ceil(seq_len / encoder_downsampling_factor),
             dtype=torch.int32,
-            device=mel.device)
-        encoder_max_input_length = torch.max(input_lengths).item()
+            device=mel.device).expand(bsz, -1).contiguous()
         if self.encoder_config['plugin_config']['remove_input_padding']:
-            mel_input_lengths = torch.full((mel.shape[0], ),
-                                           mel.shape[2],
-                                           dtype=torch.int32,
-                                           device='cuda')
             # mel B,D,T -> B,T,D -> BxT, D
             mel = mel.transpose(1, 2)
             mel = remove_tensor_padding(mel, mel_input_lengths)
-
+            position_ids = remove_tensor_padding(
+                position_ids, mel_input_lengths // encoder_downsampling_factor)
         inputs = OrderedDict()
         inputs['input_features'] = mel
-        inputs['input_lengths'] = input_lengths
+        inputs['input_lengths'] = mel_input_lengths
+        inputs['position_ids'] = position_ids
 
         output_list = [
             TensorInfo('input_features', str_dtype_to_trt(self.dtype),
                        mel.shape),
             TensorInfo('input_lengths', str_dtype_to_trt('int32'),
-                       input_lengths.shape)
+                       mel_input_lengths.shape),
+            TensorInfo('position_ids', str_dtype_to_trt('int32'),
+                       inputs['position_ids'].shape)
         ]
 
         output_info = (self.session).infer_shapes(output_list)
 
         logger.debug(f'output info {output_info}')
         outputs = {
-            t.name: torch.empty(tuple(t.shape),
-                                dtype=trt_dtype_to_torch(t.dtype),
-                                device='cuda')
+            t.name:
+            torch.empty(tuple(t.shape),
+                        dtype=trt_dtype_to_torch(t.dtype),
+                        device='cuda')
             for t in output_info
         }
         stream = torch.cuda.current_stream()
@@ -167,8 +215,9 @@ class WhisperEncoding:
                               stream=stream.cuda_stream)
         assert ok, 'Engine execution failed'
         stream.synchronize()
-        audio_features = outputs['encoder_output']
-        return audio_features, encoder_max_input_length, input_lengths
+        encoder_output = outputs['encoder_output']
+        encoder_output_lengths = mel_input_lengths // encoder_downsampling_factor
+        return encoder_output, encoder_output_lengths
 
 
 class WhisperDecoding:
@@ -197,8 +246,9 @@ class WhisperDecoding:
             ['gpt_attention_plugin'],
             remove_input_padding=self.decoder_config['plugin_config']
             ['remove_input_padding'],
-            paged_kv_cache=self.decoder_config['plugin_config']
-            ['paged_kv_cache'],
+            kv_cache_type=KVCacheType.PAGED
+            if self.decoder_config['plugin_config']['paged_kv_cache'] == True
+            else KVCacheType.CONTINUOUS,
             has_position_embedding=self.
             decoder_config['has_position_embedding'],
             dtype=self.decoder_config['dtype'],
@@ -229,9 +279,10 @@ class WhisperDecoding:
                                              device='cuda')
         decoder_max_input_length = torch.max(decoder_input_lengths).item()
 
-        cross_attention_mask = torch.ones(
-            [batch_size, 1, encoder_max_input_length]).int().cuda()
-
+        cross_attention_mask = torch.ones([
+            batch_size, decoder_max_input_length + max_new_tokens,
+            encoder_max_input_length
+        ]).int().cuda()
         # generation config
         sampling_config = SamplingConfig(end_id=eot_id,
                                          pad_id=eot_id,
@@ -276,18 +327,23 @@ class WhisperDecoding:
 
 class WhisperTRTLLM(object):
 
-    def __init__(self, engine_dir, debug_mode=False, assets_dir=None):
+    def __init__(self,
+                 engine_dir,
+                 debug_mode=False,
+                 assets_dir=None,
+                 batch_size=64,
+                 use_py_session=False,
+                 num_beams=1):
         world_size = 1
         runtime_rank = tensorrt_llm.mpi_rank()
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
         torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
         engine_dir = Path(engine_dir)
-
-        self.encoder = WhisperEncoding(engine_dir)
-        self.decoder = WhisperDecoding(engine_dir,
-                                       runtime_mapping,
-                                       debug_mode=False)
-        is_multilingual = (self.decoder.decoder_config['vocab_size'] >= 51865)
+        encoder_config = read_config('encoder', engine_dir)
+        decoder_config = read_config('decoder', engine_dir)
+        self.n_mels = encoder_config['n_mels']
+        self.num_languages = encoder_config['num_languages']
+        is_multilingual = (decoder_config['vocab_size'] >= 51865)
         if is_multilingual:
             tokenizer_name = "multilingual"
             assert (Path(assets_dir) / "multilingual.tiktoken").exists(
@@ -297,32 +353,77 @@ class WhisperTRTLLM(object):
             assert (Path(assets_dir) / "gpt2.tiktoken").exists(
             ), "gpt2.tiktoken file is not existed in assets_dir"
         self.tokenizer = get_tokenizer(name=tokenizer_name,
-                                       num_languages=self.encoder.num_languages,
+                                       num_languages=self.num_languages,
                                        tokenizer_dir=assets_dir)
         self.eot_id = self.tokenizer.encode(
             "<|endoftext|>",
             allowed_special=self.tokenizer.special_tokens_set)[0]
+        if use_py_session:
+            self.encoder = WhisperEncoding(engine_dir)
+            self.decoder = WhisperDecoding(engine_dir,
+                                           runtime_mapping,
+                                           debug_mode=debug_mode)
+        else:
+            json_config = GptJsonConfig.parse_file(engine_dir / 'decoder' /
+                                                   'config.json')
+            assert json_config.model_config.supports_inflight_batching
+            runner_kwargs = dict(engine_dir=engine_dir,
+                                 is_enc_dec=True,
+                                 max_batch_size=batch_size,
+                                 max_input_len=3000,
+                                 max_output_len=96,
+                                 max_beam_width=num_beams,
+                                 debug_mode=debug_mode,
+                                 kv_cache_free_gpu_memory_fraction=0.9,
+                                 cross_kv_cache_fraction=0.5)
+            self.model_runner_cpp = ModelRunnerCpp.from_dir(**runner_kwargs)
+        self.use_py_session = use_py_session
 
     def process_batch(
             self,
             mel,
+            mel_input_lengths,
             text_prefix="<|startoftranscript|><|en|><|transcribe|><|notimestamps|>",
-            num_beams=1):
+            num_beams=1,
+            max_new_tokens=96):
         prompt_id = self.tokenizer.encode(
             text_prefix, allowed_special=self.tokenizer.special_tokens_set)
         prompt_id = torch.tensor(prompt_id)
-        batch_size = mel.shape[0]
+        batch_size = len(mel)
         decoder_input_ids = prompt_id.repeat(batch_size, 1)
-
-        encoder_output, encoder_max_input_length, encoder_input_lengths = self.encoder.get_audio_features(
-            mel)
-        output_ids = self.decoder.generate(decoder_input_ids,
-                                           encoder_output,
-                                           encoder_max_input_length,
-                                           encoder_input_lengths,
-                                           self.eot_id,
-                                           max_new_tokens=96,
-                                           num_beams=num_beams)
+        if self.use_py_session:
+            encoder_output, encoder_output_lengths = self.encoder.get_audio_features(
+                mel, mel_input_lengths)
+            encoder_max_input_length = torch.max(encoder_output_lengths).item()
+            output_ids = self.decoder.generate(decoder_input_ids,
+                                               encoder_output,
+                                               encoder_max_input_length,
+                                               encoder_output_lengths,
+                                               self.eot_id,
+                                               max_new_tokens=max_new_tokens,
+                                               num_beams=num_beams)
+        else:
+            with torch.no_grad():
+                if isinstance(mel, list):
+                    mel = [
+                        m.transpose(1, 2).type(
+                            str_dtype_to_torch("float16")).squeeze(0)
+                        for m in mel
+                    ]
+                else:
+                    mel = mel.transpose(1, 2)
+                outputs = self.model_runner_cpp.generate(
+                    batch_input_ids=decoder_input_ids,
+                    encoder_input_features=mel,
+                    encoder_output_lengths=mel_input_lengths // 2,
+                    max_new_tokens=max_new_tokens,
+                    end_id=self.eot_id,
+                    pad_id=self.eot_id,
+                    num_beams=num_beams,
+                    output_sequence_lengths=True,
+                    return_dict=True)
+                torch.cuda.synchronize()
+                output_ids = outputs['output_ids'].cpu().numpy().tolist()
         texts = []
         for i in range(len(output_ids)):
             text = self.tokenizer.decode(output_ids[i][0]).strip()
@@ -338,9 +439,10 @@ def decode_wav_file(
         batch_size=1,
         num_beams=1,
         normalizer=None,
-        mel_filters_dir=None):
+        mel_filters_dir=None,
+        padding_strategy="longest"):
     mel, total_duration = log_mel_spectrogram(input_file_path,
-                                              model.encoder.n_mels,
+                                              model.n_mels,
                                               device='cuda',
                                               return_duration=True,
                                               mel_filters_dir=mel_filters_dir)
@@ -348,7 +450,16 @@ def decode_wav_file(
     mel = mel.unsqueeze(0)
     # repeat the mel spectrogram to match the batch size
     mel = mel.repeat(batch_size, 1, 1)
-    predictions = model.process_batch(mel, text_prefix, num_beams)
+    if padding_strategy == "longest":
+        pass
+    else:
+        mel = torch.nn.functional.pad(mel, (0, 3000 - mel.shape[2]))
+    features_input_lengths = torch.full((mel.shape[0], ),
+                                        mel.shape[2],
+                                        dtype=torch.int32,
+                                        device=mel.device)
+    predictions = model.process_batch(mel, features_input_lengths, text_prefix,
+                                      num_beams)
     prediction = predictions[0]
 
     # remove all special tokens in the prediction
@@ -365,13 +476,15 @@ def collate_wrapper(batch):
     for item in batch:
         speech = item["audio"]["array"]
         duration = speech.shape[-1]
-        speech = pad_or_trim(speech, N_SAMPLES)
         speech = speech.astype(np.float32)
         speech = torch.from_numpy(speech)
         speeches.append(speech)
         durations.append(duration)
         labels.append(item["text"])
-        ids.append(item["id"])
+        if 'id' in item:
+            ids.append(item["id"])
+        else:
+            ids.append(item["segment_id"])
     return speeches, durations, labels, ids
 
 
@@ -384,10 +497,10 @@ def decode_dataset(
         num_beams=1,
         normalizer=None,
         sample_rate=16000,
-        mel_filters_dir=None):
-    librispeech_dummy = load_dataset(dataset, "clean", split="validation")
-
-    data_loader = DataLoader(librispeech_dummy,
+        mel_filters_dir=None,
+        compute_cer=False,
+        padding_strategy="longest"):
+    data_loader = DataLoader(dataset,
                              batch_size=batch_size,
                              num_workers=4,
                              pin_memory=True,
@@ -401,56 +514,90 @@ def decode_dataset(
         for wave in waveforms:
             assert wave.is_pinned()
 
+        if padding_strategy == "longest":
+            longest_duration = max(durations)
+        elif padding_strategy == "nopad":
+            longest_duration = 0
+        else:
+            longest_duration = int(16000 * 30)
+
         features = [
             log_mel_spectrogram(wave,
-                                model.encoder.n_mels,
+                                model.n_mels,
+                                padding=longest_duration - wave.shape[-1],
                                 device='cuda',
                                 mel_filters_dir=mel_filters_dir).unsqueeze(0)
             for wave in waveforms
         ]
-        features = torch.cat(features, dim=0).type(str_dtype_to_torch(dtype))
-        predictions = model.process_batch(features, text_prefix, num_beams)
+
+        # pad to the even number of features, for remove_padding option, conv layer padding corner case
+        for i, feature in enumerate(features):
+            if feature.shape[2] % 2:
+                features[i] = torch.nn.functional.pad(feature, (0, 1))
+
+        features_input_lengths = torch.tensor([f.shape[2] for f in features],
+                                              dtype=torch.int32,
+                                              device='cuda')
+
+        predictions = model.process_batch(features, features_input_lengths,
+                                          text_prefix, num_beams)
         for wav_id, label, prediction in zip(ids, texts, predictions):
             # remove all special tokens in the prediction
             prediction = re.sub(r'<\|.*?\|>', '', prediction)
             if normalizer:
                 prediction, label = normalizer(prediction), normalizer(label)
+            label = label.split()
+            prediction = prediction.split()
+            if compute_cer:
+                label = list("".join(label))
+                prediction = list("".join(prediction))
             print(f"wav_id: {wav_id}, label: {label}, prediction: {prediction}")
-            results.append((wav_id, label.split(), prediction.split()))
+            results.append((wav_id, label, prediction))
     return results, total_duration
 
 
 if __name__ == '__main__':
     args = parse_arguments()
     tensorrt_llm.logger.set_level(args.log_level)
-    model = WhisperTRTLLM(args.engine_dir, args.debug, args.assets_dir)
+    model = WhisperTRTLLM(args.engine_dir, args.debug, args.assets_dir,
+                          args.batch_size, args.use_py_session, args.num_beams)
     normalizer = EnglishTextNormalizer()
+    dataset = load_dataset(args.dataset,
+                           args.dataset_name,
+                           split=args.dataset_split)
     if args.enable_warmup:
         results, total_duration = decode_dataset(
             model,
-            "hf-internal-testing/librispeech_asr_dummy",
+            dataset,
             batch_size=args.batch_size,
             num_beams=args.num_beams,
             normalizer=normalizer,
-            mel_filters_dir=args.assets_dir)
+            mel_filters_dir=args.assets_dir,
+            padding_strategy=args.padding_strategy)
+
     start_time = time.time()
     if args.input_file:
         results, total_duration = decode_wav_file(
             args.input_file,
             model,
+            text_prefix=args.text_prefix,
             dtype=args.dtype,
             batch_size=args.batch_size,
             num_beams=args.num_beams,
-            mel_filters_dir=args.assets_dir)
+            mel_filters_dir=args.assets_dir,
+            padding_strategy=args.padding_strategy)
     else:
         results, total_duration = decode_dataset(
             model,
-            args.dataset,
+            dataset,
+            text_prefix=args.text_prefix,
             dtype=args.dtype,
             batch_size=args.batch_size,
             num_beams=args.num_beams,
             normalizer=normalizer,
-            mel_filters_dir=args.assets_dir)
+            mel_filters_dir=args.assets_dir,
+            compute_cer=args.compute_cer,
+            padding_strategy=args.padding_strategy)
     elapsed = time.time() - start_time
     results = sorted(results)
 

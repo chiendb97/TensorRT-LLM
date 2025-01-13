@@ -15,12 +15,15 @@
  */
 
 #include "tensorrt_llm/runtime/transformerBuffers.h"
+#include "iTensor.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 #include <cstdlib> // std::getenv
+#include <vector>
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
@@ -34,6 +37,7 @@ TransformerBuffers::TransformerBuffers()
     presentKeysVals.clear();
     presentKeysValsAlt.clear();
     kvCacheBlockPoolPointers = nullptr;
+    kvCacheBlockPoolMapping = nullptr;
     kvCacheBlockOffsetsHost = nullptr;
     kvCacheBlockOffsetsDevice = nullptr;
 }
@@ -43,8 +47,8 @@ TransformerBuffers::TransformerBuffers(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(modelConfig.isTransformerBased());
-    auto& manager = runtime.getBufferManager();
-    auto& engine = runtime.getEngine();
+    auto const& manager = runtime.getBufferManager();
+    auto const& engine = runtime.getEngine();
 
     auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
     auto firstAttentionLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
@@ -56,26 +60,20 @@ TransformerBuffers::TransformerBuffers(
             = std::find(layerTypes.begin(), layerTypes.end(), ModelConfig::LayerType::kATTENTION) - layerTypes.begin();
     }
 
-    nvinfer1::DataType kvDtype;
-    if (modelConfig.usePagedKvCache())
+    nvinfer1::DataType kvDtype{};
+
+    if (modelConfig.isPagedKVCache())
     {
         kvDtype = modelConfig.getKvDataType();
-    }
-    else
-    {
-        kvDtype = modelConfig.getQuantMode().hasFp8KvCache()
-            ? nvinfer1::DataType::kFP8
-            : engine.getTensorDataType(("present_key_value_" + std::to_string(firstAttentionLayerId)).c_str());
-    }
-
-    if (modelConfig.usePagedKvCache())
-    {
         auto const kvCacheBlockOffsetsType = engine.getTensorDataType("kv_cache_block_offsets");
         kvCacheBlockOffsetsHost = manager.emptyTensor(MemoryType::kCPU, kvCacheBlockOffsetsType);
         kvCacheBlockOffsetsDevice = manager.emptyTensor(MemoryType::kGPU, kvCacheBlockOffsetsType);
     }
     else
     {
+        kvDtype = modelConfig.getQuantMode().hasFp8KvCache()
+            ? nvinfer1::DataType::kFP8
+            : engine.getTensorDataType(("present_key_value_" + std::to_string(firstAttentionLayerId)).c_str());
         presentKeysVals = utils::createBufferVector(runtime, localNbLayers, MemoryType::kGPU, kvDtype);
     }
 
@@ -86,8 +84,10 @@ TransformerBuffers::TransformerBuffers(
         sinkTokenLengths = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
         SizeType32 perfKnobSize = 16;
         runtimePerfKnobsHost = BufferManager::cpu(ITensor::makeShape({perfKnobSize}), nvinfer1::DataType::kINT64);
-        auto runtimePerfKnobsHostPtr = bufferCast<int64_t>(*runtimePerfKnobsHost);
+        auto* runtimePerfKnobsHostPtr = bufferCast<int64_t>(*runtimePerfKnobsHost);
         std::fill_n(runtimePerfKnobsHostPtr, perfKnobSize, -1);
+        contextProgressHost = BufferManager::cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT64);
+        bufferCast<int64_t>(*contextProgressHost)[0] = 0;
     }
     else
     {
@@ -107,15 +107,16 @@ void TransformerBuffers::reshape(
     auto const maxAttentionWindow = generationConfig.maxAttentionWindow;
 
     auto const kvCacheReserve = ITensor::makeShape(
-        {batchSize, 2, modelConfig.getNbKvHeads(), maxAttentionWindow, modelConfig.getSizePerHead()});
+        {batchSize, 2, modelConfig.getNbKvHeads(0), maxAttentionWindow, modelConfig.getSizePerHead()});
     auto const kvCacheShape
-        = ITensor::makeShape({batchSize, 2, modelConfig.getNbKvHeads(), maxInputLength, modelConfig.getSizePerHead()});
-    if (modelConfig.usePagedKvCache())
+        = ITensor::makeShape({batchSize, 2, modelConfig.getNbKvHeads(0), maxInputLength, modelConfig.getSizePerHead()});
+
+    if (modelConfig.isPagedKVCache())
     {
         auto cacheBlockOffsetsShape = kvCacheBlockOffsetsHost->getShape();
         if (cacheBlockOffsetsShape.nbDims > 0)
         {
-            cacheBlockOffsetsShape.d[0] = batchSize;
+            cacheBlockOffsetsShape.d[1] = batchSize;
             kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
             kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
         }
@@ -129,7 +130,8 @@ void TransformerBuffers::reshape(
         utils::reshapeBufferVector(presentKeysVals, kvCacheReserve);
     }
 
-    auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
+    auto const localNbLayers
+        = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
 
     if (modelConfig.useGptAttentionPlugin())
     {
@@ -153,7 +155,7 @@ void TransformerBuffers::reshapeKvTensors(
 {
     auto const& manager = runtime.getBufferManager();
 
-    auto const cacheBlockOffsetsShape = ITensor::makeShape({maxBatchSize * maxBeamWidth, 2, maxBlocksPerSeq});
+    auto const cacheBlockOffsetsShape = ITensor::makeShape({1, maxBatchSize * maxBeamWidth, 2, maxBlocksPerSeq});
 
     kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
     manager.setZero(*kvCacheBlockOffsetsHost);
@@ -162,9 +164,14 @@ void TransformerBuffers::reshapeKvTensors(
     manager.setZero(*kvCacheBlockOffsetsDevice);
 }
 
-void TransformerBuffers::setKvPoolPointers(KvCacheManager const* kvCacheManager)
+void TransformerBuffers::setKvPoolPointers(BaseKVCacheManager const* kvCacheManager)
 {
     kvCacheBlockPoolPointers = kvCacheManager->getBlockPoolPointers();
+}
+
+void TransformerBuffers::setKvPoolMapping(BaseKVCacheManager const* kvCacheManager)
+{
+    kvCacheBlockPoolMapping = kvCacheManager->getLayerToPoolMapping();
 }
 
 TransformerBuffers TransformerBuffers::sliceTo(
@@ -173,10 +180,17 @@ TransformerBuffers TransformerBuffers::sliceTo(
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TransformerBuffers buffers;
     auto const generationBatchSize = generationConfig.batchSize;
-    if (modelConfig.usePagedKvCache())
+    if (modelConfig.isPagedKVCache())
     {
+
         auto const& realCacheBlockOffsetsShape = kvCacheBlockOffsetsHost->getShape();
-        auto const maxBlocksPerSeq = realCacheBlockOffsetsShape.d[2];
+        auto const numPools = realCacheBlockOffsetsShape.d[0];
+        // (oargov) with multiple pools, slicing the tensor along the batch*beam dimension would require us to support
+        // non-contiguous tensors. with a single pool, we can just ignore the pools dimension when slicing and restore
+        // it later. this is part of the deprecated GPTSession API, so not supporting VGQA here should be ok.
+        TLLM_CHECK_WITH_INFO(numPools == 1,
+            "Deprecated transformerBuffers API does not support multiple cache pools, use the newer API instead");
+        auto const maxBlocksPerSeq = realCacheBlockOffsetsShape.d[3];
 
         // enable slicing by moving generationBatchSize to first dim
         auto const fakeCacheBlockOffsetsShape = ITensor::makeShape({generationBatchSize, 2, maxBlocksPerSeq});
@@ -184,13 +198,14 @@ TransformerBuffers TransformerBuffers::sliceTo(
         TensorPtr kvCacheBlockOffsetsDeviceView{ITensor::view(kvCacheBlockOffsetsDevice, fakeCacheBlockOffsetsShape)};
 
         // slice and reshape to correct shape
-        auto const cacheBlockOffsetsShape = ITensor::makeShape({batchSize, 2, maxBlocksPerSeq});
+        auto const cacheBlockOffsetsShape = ITensor::makeShape({numPools, batchSize, 2, maxBlocksPerSeq});
         buffers.kvCacheBlockOffsetsHost = ITensor::slice(kvCacheBlockOffsetsHostView, offset, batchSize);
         buffers.kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
         buffers.kvCacheBlockOffsetsDevice = ITensor::slice(kvCacheBlockOffsetsDeviceView, offset, batchSize);
         buffers.kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
 
         buffers.kvCacheBlockPoolPointers = kvCacheBlockPoolPointers;
+        buffers.kvCacheBlockPoolMapping = kvCacheBlockPoolMapping;
     }
     else
     {
@@ -203,6 +218,7 @@ TransformerBuffers TransformerBuffers::sliceTo(
         buffers.maxAttentionWindows = maxAttentionWindows;
         buffers.sinkTokenLengths = sinkTokenLengths;
         buffers.runtimePerfKnobsHost = runtimePerfKnobsHost;
+        buffers.contextProgressHost = contextProgressHost;
     }
     else
     {
@@ -264,8 +280,8 @@ static std::vector<SizeType32> getPositionIdsContextPhaseGlm(SizeType32 const& b
 }
 
 void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, TensorPtr const& inputIds,
-    TokenIdType const padId, BufferManager& manager, KvCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx,
-    ModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    TokenIdType const padId, BufferManager& manager, BaseKVCacheManager const* kvCacheManager,
+    SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& generationConfig = runtimeBuffers->generationConfig;
@@ -274,29 +290,35 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
     auto& hiddenStates = runtimeBuffers->hiddenStates;
     auto& promptTuningTasksHost = runtimeBuffers->promptTuningTasksHost;
     auto& promptTuningParams = runtimeBuffers->promptTuningParams;
-    auto& stream = manager.getStream();
+    auto const& stream = manager.getStream();
     SizeType32 const batchSize = generationConfig.batchSize;
     SizeType32 const maxInputLength = generationConfig.maxInputLength;
     auto const& inputShape = inputIds->getShape();
 
     // get local number of layers.
     auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
+    auto const firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
 
     if (modelConfig.useGptAttentionPlugin())
     {
-        auto pastKeyValueLengthsPtr = bufferCast<SizeType32>(*pastKeyValueLengths);
+        auto* pastKeyValueLengthsPtr = bufferCast<SizeType32>(*pastKeyValueLengths);
         TLLM_CHECK(pastKeyValueLengths->getSize() == static_cast<std::size_t>(batchSize));
 
-        auto RequestTypesPtr = bufferCast<int32_t>(*requestTypes);
+        auto* RequestTypesPtr = bufferCast<int32_t>(*requestTypes);
         TLLM_CHECK(requestTypes->getSize() == static_cast<std::size_t>(batchSize));
         std::fill_n(RequestTypesPtr, batchSize, 0);
 
-        auto maxAttentionWindowsPtr = bufferCast<SizeType32>(*maxAttentionWindows);
-        std::fill_n(maxAttentionWindowsPtr, localNbLayers, generationConfig.maxAttentionWindow);
+        auto* maxAttentionWindowsPtr = bufferCast<SizeType32>(*maxAttentionWindows);
+        auto const attentionWindowLength = generationConfig.maxAttentionWindowVec.size();
+        for (SizeType32 i = 0; i < localNbLayers; ++i)
+        {
+            maxAttentionWindowsPtr[i]
+                = generationConfig.maxAttentionWindowVec[(firstLayerId + i) % attentionWindowLength];
+        }
 
         bufferCast<SizeType32>(*sinkTokenLengths)[0] = generationConfig.sinkTokenLength;
 
-        auto const contextLengthsHostPtr = bufferCast<SizeType32 const>(*contextLengthsHost);
+        auto const* const contextLengthsHostPtr = bufferCast<SizeType32 const>(*contextLengthsHost);
         auto const modelVariant = modelConfig.getModelVariant();
 
         if (modelVariant == ModelConfig::ModelVariant::kGpt
@@ -319,7 +341,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
                 modelConfig.useGptAttentionPlugin(), modelConfig.usePackedInput());
             if (modelConfig.usePackedInput())
             {
-                int num_tokens = (int) positionIdsVec.size() / 2;
+                auto const num_tokens = static_cast<SizeType32>(positionIdsVec.size()) / 2;
                 auto const positionIdsShape = ITensor::makeShape({2, num_tokens});
                 positionIds = manager.copyFrom(positionIdsVec, positionIdsShape, MemoryType::kGPU);
             }
@@ -343,6 +365,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
         {
             std::vector<SizeType32> reqBeamWidths(batchSize, 1);
             std::vector<SizeType32> reqPromptLengths;
+            reqPromptLengths.reserve(batchSize);
             for (SizeType32 i = 0; i < batchSize; ++i)
             {
                 reqPromptLengths.push_back(contextLengthsHostPtr[i]);
@@ -370,21 +393,25 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
                 attentionMaskData + (i + 1) * maxInputLength, std::begin(positionIdsVec) + i * maxInputLength, 0);
         }
         for (std::size_t i = 0; i < positionIdsVec.size(); ++i)
+        {
             if (attentionMaskData[i] == 0)
+            {
                 positionIdsVec[i] = 1;
+            }
+        }
         positionIds = manager.copyFrom(positionIdsVec, attentionMask->getShape(), MemoryType::kGPU);
     }
 
     if (worldConfig.isPipelineParallel())
     {
-        auto const hiddenSize = hiddenStates->getShape().d[hiddenStates->getShape().nbDims - 1];
+        auto const hiddenSize = hiddenStates->getDimension<-1>();
         auto const hiddenStatesShape = modelConfig.usePackedInput()
             ? ITensor::makeShape({inputShape.d[0], hiddenSize})
             : ITensor::makeShape({inputShape.d[0], inputShape.d[1], hiddenSize});
         hiddenStates->reshape(hiddenStatesShape);
     }
 
-    if (modelConfig.useGptAttentionPlugin() && modelConfig.usePagedKvCache())
+    if (modelConfig.useGptAttentionPlugin() && modelConfig.isPagedKVCache())
     {
         auto constexpr contextBeamWidth = 1;
         kvCacheManager->getBlockOffsetsOfBatch(
@@ -396,7 +423,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
 }
 
 static std::vector<SizeType32> getPositionIdsGenerationPhaseGlm(SizeType32 const& batchSize, SizeType32 const& beamSize,
-    SizeType32 const& step, SizeType32 const* pInputLengths, bool useGptAttentionPlugin, bool usePackedInput)
+    SizeType32 const& step, SizeType32 const* pInputLengths, bool useGptAttentionPlugin)
 {
     TLLM_CHECK(pInputLengths != nullptr);
 
@@ -440,7 +467,7 @@ void TransformerBuffers::copyAttentionMasks(
     auto offset = 0;
     for (auto contextBatchId = 0; contextBatchId < numContextBatches; ++contextBatchId)
     {
-        auto& buffers = contextBatches.at(contextBatchId);
+        auto const& buffers = contextBatches.at(contextBatchId);
         auto contextBatchSize = buffers.generationConfig.batchSize;
         auto attentionMaskSlice = ITensor::slice(attentionMask, offset, contextBatchSize);
         manager.copy(*buffers.transformerBuffers->attentionMask, *attentionMaskSlice);
@@ -482,12 +509,16 @@ void TransformerBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& man
         utils::tileBufferReplace(attentionMask, beamWidth, manager);
     }
 
-    if (!modelConfig.usePagedKvCache())
+    if (!modelConfig.isPagedKVCache())
     {
         for (auto& buffer : presentKeysVals)
+        {
             utils::tileBufferReplace(buffer, beamWidth, manager);
+        }
         for (auto& buffer : presentKeysValsAlt)
+        {
             utils::tileBufferReplace(buffer, beamWidth, manager);
+        }
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -505,7 +536,7 @@ void TransformerBuffers::postContextStep(RuntimeBuffers* runtimeBuffers,
     if (modelConfig.useGptAttentionPlugin())
     {
         requestTypes->reshape(ITensor::makeShape({batchSize * beamWidth}));
-        auto hostRequestTypes = bufferCast<int32_t>(*requestTypes);
+        auto* hostRequestTypes = bufferCast<int32_t>(*requestTypes);
         std::fill_n(hostRequestTypes, requestTypes->getSize(), 1);
     }
     else
@@ -526,10 +557,10 @@ void TransformerBuffers::postContextStep(RuntimeBuffers* runtimeBuffers,
         tile(runtimeBuffers, manager, modelConfig, worldConfig);
     }
 
-    if (modelConfig.useGptAttentionPlugin() && modelConfig.usePagedKvCache())
+    if (modelConfig.useGptAttentionPlugin() && modelConfig.isPagedKVCache())
     {
         auto cacheBlockOffsetsShape = kvCacheBlockOffsetsHost->getShape();
-        cacheBlockOffsetsShape.d[0] = batchSize * beamWidth;
+        cacheBlockOffsetsShape.d[1] = batchSize * beamWidth;
         kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
         kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
     }
@@ -538,7 +569,7 @@ void TransformerBuffers::postContextStep(RuntimeBuffers* runtimeBuffers,
 }
 
 void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 const step, BufferManager& manager,
-    KvCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
+    BaseKVCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -546,7 +577,7 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
     auto& contextLengthsDevice = runtimeBuffers->contextLengthsDevice;
     auto& hiddenStates = runtimeBuffers->hiddenStates;
     auto& generationConfig = runtimeBuffers->generationConfig;
-    auto& stream = manager.getStream();
+    auto const& stream = manager.getStream();
     SizeType32 const batchSize = generationConfig.batchSize;
     SizeType32 const beamWidth = generationConfig.beamWidth;
     auto const inputShape = [&modelConfig, batchSize, beamWidth]()
@@ -556,16 +587,14 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
             // batch in last dim
             return ITensor::makeShape({batchSize * beamWidth});
         }
-        else
-        {
-            // batch in first dim
-            return ITensor::makeShape({batchSize * beamWidth, 1});
-        }
+
+        // batch in first dim
+        return ITensor::makeShape({batchSize * beamWidth, 1});
     }();
     if (modelConfig.useGptAttentionPlugin())
     {
-        auto const contextLengthsHostPtr = bufferCast<SizeType32 const>(*contextLengthsHost);
-        auto const pastKeyValueLengthsPtr = bufferCast<SizeType32>(*pastKeyValueLengths);
+        auto const* const contextLengthsHostPtr = bufferCast<SizeType32 const>(*contextLengthsHost);
+        auto* const pastKeyValueLengthsPtr = bufferCast<SizeType32>(*pastKeyValueLengths);
         auto const tensorBatchSize = static_cast<SizeType32>(pastKeyValueLengths->getSize());
         SizeType32 const srcStride{modelConfig.useGptAttentionPlugin() ? 1 : beamWidth};
         TLLM_CHECK(static_cast<std::size_t>(tensorBatchSize * srcStride) == contextLengthsDevice->getSize());
@@ -585,8 +614,8 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
         }
         else if (modelVariant == ModelConfig::ModelVariant::kChatGlm)
         {
-            auto const positionIdsVec = getPositionIdsGenerationPhaseGlm(batchSize, beamWidth, step,
-                contextLengthsHostPtr, modelConfig.useGptAttentionPlugin(), modelConfig.usePackedInput());
+            auto const positionIdsVec = getPositionIdsGenerationPhaseGlm(
+                batchSize, beamWidth, step, contextLengthsHostPtr, modelConfig.useGptAttentionPlugin());
             if (modelConfig.usePackedInput())
             {
                 auto const positionIdsShape = ITensor::makeShape({2, batchSize * beamWidth});
@@ -626,25 +655,31 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
                 std::begin(positionIdsVec) + i * newLength, 0);
         }
         for (std::size_t i = 0; i < positionIdsVec.size(); ++i)
+        {
             if (attentionMaskPtr[i] == 0)
+            {
                 positionIdsVec[i] = 1;
+            }
+        }
         std::vector<SizeType32> positionIdsEndVec(nbInputs);
         for (SizeType32 i = 0; i < nbInputs; ++i)
+        {
             positionIdsEndVec[i] = positionIdsVec[(i + 1) * newLength - 1];
+        }
 
         positionIds = manager.copyFrom(positionIdsEndVec, ITensor::makeShape({nbInputs, 1}), MemoryType::kGPU);
     }
 
     if (worldConfig.isPipelineParallel())
     {
-        auto const hiddenSize = hiddenStates->getShape().d[hiddenStates->getShape().nbDims - 1];
+        auto const hiddenSize = hiddenStates->getDimension<-1>();
         auto const hiddenStatesShape = modelConfig.usePackedInput()
             ? ITensor::makeShape({inputShape.d[0], hiddenSize})
             : ITensor::makeShape({inputShape.d[0], inputShape.d[1], hiddenSize});
         hiddenStates->reshape(hiddenStatesShape);
     }
 
-    if (modelConfig.usePagedKvCache())
+    if (modelConfig.isPagedKVCache())
     {
         for (auto batchIdx = firstBatchSlotIdx; batchIdx < firstBatchSlotIdx + batchSize; ++batchIdx)
         {
@@ -664,12 +699,12 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
     inputBuffers.clear();
     outputBuffers.clear();
 
-    auto& logits = runtimeBuffers->logits;
-    auto& hiddenStates = runtimeBuffers->hiddenStates;
-    auto& contextLengthsDevice = runtimeBuffers->contextLengthsDevice;
-    auto& contextLengthsHost = runtimeBuffers->contextLengthsHost;
-    auto& lastTokenIds = runtimeBuffers->lastTokenIds;
-    auto& requestTypes = runtimeBuffers->requestTypes;
+    auto const& logits = runtimeBuffers->logits;
+    auto const& hiddenStates = runtimeBuffers->hiddenStates;
+    auto const& contextLengthsDevice = runtimeBuffers->contextLengthsDevice;
+    auto const& contextLengthsHost = runtimeBuffers->contextLengthsHost;
+    auto const& lastTokenIds = runtimeBuffers->lastTokenIds;
+    auto const& requestTypes = runtimeBuffers->requestTypes;
 
     if (worldConfig.isLastPipelineParallelRank())
     {
@@ -710,16 +745,18 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
         inputBuffers.insert_or_assign("host_sink_token_length", sinkTokenLengths);
         inputBuffers.insert_or_assign("host_max_attention_window_sizes", maxAttentionWindows);
         inputBuffers.insert_or_assign("host_runtime_perf_knobs", runtimePerfKnobsHost);
+        inputBuffers.insert_or_assign("host_context_progress", contextProgressHost);
 
         if (modelConfig.usePackedInput())
         {
             inputBuffers.insert_or_assign("host_context_lengths", contextLengthsHost);
         }
-        if (modelConfig.usePagedKvCache())
+        if (modelConfig.isPagedKVCache())
         {
             inputBuffers.insert_or_assign("kv_cache_block_offsets", kvCacheBlockOffsetsDevice);
             inputBuffers.insert_or_assign("host_kv_cache_block_offsets", kvCacheBlockOffsetsHost);
             inputBuffers.insert_or_assign("host_kv_cache_pool_pointers", kvCacheBlockPoolPointers);
+            inputBuffers.insert_or_assign("host_kv_cache_pool_mapping", kvCacheBlockPoolMapping);
         }
         else
         {

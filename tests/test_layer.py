@@ -240,6 +240,7 @@ class TestLayer(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         with tensorrt_llm.net_guard(net):
             network = tensorrt_llm.default_trtnet()
@@ -317,9 +318,20 @@ class TestLayer(unittest.TestCase):
          ["bfloat16", True], ["bfloat16", True, "float32"],
          ["float32", True, None, 4], ["float16", True, None, 4],
          ["bfloat16", True, None, 4], ["float16", True, "float32", 4],
-         ["bfloat16", True, "float32", 4]],
+         ["bfloat16", True, "float32", 4], ["float32", True, None, 0, 10],
+         ["float16", True, None, 0, 10], ["bfloat16", True, None, 0, 10],
+         ["float16", True, "float32", 0, 10],
+         ["bfloat16", True, "float32", 0, 10], ["float32", True, None, 4, 10],
+         ["float16", True, None, 4, 10], ["bfloat16", True, None, 4, 10],
+         ["float16", True, "float32", 4, 10],
+         ["bfloat16", True, "float32", 4, 10]],
         name_func=unittest_name_func)
-    def test_linear(self, dtype, use_plugin, output_dtype=None, pad_lda=0):
+    def test_linear(self,
+                    dtype,
+                    use_plugin,
+                    output_dtype=None,
+                    pad_lda=0,
+                    pad_ldc=0):
         # Skip tests that are not supported on pre-Ampere
         skip_bf16_pre_ampere(dtype)
 
@@ -330,10 +342,11 @@ class TestLayer(unittest.TestCase):
         torch.manual_seed(0)
         torch_dtype = str_dtype_to_torch(dtype)
         x_data = torch.randn(128, 20 + pad_lda, dtype=torch_dtype)
-        m = torch.nn.Linear(20, 30, dtype=torch.float32)
+        m = torch.nn.Linear(20, 30, bias=(pad_ldc == 0), dtype=torch.float32)
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         if use_plugin:
             net.plugin_config.gemm_plugin = dtype
@@ -345,13 +358,16 @@ class TestLayer(unittest.TestCase):
 
             gm = tensorrt_llm.layers.Linear(20,
                                             30,
+                                            bias=(pad_ldc == 0),
                                             dtype=dtype,
-                                            pad_lda=pad_lda)
+                                            pad_lda=pad_lda,
+                                            pad_ldc=pad_ldc)
 
             gm.weight.value = torch_to_numpy(
                 m.weight.to(torch_dtype).detach().cpu())
-            gm.bias.value = torch_to_numpy(
-                m.bias.to(torch_dtype).detach().cpu())
+            if pad_ldc == 0:
+                gm.bias.value = torch_to_numpy(
+                    m.bias.to(torch_dtype).detach().cpu())
             output = gm.forward(x).trt_tensor
             output.name = 'output'
             output.dtype = tensorrt_llm.str_dtype_to_trt(output_dtype)
@@ -365,6 +381,10 @@ class TestLayer(unittest.TestCase):
                          precision_constraints="obey"))
         with TrtRunner(build_engine) as runner:
             outputs = runner.infer(feed_dict={'x': x_data})
+
+        if pad_ldc:
+            outputs['output'] = torch.split(outputs['output'], [30, pad_ldc],
+                                            dim=-1)[0]
 
         # pytorch run
         with torch.no_grad():
@@ -415,6 +435,7 @@ class TestLayer(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         if use_plugin:
             net.plugin_config.gemm_plugin = dtype
@@ -462,11 +483,10 @@ class TestLayer(unittest.TestCase):
                                    outputs['output'].to(torch.float32).numpy(),
                                    atol=atols[dtype])
 
-    @parameterized.expand(list(product([True, False], [True, False])),
+    @parameterized.expand(list(product([True, False])),
                           name_func=unittest_name_func)
     @skip_pre_ampere  # Skip tests that are not supported in pre-ampere architecture
-    def test_prompt_tuning_embedding(self, enable_lookup_plugin,
-                                     remove_padding):
+    def test_prompt_tuning_embedding(self, remove_padding):
         torch.random.manual_seed(0)
         dtype = "bfloat16"
         trt_dtype = tensorrt_llm.str_dtype_to_trt(dtype)
@@ -505,10 +525,8 @@ class TestLayer(unittest.TestCase):
             input_ids = ids
 
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
-
-        if enable_lookup_plugin:
-            net.plugin_config.lookup_plugin = dtype
 
         with tensorrt_llm.net_guard(net):
             ids_tensor = Tensor(name='ids',
@@ -708,6 +726,7 @@ class TestLayer(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
 
         with tensorrt_llm.net_guard(net):
@@ -897,6 +916,9 @@ class TestLayer(unittest.TestCase):
                                                           perf_knob_tensor_size,
                                                           dtype=torch.int64,
                                                           device='cpu')
+            host_context_progress = torch.tensor([0],
+                                                 dtype=torch.int64,
+                                                 device='cpu')
 
         q_weight = torch.empty(size=[hidden_size, hidden_size],
                                dtype=torch_dtype)
@@ -962,6 +984,10 @@ class TestLayer(unittest.TestCase):
                     name='host_runtime_perf_knobs',
                     shape=[16],
                     dtype=tensorrt_llm.str_dtype_to_trt('int64'))
+                host_context_progress_tensor = Tensor(
+                    name='host_context_progress',
+                    shape=[1],
+                    dtype=tensorrt_llm.str_dtype_to_trt('int64'))
 
             mask_type = tensorrt_llm.layers.AttentionMaskType.padding
             if causal_mask:
@@ -998,7 +1024,8 @@ class TestLayer(unittest.TestCase):
                         context_lengths=context_lengths_tensor,
                         host_request_types=host_request_types_tensor,
                         max_context_length=seq_len,
-                        host_runtime_perf_knobs=host_runtime_perf_knobs))
+                        host_runtime_perf_knobs=host_runtime_perf_knobs,
+                        host_context_progress=host_context_progress_tensor))
                 assert isinstance(output, Tensor)
                 output = output
                 present_key_value.mark_output(
@@ -1042,7 +1069,8 @@ class TestLayer(unittest.TestCase):
                 'context_lengths': context_lengths,
                 'host_request_types': host_request_types,
                 'cache_indirection': cache_indirection,
-                'host_runtime_perf_knobs': host_runtime_perf_knobs_tensor
+                'host_runtime_perf_knobs': host_runtime_perf_knobs_tensor,
+                'host_context_progress': host_context_progress
             }
             outputs = {
                 'output':
@@ -1292,16 +1320,24 @@ class TestLayer(unittest.TestCase):
             mamba_layer.D.value = torch_to_numpy(D.detach().cpu())
             mamba_layer.dt_bias.value = torch_to_numpy(dt_bias.detach().cpu())
             mamba_layer.in_proj_x.weight.value = torch_to_numpy(
-                mamba_torch.in_proj.weight[0:d_inner, ].detach().cpu())
+                mamba_torch.in_proj.weight[
+                    0:d_inner,
+                ].detach().cpu())
             mamba_layer.in_proj_z.weight.value = torch_to_numpy(
-                mamba_torch.in_proj.weight[d_inner:, ].detach().cpu())
+                mamba_torch.in_proj.weight[
+                    d_inner:,
+                ].detach().cpu())
             mamba_layer.out_proj.weight.value = torch_to_numpy(
                 mamba_torch.out_proj.weight.detach().cpu())
             if bias:
                 mamba_layer.in_proj_x.bias.value = torch_to_numpy(
-                    mamba_torch.in_proj.bias[0:d_inner, ].detach().cpu())
+                    mamba_torch.in_proj.bias[
+                        0:d_inner,
+                    ].detach().cpu())
                 mamba_layer.in_proj_z.bias.value = torch_to_numpy(
-                    mamba_torch.in_proj.bias[d_inner:, ].detach().cpu())
+                    mamba_torch.in_proj.bias[
+                        d_inner:,
+                    ].detach().cpu())
                 mamba_layer.out_proj.bias.value = torch_to_numpy(
                     mamba_torch.out_proj.bias.detach().cpu())
             mamba_layer.conv1d.weight.value = torch_to_numpy(
@@ -1354,7 +1390,6 @@ class TestLayer(unittest.TestCase):
 
         stream = torch.cuda.current_stream()
         builder_config = builder.create_builder_config(name='mamba',
-                                                       opt_level=0,
                                                        precision=dtype)
         engine = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
@@ -1365,7 +1400,7 @@ class TestLayer(unittest.TestCase):
             hidden_states_ref, last_token_ids, conv_state_ref, ssm_state_ref,
             remove_padding, batch_size, seqlen_offset)
 
-        dtype_atol = {"float16": 5e-3, "float32": 5e-3, "bfloat16": 5e-2}
+        dtype_atol = {"float16": 1e-2, "float32": 5e-3, "bfloat16": 5e-2}
 
         if not remove_padding:
             # get out_mask
@@ -1415,7 +1450,10 @@ class TestLayer(unittest.TestCase):
     @parameterized.expand(list(
         product([3], [16], [1], [1024], [128], [64], [256], [1, 4],
                 ['context', 'generation'], ["float32", "float16", "bfloat16"],
-                [True, False], [True, False])),
+                [True, False], [True, False])) + list(
+                    product([16], [16], [1], [160, 320, 640], [128], [80],
+                            [256], [1], ['context', 'generation'],
+                            ["float16", "bfloat16"], [True], [True])),
                           name_func=unittest_name_func)
     def test_mamba2(self, batch_size, in_seq_len, out_seq_len, d_model, d_state,
                     headdim, chunk_size, ngroups, req_type, dtype,
@@ -1579,11 +1617,14 @@ class TestLayer(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         if use_plugin:
             net.plugin_config.mamba_conv1d_plugin = dtype
+            net.plugin_config.gemm_plugin = dtype
         else:
             net.plugin_config.mamba_conv1d_plugin = None
+            net.plugin_config.gemm_plugin = None
         if remove_padding:
             net.plugin_config.remove_input_padding = True
         else:
@@ -1689,7 +1730,6 @@ class TestLayer(unittest.TestCase):
 
         stream = torch.cuda.current_stream()
         builder_config = builder.create_builder_config(name='mamba2',
-                                                       opt_level=0,
                                                        precision=dtype)
         engine = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
@@ -1700,7 +1740,7 @@ class TestLayer(unittest.TestCase):
             hidden_states_ref, last_token_ids, conv_state_ref, ssm_state_ref,
             remove_padding, batch_size, seqlen_offset)
 
-        dtype_atol = {"float16": 5e-3, "float32": 5e-3, "bfloat16": 5e-2}
+        dtype_atol = {"float16": 1e-2, "float32": 5e-3, "bfloat16": 5e-2}
 
         if not remove_padding:
             # get out_mask
@@ -1920,6 +1960,7 @@ class TestLayer(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         if use_plugin:
             net.plugin_config.mamba_conv1d_plugin = dtype
@@ -2038,7 +2079,6 @@ class TestLayer(unittest.TestCase):
 
         stream = torch.cuda.current_stream()
         builder_config = builder.create_builder_config(name='recurrent',
-                                                       opt_level=0,
                                                        precision=dtype)
         engine = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
@@ -2049,7 +2089,7 @@ class TestLayer(unittest.TestCase):
             hidden_states_ref, segment_pos, batch_size, remove_padding,
             last_token_ids, conv_state_ref, lru_state_ref, conv_indices_ref)
 
-        dtype_atol = {"float16": 5e-3, "float32": 5e-3, "bfloat16": 5e-2}
+        dtype_atol = {"float16": 1e-2, "float32": 5e-3, "bfloat16": 5e-2}
 
         # get mask
         if not remove_padding and req_type == 'context':

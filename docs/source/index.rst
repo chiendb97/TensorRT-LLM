@@ -13,6 +13,7 @@ Welcome to TensorRT-LLM's Documentation!
 
    overview.md
    quick-start-guide.md
+   key-features.md
    release-notes.md
 
 
@@ -27,6 +28,58 @@ Welcome to TensorRT-LLM's Documentation!
    installation/build-from-source-linux.md
    installation/windows.md
    installation/build-from-source-windows.md
+   installation/grace-hopper.md
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: LLM API
+   :hidden:
+   :glob:
+
+   llm-api/*
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: LLM API Examples
+   :hidden:
+
+   llm-api-examples/index.rst
+   llm-api-examples/customization.md
+   llm-api-examples/llm_api_examples
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Model Definition API
+   :hidden:
+
+   python-api/tensorrt_llm.layers.rst
+   python-api/tensorrt_llm.functional.rst
+   python-api/tensorrt_llm.models.rst
+   python-api/tensorrt_llm.plugin.rst
+   python-api/tensorrt_llm.quantization.rst
+   python-api/tensorrt_llm.runtime.rst
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: C++ API
+   :hidden:
+
+   _cpp_gen/executor.rst
+   _cpp_gen/runtime.rst
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Command-Line Reference
+   :hidden:
+
+   commands/trtllm-build.rst
+   commands/trtllm-serve.rst
+
 
 .. toctree::
    :maxdepth: 2
@@ -46,11 +99,13 @@ Welcome to TensorRT-LLM's Documentation!
 
    advanced/gpt-attention.md
    advanced/gpt-runtime.md
+   advanced/executor.md
    advanced/graph-rewriting.md
-   advanced/batch-manager.md
    advanced/inference-request.md
    advanced/lora.md
    advanced/expert-parallelism.md
+   advanced/kv-cache-reuse.md
+   advanced/speculative-decoding.md
 
 .. toctree::
    :maxdepth: 2
@@ -58,7 +113,8 @@ Welcome to TensorRT-LLM's Documentation!
    :name: Performance
 
    performance/perf-overview.md
-   performance/perf-best-practices.md
+   Benchmarking <performance/perf-benchmarking.md>
+   Best Practices <performance/perf-best-practices.md>
    performance/perf-analysis.md
 
 
@@ -75,14 +131,6 @@ Welcome to TensorRT-LLM's Documentation!
    reference/precision.md
    reference/memory.md
 
-
-.. toctree::
-   :maxdepth: 2
-   :caption: C++ API
-   :hidden:
-
-   _cpp_gen/executor.rst
-   _cpp_gen/runtime.rst
 
 .. toctree::
    :maxdepth: 2

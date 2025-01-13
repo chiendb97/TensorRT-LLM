@@ -25,16 +25,16 @@ import torch
 
 from .. import profiler
 from .._utils import mpi_comm, mpi_world_size, numpy_to_torch
-from ..bindings import MpiComm
+from ..bindings import KVCacheType, MpiComm
 from ..bindings.executor import Executor
-from ..builder import Engine, get_engine_version
+from ..builder import Engine, EngineConfig, get_engine_version
 from ..logger import logger
 from ..mapping import Mapping
 from ..quantization import QuantMode
-from .generation import (ChatGLMGenerationSession, GenerationSession,
-                         LogitsProcessor, LoraManager, ModelConfig,
-                         QWenForCausalLMGenerationSession, SamplingConfig,
-                         StoppingCriteria, to_word_list_format)
+from .generation import (DISABLE_TORCH_DEVICE_SET, ChatGLMGenerationSession,
+                         GenerationSession, LogitsProcessor, LoraManager,
+                         ModelConfig, QWenForCausalLMGenerationSession,
+                         SamplingConfig, StoppingCriteria, to_word_list_format)
 
 
 def get_engine_name(model: str, dtype: str, tp_size: int, pp_size: int,
@@ -86,6 +86,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     dtype = builder_config['precision']
     tp_size = builder_config['tensor_parallel']
     pp_size = builder_config.get('pipeline_parallel', 1)
+    kv_cache_type = KVCacheType(builder_config.get('kv_cache_type'))
     world_size = tp_size * pp_size
     assert world_size == mpi_world_size(), \
         f'Engine world size ({tp_size} * {pp_size}) != Runtime world size ({mpi_world_size()})'
@@ -129,6 +130,9 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     max_medusa_token_len = builder_config.get('max_draft_len', 0)
     num_medusa_heads = builder_config.get('num_medusa_heads', 0)
 
+    skip_cross_attn_blocks = bool(config['pretrained_config'].get(
+        'skip_cross_attn_blocks', False))
+
     # ReDrafter
     redrafter_num_beams = config['pretrained_config'].get(
         'redrafter_num_beams', 0)
@@ -139,7 +143,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
     mamba_conv1d_plugin = bool(plugin_config['mamba_conv1d_plugin'])
     remove_input_padding = plugin_config['remove_input_padding']
-    paged_kv_cache = plugin_config['paged_kv_cache']
     paged_state = plugin_config['paged_state']
     tokens_per_block = plugin_config['tokens_per_block']
     lora_plugin = plugin_config.get('lora_plugin')
@@ -157,7 +160,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         mamba_conv1d_plugin=mamba_conv1d_plugin,
         remove_input_padding=remove_input_padding,
         model_name=model_name,
-        paged_kv_cache=paged_kv_cache,
+        kv_cache_type=kv_cache_type,
         paged_state=paged_state,
         cross_attention=cross_attention,
         has_position_embedding=has_position_embedding,
@@ -173,6 +176,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         trtllm_modules_to_hf_modules=lora_trtllm_modules_to_hf_modules,
         num_medusa_heads=num_medusa_heads,
         max_medusa_tokens=max_medusa_token_len,
+        skip_cross_attn_blocks=skip_cross_attn_blocks,
         # ReDrafter
         redrafter_num_beams=redrafter_num_beams,
         redrafter_draft_len_per_beam=redrafter_draft_len_per_beam,
@@ -188,6 +192,103 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         'max_beam_width': builder_config['max_beam_width']
     }
     return model_config, other_config
+
+
+def _engine_config_to_model_config(engine_config: EngineConfig,
+                                   **kwargs) -> ModelConfig:
+    pretrained_config = engine_config.pretrained_config
+    build_config = engine_config.build_config
+
+    tp_size = pretrained_config.mapping.tp_size
+    num_heads = pretrained_config.num_attention_heads // tp_size
+    num_kv_heads = pretrained_config.num_key_value_heads
+    num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
+    hidden_size = pretrained_config.hidden_size // tp_size
+    head_size = pretrained_config.head_size
+
+    rnn_config_items = [
+        'conv_kernel', 'layer_types', 'rnn_hidden_size', 'state_size',
+        'state_dtype', 'rnn_head_size', 'rnn_conv_dim_size'
+    ]
+    rnn_configs_kwargs = {}
+    for item in rnn_config_items:
+        if hasattr(pretrained_config, item):
+            rnn_configs_kwargs[item] = getattr(pretrained_config, item)
+
+    if not hasattr(build_config, 'kv_cache_type'):
+        logger.Warning(
+            'Build config doesn\'t have kv_cache_type, you might need to rebuild your enigne.'
+        )
+
+    # TODO(oargov): this is a hack, make it prettier!
+    if hasattr(pretrained_config, "num_kv_heads_per_layer"):
+        num_kv_heads_per_layer = pretrained_config.num_kv_heads_per_layer
+    elif hasattr(pretrained_config, "get_layer_num_kv_heads"):
+        # each layer has a different number of kv heads
+        attention_layers = [
+            layer_idx for layer_idx, layer_type in enumerate(
+                pretrained_config.layer_types) if layer_type == "attention"
+        ] if hasattr(pretrained_config, "layer_types") else list(
+            range(pretrained_config.num_hidden_layers))
+        num_kv_heads_per_layer = [
+            pretrained_config.get_layer_num_kv_heads(layer_idx)
+            if layer_idx in attention_layers else 0
+            for layer_idx in range(pretrained_config.num_hidden_layers)
+        ]
+    else:
+        num_kv_heads_per_layer = None
+
+    if hasattr(pretrained_config, "num_kv_heads_per_cross_attn_layer"):
+        num_kv_heads_per_cross_attn_layer = pretrained_config.num_kv_heads_per_cross_attn_layer
+    else:
+        num_kv_heads_per_cross_attn_layer = None
+
+    return ModelConfig(
+        max_batch_size=build_config.max_batch_size,
+        max_beam_width=build_config.max_beam_width,
+        vocab_size=pretrained_config.vocab_size,
+        num_layers=pretrained_config.num_hidden_layers,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        hidden_size=hidden_size,
+        head_size=head_size,
+        gpt_attention_plugin=bool(
+            build_config.plugin_config.gpt_attention_plugin),
+        mamba_conv1d_plugin=bool(
+            build_config.plugin_config.mamba_conv1d_plugin),
+        remove_input_padding=build_config.plugin_config.remove_input_padding,
+        paged_state=build_config.plugin_config.paged_state,
+        tokens_per_block=build_config.plugin_config.tokens_per_block,
+        quant_mode=pretrained_config.quant_mode,
+        gather_context_logits=build_config.gather_context_logits,
+        gather_generation_logits=build_config.gather_generation_logits,
+        dtype=pretrained_config.dtype,
+        max_prompt_embedding_table_size=build_config.
+        max_prompt_embedding_table_size,
+        lora_plugin=build_config.plugin_config.lora_plugin,
+        lora_target_modules=build_config.lora_config.lora_target_modules,
+        trtllm_modules_to_hf_modules=build_config.lora_config.
+        trtllm_modules_to_hf_modules,
+        max_medusa_tokens=pretrained_config.max_draft_len if hasattr(
+            pretrained_config, 'max_draft_len') else 0,
+        num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
+            pretrained_config, 'num_medusa_heads') else 0,
+        **rnn_configs_kwargs,
+        num_kv_heads_per_layer=num_kv_heads_per_layer,
+        num_kv_heads_per_cross_attn_layer=num_kv_heads_per_cross_attn_layer,
+        redrafter_num_beams=pretrained_config.redrafter_num_beams if hasattr(
+            pretrained_config, 'redrafter_num_beams') else 0,
+        redrafter_draft_len_per_beam=pretrained_config.
+        redrafter_draft_len_per_beam
+        if hasattr(pretrained_config, 'redrafter_draft_len_per_beam') else 0,
+        kv_cache_type=getattr(build_config, 'kv_cache_type',
+                              KVCacheType.CONTINUOUS),
+        cross_attention=getattr(pretrained_config, 'cross_attention', False),
+        has_position_embedding=getattr(pretrained_config,
+                                       'has_position_embedding', True),
+        skip_cross_attn_blocks=getattr(pretrained_config,
+                                       'skip_cross_attn_blocks', False),
+        **kwargs)
 
 
 class ModelRunnerMixin:
@@ -357,14 +458,16 @@ class ModelRunnerMixin:
 
         if prompt_table is not None:
             prompt_table_data = self._prepare_embedding_table(prompt_table)
-            _, task_vocab_size, hidden_size = prompt_table_data.size()
+            if len(prompt_table_data.size()) == 3:
+                _, task_vocab_size, hidden_size = prompt_table_data.size()
+            elif len(prompt_table_data.size()) == 2:
+                task_vocab_size, hidden_size = prompt_table_data.size()
             task_vocab_size = torch.tensor([task_vocab_size], dtype=torch.int32)
             prompt_table_data = prompt_table_data.view(-1, hidden_size)
         else:
-            prompt_table_data = torch.empty([1, self.hidden_size],
-                                            dtype=self.dtype)
+            prompt_table_data = torch.empty(
+                [1, self.hidden_size * self.mapping.tp_size], dtype=self.dtype)
             task_vocab_size = torch.zeros([1], dtype=torch.int32)
-
         if tasks is not None:
             tasks = torch.tensor([int(t) for t in tasks.split(',')],
                                  dtype=torch.int32)
@@ -392,13 +495,16 @@ class ModelRunner(ModelRunnerMixin):
     An interface class that wraps GenerationSession and provides generation methods.
     """
 
-    def __init__(self,
-                 session: GenerationSession,
-                 max_batch_size: int,
-                 max_input_len: int,
-                 max_seq_len: int,
-                 max_beam_width: int,
-                 lora_manager: Optional[LoraManager] = None) -> None:
+    def __init__(
+        self,
+        session: GenerationSession,
+        max_batch_size: int,
+        max_input_len: int,
+        max_seq_len: int,
+        max_beam_width: int,
+        kv_cache_type: KVCacheType,
+        lora_manager: Optional[LoraManager] = None,
+    ) -> None:
         """
         Create a ModelRunner instance.
         You are recommended to use the from_dir method to load the engine and create a ModelRunner instance.
@@ -423,80 +529,34 @@ class ModelRunner(ModelRunnerMixin):
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         self.lora_manager = lora_manager
+        self.kv_cache_type = kv_cache_type
         self.enable_context_fmha_fp32_acc = False
+        self.multi_block_mode = True
 
     @classmethod
     def from_engine(
-            cls,
-            engine: Engine,
-            lora_dir: Optional[List[str]] = None,
-            rank: int = 0,
-            debug_mode: bool = False,
-            lora_ckpt_source: str = "hf",
-            medusa_choices: List[List[int]] = None,
-            stream: torch.cuda.Stream = None,
-            gpu_weights_percent: float = 1,
-            enable_context_fmha_fp32_acc: Optional[bool] = None
+        cls,
+        engine: Engine,
+        *,
+        max_output_len: Optional[int],
+        lora_dir: Optional[List[str]],
+        rank: int,
+        debug_mode: bool,
+        lora_ckpt_source: str,
+        medusa_choices: List[List[int]],
+        stream: torch.cuda.Stream,
+        gpu_weights_percent: float,
+        enable_context_fmha_fp32_acc: Optional[bool],
+        multi_block_mode: Optional[bool],
     ) -> 'ModelRunner':
+        model_config = _engine_config_to_model_config(
+            engine.config, gpu_weights_percent=gpu_weights_percent)
+
+        if model_config.kv_cache_type == KVCacheType.DISABLED:
+            assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
+
         pretrained_config = engine.config.pretrained_config
         build_config = engine.config.build_config
-
-        tp_size = pretrained_config.mapping.tp_size
-        num_heads = pretrained_config.num_attention_heads // tp_size
-        num_kv_heads = pretrained_config.num_key_value_heads
-        num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
-        hidden_size = pretrained_config.hidden_size // tp_size
-        head_size = pretrained_config.head_size
-
-        rnn_config_items = [
-            'conv_kernel', 'layer_types', 'rnn_hidden_size', 'state_size',
-            'state_dtype', 'rnn_head_size', 'rnn_conv_dim_size'
-        ]
-        rnn_configs_kwargs = {}
-        for item in rnn_config_items:
-            if hasattr(pretrained_config, item):
-                rnn_configs_kwargs[item] = getattr(pretrained_config, item)
-
-        model_config = ModelConfig(
-            max_batch_size=build_config.max_batch_size,
-            max_beam_width=build_config.max_beam_width,
-            vocab_size=pretrained_config.vocab_size,
-            num_layers=pretrained_config.num_hidden_layers,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            hidden_size=hidden_size,
-            head_size=head_size,
-            gpt_attention_plugin=bool(
-                build_config.plugin_config.gpt_attention_plugin),
-            mamba_conv1d_plugin=bool(
-                build_config.plugin_config.mamba_conv1d_plugin),
-            remove_input_padding=build_config.plugin_config.
-            remove_input_padding,
-            paged_kv_cache=build_config.plugin_config.paged_kv_cache,
-            paged_state=build_config.plugin_config.paged_state,
-            tokens_per_block=build_config.plugin_config.tokens_per_block,
-            quant_mode=pretrained_config.quant_mode,
-            gather_context_logits=build_config.gather_context_logits,
-            gather_generation_logits=build_config.gather_generation_logits,
-            dtype=pretrained_config.dtype,
-            max_prompt_embedding_table_size=build_config.
-            max_prompt_embedding_table_size,
-            lora_plugin=build_config.plugin_config.lora_plugin,
-            lora_target_modules=build_config.lora_config.lora_target_modules,
-            trtllm_modules_to_hf_modules=build_config.lora_config.
-            trtllm_modules_to_hf_modules,
-            max_medusa_tokens=pretrained_config.max_draft_len if hasattr(
-                pretrained_config, 'max_draft_len') else 0,
-            num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
-                pretrained_config, 'num_medusa_heads') else 0,
-            **rnn_configs_kwargs,
-            gpu_weights_percent=gpu_weights_percent,
-            redrafter_num_beams=pretrained_config.redrafter_num_beams
-            if hasattr(pretrained_config, 'redrafter_num_beams') else 0,
-            redrafter_draft_len_per_beam=pretrained_config.
-            redrafter_draft_len_per_beam if hasattr(
-                pretrained_config, 'redrafter_draft_len_per_beam') else 0,
-        )
         max_batch_size = build_config.max_batch_size
         max_input_len = build_config.max_input_len
         max_seq_len = build_config.max_seq_len
@@ -518,7 +578,8 @@ class ModelRunner(ModelRunnerMixin):
 
         if MpiComm.size() > runtime_mapping.gpus_per_node:
             assert MpiComm.local_size() == runtime_mapping.gpus_per_node
-        torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
+        if not DISABLE_TORCH_DEVICE_SET:
+            torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
         session = session_cls(model_config,
                               engine_buffer,
                               runtime_mapping,
@@ -530,7 +591,7 @@ class ModelRunner(ModelRunnerMixin):
         if session.use_lora_plugin:
             lora_manager = LoraManager()
             if lora_dir is not None:
-                lora_manager.load_from_ckpt(model_dir=lora_dir,
+                lora_manager.load_from_ckpt(lora_dir,
                                             model_config=model_config,
                                             runtime_mapping=runtime_mapping,
                                             ckpt_source=lora_ckpt_source)
@@ -542,22 +603,27 @@ class ModelRunner(ModelRunnerMixin):
                      max_input_len=max_input_len,
                      max_seq_len=max_seq_len,
                      max_beam_width=max_beam_width,
+                     kv_cache_type=model_config.kv_cache_type,
                      lora_manager=lora_manager)
         runner.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
+        runner.multi_block_mode = multi_block_mode
         return runner
 
     @classmethod
     def from_dir(
-            cls,
-            engine_dir: str,
-            lora_dir: Optional[List[str]] = None,
-            rank: int = 0,
-            debug_mode: bool = False,
-            lora_ckpt_source: str = "hf",
-            medusa_choices: List[List[int]] = None,
-            stream: torch.cuda.Stream = None,
-            gpu_weights_percent: float = 1,
-            enable_context_fmha_fp32_acc: Optional[bool] = None
+        cls,
+        engine_dir: str,
+        *,
+        max_output_len: Optional[int] = None,
+        lora_dir: Optional[List[str]] = None,
+        rank: int = 0,
+        debug_mode: bool = False,
+        lora_ckpt_source: str = "hf",
+        medusa_choices: List[List[int]] = None,
+        stream: torch.cuda.Stream = None,
+        gpu_weights_percent: float = 1,
+        enable_context_fmha_fp32_acc: Optional[bool] = None,
+        multi_block_mode: Optional[bool] = None,
     ) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
@@ -565,6 +631,8 @@ class ModelRunner(ModelRunnerMixin):
         Args:
             engine_dir (str):
                 The directory that contains the serialized engine files and config files.
+            max_output_len (Optional[int]):
+                max_output_len, this arg might be available only when loading time, generate will still to check when disable_kv_cache is enabled.
             lora_dir (Optional[List[str]]):
                 The directories that contain LoRA weights.
             rank (int):
@@ -575,6 +643,8 @@ class ModelRunner(ModelRunnerMixin):
                 Medusa choices to use when in Medusa decoding
             stream (torch.cuda.Stream):
                 Stream to use.
+            multi_block_mode (bool):
+                Whether to distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel.
         Returns:
             ModelRunner: An instance of ModelRunner.
         """
@@ -616,7 +686,8 @@ class ModelRunner(ModelRunnerMixin):
                 assert model_config.max_medusa_tokens > 0, \
                     "medusa_choice is specified but model_config.max_medusa_tokens is 0."
 
-            torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
+            if not DISABLE_TORCH_DEVICE_SET:
+                torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
             session = session_cls(model_config,
                                   engine_buffer,
                                   runtime_mapping,
@@ -625,7 +696,7 @@ class ModelRunner(ModelRunnerMixin):
             if session.use_lora_plugin:
                 lora_manager = LoraManager()
                 if lora_dir is not None:
-                    lora_manager.load_from_ckpt(model_dir=lora_dir,
+                    lora_manager.load_from_ckpt(lora_dir,
                                                 model_config=model_config,
                                                 runtime_mapping=runtime_mapping,
                                                 ckpt_source=lora_ckpt_source)
@@ -645,8 +716,10 @@ class ModelRunner(ModelRunnerMixin):
                          max_input_len=max_input_len,
                          max_seq_len=max_input_len + max_output_len,
                          max_beam_width=max_beam_width,
+                         kv_cache_type=KVCacheType.CONTINUOUS,
                          lora_manager=lora_manager)
             runner.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
+            runner.multi_block_mode = multi_block_mode
             return runner
         else:
             # the new engine format
@@ -658,16 +731,20 @@ class ModelRunner(ModelRunnerMixin):
                         f"{engine_dir}/{dir}" for dir in config_lora_dir
                     ]
                     lora_ckpt_source = engine.config.build_config.lora_config.lora_ckpt_source
+
             runner = ModelRunner.from_engine(
-                engine,
-                lora_dir,
-                rank,
-                debug_mode,
-                lora_ckpt_source,
-                medusa_choices,
-                stream,
-                gpu_weights_percent,
-                enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc)
+                engine=engine,
+                max_output_len=max_output_len,
+                lora_dir=lora_dir,
+                rank=rank,
+                debug_mode=debug_mode,
+                lora_ckpt_source=lora_ckpt_source,
+                medusa_choices=medusa_choices,
+                stream=stream,
+                gpu_weights_percent=gpu_weights_percent,
+                enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc,
+                multi_block_mode=multi_block_mode,
+            )
             profiler.stop('load tensorrt_llm engine')
             loading_time = profiler.elapsed_time_in_sec(
                 "load tensorrt_llm engine")
@@ -728,6 +805,7 @@ class ModelRunner(ModelRunnerMixin):
 
     def generate(self,
                  batch_input_ids: List[torch.Tensor],
+                 position_ids: List[torch.Tensor] = None,
                  sampling_config: Optional[SamplingConfig] = None,
                  prompt_table: Optional[Union[str, torch.Tensor]] = None,
                  prompt_tasks: Optional[str] = None,
@@ -736,6 +814,10 @@ class ModelRunner(ModelRunnerMixin):
                  stopping_criteria: Optional[StoppingCriteria] = None,
                  logits_processor: Optional[LogitsProcessor] = None,
                  medusa_choices: Optional[List[List[int]]] = None,
+                 encoder_max_input_length: int = None,
+                 encoder_input_features: List[torch.Tensor] = None,
+                 encoder_output_lengths: List[torch.Tensor] = None,
+                 cross_attention_masks: List[torch.Tensor] = None,
                  **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
@@ -793,16 +875,42 @@ class ModelRunner(ModelRunnerMixin):
 
         self._check_inputs(batch_input_ids, sampling_config)
 
+        if kwargs.get('num_return_sequences', None) is not None:
+            raise ValueError(
+                'num_return_sequences will be ignored since '
+                'num_return_sequences > 1 is not supported on python runtime. '
+                'Please use C++ runtime.')
+
         batch_size = len(batch_input_ids)
         batch_input_ids, input_lengths = self._prepare_inputs(
             batch_input_ids, sampling_config.pad_id)
 
-        if sampling_config.bad_words_list is not None:
-            sampling_config.bad_words_list = to_word_list_format(
-                sampling_config.bad_words_list)
-        if sampling_config.stop_words_list is not None:
-            sampling_config.stop_words_list = to_word_list_format(
-                sampling_config.stop_words_list)
+        def maybe_convert_to_words_list_format(
+            words_list: Optional[Union[list, np.ndarray, torch.Tensor]]
+        ) -> Optional[np.ndarray]:
+            if words_list is None or isinstance(words_list, np.ndarray):
+                return words_list
+            elif isinstance(words_list, torch.Tensor):
+                return words_list.numpy()
+            elif isinstance(words_list, list):
+                return to_word_list_format(words_list)
+            else:
+                raise TypeError(
+                    f"Unexpected words_list type={type(words_list)}. Only list, np.ndarray, and torch.Tensor are supported."
+                )
+
+        if cross_attention_masks is not None:
+            encoder_input_features = torch.concat(encoder_input_features)
+            encoder_output_lengths = torch.concat(encoder_output_lengths)
+
+        sampling_config.bad_words_list = maybe_convert_to_words_list_format(
+            sampling_config.bad_words_list)
+        sampling_config.stop_words_list = maybe_convert_to_words_list_format(
+            sampling_config.stop_words_list)
+
+        if not self.kv_cache_type and sampling_config.max_new_tokens > 1:
+            raise RuntimeError(
+                'Disabled KV cache is intended for context phase only now.')
 
         self.session.setup(
             batch_size=batch_size,
@@ -814,12 +922,17 @@ class ModelRunner(ModelRunnerMixin):
             lora_manager=self.lora_manager,
             lora_uids=lora_uids,
             medusa_choices=medusa_choices,
-            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc)
+            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc,
+            multi_block_mode=self.multi_block_mode,
+            encoder_max_input_length=encoder_max_input_length,
+        )
 
         batch_input_ids = batch_input_ids.cuda()
         input_lengths = input_lengths.cuda()
-        ptuning_kwargs = self._prepare_ptuning(prompt_table, prompt_tasks,
-                                               batch_size)
+        other_kwargs = self._prepare_ptuning(prompt_table, prompt_tasks,
+                                             batch_size)
+        other_kwargs['skip_cross_attn_blocks'] = kwargs.get(
+            'skip_cross_attn_blocks', None)
         outputs = self.session.decode(
             batch_input_ids,
             input_lengths,
@@ -831,7 +944,11 @@ class ModelRunner(ModelRunnerMixin):
             streaming=streaming,
             stopping_criteria=stopping_criteria,
             logits_processor=logits_processor,
-            **ptuning_kwargs)
+            position_ids=position_ids,
+            encoder_output=encoder_input_features,
+            encoder_input_lengths=encoder_output_lengths,
+            cross_attention_mask=cross_attention_masks,
+            **other_kwargs)
         if sampling_config.return_dict:
             if streaming:
                 outputs = (self._prepare_outputs(curr_outputs, input_lengths)

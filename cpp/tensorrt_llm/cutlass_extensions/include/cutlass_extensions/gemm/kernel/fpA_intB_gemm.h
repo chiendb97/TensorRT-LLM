@@ -248,7 +248,6 @@ struct GemmFpAIntB
     GemmFpAIntB() {}
 
     /// Determines whether kernel satisfies alignment
-    CUTLASS_HOST_DEVICE
     static Status can_implement(Arguments const& args)
     {
         static int const kAlignmentA
@@ -542,9 +541,7 @@ struct GemmFpAIntB
     void operator()(Params const& params, SharedStorage& shared_storage)
     {
 #if defined(__CUDA_ARCH__)
-#if (__CUDA_ARCH__ >= 700) && (__CUDA_ARCH__ < 750)
-        run_kernel<arch::Sm70>(params, shared_storage);
-#elif (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
+#if (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
         run_kernel<arch::Sm75>(params, shared_storage);
 #elif (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 890)
         run_kernel<arch::Sm80>(params, shared_storage);

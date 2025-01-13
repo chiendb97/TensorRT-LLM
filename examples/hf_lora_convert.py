@@ -47,19 +47,29 @@ def get_all_lora_weights(lora_weights):
     pattern = re.compile(
         r'.*\.(h|layers)\.([0-9]+)\.(attn|self_attn|mlp)\.([a-z1-2_]+)\.lora_(A|B)\.weight.*'
     )
+    moe_pattern = re.compile(
+        r'.*\.layers\.([0-9]+)\.(block_sparse_moe)\.((experts)\.([0-9]+)\.|)([a-zA-Z0-9_]+)\.lora_(A|B)\.weight.*'
+    )
     for key, weights in lora_weights.items():
         m = pattern.match(key)
-        if not m:
+        m_moe = moe_pattern.match(key)
+        if m:
+            layer_idx = int(m.group(2))
+            if m.group(3) in ["attn", "self_attn"]:
+                attn_or_bias = "attn"
+            else:
+                attn_or_bias = "mlp"
+            hf_module = attn_or_bias + "." + m.group(4)
+            inout = "in" if m.group(5) == "A" else "out"
+            all_weights[layer_idx][hf_module][inout] = weights
+        elif m_moe:
+            layer_idx = int(m_moe.group(1))
+            hf_module = m_moe.group(6)
+            inout = "in" if m_moe.group(7) == "A" else "out"
+            all_weights[layer_idx][hf_module][inout] = weights
+        else:
             print(f"no match {key}")
             continue
-        layer_idx = int(m.group(2))
-        if m.group(3) in ["attn", "self_attn"]:
-            attn_or_bias = "attn"
-        else:
-            attn_or_bias = "mlp"
-
-        hf_module = attn_or_bias + "." + m.group(4)
-        inout = "in" if m.group(5) == "A" else "out"
 
         all_weights[layer_idx][hf_module][inout] = weights
     return all_weights
@@ -97,6 +107,10 @@ hf_modules_to_trtllm_modules = {
     "mlp.gate_up_proj": "mlp_h_to_4h",
     "mlp.c_fc": "mlp_h_to_4h",
     "mlp.c_proj": "mlp_4h_to_h",
+    "moe.w1": "moe_h_to_4h",
+    "moe.w2": "moe_4h_to_h",
+    "moe.w3": "moe_gate",
+    "moe.gate": "moe_router",
 }  # lora modules on llama
 hf_modules_to_module_id = {
     k: LoraManager.LORA_MODULE_IDS[v]
@@ -110,13 +124,8 @@ def convert_hf_model(model_dir, dtype, out_dir):
     with open(f"{model_dir}/adapter_config.json", "r") as f:
         config = json.load(f)
 
-    rank = config.get("r")
     alpha = config.get("lora_alpha")
     use_rslora = config.get("use_rslora", False)
-    if use_rslora:
-        scale = alpha / np.sqrt(rank)
-    else:
-        scale = alpha / rank
 
     lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
     lora_model = preprocess_lora_weights(lora_model)
@@ -144,6 +153,10 @@ def convert_hf_model(model_dir, dtype, out_dir):
                     adapter_size = dim0
                     w = w.transpose(1, 0)
                 if inout == "out":
+                    if use_rslora:
+                        scale = alpha / np.sqrt(adapter_size)
+                    else:
+                        scale = alpha / adapter_size
                     w = w * scale
                 w = w.contiguous().flatten().to(dtype=str_dtype_to_torch(dtype))
                 in_out_weights.append(w)

@@ -29,6 +29,11 @@
 
 #include <NvInferRuntime.h>
 
+namespace tensorrt_llm::batch_manager
+{
+struct DecoderBuffers;
+}
+
 namespace tensorrt_llm::runtime
 {
 
@@ -80,8 +85,8 @@ public:
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.
-    virtual void newBatch(
-        GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig)
+    virtual void newBatch(GenerationInput const& inputs, GenerationOutput const& outputs,
+        SamplingConfig const& samplingConfig, ModelConfig const& modelConfig)
         = 0;
 
     //! @brief Run one step for all requests without blocking the host thread.
@@ -101,7 +106,10 @@ public:
     virtual void finalize(SamplingConfig const& samplingConfig) const = 0;
 
     //! @returns [batchSize, beamWidth, maxSequenceLength], all token ids, on gpu
-    [[nodiscard]] virtual TensorPtr getOutputIds() const = 0;
+    [[nodiscard]] virtual TensorPtr getIds() const = 0;
+
+    //! @returns [batchSize, beamWidth, maxSequenceLength] token ids after gatherTree
+    [[nodiscard]] virtual TensorPtr getGatheredIds() const = 0;
 
     //! @returns [batchSize, maxBeamWidth], cumulative log probabilities (per beam), on gpu
     [[nodiscard]] virtual TensorPtr getCumLogProbs() const = 0;

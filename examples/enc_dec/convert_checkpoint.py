@@ -1271,7 +1271,6 @@ def convert_checkpoint(args):
             },
             'use_parallel_embedding': args.use_parallel_embedding,
             'embedding_sharding_dim': args.embedding_sharding_dim,
-            'share_embedding_table': args.use_embedding_sharing,
             'max_position_embeddings': encoder_config.n_positions,
             'num_key_value_heads': encoder_config.n_head,
             'head_size': encoder_config.head_size,
@@ -1327,7 +1326,6 @@ def convert_checkpoint(args):
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'max_position_embeddings': decoder_config.n_positions,
         'head_size': decoder_config.head_size,
         'has_position_embedding': decoder_config.has_position_embedding,
@@ -1349,7 +1347,7 @@ def convert_checkpoint(args):
         'encoder_hidden_size': decoder_config.encoder_hidden_size,
         'encoder_num_heads': decoder_config.encoder_num_heads,
         'encoder_head_size': decoder_config.encoder_head_size,
-        'skip_cross_qkv': args.skip_cross_qkv,
+        'skip_cross_kv': args.skip_cross_kv,
         'use_implicit_relative_attention': args.use_implicit_relative_attention,
         'decoder_start_token_id': decoder_config.decoder_start_token_id,
         'eos_token_id': decoder_config.eos_token_id,
@@ -1493,13 +1491,6 @@ if __name__ == "__main__":
         'You must also use --use_weight_only for that argument to have an impact.'
     )
     parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
-    parser.add_argument(
         '--dtype',
         type=str,
         default='float16',
@@ -1508,7 +1499,7 @@ if __name__ == "__main__":
         'Target inference dtype. Weights and Computation will be in this dtype, no matter what original dtype the weight checkpoint has.'
     )
     parser.add_argument(
-        '--skip_cross_qkv',
+        '--skip_cross_kv',
         action='store_true',
         help=
         'Skip redundant cross qkv computation by using TensorRT IfConditional switch (experimental).'

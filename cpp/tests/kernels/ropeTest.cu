@@ -226,7 +226,7 @@ void computeReferenceBiasRope(QKVPreprocessingParams<fpType, KVCacheBuffer> para
             for (SizeType32 headIt = 0; headIt < qHeadNum; ++headIt)
             {
                 auto const currOffset = tokenIt * tokenSize + headIt * sizePerHead;
-                auto const currPtr = params.QKV + currOffset;
+                auto const currPtr = params.qkv_input + currOffset;
 
                 applyRopeToBuffer<fpType>(currPtr, tmpResultPtr, currentCosSinPtr, rotaryEmbeddingDim);
                 memcpy(currPtr, tmpResultPtr, rotaryEmbeddingDim * sizeof(fpType));
@@ -236,7 +236,7 @@ void computeReferenceBiasRope(QKVPreprocessingParams<fpType, KVCacheBuffer> para
             for (SizeType32 headIt = 0; headIt < kvHeadNum; ++headIt)
             {
                 auto const currOffset = tokenIt * tokenSize + headIt * sizePerHead + qHiddenSize;
-                auto const currPtr = params.QKV + currOffset;
+                auto const currPtr = params.qkv_input + currOffset;
 
                 applyRopeToBuffer<fpType>(currPtr, tmpResultPtr, currentCosSinPtr, rotaryEmbeddingDim);
                 memcpy(currPtr, tmpResultPtr, rotaryEmbeddingDim * sizeof(fpType));
@@ -253,7 +253,7 @@ void computeReferenceBiasRope(QKVPreprocessingParams<fpType, KVCacheBuffer> para
             for (SizeType32 headIt = 0; headIt < kvHeadNum; ++headIt)
             {
                 auto const currOffset = tokenIt * tokenSize + headIt * sizePerHead + qHiddenSize + kvHiddenSize;
-                auto const currPtr = params.QKV + currOffset;
+                auto const currPtr = params.qkv_input + currOffset;
 
                 auto token_kv_idx = kvCache.getKVTokenIdx(contextIt);
                 auto vCachePtr = reinterpret_cast<fpType*>(kvCache.getVBlockPtr(batchIt, token_kv_idx));
@@ -275,7 +275,8 @@ protected:
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     BufferManager::ITensorPtr cu_q_seqlens_tensor{nullptr}, cu_kv_seqlens_tensor{nullptr},
-        padding_offset_tensor{nullptr}, fmha_tile_counter_ptr_tensor{nullptr}, rotary_inv_freq_buf_tensor{nullptr};
+        padding_offset_tensor{nullptr}, encoder_padding_offset_tensor{nullptr}, fmha_tile_counter_ptr_tensor{nullptr},
+        rotary_inv_freq_buf_tensor{nullptr};
     std::mt19937 gen;
     //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     // initialize params coming from GPTAttentionPluginCommon
@@ -364,9 +365,10 @@ protected:
         cu_q_seqlens_tensor = mBufferManager->pinned(ITensor::makeShape({cu_seqlens_size}), nvinfer1::DataType::kINT32);
         cu_kv_seqlens_tensor
             = mBufferManager->pinned(ITensor::makeShape({cu_seqlens_size}), nvinfer1::DataType::kINT32);
-        padding_offset_tensor = mBufferManager->pinned(
-            ITensor::makeShape({batch_size, (mCrossAttention ? cross_qkv_length : input_seq_length)}),
-            nvinfer1::DataType::kINT32);
+        padding_offset_tensor
+            = mBufferManager->pinned(ITensor::makeShape({batch_size, input_seq_length}), nvinfer1::DataType::kINT32);
+        encoder_padding_offset_tensor
+            = mBufferManager->pinned(ITensor::makeShape({batch_size, cross_qkv_length}), nvinfer1::DataType::kINT32);
         fmha_tile_counter_ptr_tensor
             = mBufferManager->pinned(ITensor::makeShape({mEnableContextFMHA ? 1 : 0}), nvinfer1::DataType::kINT32);
         rotary_inv_freq_buf_tensor = mBufferManager->pinned(
@@ -470,6 +472,7 @@ protected:
         cu_q_seqlens = bufferCast<int32_t>(*(this->cu_q_seqlens_tensor));
         int* cu_kv_seqlens = bufferCast<int32_t>(*(this->cu_kv_seqlens_tensor));
         int* padding_offset = bufferCast<int32_t>(*(this->padding_offset_tensor));
+        int* encoder_padding_offset = bufferCast<int32_t>(*(this->encoder_padding_offset_tensor));
         uint32_t* fmha_tile_counter_ptr = bufferCast<uint32_t>(*(this->fmha_tile_counter_ptr_tensor));
         rotary_inv_freq_buf = bufferCast<float>(*(this->rotary_inv_freq_buf_tensor));
 
@@ -478,13 +481,14 @@ protected:
         decoderParams.seqQOffsets = cu_q_seqlens;
         decoderParams.seqKVOffsets = cu_kv_seqlens;
         decoderParams.paddingOffsets = padding_offset;
+        decoderParams.encoderPaddingOffsets = mCrossAttention ? encoder_padding_offset : nullptr;
         decoderParams.attentionMask = mCrossAttention ? nullptr : attention_mask; // manually set for cross attn
         // Fixed sequence length offset if not removing the padding (cu_q_seqlens[ii] = ii * seq_length).
-        decoderParams.seqQLengths = mCrossAttention ? encoder_input_lengths : q_seq_lengths;
+        decoderParams.seqQLengths = q_seq_lengths;
         decoderParams.seqKVLengths = mCrossAttention ? encoder_input_lengths : kv_seq_lengths;
         decoderParams.batchSize = batch_size;
-        decoderParams.maxQSeqLength = mCrossAttention ? cross_qkv_length : input_seq_length;
-        decoderParams.removePadding = mRemovePadding;
+        decoderParams.maxQSeqLength = input_seq_length;
+        decoderParams.maxEncoderQSeqLength = mCrossAttention ? cross_qkv_length : 0;
         decoderParams.attentionWindowSize = cyclic_attention_window_size;
         decoderParams.sinkTokenLength = sink_token_length;
         decoderParams.numTokens = num_tokens;
@@ -518,14 +522,17 @@ protected:
         attention_input = bufferCast<fpType>(*attention_input_buf);
         this->fillRandomNormal(attention_input, qkv_size);
 
-        preprocessingParams.QKV = const_cast<fpType*>(attention_input);
-        preprocessingParams.QuantizedQKV = nullptr; // Assuming this is the correct member for 'O'
-        preprocessingParams.Q = nullptr;
+        preprocessingParams.qkv_input = const_cast<fpType*>(attention_input);
+        preprocessingParams.cross_kv_input = nullptr;
+        preprocessingParams.quantized_qkv_output = nullptr; // Assuming this is the correct member for 'O'
+        preprocessingParams.q_output = nullptr;
         preprocessingParams.kv_cache_buffer = keyValueCache;
         preprocessingParams.qkv_bias = qkv_bias;
         preprocessingParams.seq_lens = q_seq_lengths;
         preprocessingParams.cache_seq_lens = kv_seq_lengths;
+        preprocessingParams.encoder_seq_lens = nullptr;
         preprocessingParams.cu_seq_lens = cu_q_seqlens;
+        preprocessingParams.cu_kv_seq_lens = nullptr; // Only used by cross attention.
         preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParams.rotary_coef_cache_buffer = rotary_cos_sin;
         preprocessingParams.kvScaleOrigQuant = kv_scale_orig_quant;
@@ -536,6 +543,7 @@ protected:
         preprocessingParams.cyclic_kv_cache_len = cyclic_attention_window_size;
         preprocessingParams.sink_token_len = sink_token_length;
         preprocessingParams.token_num = num_tokens;
+        preprocessingParams.remove_padding = mRemovePadding;
         preprocessingParams.head_num = mNumHeads;
         preprocessingParams.kv_head_num = mNumKVHeads;
         preprocessingParams.qheads_per_kv_head = mNumHeads / mNumKVHeads;
@@ -548,7 +556,7 @@ protected:
         preprocessingParams.position_embedding_type = mPositionEmbeddingType;
         preprocessingParams.position_shift_enabled = mPosShiftEnabled;
         preprocessingParams.cache_type = cache_type;
-        preprocessingParams.enable_paged_kv_fmha = enablePagedKVContextFMHA;
+        preprocessingParams.separate_q_kv_output = enablePagedKVContextFMHA || mCrossAttention;
         preprocessingParams.quantized_fp8_output = mFP8ContextFMHA;
         preprocessingParams.multi_processor_count = mMultiProcessorCount;
         TLLM_CHECK_WITH_INFO(sink_token_length == 0, "sink_token_length != 0 is not supported in the RoPE test.");
@@ -561,6 +569,7 @@ protected:
         auto const totalSize = this->batch_size * 2
             * (this->mCrossAttention ? this->cross_qkv_length : this->max_attention_window) * this->mNumKVHeads
             * this->mHeadSize * elemSize;
+        bool constexpr canUseOneMoreBlock{true};
         keyValueCacheBuffer = BufferManager::pinned(totalSize);
         void* key_value_cache = static_cast<void*>(keyValueCacheBuffer->data());
 
@@ -572,8 +581,9 @@ protected:
         {
             TLLM_THROW("Paged KV Cache currently not supported in ropeTest");
             keyValueCache = KVBlockArray(this->batch_size, this->max_blocks_per_sequence, this->mTokensPerBlock,
-                sizePerToken, this->cyclic_attention_window_size, this->sink_token_length,
-                this->host_primary_pool_pointer, this->host_secondary_pool_pointer, this->block_offsets);
+                sizePerToken, this->cyclic_attention_window_size, this->cyclic_attention_window_size,
+                this->sink_token_length, canUseOneMoreBlock, this->host_primary_pool_pointer,
+                this->host_secondary_pool_pointer, this->block_offsets);
             // hostKvCacheBlockOffsets = host_block_offsets;
         }
         else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
@@ -628,7 +638,7 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
 
     bool allEqual{true};
     BufferManager::ITensorPtr reference_qkv_buf
-        = this->mBufferManager->copyFrom(*(this->attention_input_buf), tensorrt_llm::runtime::MemoryType::kPINNED);
+        = this->mBufferManager->copyFrom(*(this->attention_input_buf), tensorrt_llm::runtime::MemoryType::kPINNEDPOOL);
     fpType* reference_qkv = bufferCast<fpType>(*reference_qkv_buf);
 
     for (SizeType32 iAssert = 0; iAssert < this->qkv_size; iAssert++)
@@ -649,7 +659,7 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
     invokeQKVPreprocessing(this->preprocessingParams, this->mStream->get());
     cudaDeviceSynchronize();
 
-    this->preprocessingParams.QKV = const_cast<fpType*>(reference_qkv);
+    this->preprocessingParams.qkv_input = const_cast<fpType*>(reference_qkv);
     this->preprocessingParams.kv_cache_buffer = this->keyValueCacheReference;
     TLLM_LOG_DEBUG("Kernel finished, calling reference");
 

@@ -49,14 +49,27 @@ if __name__ == "__main__":
         "Pipeline parallel size for calibration; effective for NeMo checkpoint only."
     )
 
-    parser.add_argument("--dtype", help="Model data type.", default="float16")
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float16', 'bfloat16', 'float32'],
+        help=
+        "The data type for the model weights and activations of the non-quantized part, e.g., embedding and lm_head. "
+        "If 'auto', the data type is automatically inferred from the source model; "
+        "however, if the source dtype is float32, it is converted to float16.")
     parser.add_argument(
         "--qformat",
         help="Quantization format.",
         default="full_prec",
         choices=[
-            "fp8", "int8_sq", "int4_awq", "w4a8_awq", "int8_wo", "int4_wo",
-            "full_prec"
+            "fp8",
+            "int8_sq",
+            "int4_awq",
+            "w4a8_awq",
+            "int8_wo",
+            "int4_wo",
+            "full_prec",
         ],
     )
     parser.add_argument(
@@ -85,6 +98,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", default="exported_model")
     parser.add_argument("--tp_size", type=int, default=1)
     parser.add_argument("--pp_size", type=int, default=1)
+    parser.add_argument("--cp_size", type=int, default=1)
     parser.add_argument("--awq_block_size", type=int, default=128)
     parser.add_argument("--kv_cache_dtype",
                         help="KV Cache dtype.",
@@ -101,7 +115,36 @@ if __name__ == "__main__":
                         action='store_true',
                         help="whether to quantize the weights of medusa heads")
 
+    # auto quantization
+    parser.add_argument(
+        '--autoq_format',
+        default=None,
+        type=str,
+        help=
+        "Specific quantization algorithms will be searched in auto quantization."
+        "The algorithm must in ['fp8', 'int4_awq', 'w4a8_awq', 'int8_sq']."
+        "You can use ',' to separate more than one quantization algorithms(e.g. --autoq_format fp8,int4_awq,w4a8_awq)."
+        "Notice: fp8 and int8_sq can't be used at the same time.")
+    parser.add_argument(
+        '--auto_quantize_bits',
+        type=float,
+        default=None,
+        help="Effective bits constraint for auto quantization. If not set, "
+        "regular quantization without auto quantization search will be applied."
+        "You can't set it lower than the num_bits of most aggressive quantization format."
+        "For example, if 'int4_awq' is in autoq_format, it can't be lower than 4.0."
+    )
+
     args = parser.parse_args()
+
+    # auto_quantize_bits check
+    if args.autoq_format:
+        lower_bound, upper_bound = 4 if '4' in args.autoq_format else 8, 16
+        if args.auto_quantize_bits is None or args.auto_quantize_bits < lower_bound or args.auto_quantize_bits > upper_bound:
+            print(
+                f"invalid auto_quantize_bits value, will be set to {lower_bound}"
+            )
+            args.auto_quantize_bits = lower_bound
 
     if args.model_dir is not None:
         quantize_and_export(
@@ -109,7 +152,8 @@ if __name__ == "__main__":
             device=args.device,
             calib_dataset=args.calib_dataset,
             dtype=args.dtype,
-            qformat=args.qformat,
+            qformat=args.qformat
+            if args.auto_quantize_bits is None else args.autoq_format,
             kv_cache_dtype=args.kv_cache_dtype,
             calib_size=args.calib_size,
             batch_size=args.batch_size,
@@ -118,6 +162,7 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             tp_size=args.tp_size,
             pp_size=args.pp_size,
+            cp_size=args.cp_size,
             seed=args.seed,
             tokenizer_max_seq_length=args.tokenizer_max_seq_length,
             num_medusa_heads=args.num_medusa_heads,
@@ -125,7 +170,8 @@ if __name__ == "__main__":
             max_draft_len=args.max_draft_len,
             medusa_hidden_act=args.medusa_hidden_act,
             medusa_model_dir=args.medusa_model_dir,
-            quant_medusa_head=args.quant_medusa_head)
+            quant_medusa_head=args.quant_medusa_head,
+            auto_quantize_bits=args.auto_quantize_bits)
     elif args.nemo_ckpt_path is not None:
         quantize_nemo_and_export(nemo_ckpt_path=args.nemo_ckpt_path,
                                  decoder_type=args.decoder_type,
@@ -142,6 +188,7 @@ if __name__ == "__main__":
                                  output_dir=args.output_dir,
                                  tp_size=args.tp_size,
                                  pp_size=args.pp_size,
+                                 cp_size=args.cp_size,
                                  seed=args.seed)
     else:
         raise ValueError(

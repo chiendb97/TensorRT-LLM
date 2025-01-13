@@ -32,7 +32,7 @@ from tensorrt_llm.network import net_guard
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
-from examples.mamba.convert_checkpoint import (convert_from_hf_checkpoint,
+from tensorrt_llm.models.mamba.convert import (convert_from_hf_checkpoint,
                                                convert_hf_mamba)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -68,13 +68,18 @@ class TestMamba(unittest.TestCase):
             'conv_kernel': hf_config.conv_kernel,
             'use_bias': hf_config.use_bias,
             'mamba_version': 'Mamba1',
+            'mapping': {
+                'world_size': 1,
+                'tp_size': 1,
+                'pp_size': 1
+            },
         }
         config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         if load_mode == 'from_checkpoint':
-            weights = convert_from_hf_checkpoint(model_dir=hf_path, dtype=dtype)
+            weights = convert_from_hf_checkpoint(mamba_config=config,
+                                                 model_dir=hf_path)
         else:
-            weights = convert_hf_mamba(hf_mamba, rank=0, dtype=dtype)
-
+            weights = convert_hf_mamba(hf_mamba, dtype=dtype)
         tensorrt_llm_mamba = tensorrt_llm.models.MambaForCausalLM(config)
         tensorrt_llm_mamba.load(weights)
         return tensorrt_llm_mamba
@@ -245,7 +250,7 @@ class TestMamba(unittest.TestCase):
                                                   device=step1_id.device))
                 gen_ref = hf_outputs.logits[:, -1, :]
 
-        # get tensorrt llm mamba rumtime
+        # get tensorrt llm mamba runtime
         runtime, _ = self._gen_tensorrt_llm_runtime(
             log_level, model_name, gemm_plugin, mamba_conv1d_plugin, hf_config,
             hf_path, hf_mamba, load_mode, batch_size, input_len, output_len,
@@ -439,9 +444,11 @@ class TestMamba(unittest.TestCase):
         d_inner = tensorrt_llm_mamba.backbone.layers[
             l].ssm.in_proj_x.weight.raw_value.shape[0]
         in_proj_x_hf = hf_mamba.backbone.layers[l].mixer.in_proj.weight[
-            0:d_inner, ]
+            0:d_inner,
+        ]
         in_proj_z_hf = hf_mamba.backbone.layers[l].mixer.in_proj.weight[
-            d_inner:, ]
+            d_inner:,
+        ]
         np.testing.assert_allclose(tensorrt_llm_mamba.backbone.layers[l].ssm.
                                    in_proj_x.weight.raw_value,
                                    in_proj_x_hf.cpu().detach(),

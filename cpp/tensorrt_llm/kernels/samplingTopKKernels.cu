@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include <stdexcept>
 #ifndef CUDART_VERSION
 #error CUDART_VERSION Undefined!
 #elif (CUDART_VERSION >= 11050)
@@ -27,15 +26,12 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
-#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 
 template <typename T, int32_t BLOCK_SIZE_, int32_t BLOCKS_PER_BEAM_>
@@ -52,7 +48,7 @@ __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restr
     auto const tokenIdx = static_cast<SizeType32>(blockIdx.y);
 
     auto const batchId = bid / BLOCKS_PER_BEAM_; // row id for logProbs
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchId] : batchId;
+    auto const batchSlot = batchSlots == nullptr ? batchId : batchSlots[batchId];
     if (tokensPerStep != nullptr && tokenIdx >= tokensPerStep[batchSlot])
     {
         return;
@@ -67,7 +63,6 @@ __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restr
     auto const logBufIndex = batchId * maxTokensPerStep * vocabSize + tokenIdx * vocabSize;
     auto logProbsSlot
         = logProbsPtrs == nullptr ? logProbs + logBufIndex : logProbsPtrs[batchId * maxTokensPerStep + tokenIdx];
-
     auto const blockLane = bid % BLOCKS_PER_BEAM_;                  // block id for a beam
     auto const k = (topKs != nullptr) ? topKs[batchSlot] : maxTopK; // batchId = batch index
 
@@ -81,7 +76,7 @@ __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restr
 
     if (finished != nullptr && finishState.isFinished())
     {
-        if (tid < k)
+        if (tid < k && endIds != nullptr) // if returnAllSelectedToken, endIds would not be an input
         {
             auto const index = tmpTopKBufIndex + tid;
             if (blockLane == 0 && tid == 0)
@@ -138,7 +133,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     float const* topPs, curandState_t* curandState, TokenIdType const* endIds, SizeType32 vocabSize,
     bool const* skipDecode, SizeType32 const* batchSlots, SizeType32 maxBatchSize, bool normalizeLogProbs,
     bool logitHasProbs, SizeType32 const* tokensPerStep, SizeType32 maxTokensPerStep, SizeType32 maxSeqLen,
-    bool returnAllTopK)
+    bool returnAllSelectedTokens, TokenIdType* outputIdCurrentStep, bool const* skipOutputIdCurrentStep)
 {
     bool const IS_FP16 = std::is_same<T, half>::value;
     T const MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
@@ -146,7 +141,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     auto const tid = static_cast<SizeType32>(threadIdx.x);
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
     auto const tokenIdx = static_cast<SizeType32>(blockIdx.y);
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
+    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
     FinishedState const finishState = finishedInput != nullptr ? finishedInput[batchSlot] : FinishedState::empty();
     if ((skipDecode != nullptr && skipDecode[batchSlot]) || (finishState.isSkipDecoding()))
     {
@@ -161,6 +156,8 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     auto const probThreshold = (topPs != nullptr) ? topPs[batchSlot] : topP;
     auto const size = k * BLOCKS_PER_BEAM_;
     auto const stride = maxTopK * BLOCKS_PER_BEAM_;
+    bool const sampleTokenInSelected = returnAllSelectedTokens && outputIdCurrentStep && curandState
+        && skipOutputIdCurrentStep && !skipOutputIdCurrentStep[batchSlot];
 
     typedef cub::BlockReduce<TopK_2<float>, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
@@ -219,13 +216,24 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
 
     if (tid == 0)
     {
-        auto randNum = static_cast<float>(curand_uniform(curandState + batchSlot) * probThreshold * sSum);
+        // if we want to return all top k indices, we should not do random sampling for probThreshold
+        auto randNum = (returnAllSelectedTokens || curandState == nullptr)
+            ? static_cast<float>(probThreshold * sSum)
+            : static_cast<float>(curand_uniform(curandState + batchSlot) * probThreshold * sSum);
+        // when a token must still be multinomial sampled when returnAllSelectedTokens == True.
+        auto randNum2 = sampleTokenInSelected
+            ? static_cast<float>(curand_uniform(curandState + batchSlot) * probThreshold * sSum)
+            : 0.0f;
         auto* outputIdsRequestPtr = idsPtrs == nullptr ? ids + batchSlot * maxSeqLen : idsPtrs[batchSlot];
         for (SizeType32 ki = 0; ki < k; ki++)
         {
             auto expLogit = sVal2[ki];
             randNum = randNum - expLogit;
-            if (randNum <= 0.0f || ki == k - 1 || returnAllTopK)
+            if (sampleTokenInSelected)
+            {
+                randNum2 = randNum2 - expLogit;
+            }
+            if (randNum <= 0.0f || ki == k - 1 || returnAllSelectedTokens)
             {
                 auto idx = sId[ki];
                 // If sId is -1 here we force output token to the last from vocabulary to get vivid indicator of smth
@@ -233,11 +241,27 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                 auto outputId = idx != -1
                     ? topKTmpIdBuf[(batchIdx * maxTokensPerStep + tokenIdx) * stride + idx] % vocabSize
                     : vocabSize - 1;
+                outputId = outputId == -1 ? vocabSize - 1 : outputId;
                 auto const curSeqLen = sequenceLengths == nullptr ? 0 : sequenceLengths[batchSlot];
-                auto const outIdx = returnAllTopK ? tokenIdx * maxTopK + ki : curSeqLen + tokenIdx;
+                auto const outIdx = returnAllSelectedTokens ? tokenIdx * maxTopK + ki : curSeqLen + tokenIdx;
                 outputIdsRequestPtr[outIdx] = outputId;
-                // cum log prob is not supported with returnAllTopK
-                if (!returnAllTopK)
+
+                if (returnAllSelectedTokens)
+                {
+                    // 'outputLogProbs' is the probability induced by the top-k sampling:
+                    // NOT normalized (same way as OpenAI does):
+                    // log_prob = log P(i | i is in vocab) = log(expLogit)
+                    // normalized:
+                    // log_prob = log P(i | i is in top-k) = log(expLogit / sum)
+                    if (outputLogProbs != nullptr)
+                    {
+                        // outputLogProbs shape: [maxBatchSize, maxTopK]
+                        auto logProb = logf(expLogit);
+                        auto const normalizedProb = normalizeLogProbs ? logProb - logf(sSum) : logProb;
+                        outputLogProbs[batchSlot * maxTopK + ki] = normalizedProb;
+                    }
+                }
+                else
                 {
                     if (cumLogProbs != nullptr || outputLogProbs != nullptr)
                     {
@@ -248,20 +272,32 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                         }
                         if (outputLogProbs != nullptr)
                         {
-                            // 'outputLogProbs' is the probability induced by the top-k sampling:
-                            // NOT normalized (same way as OpenAI does):
-                            // log_prob = log P(i | i is in vocab) = log(expLogit)
-                            // normalized:
-                            // log_prob = log P(i | i is in top-k) = log(expLogit / sum)
-                            outputLogProbs[curSeqLen * maxBatchSize + batchSlot]
-                                = normalizeLogProbs ? logProb - logf(sSum) : logProb;
+                            auto const normalizedProb = normalizeLogProbs ? logProb - logf(sSum) : logProb;
+                            // outputLogProbs shape: [maxSeqLen, maxBatchSize]
+                            outputLogProbs[curSeqLen * maxBatchSize + batchSlot] = normalizedProb;
                         }
+                    }
+                    break;
+                }
+
+                if (sampleTokenInSelected && randNum2 <= 0.0f)
+                {
+                    // record the multinomial sampled token when returnAllSelectedTokens == True.
+                    randNum2 = MAX_T_VAL;
+                    outputIdCurrentStep[batchSlot] = outputId;
+                }
+
+                if (returnAllSelectedTokens && randNum <= 0.0f)
+                {
+                    if (ki < k - 1)
+                    { // not the last k, write a -1 to to log top p tokens boundary for external draft token masking
+                        outputIdsRequestPtr[outIdx + 1] = -1;
                     }
                     break;
                 }
             }
         }
-        if (maxTokensPerStep == 1 && !returnAllTopK && sequenceLengths != nullptr && finishedOutput != nullptr
+        if (maxTokensPerStep == 1 && !returnAllSelectedTokens && sequenceLengths != nullptr && finishedOutput != nullptr
             && endIds != nullptr)
         {
             auto const seqLen = sequenceLengths[batchSlot];
@@ -301,7 +337,8 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                     params.maxTopK, params.topKs, params.maxTopP, params.topPs, params.curandState, params.endIds,     \
                     params.vocabSizePadded, params.skipDecode, params.batchSlots, params.maxBatchSize,                 \
                     params.normalizeLogProbs, params.logitsHasProbs, params.tokensPerStep, params.maxTokensPerStep,    \
-                    params.maxSeqLen, params.returnAllTopK);                                                           \
+                    params.maxSeqLen, params.returnAllSelectedTokens, params.outputIdCurrentStep,                      \
+                    params.skipOutputIdCurrentStep);                                                                   \
         }                                                                                                              \
     } while (0)
 
@@ -367,5 +404,65 @@ template void invokeBatchTopKSampling(TopKSamplingKernelParams<float> const& par
 
 template void invokeBatchTopKSampling(TopKSamplingKernelParams<half> const& params, cudaStream_t stream);
 
-} // namespace kernels
-} // namespace tensorrt_llm
+__global__ void setupTopKRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEntry<SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, SizeType32 const* batchSlots, bool* skipDecode)
+{
+    auto const index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    for (auto bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
+    {
+        setupTopKTopPRuntimeArgOne(bi, topK, topP, batchSlots, skipDecode, nullptr, nullptr);
+    }
+}
+
+void invokeSetupTopKRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEntry<SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, bool* skipDecodePtr, SizeType32 const* batchSlotsPtr, bool onDevice,
+    cudaStream_t stream)
+{
+    if (onDevice)
+    {
+        dim3 block(std::min(static_cast<uint32_t>(batchSize), 256u));
+        dim3 grid(divUp(static_cast<uint32_t>(batchSize), block.x));
+        // support topK up to TOP_K_MAX.
+        setupTopKRuntimeArgs<<<grid, block, 0, stream>>>(batchSize, topK, topP, batchSlotsPtr, skipDecodePtr);
+    }
+    else
+    {
+        for (int bi = 0; bi < batchSize; ++bi)
+        {
+            setupTopKTopPRuntimeArgOne(bi, topK, topP, batchSlotsPtr, skipDecodePtr, nullptr, nullptr);
+        }
+    }
+}
+
+__global__ void setupTopKTopPRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEntry<SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, SizeType32 const* batchSlots, bool* skipDecodeTopK, bool* skipDecodeTopP)
+{
+    auto const index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    for (auto bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
+    {
+        setupTopKTopPRuntimeArgOne(bi, topK, topP, batchSlots, skipDecodeTopK, skipDecodeTopP, nullptr);
+    }
+}
+
+void invokeSetupTopKTopPRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEntry<SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, bool* skipDecodeTopKPtr, bool* skipDecodeTopPPtr,
+    SizeType32 const* batchSlotsPtr, bool onDevice, cudaStream_t stream)
+{
+    if (onDevice)
+    {
+        dim3 block(std::min(static_cast<uint32_t>(batchSize), 256u));
+        dim3 grid(divUp(static_cast<uint32_t>(batchSize), block.x));
+        // support topK up to TOP_K_MAX.
+        setupTopKTopPRuntimeArgs<<<grid, block, 0, stream>>>(
+            batchSize, topK, topP, batchSlotsPtr, skipDecodeTopKPtr, skipDecodeTopPPtr);
+    }
+    else
+    {
+        for (int bi = 0; bi < batchSize; ++bi)
+        {
+            setupTopKTopPRuntimeArgOne(bi, topK, topP, batchSlotsPtr, skipDecodeTopKPtr, skipDecodeTopPPtr, nullptr);
+        }
+    }
+}
+
+} // namespace tensorrt_llm::kernels

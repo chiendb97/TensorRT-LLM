@@ -21,7 +21,7 @@ from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, check_share_embedding)
+                              QuantConfig)
 from .config import FalconConfig
 from .convert import load_weights_from_hf_by_shard, load_weights_from_hf_model
 
@@ -46,6 +46,9 @@ class FalconDecoderLayer(Module):
 
         self.new_decoder_architecture = config.new_decoder_architecture
         self.parallel_attn = config.parallel_attention
+        self.num_ln_in_parallel_attn = config.num_ln_in_parallel_attn
+        if self.num_ln_in_parallel_attn is None and self.new_decoder_architecture:
+            self.num_ln_in_parallel_attn = 2
         if self.is_parallel_attention:
             # Not to apply allreduce inside the Attention/MLP layers.
             # allreduce applies after those layer.
@@ -65,12 +68,13 @@ class FalconDecoderLayer(Module):
             tp_rank=tp_rank,
             bias=config.bias,
             position_embedding_type=config.position_embedding_type,
+            rotary_embedding_base=config.rotary_base,
             quant_mode=config.quantization.quant_mode,
         )
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
-        if self.new_decoder_architecture:
+        if self.new_decoder_architecture and self.num_ln_in_parallel_attn == 2:
             # Layernorm before MLP.
             self.mlp_layernorm = LayerNorm(normalized_shape=hidden_size,
                                            eps=layernorm_epsilon,
@@ -107,7 +111,7 @@ class FalconDecoderLayer(Module):
 
         residual = hidden_states
 
-        if self.new_decoder_architecture:
+        if self.new_decoder_architecture and self.num_ln_in_parallel_attn == 2:
             mlp_ln_output = self.mlp_layernorm(hidden_states)
         hidden_states = self.input_layernorm(hidden_states)
         input_ln_output = hidden_states
@@ -127,8 +131,12 @@ class FalconDecoderLayer(Module):
                 hidden_states = residual + attention_output
                 residual = hidden_states
                 hidden_states = self.post_layernorm(hidden_states)
-        else:
+        elif self.num_ln_in_parallel_attn == 2:
             hidden_states = mlp_ln_output
+
+        if (self.new_decoder_architecture and self.parallel_attn
+                and self.num_ln_in_parallel_attn == 1):
+            hidden_states = input_ln_output
 
         hidden_states = self.mlp(hidden_states)
 
@@ -232,7 +240,7 @@ class FalconForCausalLM(DecoderModelForCausalLM):
         import transformers
 
         load_by_shard = kwargs.pop('load_by_shard', False)
-        load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+        # load_model_on_cpu is ignored here, since specify target device_map will fail when workers > 1.
 
         assert hf_model_or_dir is not None
         use_preloading = isinstance(hf_model_or_dir,
@@ -257,50 +265,9 @@ class FalconForCausalLM(DecoderModelForCausalLM):
             weights = load_weights_from_hf_by_shard(hf_model_dir, config)
         else:
             hf_model = transformers.AutoModelForCausalLM.from_pretrained(
-                hf_model_dir,
-                trust_remote_code=True,
-                torch_dtype='auto',
-                device_map='auto' if not load_model_on_cpu else 'cpu')
+                hf_model_dir, torch_dtype='auto')
             weights = load_weights_from_hf_model(hf_model, config)
 
-        check_share_embedding(weights, config)
         model = cls(config)
         model.load(weights)
         return model
-
-    @classmethod
-    def quantize(
-        cls,
-        hf_model_dir: str,
-        output_dir: str,
-        dtype: str = 'float16',
-        mapping: Optional[Mapping] = None,
-        quant_config: Optional[QuantConfig] = None,
-        *,
-        device: str = 'cuda',
-        calib_dataset: str = 'cnn_dailymail',
-        calib_batches: int = 512,
-        calib_batch_size: int = 1,
-        calib_max_seq_length: int = 512,
-        random_seed: int = 1234,
-        tokenizer_max_seq_length: int = 2048,
-        **kwargs,
-    ):
-        config = FalconConfig.from_hugging_face(hf_model_dir,
-                                                dtype=dtype,
-                                                mapping=mapping,
-                                                quantization=quant_config,
-                                                **kwargs)
-
-        super().quantize(hf_model_dir,
-                         output_dir,
-                         dtype=config.dtype,
-                         mapping=config.mapping,
-                         quant_config=config.quantization,
-                         device=device,
-                         calib_dataset=calib_dataset,
-                         calib_batches=calib_batches,
-                         calib_batch_size=calib_batch_size,
-                         calib_max_seq_length=calib_max_seq_length,
-                         random_seed=random_seed,
-                         tokenizer_max_seq_length=tokenizer_max_seq_length)

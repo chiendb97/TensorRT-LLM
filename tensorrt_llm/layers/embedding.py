@@ -15,10 +15,11 @@
 import math
 from typing import Optional
 
+import numpy as np
 import torch
 
-from .._utils import set_obj_attrs
-from ..functional import embedding, unsqueeze, where
+from .._utils import set_obj_attrs, str_dtype_to_torch, trt_dtype_to_np
+from ..functional import constant, embedding, unsqueeze, where
 from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
@@ -54,27 +55,43 @@ class Embedding(Module):
         self.sharding_dim = sharding_dim
         self.tp_rank = tp_rank
         self.dtype = dtype
+        self.tp_dim = sharding_dim
 
         if sharding_dim == 1:
-            self.weight = Parameter(shape=(self.num_embeddings,
-                                           self.embedding_dim // self.tp_size),
-                                    dtype=dtype)
+            shape = (self.num_embeddings, self.embedding_dim // self.tp_size)
         elif sharding_dim == 0:
-            self.weight = Parameter(shape=(math.ceil(
-                self.num_embeddings / self.tp_size), self.embedding_dim),
-                                    dtype=dtype)
+            shape = (math.ceil(self.num_embeddings / self.tp_size),
+                     self.embedding_dim)
+
+        self.weight = Parameter(shape=shape, dtype=dtype)
+
+        self.weight_padding_size = ((8 - shape[0] % 8) % 8, shape[1])
 
         set_obj_attrs(self.weight, {
             "weight_loader": self.weight_loader,
         })
 
     def forward(self, x):
+        # The embedding weight is padded to the multiple of 8.
+        # The reason is that when lm_head and vocab_embedding are using the same embedding weight,
+        # previously weights can't be depulicated in the engine because gemm will pad the weight to the multiple of 8.
+        # If we also pad the embedding weight to the multiple of 8, the weights can be successfully deduplicated.
+        # This will not affect the input and output of the gather op and perf impact is negligible.
+        if self.weight_padding_size[0] != 0:
+            padding_values = np.zeros(self.weight_padding_size,
+                                      dtype=trt_dtype_to_np(
+                                          self.weight.value.dtype))
+            padding = constant(padding_values)
+        else:
+            padding = None
+
         return embedding(x,
                          self.weight.value,
                          tp_size=self.tp_size,
                          tp_group=self.tp_group,
                          sharding_dim=self.sharding_dim,
-                         tp_rank=self.tp_rank)
+                         tp_rank=self.tp_rank,
+                         padding=padding)
 
     def weight_loader(self, mapping: Mapping, param: Parameter,
                       loaded_weight: torch.Tensor):
@@ -87,6 +104,12 @@ class Embedding(Module):
             loaded_weight = loaded_weight.narrow(sharding_dim, start_idx,
                                                  shard_size)
         param.value = loaded_weight
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+        if weights is None:
+            return {}
+        weights = weights.to(str_dtype_to_torch(self.dtype))
+        return {tllm_key: weights}
 
 
 class PromptTuningEmbedding(Embedding):
@@ -121,7 +144,7 @@ class PromptTuningEmbedding(Embedding):
 
         Parameters:
             tokens : Tensor
-                the ids to embbed, size [batch_size, seq_len]
+                the ids to embed, size [batch_size, seq_len]
 
             prompt_embedding_table : Tensor
                 the additional embedding table for prompt-tuned tokens, size [num_tasks * num_tokens_per_task, hidden_size]
@@ -146,7 +169,6 @@ class PromptTuningEmbedding(Embedding):
 
         # put virtual tokens in the [0, max_prompt_vocab_size) range
         prompt_tokens = where(prompt_tokens_mask, tokens - self.vocab_size, 0)
-
         # add offsets to match the concatenated embedding tables
         tasks = tasks * task_vocab_size
 

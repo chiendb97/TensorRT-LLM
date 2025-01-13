@@ -76,7 +76,8 @@ void RuntimeBuffers::create(TllmRuntime const& runtime, ModelConfig const& model
         if (modelConfig.computeGenerationLogits())
         {
             cacheGenerationFragmentPointerDevice = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT64);
-            cacheGenerationFragmentPointerHost = manager.emptyTensor(MemoryType::kPINNED, nvinfer1::DataType::kINT64);
+            cacheGenerationFragmentPointerHost
+                = manager.emptyTensor(MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT64);
 
             generationLogitsFragments = std::make_shared<std::vector<TensorPtr>>();
         }
@@ -87,7 +88,7 @@ void RuntimeBuffers::create(TllmRuntime const& runtime, ModelConfig const& model
     bool transformerBased = modelConfig.isTransformerBased();
     bool rnnBased = modelConfig.isRnnBased();
 
-    contextLengthsHost = manager.emptyTensor(MemoryType::kPINNED, nvinfer1::DataType::kINT32);
+    contextLengthsHost = manager.emptyTensor(MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     if (transformerBased)
     {
         if (modelConfig.useGptAttentionPlugin())
@@ -116,16 +117,16 @@ void RuntimeBuffers::create(TllmRuntime const& runtime, ModelConfig const& model
 }
 
 void RuntimeBuffers::initFromInput(ITensor const& inputIds, TensorPtr const& inputLengths, bool inputPacked,
-    SizeType32 beamWidth, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-    BufferManager& manager)
+    SizeType32 beamWidth, std::vector<SizeType32> maxAttentionWindowVec, SizeType32 maxAttentionWindow,
+    SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, BufferManager& manager)
 {
     contextLengthsDevice = inputLengths;
     contextLengthsHost->reshape(inputLengths->getShape());
     manager.copy(*contextLengthsDevice, *contextLengthsHost);
     manager.getStream().synchronize(); // wait for context lengths to be copied to host
 
-    generationConfig = GenerationConfig::fromInput(
-        inputIds, *contextLengthsHost, inputPacked, beamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength);
+    generationConfig = GenerationConfig::fromInput(inputIds, *contextLengthsHost, inputPacked, beamWidth,
+        maxAttentionWindowVec, maxAttentionWindow, sinkTokenLength, maxSequenceLength);
 }
 
 void RuntimeBuffers::reshape(ModelConfig const& modelConfig, WorldConfig const& worldConfig)
@@ -350,7 +351,7 @@ void RuntimeBuffers::postContextStep(std::vector<RuntimeBuffers> const& contextB
         //// Note: reqPromptLenghts won't be used
         std::vector<SizeType32> reqPromptLengths;
         // Copy the generationInput tasks to host
-        promptTuningTasksHost = manager.copyFrom(*promptTuningParams.tasks, MemoryType::kPINNED);
+        promptTuningTasksHost = manager.copyFrom(*promptTuningParams.tasks, MemoryType::kPINNEDPOOL);
         // Update the promptTuningParams tasks tensor
         promptTuningParams.fillTasksTensor(promptTuningTasksHost, batchSize, 0, reqBeamWidths, reqPromptLengths,
             manager, modelConfig.usePackedInput());
@@ -360,7 +361,7 @@ void RuntimeBuffers::postContextStep(std::vector<RuntimeBuffers> const& contextB
 }
 
 void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType const padId, BufferManager& manager,
-    batch_manager::kv_cache_manager::KVCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx,
+    batch_manager::kv_cache_manager::BaseKVCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -393,7 +394,7 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
 }
 
 RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType32 const step, BufferManager& manager,
-    batch_manager::kv_cache_manager::KVCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx,
+    batch_manager::kv_cache_manager::BaseKVCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);

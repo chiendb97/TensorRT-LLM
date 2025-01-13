@@ -22,6 +22,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/kernels/math.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 
 using namespace tensorrt_llm::common;
@@ -180,8 +181,8 @@ INSTANTIATE_ADDQKVBIASIA3_TRANSPOSE(__nv_bfloat16);
 template <typename T, typename T_IN, int ITEMS_PER_THREAD>
 __global__ void softmax_kernel(T* attn_score, const T_IN* qk, T const* attn_mask, T const* linear_bias_slopes,
     const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length,
-    float const qk_scale, float const qk_tanh_scale, float const qk_tanh_inverse_scale, bool const block_sparse_attn,
-    BlockSparseParams const block_sparse_params, int const* q_seq_lengths)
+    float const qk_scale, float const attn_logit_softcapping_scale, float const attn_logit_softcapping_inverse_scale,
+    bool const block_sparse_attn, BlockSparseParams const block_sparse_params, int const* q_seq_lengths)
 {
     // attn_score, [batch_size, num_heads, q_length, k_length]
     // qk, [batch_size, num_heads, q_length, k_length]
@@ -232,9 +233,9 @@ __global__ void softmax_kernel(T* attn_score, const T_IN* qk, T const* attn_mask
             qk_bias += (1.0f - mask_val) * -10000.0f;
 
             data[i] = qk_scale * qk_val + qk_bias;
-            if (qk_tanh_scale > 0.f)
+            if (attn_logit_softcapping_scale > 0.f)
             {
-                data[i] = qk_tanh_scale * tanhf(data[i] * qk_tanh_inverse_scale);
+                data[i] = attn_logit_softcapping_scale * __tanhf(data[i] * attn_logit_softcapping_inverse_scale);
             }
             local_max = fmax(local_max, data[i]);
         }
@@ -274,8 +275,8 @@ __global__ void softmax_kernel(T* attn_score, const T_IN* qk, T const* attn_mask
 template <typename T, int ITEMS_PER_THREAD>
 __global__ void softmax_kernel_h2(T* attn_score, T const* qk_buf, T const* attn_mask, T const* linear_bias_slopes,
     const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length, const T qk_scale,
-    float const qk_tanh_scale, float const qk_tanh_inverse_scale, bool const block_sparse_attn,
-    BlockSparseParams const block_sparse_params, int const* q_seq_lengths)
+    float const attn_logit_softcapping_scale, float const attn_logit_softcapping_inverse_scale,
+    bool const block_sparse_attn, BlockSparseParams const block_sparse_params, int const* q_seq_lengths)
 {
     // attn_score, [batch_size, num_heads, q_length, k_length]
     // qk, [batch_size, num_heads, q_length, k_length]
@@ -347,11 +348,11 @@ __global__ void softmax_kernel_h2(T* attn_score, T const* qk_buf, T const* attn_
             qk_bias = hadd2<T2>(qk_bias, hmul2<T2>(hsub2<T2>(ONE, mask_val), NEG_INFTY));
 
             data[i] = hadd2<T2>(hmul2<T2>(qk, qk_scale_h2), qk_bias);
-            if (qk_tanh_scale > 0.f)
+            if (attn_logit_softcapping_scale > 0.f)
             {
                 float2 f2;
-                f2.x = qk_tanh_scale * tanhf((float) data[i].x * qk_tanh_inverse_scale);
-                f2.y = qk_tanh_scale * tanhf((float) data[i].y * qk_tanh_inverse_scale);
+                f2.x = attn_logit_softcapping_scale * __tanhf((float) data[i].x * attn_logit_softcapping_inverse_scale);
+                f2.y = attn_logit_softcapping_scale * __tanhf((float) data[i].y * attn_logit_softcapping_inverse_scale);
                 data[i] = cuda_cast<T2>(f2);
             }
             local_max = fmax(local_max, fmax((float) data[i].x, (float) data[i].y));
@@ -393,8 +394,8 @@ __global__ void softmax_kernel_h2(T* attn_score, T const* qk_buf, T const* attn_
 template <typename T, int K_ITEMS_PER_THREAD, int Q_ITEMS_PER_THREAD>
 __global__ void softmax_kernel_h2_v2(T* attn_score, T const* qk_buf, T const* attn_mask, T const* linear_bias_slopes,
     const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length, const T scalar,
-    float const qk_tanh_scale, float const qk_tanh_inverse_scale, bool const block_sparse_attn,
-    BlockSparseParams const block_sparse_params, int const* q_seq_lengths)
+    float const attn_logit_softcapping_scale, float const attn_logit_softcapping_inverse_scale,
+    bool const block_sparse_attn, BlockSparseParams const block_sparse_params, int const* q_seq_lengths)
 {
     // attn_score, [batch_size, num_heads, q_length, k_length]
     // qk, [batch_size, num_heads, q_length, k_length]
@@ -497,11 +498,11 @@ __global__ void softmax_kernel_h2_v2(T* attn_score, T const* qk_buf, T const* at
             for (int j = 0; j < q_items; j++)
             {
                 T2 val = hadd2<T2>(hmul2<T2>(qk_scale, qk[j]), mask_val[j]);
-                if (qk_tanh_scale > 0.f)
+                if (attn_logit_softcapping_scale > 0.f)
                 {
                     float2 f2;
-                    f2.x = qk_tanh_scale * tanhf(float(val.x) * qk_tanh_inverse_scale);
-                    f2.y = qk_tanh_scale * tanhf(float(val.y) * qk_tanh_inverse_scale);
+                    f2.x = attn_logit_softcapping_scale * __tanhf(float(val.x) * attn_logit_softcapping_inverse_scale);
+                    f2.y = attn_logit_softcapping_scale * __tanhf(float(val.y) * attn_logit_softcapping_inverse_scale);
                     val = cuda_cast<T2>(f2);
                 }
                 if (linear_bias_slopes != nullptr)
@@ -600,24 +601,25 @@ __global__ void softmax_kernel_h2_v2(T* attn_score, T const* qk_buf, T const* at
             softmax_kernel_h2_v2<T_, ITEMS_PER_THREAD, 4><<<grid, block, 0, stream>>>((T_*) param.attention_score,     \
                 (const T_*) param.qk, (const T_*) param.attention_mask, (const T_*) param.linear_bias_slopes,          \
                 param.batch_size, param.num_heads, param.q_length, param.k_length, (const T_) param.qk_scale,          \
-                param.qk_tanh_scale, param.qk_tanh_inverse_scale, param.block_sparse_attn, param.block_sparse_params,  \
-                param.q_seq_lengths);                                                                                  \
+                param.attn_logit_softcapping_scale, param.attn_logit_softcapping_inverse_scale,                        \
+                param.block_sparse_attn, param.block_sparse_params, param.q_seq_lengths);                              \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
             softmax_kernel_h2<T_, ITEMS_PER_THREAD><<<grid, block, 0, stream>>>((T_*) param.attention_score,           \
                 (const T_*) param.qk, (const T_*) param.attention_mask, (const T_*) param.linear_bias_slopes,          \
                 param.batch_size, param.num_heads, param.q_length, param.k_length, (const T_) param.qk_scale,          \
-                param.qk_tanh_scale, param.qk_tanh_inverse_scale, param.block_sparse_attn, param.block_sparse_params,  \
-                param.q_seq_lengths);                                                                                  \
+                param.attn_logit_softcapping_scale, param.attn_logit_softcapping_inverse_scale,                        \
+                param.block_sparse_attn, param.block_sparse_params, param.q_seq_lengths);                              \
         }                                                                                                              \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         softmax_kernel<T, T_IN, ITEMS_PER_THREAD><<<grid, block, 0, stream>>>(param.attention_score, param.qk,         \
             param.attention_mask, param.linear_bias_slopes, param.batch_size, param.num_heads, param.q_length,         \
-            param.k_length, param.qk_scale, param.qk_tanh_scale, param.qk_tanh_inverse_scale, param.block_sparse_attn, \
-            param.block_sparse_params, param.q_seq_lengths);                                                           \
+            param.k_length, param.qk_scale, param.attn_logit_softcapping_scale,                                        \
+            param.attn_logit_softcapping_inverse_scale, param.block_sparse_attn, param.block_sparse_params,            \
+            param.q_seq_lengths);                                                                                      \
     }
 
 #define LAUNCH_MASKED_SOFTMAX(ITEMS_PER_THREAD) LAUNCH_MASKED_SOFTMAX_(half, ITEMS_PER_THREAD)
@@ -1065,8 +1067,10 @@ __global__ void transpose_remove_padding(T const* src, T* dst, int const batch_s
     // do remove_sequence_length_padding
     int const bid = blockIdx.x; // batch * seq_len or valid_word_num
 
-    int const src_batch_id = (bid + mask_offset[bid]) / seq_len;
-    int const src_seq_id = (bid + mask_offset[bid]) % seq_len;
+    int const mask_offset_value = (mask_offset == nullptr) ? 0 : mask_offset[bid];
+
+    int const src_batch_id = (bid + mask_offset_value) / seq_len;
+    int const src_seq_id = (bid + mask_offset_value) % seq_len;
 
     int const dst_seq_id = bid;
 
@@ -1155,18 +1159,52 @@ INSTANTIATE_TRANSPOSE_ATTENTION_OUT_REMOVE_PADDING(__nv_bfloat16);
 #endif
 #undef INSTANTIATE_TRANSPOSE_ATTENTION_OUT_REMOVE_PADDING
 
+template <typename T>
+struct Vec_t
+{
+    static constexpr int size = 0;
+};
+
+template <>
+struct Vec_t<float>
+{
+    using Type = float2;
+    static constexpr int size = 2;
+};
+
+template <>
+struct Vec_t<half>
+{
+    using Type = uint32_t;
+    static constexpr int size = 2;
+};
+
+#ifdef ENABLE_BF16
+template <>
+struct Vec_t<__nv_bfloat16>
+{
+    using Type = __nv_bfloat162;
+    static constexpr int size = 2;
+};
+#endif
+
 template <typename T, bool ADD_BIAS>
 __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV, T const* __restrict qkv_bias,
     int const* seq_lens, int const* padding_offset, int const batch_size, int const seq_len, int const token_num,
     int const head_num, int const kv_head_num, int const size_per_head, float const* scale, int const int8_mode)
 {
-    //   QKV: [token_num, hidden + 2 * kv_head_num * size_per_head]
-    //   qkv_bias: [hidden + 2 * kv_head_num * size_per_head]
-    //   q_buf: [batch, head_num, seq_len, size_per_head]
-    //   k_buf, v_buf: [batch, kv_head_num, seq_len, size_per_head]
-    // For cross attention where q/k/v buffer could be nullptr, writing to split buffer is suppressed when null
+    //   source input QKV may or may not have padding, but target output Q/K/V must be with padding in order to do
+    //   attention!
+    //   QKV: [token_num, head_num * size_per_head + 2 * kv_head_num * size_per_head] for remove padding. 1st dim could
+    //   be batch * seq_len if not remove padding. Last dim could be head_num * size_per_head if KV are nullptr or 2 *
+    //   kv_head_num * size_per_head if Q is nullptr qkv_bias: [head_num * size_per_head + 2 * kv_head_num *
+    //   size_per_head], same as last dim of QKV q_buf: [batch, head_num, seq_len, size_per_head] k_buf, v_buf: [batch,
+    //   kv_head_num, seq_len, size_per_head] For cross attention where q/k/v buffer could be nullptr, writing to split
+    //   buffer is suppressed when null
     T* qkv_ptr[3] = {q_buf, k_buf, v_buf};
-    bool const has_padding = padding_offset == nullptr;
+    bool const remove_padding
+        = padding_offset != nullptr; // remove padding mode will have padding_offset to indicate the padding length,
+                                     // while keep padding mode doesn't need this
     int const hidden = head_num * size_per_head; // hidden dim Q
     int const n = hidden + 2 * kv_head_num * size_per_head;
 
@@ -1175,19 +1213,21 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         int const bias_id = index % n;
 
         int const token_idx = index / n;
-        int const token_padded_idx = token_idx + (has_padding ? 0 : padding_offset[token_idx]);
+        int const token_padded_idx = token_idx
+            + (remove_padding ? padding_offset[token_idx]
+                              : 0); // recover token idx in padding mode by adding the offset
         int const target_batch_id = token_padded_idx / seq_len;
         int const actual_seq_len = seq_lens[target_batch_id];
         int const seq_id = token_padded_idx % seq_len;
-        bool const valid_seq = seq_id < actual_seq_len || !has_padding;
+        bool const valid_seq = seq_id < actual_seq_len || remove_padding;
 
         int qkv_id;
         int head_id;
         int size_id = index % size_per_head;
-        if (kv_head_num < head_num)
+        if (head_num == 0 || kv_head_num < head_num)
         {
-            // [token, h + 2*kv_head_num, d]
-            //  ^^^^^  ^^^^^^^^
+            // [token, head_num + 2*kv_head_num, d]
+            //  ^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
             //    m       n
             // TODO: This block will also work for MHA but
             // would that be slower due to more branches?
@@ -1236,7 +1276,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
             }
         }
         // Write to split QKV buffer
-        if (head_num == kv_head_num || qkv_id == 0) // QKV or Q when MQA/GQA
+        if (head_num == kv_head_num || qkv_id == 0) // QKV when MHA or Q when MQA/GQA
         {
             int const target_batch_stride = head_num * seq_len * size_per_head;
             int const target_head_stride = seq_len * size_per_head;
@@ -1259,40 +1299,12 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     }
 }
 
-template <typename T>
-struct Vec_t
-{
-    static constexpr int size = 0;
-};
-
-template <>
-struct Vec_t<float>
-{
-    using Type = float2;
-    static constexpr int size = 2;
-};
-
-template <>
-struct Vec_t<half>
-{
-    using Type = uint32_t;
-    static constexpr int size = 2;
-};
-
-#ifdef ENABLE_BF16
-template <>
-struct Vec_t<__nv_bfloat16>
-{
-    using Type = __nv_bfloat162;
-    static constexpr int size = 2;
-};
-#endif
-
 template <typename T, bool ADD_BIAS>
-__global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV, T const* __restrict qkv_bias,
-    int const* seq_lens, int const* padding_offset, int const batch_size, int const seq_len, int const head_num,
-    int const kv_head_num, int const size_per_head, int const rotary_embedding_dim, float rotary_embedding_base,
-    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
+__global__ void add_fusedQKV_bias_rope_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV,
+    T const* __restrict qkv_bias, int const* seq_lens, int const* padding_offset, int const batch_size,
+    int const seq_len, int const head_num, int const kv_head_num, int const size_per_head,
+    int const rotary_embedding_dim, float rotary_embedding_base, RotaryScalingType const rotary_scale_type,
+    float rotary_embedding_scale, int const rotary_embedding_max_positions,
     PositionEmbeddingType const position_embedding_type)
 {
     // This kernel add bias to QKV, which has shape [batch_size, seq_len, 3, head_num, size_per_head], and
@@ -1302,7 +1314,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
 
     // NOTE:
     // head_num == kv_head_num
-    //   QKV src shape (batch_size, seq_len, 3, head_num, size_per_head)
+    //   QKV src shape (batch_size, seq_len, 3, head_num * size_per_head)
     //                  ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^
     //                           m                        n
     //   QKV dst shape (3, batch_size, head_num, seq_len, size_per_head)
@@ -1313,18 +1325,19 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     //   Q dst shape: (batch_size, head_num, seq_len, size_per_head)
     //   KV dst shape: (batch_size, kv_head_num, seq_len, size_per_head)
     extern __shared__ __align__(sizeof(float2)) char smem_[]; // align on largest vector type
+    bool isCrossKV = q_buf == nullptr;                        // does not have query in qkv buffer (namely, only kv)
 
     constexpr int vec_size = Vec_t<T>::size;
     using Vec_t = typename Vec_t<T>::Type;
     int const token_idx = blockIdx.x;
     int const token_padding_offset = (padding_offset == nullptr || token_idx < 0) ? 0 : padding_offset[token_idx];
     int const tgt_token_idx = token_idx + token_padding_offset;
-    bool const has_padding = padding_offset == nullptr;
+    bool const remove_padding = padding_offset != nullptr;
 
     int const batch_idx = tgt_token_idx / seq_len;
     int const seq_idx = tgt_token_idx % seq_len;
     int const actual_seq_len = seq_lens[batch_idx];
-    bool const valid_seq = seq_idx < actual_seq_len || !has_padding;
+    bool const valid_seq = seq_idx < actual_seq_len || remove_padding;
 
     int const head_idx = blockIdx.y;
     int const tidx = threadIdx.x;
@@ -1335,16 +1348,15 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     bool const is_head_size_masked = tidx * vec_size >= size_per_head;
     bool const is_masked = is_head_size_masked || is_seq_masked;
 
-    int const hidden_size = head_num * size_per_head;
     int const hidden_idx = head_idx * size_per_head + tidx * vec_size;
-    int const qheads_per_kv_head = head_num / kv_head_num;
+    int const qheads_per_kv_head = isCrossKV ? 1 : head_num / kv_head_num;
     int const kv_head_idx = head_idx / qheads_per_kv_head;
     int const hidden_idx_kv = kv_head_idx * size_per_head + tidx * vec_size;
-    int const n = (head_num + 2 * kv_head_num) * size_per_head;
+    int const n = (isCrossKV ? 0 : head_num + 2 * kv_head_num) * size_per_head;
 
     int const dst_kv_seq_idx = seq_idx;
-    int const src_k_offset = hidden_size;
-    int const src_v_offset = hidden_size + kv_head_num * size_per_head;
+    int const src_k_offset = isCrossKV ? 0 : head_num * size_per_head;
+    int const src_v_offset = src_k_offset + kv_head_num * size_per_head;
 
     // NOTE: q has seq len excluding prefix prompt
     // head_num == kv_head_num:
@@ -1404,6 +1416,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         break;
     }
     case PositionEmbeddingType::kLONG_ROPE:
+    case PositionEmbeddingType::kROPE_M:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = !is_masked && vec_size * tidx < rotary_embedding_dim;
@@ -1486,7 +1499,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         int8_mode);
 
 #define FUSED_QKV_BIAS_ROTARY_TRANSPOSE_LAUNCH(T, ADD_BIAS)                                                            \
-    add_fusedQKV_bias_transpose_kernel<T, ADD_BIAS><<<grid, block, smem_size, stream>>>(q_buf, k_buf, v_buf, QKV,      \
+    add_fusedQKV_bias_rope_transpose_kernel<T, ADD_BIAS><<<grid, block, smem_size, stream>>>(q_buf, k_buf, v_buf, QKV, \
         qkv_bias, seq_lens, padding_offset, batch_size, seq_len, head_num, kv_head_num, size_per_head,                 \
         rotary_embedding_dim, rotary_embedding_base, rotary_scale_type, rotary_embedding_scale,                        \
         rotary_embedding_max_positions, position_embedding_type);
@@ -1499,11 +1512,21 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T cons
     int const rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type, float const* scale,
     int const int8_mode, cudaStream_t stream)
 {
-    // [bs, seq_len, 3, head, Dh]
+    // called by both self attention and cross attention in the non-FMHA path
+    // for self attn, (a) called once from QKV to Q/K/V (use higher head_num to launch kernels, which is the Q head_num,
+    // usually >= KV head_num ) for cross attn, (b) called 1st from Q to Q and (c) 2nd from KV to K/V (a) has both Q and
+    // KV head_num, (b) has KV head_num = 0, (c) has Q head_num = 0 Note: ROPE and non-ROPE kernels are two different
+    // code paths, and the kernel launch configs are also different
+    // TODO: in the ROPE kernel, we skip the Q or KV write in the cross attn 1st and 2nd call, but unnecessary KV or Q
+    // read is still there
+    TLLM_CHECK_WITH_INFO(
+        head_num != 0 || q_buf == nullptr, "Q head_num must be specified except for cross attention KV-only transpose");
+    TLLM_CHECK_WITH_INFO(kv_head_num != 0 || (k_buf == nullptr && v_buf == nullptr),
+        "KV head_num must be specified except for cross attention Q-only transpose");
     if (rotary_embedding_dim == 0)
     {
         int const m = token_num;
-        int const n = head_num * size_per_head;
+        int const n = std::max(head_num, kv_head_num) * size_per_head;
         dim3 block(384);
         dim3 grid((int) (ceil(1.0 * m * n / 384)));
 
@@ -1519,11 +1542,13 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T cons
     else
     {
         TLLM_CHECK_WITH_INFO(int8_mode != 2, "w8a8 not yet implemented with RoPE"); // TODO
-        // To implement rotary embeddings, each thread processes two QKV elems:
+        // To implement rotary embeddings, each thread processes more than one QKV elems, e.g. 2 elems for
+        // fp16/bf16/fp32
         dim3 block((size_per_head / Vec_t<T>::size + 31) / 32 * 32);
-        dim3 grid(token_num, head_num);
+        dim3 grid(token_num, std::max(head_num, kv_head_num));
         size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
                     || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+                    || position_embedding_type == PositionEmbeddingType::kROPE_M
                 ? 2 * rotary_embedding_dim * sizeof(T)
                 : 0);
         // NOTE: add offset for rotary embedding
@@ -1680,7 +1705,7 @@ __global__ void transpose4dBatchMajorKVCache(T const* kSrc, T const* vSrc, KVCac
         T_scale scaleOrigQuant;
         mmha::convert_from_float(&scaleOrigQuant, kvScaleOrigQuant[0]);
         // Store 8bits kv cache.
-        mmha::store_8bits_kv_cache_vec(valDst, val, inBlockIdx, scaleOrigQuant);
+        mmha::store_8bits_vec(valDst, val, inBlockIdx, scaleOrigQuant);
     }
     else
     {
@@ -1916,6 +1941,7 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
         break;
     }
     case PositionEmbeddingType::kLONG_ROPE:
+    case PositionEmbeddingType::kROPE_M:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = vec_size * tidx < rotary_embedding_dim;
@@ -1976,6 +2002,7 @@ void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const&
     dim3 grid(token_num_in_k, kv_head_num, batch_beam);
     size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
                 || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+                || position_embedding_type == PositionEmbeddingType::kROPE_M
             ? 2 * rotary_embedding_dim * sizeof(T)
             : 0);
 
@@ -2109,6 +2136,195 @@ __global__ void convertData(Dst* dst, Src const* src, int64_t size, float const*
         }
     }
 }
+
+template <typename T>
+__global__ void runCpTranspose(T* dst, T* dst2, T const* src, int64_t partialTokenNum, int64_t cpSize,
+    int64_t partialQHeads, int64_t partialKVHeads, int64_t headSize, int64_t rank)
+{
+    // Do transpose from
+    // [partialTokenNum, mNumHeads + 2*mNumKVHeads, headSize]
+    // -> (view) [partialTokenNum, cpSize * partialQHeads + cpSize * partialKVHeads + cpSize * partilKVHeads, headSize]
+    // -> (transpose) [cpSize, partialTokenNum, partialQHeads + partialKvHeads + partialKVHeads, headSize]
+    using VecType = int4;
+    static constexpr int32_t kStep = static_cast<int32_t>(sizeof(VecType) / sizeof(T));
+    int64_t hiddenSize = static_cast<int64_t>(headSize / kStep);
+    int64_t hiddenRestSize = static_cast<int64_t>(headSize % kStep);
+
+    if (threadIdx.x >= hiddenSize + hiddenRestSize)
+        return;
+
+    int64_t seqIdx = blockIdx.x;
+    int64_t cpIdx = blockIdx.y;
+    int64_t headIdx = blockIdx.z;
+
+    auto srcHeadIdx = 0;
+    if (headIdx < partialQHeads)
+    {
+        srcHeadIdx = cpIdx * partialQHeads + headIdx;
+    }
+    else if (headIdx < partialQHeads + partialKVHeads)
+    {
+        srcHeadIdx = cpSize * partialQHeads + cpIdx * partialKVHeads + (headIdx - partialQHeads);
+    }
+    else
+    {
+        srcHeadIdx = cpSize * partialQHeads + cpSize * partialKVHeads + cpIdx * partialKVHeads
+            + (headIdx - partialQHeads - partialKVHeads);
+    }
+
+    if (cpIdx == rank)
+    {
+        dst = dst2;
+    }
+    VecType* out = reinterpret_cast<VecType*>(dst
+        + (cpIdx * partialTokenNum * (partialQHeads + 2 * partialKVHeads)
+              + seqIdx * (partialQHeads + 2 * partialKVHeads) + headIdx)
+            * headSize);
+    VecType const* in = reinterpret_cast<VecType const*>(
+        src + (seqIdx * (partialQHeads + 2 * partialKVHeads) * cpSize + srcHeadIdx) * headSize);
+
+    for (int hiddenIdx = threadIdx.x; hiddenIdx < hiddenSize + hiddenRestSize; hiddenIdx += blockDim.x)
+    {
+        if (hiddenIdx < hiddenSize)
+            out[hiddenIdx] = in[hiddenIdx];
+        else
+            reinterpret_cast<T*>(out + hiddenSize)[hiddenIdx - hiddenSize]
+                = reinterpret_cast<T const*>(in + hiddenSize)[hiddenIdx - hiddenSize];
+    }
+}
+
+template <typename T>
+__global__ void runCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* srcOtherRank, int64_t partialLength,
+    int64_t cpSize, int64_t newPartialHeads, int64_t headSize, int64_t rank)
+{
+    // Do transpose from
+    // [totalLength, mNumHeads / cp, Dh]
+    // -> (view) [cp, partialLength, mNumHeads / cp, Dh]
+    // -> (transpose) [partialLength, mNumHeads, Dh]
+    using VecType = int4;
+    static constexpr int32_t kStep = static_cast<int32_t>(sizeof(VecType) / sizeof(T));
+    int64_t hiddenSize = static_cast<int64_t>(headSize * newPartialHeads / kStep);
+    int64_t hiddenRestSize = static_cast<int64_t>(headSize * newPartialHeads % kStep);
+
+    if (threadIdx.x >= hiddenSize + hiddenRestSize)
+        return;
+
+    int64_t cpIdx = blockIdx.x;
+    int64_t seqIdx = blockIdx.y;
+    T const* src;
+    if (cpIdx == rank)
+    {
+        src = srcMyRank;
+    }
+    else
+    {
+        src = srcOtherRank;
+    }
+    VecType const* in
+        = reinterpret_cast<VecType const*>(src + (cpIdx * partialLength + seqIdx) * headSize * newPartialHeads);
+    VecType* out = reinterpret_cast<VecType*>(dst + (seqIdx * cpSize + cpIdx) * headSize * newPartialHeads);
+    for (int hiddenIdx = threadIdx.x; hiddenIdx < hiddenSize + hiddenRestSize; hiddenIdx += blockDim.x)
+    {
+        if (hiddenIdx < hiddenSize)
+            out[hiddenIdx] = in[hiddenIdx];
+        else
+            reinterpret_cast<T*>(out + hiddenSize)[hiddenIdx - hiddenSize]
+                = reinterpret_cast<T const*>(in + hiddenSize)[hiddenIdx - hiddenSize];
+    }
+}
+
+template <typename T>
+__global__ void runCpTranspose2(T* dst, T const* src, int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens,
+    int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength, int64_t batchSize,
+    int64_t partialHeads, int64_t headSize)
+{
+    // Do transpose from
+    // [cpSize_Length, bs, partialLength, partialHead, headSize]
+    // -> (transpose) [tokens(bs, cpSize_Length, partialLength), partialHead, headSize]
+    // paddings of partial length are removed here
+    using VecType = int4;
+    static constexpr int32_t kStep = static_cast<int32_t>(sizeof(VecType) / sizeof(T));
+    int64_t hiddenSize = static_cast<int64_t>(headSize * partialHeads / kStep);
+    int64_t hiddenRestSize = static_cast<int64_t>(headSize * partialHeads % kStep);
+
+    if (threadIdx.x >= hiddenSize + hiddenRestSize)
+        return;
+
+    int64_t cpIdx = blockIdx.x;
+    int64_t tokenIdx = blockIdx.y;
+    int64_t seqIdx = blockIdx.z;
+    int64_t length = q_seq_lengths[seqIdx];
+    int64_t partialLength = (length + cpSize - 1) / cpSize;
+    int64_t partialLengthOutIdx = cu_q_seqlens[seqIdx] + partialLength * cpIdx;                            // cpMajor
+    int64_t partialLengthInIdx = cu_cp_partial_seqlens[batchSize] * cpIdx + cu_cp_partial_seqlens[seqIdx]; // bsMajor
+    if (cpIdx + 1 == cpSize)
+    {
+        partialLength = length - partialLength * (cpSize - 1);
+    }
+    // for (int partialTokenIdx = blockIdx.y % maxPartalLength; partialTokenIdx < partialLength;
+    for (int partialTokenIdx = tokenIdx; partialTokenIdx < partialLength; partialTokenIdx += maxPartalLength)
+    {
+
+        VecType* out
+            = reinterpret_cast<VecType*>(dst + (partialLengthOutIdx + partialTokenIdx) * partialHeads * headSize);
+        VecType const* in
+            = reinterpret_cast<VecType const*>(src + (partialLengthInIdx + partialTokenIdx) * partialHeads * headSize);
+        for (int hiddenIdx = threadIdx.x; hiddenIdx < hiddenSize + hiddenRestSize; hiddenIdx += blockDim.x)
+        {
+            if (hiddenIdx < hiddenSize)
+                out[hiddenIdx] = in[hiddenIdx];
+            else
+                reinterpret_cast<T*>(out + hiddenSize)[hiddenIdx - hiddenSize]
+                    = reinterpret_cast<T const*>(in + hiddenSize)[hiddenIdx - hiddenSize];
+        }
+    }
+}
+
+template <typename T>
+__global__ void runCpTransposeToSeqMajor2(T* dst, T const* src, int32_t const* q_seq_lengths,
+    int32_t const* cu_q_seqlens, int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength,
+    int64_t batchSize, int64_t partialHeads, int64_t headSize)
+{
+    // Do transpose from
+    // [tokens(bs, cp, paritalLength), partialHeads, headSize]
+    // -> (transpose) [cp, partialTokens(bs, partialLength), partialHeads, headSize]
+    // paddings of partial length are added here
+    using VecType = int4;
+    static constexpr int32_t kStep = static_cast<int32_t>(sizeof(VecType) / sizeof(T));
+    int64_t hiddenSize = static_cast<int64_t>(headSize * partialHeads / kStep);
+    int64_t hiddenRestSize = static_cast<int64_t>(headSize * partialHeads % kStep);
+
+    if (threadIdx.x >= hiddenSize + hiddenRestSize)
+        return;
+
+    int64_t cpIdx = blockIdx.x;
+    int64_t tokenIdx = blockIdx.y;
+    int64_t seqIdx = blockIdx.z;
+    int64_t length = q_seq_lengths[seqIdx];
+    int64_t partialLength = (length + cpSize - 1) / cpSize;
+    int64_t partialLengthOutIdx = cu_q_seqlens[seqIdx] + partialLength * cpIdx;                            // cpMajor
+    int64_t partialLengthInIdx = cu_cp_partial_seqlens[batchSize] * cpIdx + cu_cp_partial_seqlens[seqIdx]; // bsMajor
+    if (cpIdx + 1 == cpSize)
+    {
+        partialLength = length - partialLength * (cpSize - 1);
+    }
+    for (int partialTokenIdx = tokenIdx; partialTokenIdx < partialLength; partialTokenIdx += maxPartalLength)
+    {
+        VecType* out
+            = reinterpret_cast<VecType*>(dst + (partialLengthInIdx + partialTokenIdx) * partialHeads * headSize);
+        VecType const* in
+            = reinterpret_cast<VecType const*>(src + (partialLengthOutIdx + partialTokenIdx) * partialHeads * headSize);
+        for (int hiddenIdx = threadIdx.x; hiddenIdx < hiddenSize + hiddenRestSize; hiddenIdx += blockDim.x)
+        {
+            if (hiddenIdx < hiddenSize)
+                out[hiddenIdx] = in[hiddenIdx];
+            else
+                reinterpret_cast<T*>(out + hiddenSize)[hiddenIdx - hiddenSize]
+                    = reinterpret_cast<T const*>(in + hiddenSize)[hiddenIdx - hiddenSize];
+        }
+    }
+}
+
 } // unnamed namespace
 
 template <typename Dst, typename Src>
@@ -2128,6 +2344,87 @@ void invokeConversion(Dst* dst, Src const* src, int64_t size, float const* __res
 INSTANTIATE_invokeConversion(__nv_fp8_e4m3, half);
 INSTANTIATE_invokeConversion(__nv_fp8_e4m3, __nv_bfloat16);
 #undef INSTANTIATE_invokeConversion
+
+template <typename T>
+void invokeCpTranspose(T* dst, T* dst2, T const* src, int64_t partialTokenNum, int64_t cpSize, int64_t partialQHeads,
+    int64_t partialKVHeads, int64_t headSize, int64_t rank, cudaStream_t stream)
+{
+    dim3 grid(partialTokenNum, cpSize, partialQHeads + 2 * partialKVHeads);
+    dim3 block(128);
+    runCpTranspose<T><<<grid, block, 0, stream>>>(
+        dst, dst2, src, partialTokenNum, cpSize, partialQHeads, partialKVHeads, headSize, rank);
+}
+
+#define INSTANTIATE_invokeCpTranspose(T)                                                                               \
+    template void invokeCpTranspose<T>(T * dst, T * dst2, T const* src, int64_t partialLength, int64_t cpSize,         \
+        int64_t partialQHeads, int64_t partialKVHeads, int64_t headSize, int64_t rank, cudaStream_t stream)
+INSTANTIATE_invokeCpTranspose(float);
+INSTANTIATE_invokeCpTranspose(half);
+INSTANTIATE_invokeCpTranspose(__nv_bfloat16);
+#undef INSTANTIATE_invokeCpTranspose
+
+template <typename T>
+void invokeCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* srcOtherRank, int64_t partialLength,
+    int64_t cpSize, int64_t newPartialHeads, int64_t headSize, int64_t rank, cudaStream_t stream)
+{
+    dim3 grid(cpSize, partialLength);
+    dim3 block(128);
+    runCpTransposeToSeqMajor<T><<<grid, block, 0, stream>>>(
+        dst, srcMyRank, srcOtherRank, partialLength, cpSize, newPartialHeads, headSize, rank);
+}
+
+#define INSTANTIATE_invokeCpTransposeToSeqMajor(T)                                                                     \
+    template void invokeCpTransposeToSeqMajor<T>(T * dst, T const* srcMyRank, T const* srcOtherRank,                   \
+        int64_t partialLength, int64_t cpSize, int64_t newPartialHeads, int64_t headSize, int64_t rank,                \
+        cudaStream_t stream)
+INSTANTIATE_invokeCpTransposeToSeqMajor(float);
+INSTANTIATE_invokeCpTransposeToSeqMajor(half);
+INSTANTIATE_invokeCpTransposeToSeqMajor(__nv_bfloat16);
+INSTANTIATE_invokeCpTransposeToSeqMajor(__nv_fp8_e4m3);
+#undef INSTANTIATE_invokeCpTransposeToSeqMajor
+
+template <typename T>
+void invokeCpTranspose2(T* dst, T const* src, int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens,
+    int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength, int64_t batchSize,
+    int64_t partialHeads, int64_t headSize, cudaStream_t stream)
+{
+    int64_t clipedMaxPartialLength = min(static_cast<int>(maxPartalLength), 512);
+    dim3 grid(cpSize, clipedMaxPartialLength, batchSize);
+    dim3 block(128);
+    runCpTranspose2<T><<<grid, block, 0, stream>>>(dst, src, q_seq_lengths, cu_q_seqlens, cu_cp_partial_seqlens, cpSize,
+        clipedMaxPartialLength, batchSize, partialHeads, headSize);
+}
+
+#define INSTANTIATE_invokeCpTranspose2(T)                                                                              \
+    template void invokeCpTranspose2<T>(T * dst, T const* src, int32_t const* q_seq_lengths,                           \
+        int32_t const* cu_q_seqlens, int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength,    \
+        int64_t batchSize, int64_t partialHeads, int64_t headSize, cudaStream_t stream)
+INSTANTIATE_invokeCpTranspose2(float);
+INSTANTIATE_invokeCpTranspose2(half);
+INSTANTIATE_invokeCpTranspose2(__nv_bfloat16);
+#undef INSTANTIATE_invokeCpTranspose2
+
+template <typename T>
+void invokeCpTransposeToSeqMajor2(T* dst, T const* src, int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens,
+    int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength, int64_t batchSize,
+    int64_t partialHeads, int64_t headSize, cudaStream_t stream)
+{
+    int64_t clipedMaxPartialLength = min(static_cast<int>(maxPartalLength), 512);
+    dim3 grid(cpSize, clipedMaxPartialLength, batchSize);
+    dim3 block(128);
+    runCpTransposeToSeqMajor2<T><<<grid, block, 0, stream>>>(dst, src, q_seq_lengths, cu_q_seqlens,
+        cu_cp_partial_seqlens, cpSize, clipedMaxPartialLength, batchSize, partialHeads, headSize);
+}
+
+#define INSTANTIATE_invokeCpTransposeToSeqMajor2(T)                                                                    \
+    template void invokeCpTransposeToSeqMajor2<T>(T * dst, T const* src, int32_t const* q_seq_lengths,                 \
+        int32_t const* cu_q_seqlens, int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength,    \
+        int64_t batchSize, int64_t partialHeads, int64_t headSize, cudaStream_t stream)
+INSTANTIATE_invokeCpTransposeToSeqMajor2(float);
+INSTANTIATE_invokeCpTransposeToSeqMajor2(half);
+INSTANTIATE_invokeCpTransposeToSeqMajor2(__nv_bfloat16);
+INSTANTIATE_invokeCpTransposeToSeqMajor2(__nv_fp8_e4m3);
+#undef INSTANTIATE_invokeCpTransposeToSeqMajor2
 
 } // namespace kernels
 } // namespace tensorrt_llm

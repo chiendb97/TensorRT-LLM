@@ -19,6 +19,7 @@ import platform
 import time
 from functools import wraps
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -27,6 +28,11 @@ import torch
 import tensorrt as trt
 
 # isort: on
+
+if TYPE_CHECKING:
+    from .network import Network
+else:
+    Network = None
 
 from ._utils import str_dtype_to_trt
 from .bindings import MpiComm
@@ -64,6 +70,7 @@ def _init(log_level: object = None) -> None:
         ft_decoder_lib = project_dir + '/libs/libth_common.so'
     try:
         torch.classes.load_library(ft_decoder_lib)
+        register_fake()
     except Exception as e:
         msg = '\nFATAL: Decoding operators failed to load. This may be caused by the incompatibility between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM.'
         raise ImportError(str(e) + msg)
@@ -73,7 +80,22 @@ def _init(log_level: object = None) -> None:
     logger.info('TensorRT-LLM inited.')
 
 
-def default_net():
+def register_fake():
+
+    @torch.library.register_fake("trtllm::allreduce")
+    def _(input, workspace, reduce_fusion_inputs, group, strategy, config, op,
+          eps, affine, bias):
+        final_output = torch.empty_like(input)
+        inter_output = torch.empty_like(input)
+        return final_output, inter_output
+
+    @torch.library.register_fake("trtllm::allgather")
+    def _(input, group):
+        output_shape = (len(group), *input.shape)
+        return input.new_empty(output_shape)
+
+
+def default_net() -> Network:
     assert net, "Use builder to create network first, and use `set_network` or `net_guard` to set it to default"
     return net
 
@@ -182,12 +204,9 @@ class _BuildingFlag:
 
     def __enter__(self):
         os.environ['IS_BUILDING'] = '1'
-        os.environ[
-            '__LUNOWUD'] = '-cask_fusion:fp8=off'  # will be removed in future releases
 
     def __exit__(self, type, value, tb):
         del os.environ['IS_BUILDING']
-        del os.environ['__LUNOWUD']
 
 
 def _is_building(f):

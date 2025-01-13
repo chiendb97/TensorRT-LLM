@@ -33,204 +33,13 @@ from ..._utils import pad_vocab_size, str_dtype_to_torch
 from ...logger import logger
 from ...mapping import Mapping
 from ...quantization import QuantAlgo
-from ..convert_utils import load_calib_dataset
+from ..convert_utils import (dup_kv_bias, dup_kv_weight, generate_int8,
+                             get_weight, get_weight_and_bias,
+                             load_calib_dataset, smooth_gemm,
+                             smooth_gemm_fc1_gate, split, split_matrix_tp,
+                             split_qkv_bias_tp, split_qkv_tp)
 from .config import QWenConfig
 from .utils import get_qwen_key_list, make_context
-
-
-def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
-    """
-     This function has two purposes:
-      - compute quantized weights, scaled either per-tensor or per-column
-      - compute scaling factors
-
-      Depending on the GEMM API (CUTLASS/CUBLAS) the required scaling factors differ.
-      CUTLASS uses two sets of scaling factors. One for the activation X, one for the weight W.
-      CUBLAS only has one (we can't do per-row scaling). So we must provide pre-multiplied scaling factor.
-
-      Here is the list of what we need (T means per-tensor, C per-column):
-        - scale_x_orig_quant puts fp activation into the quantized range (i.e. [-128, 127], for int8). Used before the GEMM. (T)
-        - scale_y_quant_orig puts quantized activation into the fp range. Used if the GEMM outputs int8. (T)
-        - scale_w_quant_orig puts weights from quant range to fp range (used with CUTLASS) (T, C)
-        - scale_y_accum_quant puts the GEMM result (XW) from accumulation range (int32)
-          to quant range (int8) (used for CUBLAS) (T, C)
-
-      Note that we don't do anything special about row-parallel GEMM. Theoretically, we could have per-GPU scaling factors too,
-      but then the model would change depending on the number of GPUs used.
-
-      For QKV projection, the behavior is special. Even if we have a single matrix to perform QKV projection, we consider it
-      as three different matrices: Q, K, and V. So per-tensor actually means one scaling factor for each Q, K and V.
-      For our GEMM implementation to respect this behavior, we use per-column mode and replicate values along columns.
-    """
-    weights = weights.detach().cpu().numpy()
-
-    # compute weight scaling factors for fp->int8 and int8->fp
-    if is_qkv and not multi_query_mode:
-        scale_w_orig_quant_t = 127. / act_range["w"].reshape(3, -1).max(
-            dim=-1, keepdims=True)[0].cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].reshape(3,
-                                                             -1).cpu().numpy()
-    elif is_qkv and multi_query_mode:
-        hidden_dim = weights.shape[0]
-        local_dim = act_range["w"].shape[0]
-        kv_dim = (local_dim - hidden_dim) // 2
-        scale_w_q = act_range["w"][0:hidden_dim]
-        scale_w_k = act_range["w"][hidden_dim:hidden_dim + kv_dim]
-        scale_w_v = act_range["w"][-kv_dim:]
-
-        scale_w_qkv_t = torch.concat([
-            scale_w_q.max(dim=0, keepdim=True)[0],
-            scale_w_k.max(dim=0, keepdim=True)[0],
-            scale_w_v.max(dim=0, keepdim=True)[0]
-        ])
-
-        scale_w_orig_quant_t = 127. / scale_w_qkv_t.cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].cpu().numpy()
-    else:
-        scale_w_orig_quant_t = 127. / act_range["w"].max().cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].cpu().numpy()
-    scale_w_quant_orig_t = 1.0 / scale_w_orig_quant_t
-    scale_w_quant_orig_c = 1.0 / scale_w_orig_quant_c
-
-    scale_w_orig_quant_c = scale_w_orig_quant_c.astype(np.float32)
-    scale_w_orig_quant_t = scale_w_orig_quant_t.astype(np.float32)
-
-    # compute the rest of needed scaling factors
-    scale_x_orig_quant_t = np.array(127. / act_range["x"].max().item())
-    scale_y_orig_quant_t = np.array(127. / act_range["y"].max().item())
-    scale_y_quant_orig_t = np.array(act_range["y"].max().item() / 127.)
-    scale_y_accum_quant_t = scale_y_orig_quant_t / (scale_x_orig_quant_t *
-                                                    scale_w_orig_quant_t)
-    scale_y_accum_quant_c = scale_y_orig_quant_t / (scale_x_orig_quant_t *
-                                                    scale_w_orig_quant_c)
-    if is_qkv and not multi_query_mode:
-        scale_y_accum_quant_t = np.broadcast_to(scale_y_accum_quant_t,
-                                                scale_w_orig_quant_c.shape)
-        scale_w_quant_orig_t = np.broadcast_to(scale_w_quant_orig_t,
-                                               scale_w_orig_quant_c.shape)
-    if is_qkv and multi_query_mode:
-        scale_q_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[0],
-                                            scale_w_q.shape)
-        scale_k_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[1],
-                                            scale_w_k.shape)
-        scale_v_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[2],
-                                            scale_w_v.shape)
-        scale_y_accum_quant_t = np.concatenate(
-            [scale_q_y_accum_t, scale_k_y_accum_t, scale_v_y_accum_t])
-        scale_w_quant_orig_t = np.concatenate([
-            np.broadcast_to(scale_w_quant_orig_t[0], scale_w_q.shape),
-            np.broadcast_to(scale_w_quant_orig_t[1], scale_w_k.shape),
-            np.broadcast_to(scale_w_quant_orig_t[2], scale_w_v.shape)
-        ])
-
-    to_i8 = lambda x: x.round().clip(-127, 127).astype(np.int8)
-
-    if is_qkv and multi_query_mode:
-        weight_int8 = to_i8(weights / scale_w_quant_orig_t)
-    else:
-        weight_int8 = to_i8(weights * scale_w_orig_quant_t)
-    return {
-        "weight.int8": weight_int8,
-        "weight.int8.col": to_i8(weights * scale_w_orig_quant_c),
-        "scale_x_orig_quant": scale_x_orig_quant_t.astype(np.float32),
-        "scale_w_quant_orig": scale_w_quant_orig_t.astype(np.float32),
-        "scale_w_quant_orig.col": scale_w_quant_orig_c.astype(np.float32),
-        "scale_y_accum_quant": scale_y_accum_quant_t.astype(np.float32),
-        "scale_y_accum_quant.col": scale_y_accum_quant_c.astype(np.float32),
-        "scale_y_quant_orig": scale_y_quant_orig_t.astype(np.float32),
-    }
-
-
-@torch.no_grad()
-def apply_smoothing(scales,
-                    gemm_weights,
-                    layernorm_weights=None,
-                    layernorm_bias=None,
-                    dtype=torch.float32,
-                    layernorm_1p=False):
-    if not isinstance(gemm_weights, list):
-        gemm_weights = [gemm_weights]
-
-    if layernorm_weights is not None:
-        assert layernorm_weights.numel() == scales.numel()
-        layernorm_weights.div_(scales).to(dtype)
-    if layernorm_bias is not None:
-        assert layernorm_bias.numel() == scales.numel()
-        layernorm_bias.div_(scales).to(dtype)
-    if layernorm_1p:
-        layernorm_weights += (1 / scales) - 1
-
-    for gemm in gemm_weights:
-        gemm.mul_(scales.view(1, -1)).to(dtype)
-
-
-@torch.no_grad()
-def smooth_gemm(gemm_weights,
-                act_scales,
-                layernorm_weights=None,
-                layernorm_bias=None,
-                alpha=0.5,
-                weight_scales=None):
-    if not isinstance(gemm_weights, list):
-        gemm_weights = [gemm_weights]
-    orig_dtype = gemm_weights[0].dtype
-
-    for gemm in gemm_weights:
-        # gemm_weights are expected to be transposed
-        assert gemm.shape[1] == act_scales.numel()
-
-    if weight_scales is None:
-        weight_scales = torch.cat(
-            [gemm.abs().max(dim=0, keepdim=True)[0] for gemm in gemm_weights],
-            dim=0)
-        weight_scales = weight_scales.max(dim=0)[0]
-    weight_scales.to(float).clamp(min=1e-5)
-    scales = (act_scales.to(gemm_weights[0].device).to(float).pow(alpha) /
-              weight_scales.pow(1 - alpha)).clamp(min=1e-5)
-
-    apply_smoothing(scales, gemm_weights, layernorm_weights, layernorm_bias,
-                    orig_dtype)
-
-    return scales
-
-
-@torch.no_grad()
-def smooth_gemm_fc1_gate(fc1_weights,
-                         gate_weights,
-                         act_scales,
-                         layernorm_weights=None,
-                         layernorm_bias=None,
-                         alpha=0.5,
-                         weight_scales=None):
-    gemm_weights = []
-    if not isinstance(fc1_weights, list):
-        fc1_weights = [fc1_weights]
-    if not isinstance(gate_weights, list):
-        gate_weights = [gate_weights]
-
-    for i in range(len(fc1_weights)):
-        gemm_weight = torch.cat([fc1_weights[i], gate_weights[i]], dim=0)
-        gemm_weights.append(gemm_weight)
-
-    orig_dtype = gemm_weights[0].dtype
-
-    for gemm in gemm_weights:
-        # gemm_weights are expected to be transposed
-        assert gemm.shape[1] == act_scales.numel()
-
-    if weight_scales is None:
-        weight_scales = torch.cat(
-            [gemm.abs().max(dim=0, keepdim=True)[0] for gemm in gemm_weights],
-            dim=0)
-        weight_scales = weight_scales.max(dim=0)[0]
-    weight_scales.to(float).clamp(min=1e-5)
-    scales = (act_scales.to(gemm_weights[0].device).to(float).pow(alpha) /
-              weight_scales.pow(1 - alpha)).clamp(min=1e-5)
-
-    apply_smoothing(scales, fc1_weights + gate_weights, layernorm_weights,
-                    layernorm_bias, orig_dtype)
-
-    return scales
 
 
 @torch.no_grad()
@@ -249,7 +58,8 @@ def smooth_qwen_model(model, scales, alpha, qwen_qkv_para, qwen_smoother):
         scales[layer_name]["w"] = module.attn.c_attn.weight.abs().max(dim=1)[0]
 
         # see transpose_weights function
-        qwen_qkv_para[layer_name] = module.attn.c_attn.weight.transpose(0, 1)
+        qwen_qkv_para[layer_name] = module.attn.c_attn.weight.transpose(
+            0, 1).contiguous()
 
         # =================================================================
         layer_name = name + ".attn.c_proj"
@@ -319,7 +129,7 @@ def smooth_qwen2_model(model, scales, alpha, qwen_qkv_para, qwen_smoother):
                                                 dim=0)
 
         # see transpose_weights function
-        qwen_qkv_para[layer_name_qkv] = weight.transpose(0, 1)
+        qwen_qkv_para[layer_name_qkv] = weight.transpose(0, 1).contiguous()
 
         # =================================================================
         layer_name = name + ".self_attn.o_proj"
@@ -433,55 +243,6 @@ def capture_activation_range(model,
     return act_scales
 
 
-def split(v, tp_size, idx, dim=0):
-    if tp_size == 1:
-        return v
-    if len(v.shape) == 1:
-        return torch.chunk(v, tp_size)[idx].contiguous()
-    else:
-        return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
-
-
-def split_qkv_tp(v, n_head, n_hidden, tensor_parallel, rank):
-    """
-    Splits the QKV matrix according to tensor parallelism
-    """
-    v = v.reshape(3, n_hidden, n_hidden)
-    split_v = split(v, tensor_parallel, rank, dim=1)
-    split_v = split_v.reshape(3 * (n_hidden // tensor_parallel), n_hidden)
-    return split_v.contiguous()
-
-
-def split_qkv_bias_tp(v, n_head, n_hidden, tensor_parallel, rank):
-    """
-    Splits the QKV bias according to tensor parallelism
-    """
-    v = v.reshape(3, n_hidden)
-    split_v = split(v, tensor_parallel, rank, dim=1)
-    split_v = split_v.reshape(3 * (n_hidden // tensor_parallel))
-    return split_v.contiguous()
-
-
-def split_matrix_tp(v, tensor_parallel, rank, dim):
-    return split(v, tensor_parallel, rank, dim=dim)
-
-
-def get_weight(config, prefix, dtype):
-    if config[prefix + '.weight'].dtype != dtype:
-        config[prefix + '.weight'].data = config[prefix + '.weight'].to(dtype)
-    return config[prefix + '.weight'].detach()
-
-
-def get_bias(config, prefix, dtype):
-    if config[prefix + '.bias'].dtype != dtype:
-        config[prefix + '.bias'].data = config[prefix + '.bias'].to(dtype)
-    return config[prefix + '.bias'].detach()
-
-
-def get_weight_and_bias(config, prefix, dtype):
-    return get_weight(config, prefix, dtype), get_bias(config, prefix, dtype)
-
-
 def get_tllm_linear_weight(weight,
                            prefix,
                            bias=None,
@@ -517,16 +278,6 @@ def get_tllm_linear_weight(weight,
     return results
 
 
-def dup_kv_weight(v, num_head, tp_size):
-    assert tp_size % num_head == 0
-    reps = tp_size // num_head
-    head_size = v.shape[0] // num_head
-    v = v.reshape(num_head, head_size,
-                  -1)[:, None, :, :].expand(num_head, reps, head_size,
-                                            v.shape[1])
-    return v.reshape(num_head * reps * head_size, -1).clone().detach()
-
-
 def get_tllm_linear_sq_weight(vals,
                               prefix,
                               shape,
@@ -544,12 +295,13 @@ def get_tllm_linear_sq_weight(vals,
     results = {}
 
     def multi_query_split(data, local_dim, head_size, tp_size, cur_rank):
-        q, k, v = np.split(data, [local_dim, local_dim + head_size], axis=-1)
-        q_split = np.split(q, tp_size, axis=-1)
-        k_split = np.split(k, tp_size, axis=-1)
-        v_split = np.split(v, tp_size, axis=-1)
+
+        q, k, v = torch.split(data, [local_dim, head_size, head_size], dim=-1)
+        q_split = torch.split(q, q.shape[-1] // tp_size, dim=-1)
+        k_split = torch.split(k, k.shape[-1] // tp_size, dim=-1)
+        v_split = torch.split(v, v.shape[-1] // tp_size, dim=-1)
         return [
-            np.concatenate((q_split[ii], k_split[ii], v_split[ii]), axis=-1)
+            torch.concat((q_split[ii], k_split[ii], v_split[ii]), dim=-1)
             for ii in range(tp_size)
         ][cur_rank]
 
@@ -557,9 +309,9 @@ def get_tllm_linear_sq_weight(vals,
 
     if per_token:
         if per_channel:
-            original_weights = np.array(vals["weight.int8.col"])
+            original_weights = vals["weight.int8.col"]
         else:
-            original_weights = np.array(vals["weight.int8"])
+            original_weights = vals["weight.int8"]
         local_dim = original_weights.shape[0]
         head_size = (original_weights.shape[1] - local_dim) // 2
 
@@ -567,14 +319,13 @@ def get_tllm_linear_sq_weight(vals,
             cur_weights = multi_query_split(original_weights, local_dim,
                                             head_size, tensor_parallel, rank)
         else:
-            cur_weights = np.split(original_weights,
-                                   tensor_parallel,
-                                   axis=cat_dim)[rank]
+            cur_weights = torch.chunk(original_weights,
+                                      tensor_parallel,
+                                      dim=cat_dim)[rank]
         if is_qkv:
             hidden_dim = cur_weights.shape[0]
             cur_weights = cur_weights.reshape(hidden_dim, -1)
-        results[prefix + 'weight'] = torch.from_numpy(
-            cur_weights).t().clone().contiguous()
+        results[prefix + 'weight'] = cur_weights.t().contiguous()
         if smoother_value is None:
             results[last_prefix] = torch.from_numpy(
                 np.array([1.0], dtype=np.float32))
@@ -583,6 +334,7 @@ def get_tllm_linear_sq_weight(vals,
             cur_per_channel_value = vals["scale_w_quant_orig.col"]
             if smoother_value is None:
                 if multi_query_mode:
+
                     cur_per_channel_value = multi_query_split(
                         vals["scale_w_quant_orig.col"], local_dim, head_size,
                         tensor_parallel, rank)
@@ -599,18 +351,18 @@ def get_tllm_linear_sq_weight(vals,
                         vals["scale_w_quant_orig"], local_dim, head_size,
                         tensor_parallel, rank)
                 else:
-                    cur_per_channel_value = np.split(vals["scale_w_quant_orig"],
-                                                     tensor_parallel,
-                                                     axis=cat_dim)[rank]
+                    cur_per_channel_value = torch.split(
+                        vals["scale_w_quant_orig"],
+                        tensor_parallel,
+                        axis=cat_dim)[rank]
 
-        results[prefix + 'per_channel_scale'] = torch.from_numpy(
-            np.array(cur_per_channel_value,
-                     dtype=np.float32).reshape(col_shape)).contiguous()
+        results[prefix +
+                'per_channel_scale'] = cur_per_channel_value.reshape(col_shape)
     else:
         if per_channel:
-            original_weights = np.array(vals["weight.int8.col"])
+            original_weights = vals["weight.int8.col"]
         else:
-            original_weights = np.array(vals["weight.int8"])
+            original_weights = vals["weight.int8"]
         local_dim = original_weights.shape[0]
         head_size = (original_weights.shape[1] - local_dim) // 2
 
@@ -618,14 +370,13 @@ def get_tllm_linear_sq_weight(vals,
             cur_weights = multi_query_split(original_weights, local_dim,
                                             head_size, tensor_parallel, rank)
         else:
-            cur_weights = np.split(original_weights,
-                                   tensor_parallel,
-                                   axis=cat_dim)[rank]
+            cur_weights = torch.chunk(original_weights,
+                                      tensor_parallel,
+                                      dim=cat_dim)[rank]
         if is_qkv:
             hidden_dim = cur_weights.shape[0]
             cur_weights = cur_weights.reshape(hidden_dim, -1)
-        results[prefix + 'weight'] = torch.from_numpy(
-            cur_weights).t().clone().contiguous()
+        results[prefix + 'weight'] = cur_weights.t().contiguous()
 
         if per_channel:
             cur_per_channel_value = vals["scale_y_accum_quant.col"]
@@ -653,22 +404,19 @@ def get_tllm_linear_sq_weight(vals,
                         tensor_parallel,
                         axis=cat_dim)[rank]
 
-        results[prefix + 'per_channel_scale'] = torch.from_numpy(
-            np.array([cur_per_channel_value],
-                     dtype=np.float32).reshape(col_shape)).contiguous()
+        results[prefix + 'per_channel_scale'] = cur_per_channel_value.reshape(
+            col_shape).contiguous()
 
-        results[last_prefix] = torch.from_numpy(
-            np.array([vals['scale_x_orig_quant']],
-                     dtype=np.float32)).contiguous()
+        results[last_prefix] = vals['scale_x_orig_quant'].contiguous()
 
-        results[prefix + 'act_scale'] = torch.from_numpy(
-            np.array([[vals["scale_y_quant_orig"]]],
-                     dtype=np.float32)).contiguous()
+        results[prefix + 'act_scale'] = vals["scale_y_quant_orig"].contiguous()
 
     if smoother_value is not None:
-        cur_smoother_value = np.split(smoother_value,
-                                      tensor_parallel,
-                                      axis=cat_dim)[rank]
+        cur_smoother_value = torch.split(smoother_value,
+                                         smoother_value.shape[-1] //
+                                         tensor_parallel,
+                                         dim=cat_dim)[rank]
+
         results[prefix + 'smoother'] = cur_smoother_value.reshape(
             smoother_shape).contiguous().to(torch.float32)
 
@@ -679,8 +427,17 @@ def get_tllm_linear_sq_weight(vals,
 
 
 def load_hf_qwen(model_dir: str, load_model_on_cpu: bool = False):
-    from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(
+    config_path = os.path.join(model_dir, 'config.json')
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    if config['architectures'] == ['Qwen2ForSequenceClassification']:
+        from transformers import Qwen2ForSequenceClassification as model_cls
+    elif config['architectures'] == ['Qwen2VLForConditionalGeneration']:
+        from transformers import Qwen2VLForConditionalGeneration as model_cls
+    else:
+        from transformers import AutoModelForCausalLM as model_cls
+
+    model = model_cls.from_pretrained(
         model_dir,
         device_map='auto' if not load_model_on_cpu else 'cpu',
         torch_dtype='auto',
@@ -696,7 +453,6 @@ def convert_hf_qwen(hf_model,
                     use_parallel_embedding=False,
                     sharding_dim=0,
                     use_weight_only=False,
-                    share_embedding_table=False,
                     use_gemm_woq_plugin=False,
                     plugin_weight_only_quant_type=torch.int8,
                     use_smooth_quant=False,
@@ -711,18 +467,37 @@ def convert_hf_qwen(hf_model,
     tik = time.time()
     tensor_parallel = mapping.tp_size
     model_params = dict(hf_model.named_parameters())
+
     dtype = getattr(torch, dtype)
-    num_attention_heads = hf_model.config.num_attention_heads
-    hidden_size = hf_model.config.hidden_size
+    hf_config = hf_model.config
+    if hasattr(hf_config, 'llm_config'):
+        hf_config = hf_config.llm_config
+
+    #This is for InternVL2 - 1B
+    keys_to_rename = [
+        key for key in model_params.keys() if 'language_model.' in key
+    ]
+    keys_to_delete = [
+        key for key in model_params.keys() if 'vision_model.' in key
+    ]
+    for key in keys_to_rename:
+        keys_rename = key.replace('language_model.', '')
+        model_params[keys_rename] = model_params[key]
+        del model_params[key]
+    for key in keys_to_delete:
+        del model_params[key]
+
+    num_attention_heads = hf_config.num_attention_heads
+    hidden_size = hf_config.hidden_size
     head_size = hidden_size // num_attention_heads
     if qwen_type == 'qwen':
-        intermediate_size = hf_model.config.intermediate_size // 2  # Qwen version 1 has actual intermediate_size one half of what's in hf_config
+        intermediate_size = hf_config.intermediate_size // 2  # Qwen version 1 has actual intermediate_size one half of what's in hf_config
     else:
-        intermediate_size = hf_model.config.intermediate_size
-    num_key_value_heads = hf_model.config.num_key_value_heads if hasattr(
-        hf_model.config, "num_key_value_heads") else num_attention_heads
+        intermediate_size = hf_config.intermediate_size
+    num_key_value_heads = hf_config.num_key_value_heads if hasattr(
+        hf_config, "num_key_value_heads") else num_attention_heads
     mha_mode = (num_key_value_heads == num_attention_heads)
-    layers_range = mapping.pp_layers(hf_model.config.num_hidden_layers)
+    layers_range = mapping.pp_layers(hf_config.num_hidden_layers)
 
     layer_prefix = "transformer.h." if qwen_type == 'qwen' else "model.layers."
     key_list = get_qwen_key_list(qwen_type)
@@ -753,10 +528,10 @@ def convert_hf_qwen(hf_model,
                                              tensor_parallel)
                     v_weight = dup_kv_weight(v_weight, num_key_value_heads,
                                              tensor_parallel)
-                    k_bias = dup_kv_weight(k_bias, num_key_value_heads,
-                                           tensor_parallel)
-                    v_bias = dup_kv_weight(v_bias, num_key_value_heads,
-                                           tensor_parallel)
+                    k_bias = dup_kv_bias(k_bias, num_key_value_heads,
+                                         tensor_parallel)
+                    v_bias = dup_kv_bias(v_bias, num_key_value_heads,
+                                         tensor_parallel)
                 assert (k_weight.shape[0] % (mapping.tp_size * head_size)) == 0
                 assert (v_weight.shape[0] % (mapping.tp_size * head_size)) == 0
                 assert (k_bias.shape[0] % (mapping.tp_size * head_size)) == 0
@@ -824,7 +599,6 @@ def convert_hf_qwen(hf_model,
                                        qkv_b, use_weight_only,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
-
         if int8_kv_cache:
             if qwen_type == 'qwen':
                 qkv_y = act_range.get(prefix + key_list[0])["y"]
@@ -905,16 +679,16 @@ def convert_hf_qwen(hf_model,
             ## mlp.shared_expert.gate_up_proj.weight
             weights.update(
                 get_tllm_linear_weight(shared_expert_gate_up_proj,
-                                       tllm_prex + 'shared_expert.fc.', None,
-                                       use_weight_only,
+                                       tllm_prex + 'mlp.shared_expert.fc.',
+                                       None, use_weight_only,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
             ## mlp.shared_expert.down_proj.weight
             weights.update(
                 get_tllm_linear_weight(shared_expert_down_proj.to(dtype),
-                                       tllm_prex + 'shared_expert.proj.', None,
-                                       use_weight_only,
+                                       tllm_prex + 'mlp.shared_expert.proj.',
+                                       None, use_weight_only,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
@@ -923,7 +697,7 @@ def convert_hf_qwen(hf_model,
             weights.update(
                 get_tllm_linear_weight(
                     moe_shared_expert_gate_weights,
-                    tllm_prex + 'shared_expert_gate.',
+                    tllm_prex + 'mlp.shared_expert_gate.',
                     None,
                     False,  # Router should never be quantized
                     plugin_weight_only_quant_type,
@@ -1019,6 +793,7 @@ def convert_hf_qwen(hf_model,
                 mlp_fc_weight = mlp_fc_weight.t()  #verified
                 int8_weights = generate_int8(
                     mlp_fc_weight, act_range.get(prefix + key_list[3]))
+
                 weights.update(
                     get_tllm_linear_sq_weight(
                         int8_weights,
@@ -1051,6 +826,7 @@ def convert_hf_qwen(hf_model,
                 mlp_proj_weight = mlp_proj_weight.t()
                 int8_weights = generate_int8(
                     mlp_proj_weight, act_range.get(prefix + key_list[4]))
+
                 weights.update(
                     get_tllm_linear_sq_weight(
                         int8_weights,
@@ -1084,9 +860,9 @@ def convert_hf_qwen(hf_model,
     v = get_weight(model_params, key_list[7], dtype)
 
     if mapping.is_last_pp_rank():
-        if hf_model.config.tie_word_embeddings:
+        if hf_config.tie_word_embeddings:
             # lm_head.weight has the same weights as embedding
-            lm_head_weights = v
+            lm_head_weights = v.clone()
         else:
             lm_head_weights = get_weight(model_params, 'lm_head', dtype)
 
@@ -1118,45 +894,14 @@ def convert_hf_qwen(hf_model,
         ln_f_w = get_weight(model_params, key_list[8], dtype)
         weights['transformer.ln_f.weight'] = ln_f_w
 
+    if hasattr(hf_model, 'score'):
+        score = get_weight(model_params, 'score', dtype)
+        weights['lm_head.weight'] = score
+
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     print(f'Weights loaded. Total time: {t}')
     return weights
-
-
-def smooth_quant(model,
-                 qwen_type,
-                 model_dir,
-                 calib_dataset='cnn_dailymail',
-                 smoothquant: Optional[float] = None):
-    assert model is not None
-    act_range = {}
-    qwen_qkv_para = {}
-    # smoother for inputs of self_attn.o_proj and mlp.down_proj
-    qwen_smoother = {}
-
-    os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
-        "TOKENIZERS_PARALLELISM", "false")
-    tokenizer = AutoTokenizer.from_pretrained(model_dir,
-                                              trust_remote_code=True,
-                                              use_fast=False,
-                                              padding_side='left')
-    dataset = load_calib_dataset(calib_dataset)
-    system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
-    gen_config_path = os.path.join(model_dir, 'generation_config.json')
-    with open(gen_config_path, 'r') as f:
-        gen_config = json.load(f)
-    chat_format = getattr(gen_config, 'chat_format', 'raw')
-    act_range = capture_activation_range(model, qwen_type, tokenizer, dataset,
-                                         system_prompt, chat_format)
-    if smoothquant is not None:
-        if qwen_type == 'qwen':
-            smooth_qwen_model(model, act_range, smoothquant, qwen_qkv_para,
-                              qwen_smoother)
-        else:
-            smooth_qwen2_model(model, act_range, smoothquant, qwen_qkv_para,
-                               qwen_smoother)
-    return act_range, qwen_qkv_para, qwen_smoother
 
 
 def quantize(hf_model_dir: str,
@@ -1166,22 +911,17 @@ def quantize(hf_model_dir: str,
     '''
         Quantize the save the model as TRT-LLM checkpoint to output_dir
     '''
-    #TODO: currently only smooth quant and kv cache quantization are supported, needs to support mode quant algorithm calling modelopt
-
-    with open(os.path.join(output_dir, 'config.json'), 'w') as f:
-        json.dump(config.to_dict(), f, indent=4)
+    os.makedirs(output_dir, exist_ok=True)
+    config.to_json_file(os.path.join(output_dir, 'config.json'))
 
     mapping = config.mapping
-    assert mapping.rank == -1, "You shall call quantize only once in one rank, assert rank==-1 for precaution"
-    quant_config = config.quantization
+    assert mapping.rank == 0, "quantize should be called at rank 0 only"
 
+    quant_config = config.quantization
     use_smooth_quant = quant_config.use_plugin_sq
     int8_kv_cache = quant_config.kv_cache_quant_algo == "INT8"
 
     assert use_smooth_quant or int8_kv_cache, "Call from_hugging_face when there is no quantization"
-    if use_smooth_quant:
-        assert quant_config.smoothquant_val is not None, "A smooth value must be specified when using smooth quant"
-
     assert hf_model_dir is not None
     ## only load and call smooth quant routine once for all ranks
     hf_config = AutoConfig.from_pretrained(hf_model_dir, trust_remote_code=True)
@@ -1190,10 +930,35 @@ def quantize(hf_model_dir: str,
         device_map='auto',
         torch_dtype='auto' if not use_smooth_quant else torch.float16,
         trust_remote_code=True).half()
+    if hf_config.model_type == 'internvl_chat':
+        hf_config = hf_config.llm_config
+        hf_model = hf_model.language_model
 
-    act_range, qkv_para, smoother = smooth_quant(hf_model, config.qwen_type,
-                                                 hf_model_dir, calib_dataset,
-                                                 quant_config.smoothquant_val)
+    os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
+        "TOKENIZERS_PARALLELISM", "false")
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_dir,
+                                              trust_remote_code=True,
+                                              use_fast=False,
+                                              padding_side='left')
+    dataset = load_calib_dataset(calib_dataset)
+
+    system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
+    gen_config_path = os.path.join(hf_model_dir, 'generation_config.json')
+    with open(gen_config_path, 'r') as f:
+        gen_config = json.load(f)
+    chat_format = getattr(gen_config, 'chat_format', 'chatml')
+    act_range = capture_activation_range(hf_model, config.qwen_type, tokenizer,
+                                         dataset, system_prompt, chat_format)
+    qkv_para = {}
+    # smoother for inputs of self_attn.o_proj and mlp.down_proj
+    smoother = {}
+    if use_smooth_quant:
+        if config.qwen_type == 'qwen':
+            smooth_qwen_model(hf_model, act_range, quant_config.smoothquant_val,
+                              qkv_para, smoother)
+        else:
+            smooth_qwen2_model(hf_model, act_range,
+                               quant_config.smoothquant_val, qkv_para, smoother)
 
     for rank in range(mapping.world_size):
         # To avoid changing the mapping arg in-place, also the given mapping from caller is rank agnostic, since quantize is called from only one rank
@@ -1247,7 +1012,6 @@ def load_weights_from_hf_model(hf_model,
         plugin_weight_only_quant_type=plugin_weight_only_quant_type,
         use_parallel_embedding=config.use_parallel_embedding,
         sharding_dim=config.embedding_sharding_dim,
-        share_embedding_table=config.share_embedding_table,
         use_smooth_quant=use_smooth_quant,
         per_channel=per_channel,
         per_token=per_token,
@@ -1271,7 +1035,7 @@ def load_weights_from_hf_gptq_model(hf_model, config: QWenConfig):
 
     model_params = {k: v for k, v in hf_model.state_dict().items()}
     torch.cuda.empty_cache()
-    valid_types = ('qwen', 'qwen2')
+    valid_types = ('qwen', 'qwen2', 'qwen2_vl')
     assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are supported for GPTQ."
     layer_prefix = "transformer.h." if qwen_type == 'qwen' else "model.layers."
     key_list = get_qwen_key_list(qwen_type)

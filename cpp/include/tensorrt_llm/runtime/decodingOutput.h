@@ -18,10 +18,17 @@
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include <optional>
 #include <utility>
+
+namespace tensorrt_llm::batch_manager
+{
+class LookaheadDecodingBuffers;
+}
 
 namespace tensorrt_llm::runtime
 {
@@ -59,8 +66,9 @@ public:
 
     static float constexpr kNegativeInfinity = -1e20f;
 
-    explicit DecodingOutput(TensorPtr ids)
+    explicit DecodingOutput(TensorPtr ids, TensorPtr gatheredIds)
         : ids{std::move(ids)}
+        , gatheredIds{std::move(gatheredIds)}
     {
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->ids), "Invalid ids tensor");
     }
@@ -68,6 +76,11 @@ public:
     // mandatory parameters
     TensorPtr ids;                       // [BS, BM, MSL], contains previously generated token ids for all
                                          // steps before DecodingInput.step
+
+    TensorPtr gatheredIds;               // [BS, BM, MSL], these are the tokens computed during the gatherTree step
+                                         // When doing beam search and streaming, this second set of tokens is needed
+                                         // due to the beam search kernels assuming ungathered tokens (stored in `ids`).
+
     TensorPtr newTokensSteps;            // [maxTokensPerStep, BS, BM] new tokens at each generated token of
                                          // maxTokensPerStep
     TensorPtr newTokens;                 // [BS, BM] usually a view of newTokensSteps for the current token
@@ -75,17 +88,20 @@ public:
                                          // Vector of views on newTokensSteps for each token
 
     // optional parameters
-    TensorPtr finished; // [BS, BM], set to true by decoding if any of the stop conditions are met or if
-                        // DecodingInput.finished is true. In beam search and to determine whether to stop according to
-                        // DecodingInput.sequenceLimitLength
-    TensorPtr finishedSum; // [BS], the sum of finished sequences per request, in pinned memory
+    TensorPtr finishReasons; // [BS, BM], set to FinishedState by decoding if any of the stop conditions are met or if
+                             // DecodingInput.finished is true. In beam search and to determine whether to stop
+                             // according to DecodingInput.sequenceLimitLength
+    TensorPtr finishedSum;   // [BS], the sum of finished sequences per request, in pinned memory
 
     // mandatory parameters for beam search
     TensorPtr logProbs;         // [BS, BM, MSL], must be float*
     TensorPtr cumLogProbs;      // [BS, BM], optional for sampling
-    TensorPtr parentIds;        // [BS, BM, MSL]
+    TensorPtr parentIds;        // [BS, BM, MSL] index of the beam where the previous token is
     TensorPtr lengths;          // [BS, BM], total sequence lengths including padding
     TensorPtr cacheIndirection; // [BS, BM, MSL], k/v indirection for next generation step
+
+    TensorPtr logProbsTiled;    // [MSL, BS, BM] Buffer used to store the transpose of the logProbs.
+                                // Needed because the kernels have been written to use that shape.
 
     BeamHypotheses beamHypotheses;
 
@@ -104,6 +120,10 @@ public:
     std::optional<SpeculativeDecodingOutputs> speculativeDecodingOutputs;
 
     std::optional<ExplicitDraftTokensBuffers::Inputs> explicitDraftTokensBuffers;
+
+    std::optional<LookaheadDecodingBuffers> lookaheadOutputs;
+
+    std::optional<EagleBuffers::Inputs> eagleBuffers;
 };
 
 } // namespace tensorrt_llm::runtime

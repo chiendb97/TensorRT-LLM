@@ -116,7 +116,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
                 --output_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION}/encoder \
                 --paged_kv_cache disable \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
                 --max_input_len 1024 \
@@ -130,7 +129,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
 trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION}/decoder \
                 --output_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
                 --max_input_len 1 \
@@ -167,7 +165,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
                 --output_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION}/encoder \
                 --paged_kv_cache disable \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
                 --max_input_len 1024 \
@@ -181,7 +178,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
 trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION}/decoder \
                 --output_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
                 --max_input_len 1 \
@@ -218,6 +214,8 @@ For good usability, Python binding of the C++ runtime is provided. You can use t
 # Inferencing via python binding of C++ runtime with inflight batching (IFB)
 python3 ../run.py --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} --tokenizer_dir tmp/hf_models/${MODEL_NAME} --max_output_len 64 --num_beams=1 --input_text "translate English to German: The house is wonderful."
 ```
+
+You can specify `--kv_cache_free_gpu_memory_fraction` to control the percentage of free GPU memory to be used by KV cache (by default 0.9), and `--cross_kv_cache_fraction` to control the percentage of KV cache to be used by cross attention (by default 0.5, and rest of the KV cache will be used by self attention).
 
 For pure C++ runtime, there is no example given yet. Please check the [`Executor`](../../cpp/include/tensorrt_llm/executor/executor.h) API to implement your own end-to-end workflow. It is highly recommended to leverage more encapsulated solutions such as the above C++ Python binding or [Triton backend](https://github.com/triton-inference-server/tensorrtllm_backend).
 
@@ -299,7 +297,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISIO
                 --output_dir tmp/trt_engines/bart-large-cnn/${INFERENCE_PRECISION}/encoder \
                 --paged_kv_cache disable \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
                 --max_input_len 1024 \
@@ -314,7 +311,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISIO
 trtllm-build --checkpoint_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISION}/decoder \
                 --output_dir tmp/trt_engines/bart-large-cnn/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
                 --max_input_len 1 \
@@ -404,7 +400,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/encode
                 --output_dir tmp/trt_engines/wmt14/${INFERENCE_PRECISION}/encoder \
                 --paged_kv_cache disable \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
                 --max_input_len 1024 \
@@ -415,7 +410,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/encode
 trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/decoder \
                 --output_dir tmp/trt_engines/wmt14/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
                 --max_input_len 1 \

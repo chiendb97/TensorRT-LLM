@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -49,10 +51,12 @@ using TokenIdType = std::int32_t;
 using VecTokens = std::vector<TokenIdType>;
 using BeamTokens = std::vector<VecTokens>;
 using IdType = std::uint64_t;
+using VecTokenExtraIds = std::vector<IdType>;
 using IterationType = std::uint64_t;
 using RandomSeedType = std::uint64_t;
 using VecLogProbs = std::vector<FloatType>;
 using StreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
+using MillisecondsType = std::chrono::milliseconds;
 using LogitsPostProcessor
     = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>;
 using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcessor>;
@@ -60,7 +64,9 @@ using LogitsPostProcessorBatched = std::function<void(std::vector<IdType> const&
     std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&,
     std::vector<std::optional<IdType>> const&)>;
 using MedusaChoices = std::vector<std::vector<SizeType32>>;
+using EagleChoices = std::vector<std::vector<SizeType32>>;
 using PriorityType = float;
+using BufferView = std::basic_string_view<uint8_t>;
 
 enum class DataType
 {
@@ -74,6 +80,13 @@ enum class DataType
     kFP16,
     kFP32,
     kUNKNOWN
+};
+
+enum class RequestType
+{
+    REQUEST_TYPE_CONTEXT_AND_GENERATION = 0,
+    REQUEST_TYPE_CONTEXT_ONLY = 1,
+    REQUEST_TYPE_GENERATION_ONLY = 2
 };
 
 //! \brief For converting a C++ data type to a `TrtLmmDataType`.
@@ -151,6 +164,7 @@ enum class MemoryType
 {
     kCPU,
     kCPU_PINNED,
+    kCPU_PINNEDPOOL,
     kGPU,
     kUVM,
     kUNKNOWN
@@ -187,6 +201,10 @@ enum class CapacitySchedulerPolicy
     /// @brief GUARANTEED_NO_EVICT uses KV cache more conservatively guaranteeing that a request, once started, will run
     /// to completion without eviction.
     kGUARANTEED_NO_EVICT = 1,
+
+    /// @brief kSTATIC_BATCH does not schedule new requests until all requests in current batch are completed.
+    /// Similar to kGUARANTEED_NO_EVICT, requests will run to completion without eviction.
+    kSTATIC_BATCH = 2
 };
 
 std::ostream& operator<<(std::ostream& os, CapacitySchedulerPolicy policy);
@@ -218,7 +236,8 @@ enum class CommunicationMode
                    // execution of the model
 };
 
-/// @brief Struct that holds the stats of a KV cache manager
+/// @brief Struct that holds the stats of a KV cache manager.
+// See KvCacheStats definition in kvCacheManager.h for more information about each field.
 struct KvCacheStats
 {
     /// @brief Max number of blocks
@@ -235,6 +254,10 @@ struct KvCacheStats
     SizeType32 allocNewBlocks;
     /// @brief Number of reused block
     SizeType32 reusedBlocks;
+    /// @brief Number of not reused block
+    SizeType32 missedBlocks;
+    /// @brief Measuring the KV Cache reuse rate. cacheHitRate = reusedBlocks / (reusedBlocks + missedBlocks).
+    float cacheHitRate;
 };
 
 /// @brief Struct that holds the stats of static batching models for a single iteration
@@ -280,12 +303,30 @@ struct IterationStats
     IterationType iter;
     /// @brief Iteration latency (ms)
     double iterLatencyMS;
+    /// @brief The total time spent in queue by the requests that became active in this iteration (ms)
+    double newActiveRequestsQueueLatencyMS;
+    /// @brief Number of new fetched active requests
+    SizeType32 numNewActiveRequests;
     /// @brief Number of active requests
     SizeType32 numActiveRequests;
     /// @brief Number of queued requests
     SizeType32 numQueuedRequests;
+    /// @brief  Number of requests that were completed in this iteration
+    SizeType32 numCompletedRequests;
     /// @brief Number of max active requests
     SizeType32 maxNumActiveRequests;
+    /// @brief Static max batch size passed to the executor
+    SizeType32 maxBatchSizeStatic;
+    /// @brief Batch size produced by dynamic tuner based on input stats
+    SizeType32 maxBatchSizeTunerRecommended;
+    /// @brife The min of maxBatchSizeStatic and maxBatchSizeRuntimeUpperbound
+    SizeType32 maxBatchSizeRuntime;
+    /// @brife Static max num tokens passed to the executor
+    SizeType32 maxNumTokensStatic;
+    /// @brife Max num tokens produced by dynamic tuner based on input stats
+    SizeType32 maxNumTokensTunerRecommended;
+    /// @brife The runtime max num tokens
+    SizeType32 maxNumTokensRuntime;
     /// @brief GPU memory usage in bytes
     size_t gpuMemUsage;
     /// @brief CPU memory usage in bytes
@@ -318,6 +359,13 @@ enum class RequestStage
     kGENERATION_COMPLETE,
 };
 
+/// @brief Struct that holds the request stats in the case of disaggregated serving
+struct DisServingRequestStats
+{
+    /// @brief The total time spent on transferring KV cache from context phase to generation phase (ms)
+    double kvCacheTransferMS;
+};
+
 /// @brief Struct that holds the stats of a single request
 struct RequestStats
 {
@@ -336,6 +384,18 @@ struct RequestStats
     /// @brief Whether the request is being paused at the current iteration due to lack of resources (KV cache blocks
     /// exhaustion for example)
     bool paused;
+    /// @brief Stats specific to disaggregated serving
+    std::optional<DisServingRequestStats> disServingStats;
+    /// @brief Number of total allocated blocks per request
+    SizeType32 allocTotalBlocksPerRequest;
+    /// @brief Number of newly allocated blocks per request
+    SizeType32 allocNewBlocksPerRequest;
+    /// @brief Number of reused blocks per request
+    SizeType32 reusedBlocksPerRequest;
+    /// @brief Number of missed blocks per request
+    SizeType32 missedBlocksPerRequest;
+    /// @brief KV Cache Hit Rate per request, defined as reusedBlocks / (reusedBlocks + missedBlocks)
+    SizeType32 kvCacheHitRatePerRequest;
 };
 
 /// @brief Struct that holds the stats of all requests in an iteration
@@ -345,6 +405,83 @@ struct RequestStatsPerIteration
     IterationType iter;
     /// @brief The stats of all active requests for this iteration
     std::vector<RequestStats> requestStats;
+};
+
+/// @brief Struct that holds the stats of a request
+struct RequestPerfMetrics
+{
+    using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
+
+    struct TimingMetrics
+    {
+        /// @brief The time when the request arrived
+        TimePoint arrivalTime;
+        /// @brief The time when the request was first scheduled
+        TimePoint firstScheduledTime;
+        /// @brief The time when the first token was generated
+        TimePoint firstTokenTime;
+        /// @brief The time when the request was finished
+        TimePoint lastTokenTime;
+        /// @brief Start time of the KV cache transfer for disaggregated serving
+        TimePoint kvCacheTransferStart;
+        /// @brief End time of the KV cache transfer for disaggregated serving
+        TimePoint kvCacheTransferEnd;
+    };
+
+    struct KvCacheMetrics
+    {
+        /// @brief Number of total allocated blocks
+        SizeType32 numTotalAllocatedBlocks{0};
+        /// @brief Number of newly allocated blocks
+        SizeType32 numNewAllocatedBlocks{0};
+        /// @brief Number of reused blocks
+        SizeType32 numReusedBlocks{0};
+        /// @brief Number of missed blocks
+        SizeType32 numMissedBlocks{0};
+        /// @brief KV Cache Hit Rate, defined as reusedBlocks / (reusedBlocks + missedBlocks)
+        SizeType32 kvCacheHitRate{0};
+    };
+
+    TimingMetrics timingMetrics;
+    KvCacheMetrics kvCacheMetrics;
+
+    /// @brief First iteration where the request was processed
+    std::optional<IterationType> firstIter;
+    /// @brief Last iteration where a token was generated
+    std::optional<IterationType> lastIter;
+    /// @brief Current iteration
+    std::optional<IterationType> iter;
+};
+
+/// @brief Struct that holds the debug tensors in an iteration
+struct DebugTensorsPerIteration
+{
+    /// @brief The iteration id for these tensors
+    IterationType iter;
+    /// @brief The debug tensors for this iteration
+    std::map<std::string, Tensor> debugTensors;
+};
+
+/// @brief The reason why the model stopped generating tokens for a request.
+enum class FinishReason
+{
+    /// @brief The request is not finished.
+    kNOT_FINISHED = 0,
+
+    /// @brief The request finished because the end id was generated.
+    kEND_ID = 1,
+
+    /// @brief The request finished because a stop word was generated.
+    kSTOP_WORDS = 2,
+
+    /// @brief The request finished because the maximum number of tokens was reached.
+    kLENGTH = 3,
+
+    /// @brief The request finished because it got timed out (via the mAllotedTime parameter)
+    kTIMED_OUT = 4,
+
+    /// @brief The request was cancelled by calling cancelRequest.
+    kCANCELLED = 5
 };
 
 /// @brief mode of the decoder
@@ -391,6 +528,16 @@ public:
     static auto constexpr ExplicitDraftTokens()
     {
         return DecodingMode{kExplicitDraftTokens | kStandardStopCriteria | kUseExplicitEosStop};
+    }
+
+    static auto constexpr ExternalDraftTokens()
+    {
+        return DecodingMode{kExternalDraftTokens | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
+    }
+
+    static auto constexpr Eagle()
+    {
+        return DecodingMode{kEagle | kStandardStopCriteria | kUseExplicitEosStop};
     }
 
     auto constexpr useTemperature(bool useTemp)
@@ -510,6 +657,16 @@ public:
         return anyBitSet(kExplicitDraftTokens);
     }
 
+    [[nodiscard]] bool constexpr isExternalDraftTokens() const
+    {
+        return anyBitSet(kExternalDraftTokens);
+    }
+
+    [[nodiscard]] bool constexpr isEagle() const
+    {
+        return anyBitSet(kEagle);
+    }
+
     [[nodiscard]] bool constexpr isUseTemperature() const
     {
         return anyBitSet(kUseTemperature);
@@ -623,6 +780,8 @@ private:
     static UnderlyingType constexpr kMedusa{1u << (kNumFlags + 4)};
     static UnderlyingType constexpr kLookahead{1u << (kNumFlags + 5)};
     static UnderlyingType constexpr kExplicitDraftTokens{1u << (kNumFlags + 6)};
+    static UnderlyingType constexpr kExternalDraftTokens{1u << (kNumFlags + 7)};
+    static UnderlyingType constexpr kEagle{1u << (kNumFlags + 8)};
     static UnderlyingType constexpr kTopKTopP{kTopK | kTopP};
 
     [[nodiscard]] bool constexpr anyBitSet(UnderlyingType bits) const
@@ -653,6 +812,8 @@ static_assert(!DecodingMode::Auto().isBeamSearch());
 static_assert(!DecodingMode::Auto().isMedusa());
 static_assert(!DecodingMode::Auto().isLookahead());
 static_assert(!DecodingMode::Auto().isExplicitDraftTokens());
+static_assert(!DecodingMode::Auto().isExternalDraftTokens());
+static_assert(!DecodingMode::Auto().isEagle());
 
 static_assert(DecodingMode::TopK().isTopK());
 static_assert(DecodingMode::TopK().isTopKorTopP());
@@ -673,6 +834,8 @@ static_assert(!DecodingMode::TopK().isBeamSearch());
 static_assert(!DecodingMode::TopK().isMedusa());
 static_assert(!DecodingMode::TopK().isLookahead());
 static_assert(!DecodingMode::TopK().isExplicitDraftTokens());
+static_assert(!DecodingMode::TopK().isExternalDraftTokens());
+static_assert(!DecodingMode::TopK().isEagle());
 
 static_assert(DecodingMode::TopP().isTopP());
 static_assert(DecodingMode::TopP().isTopKorTopP());
@@ -686,6 +849,7 @@ static_assert(!DecodingMode::TopP().isBeamSearch());
 static_assert(!DecodingMode::TopP().isMedusa());
 static_assert(!DecodingMode::TopP().isLookahead());
 static_assert(!DecodingMode::TopP().isExplicitDraftTokens());
+static_assert(!DecodingMode::TopP().isEagle());
 
 static_assert(DecodingMode::TopKTopP().isTopK());
 static_assert(DecodingMode::TopKTopP().isTopP());
@@ -699,6 +863,8 @@ static_assert(!DecodingMode::TopKTopP().isBeamSearch());
 static_assert(!DecodingMode::TopKTopP().isMedusa());
 static_assert(!DecodingMode::TopKTopP().isLookahead());
 static_assert(!DecodingMode::TopKTopP().isExplicitDraftTokens());
+static_assert(!DecodingMode::TopKTopP().isExternalDraftTokens());
+static_assert(!DecodingMode::TopKTopP().isEagle());
 
 static_assert(DecodingMode::BeamSearch().isBeamSearch());
 static_assert(DecodingMode::BeamSearch().isUseStopCriteria());
@@ -707,6 +873,8 @@ static_assert(!DecodingMode::BeamSearch().isTopKorTopP());
 static_assert(!DecodingMode::BeamSearch().isMedusa());
 static_assert(!DecodingMode::BeamSearch().isLookahead());
 static_assert(!DecodingMode::BeamSearch().isExplicitDraftTokens());
+static_assert(!DecodingMode::BeamSearch().isExternalDraftTokens());
+static_assert(!DecodingMode::BeamSearch().isEagle());
 
 static_assert(!DecodingMode::Medusa().isAuto());
 static_assert(!DecodingMode::Medusa().isTopK());
@@ -722,6 +890,8 @@ static_assert(DecodingMode::Medusa().isUseStopCriteria());
 static_assert(DecodingMode::Medusa().isUsePenalty());
 static_assert(DecodingMode::Medusa().isUseMinLength());
 static_assert(DecodingMode::Medusa().isMedusa());
+static_assert(!DecodingMode::Medusa().isExternalDraftTokens());
+static_assert(!DecodingMode::Medusa().isEagle());
 
 static_assert(!DecodingMode::Lookahead().isAuto());
 static_assert(!DecodingMode::Lookahead().isTopK());
@@ -735,6 +905,8 @@ static_assert(DecodingMode::Lookahead().isUseStopCriteria());
 static_assert(DecodingMode::Lookahead().isUseStopWords());
 static_assert(DecodingMode::Lookahead().isUseExplicitEosStop());
 static_assert(DecodingMode::Lookahead().isLookahead());
+static_assert(!DecodingMode::Lookahead().isExternalDraftTokens());
+static_assert(!DecodingMode::Lookahead().isEagle());
 
 static_assert(!DecodingMode::ExplicitDraftTokens().isAuto());
 static_assert(!DecodingMode::ExplicitDraftTokens().isTopK());
@@ -748,4 +920,36 @@ static_assert(!DecodingMode::ExplicitDraftTokens().isUsePenalty());
 static_assert(DecodingMode::ExplicitDraftTokens().isUseStopCriteria());
 static_assert(!DecodingMode::ExplicitDraftTokens().isUseBanWords());
 static_assert(DecodingMode::ExplicitDraftTokens().isExplicitDraftTokens());
+static_assert(!DecodingMode::ExplicitDraftTokens().isExternalDraftTokens());
+static_assert(!DecodingMode::ExplicitDraftTokens().isEagle());
+
+static_assert(!DecodingMode::ExternalDraftTokens().isTopK());
+static_assert(!DecodingMode::ExternalDraftTokens().isTopP());
+static_assert(!DecodingMode::ExternalDraftTokens().isTopKorTopP());
+static_assert(!DecodingMode::ExternalDraftTokens().isTopKandTopP());
+static_assert(DecodingMode::ExternalDraftTokens().isUseBanWords());
+static_assert(DecodingMode::ExternalDraftTokens().isUseOccurrencePenalty());
+static_assert(DecodingMode::ExternalDraftTokens().isUseStopCriteria());
+static_assert(!DecodingMode::ExternalDraftTokens().isAuto());
+static_assert(!DecodingMode::ExternalDraftTokens().isBeamSearch());
+static_assert(!DecodingMode::ExternalDraftTokens().isMedusa());
+static_assert(!DecodingMode::ExternalDraftTokens().isLookahead());
+static_assert(!DecodingMode::ExternalDraftTokens().isExplicitDraftTokens());
+static_assert(!DecodingMode::ExternalDraftTokens().isEagle());
+static_assert(DecodingMode::ExternalDraftTokens().isExternalDraftTokens());
+
+static_assert(!DecodingMode::Eagle().isTopK());
+static_assert(!DecodingMode::Eagle().isTopP());
+static_assert(!DecodingMode::Eagle().isTopKorTopP());
+static_assert(!DecodingMode::Eagle().isTopKandTopP());
+static_assert(!DecodingMode::Eagle().isUseBanWords());
+static_assert(!DecodingMode::Eagle().isUseOccurrencePenalty());
+static_assert(DecodingMode::Eagle().isUseStopCriteria());
+static_assert(!DecodingMode::Eagle().isAuto());
+static_assert(!DecodingMode::Eagle().isBeamSearch());
+static_assert(!DecodingMode::Eagle().isMedusa());
+static_assert(!DecodingMode::Eagle().isLookahead());
+static_assert(!DecodingMode::Eagle().isExplicitDraftTokens());
+static_assert(!DecodingMode::Eagle().isExternalDraftTokens());
+static_assert(DecodingMode::Eagle().isEagle());
 } // namespace tensorrt_llm::executor

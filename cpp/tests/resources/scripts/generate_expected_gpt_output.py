@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 from pathlib import Path
 
 import run
@@ -22,10 +23,17 @@ from build_engines_utils import init_model_spec_module
 init_model_spec_module()
 
 import os
+import shutil
 
 import model_spec
 
 import tensorrt_llm.bindings as _tb
+
+
+def get_model_data_dir():
+    resources_dir = Path(__file__).parent.resolve().parent
+    data_dir = resources_dir / 'data'
+    return data_dir / 'gpt2'
 
 
 def generate_output(engine: str,
@@ -38,22 +46,24 @@ def generate_output(engine: str,
                     output_log_probs: bool = False):
     tp_size = 1
     pp_size = 1
+    cp_size = 1
     model = 'gpt2'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    tp_pp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-gpu/'
-    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_dir
+    tp_pp_cp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-cp' + str(
+        cp_size) + '-gpu/'
+    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_cp_dir
 
     data_dir = resources_dir / 'data'
     input_file = data_dir / input_name
-    model_data_dir = data_dir / model
+    model_data_dir = get_model_data_dir()
     if num_beams <= 1:
         output_dir = model_data_dir / 'sampling'
     else:
         output_dir = model_data_dir / ('beam_search_' + str(num_beams))
 
     model_spec_obj.use_tensor_parallelism(tp_size).use_pipeline_parallelism(
-        pp_size)
+        pp_size).use_context_parallelism(cp_size)
 
     base_output_name = os.path.splitext(model_spec_obj.get_results_file())[0]
 
@@ -80,8 +90,6 @@ def generate_output(engine: str,
     if model_spec_obj.get_enable_context_fmha_fp32_acc():
         args_list.extend(["--enable_context_fmha_fp32_acc"])
 
-    assert not os.path.exists(results_file) and not os.path.exists(results_csv)
-
     if output_cum_log_probs:
         args_list.extend([
             '--output_cum_log_probs_npy',
@@ -95,7 +103,6 @@ def generate_output(engine: str,
         ])
 
     args = run.parse_arguments(args_list)
-    print(args_list)
     run.main(args)
 
 
@@ -105,7 +112,7 @@ def generate_outputs(num_beams):
 
     print('Generating GPT2 FP32 outputs')
     model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.FLOAT)
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
     if num_beams == 1:
         generate_output(engine=model_spec_obj.get_model_path(),
                         num_beams=num_beams,
@@ -119,7 +126,7 @@ def generate_outputs(num_beams):
 
     print('Generating GPT2 FP16 outputs')
     model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
     if num_beams == 1:
         generate_output(engine=model_spec_obj.get_model_path(),
                         num_beams=num_beams,
@@ -135,7 +142,7 @@ def generate_outputs(num_beams):
                     num_beams=num_beams,
                     input_name=input_name,
                     model_spec_obj=model_spec_obj)
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.gather_logits()
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
@@ -144,7 +151,7 @@ def generate_outputs(num_beams):
                     output_logits=True,
                     output_log_probs=True,
                     output_cum_log_probs=True)
-    # GptExecutorTest.GenerationLogitsEarlyStop requires to use context_fmha_fp32_acc flag in runtime
+    # GptExecutorTest.GenerationLogitsEarlyStop and several tests require to use context_fmha_fp32_acc flag in runtime
     model_spec_obj.enable_context_fmha_fp32_acc()
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
@@ -156,8 +163,16 @@ def generate_outputs(num_beams):
 
     model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
+    generate_output(engine=model_spec_obj.get_model_path(),
+                    num_beams=num_beams,
+                    input_name=input_name,
+                    model_spec_obj=model_spec_obj,
+                    output_logits=False,
+                    output_log_probs=True,
+                    output_cum_log_probs=True)
+    model_spec_obj.enable_context_fmha_fp32_acc()
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
                     input_name=input_name,
@@ -176,7 +191,7 @@ def generate_outputs(num_beams):
     model_spec_obj = model_spec.ModelSpec(input_name_long, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.use_packed_input()
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
                     input_name=input_name_long,
@@ -186,7 +201,7 @@ def generate_outputs(num_beams):
     model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.use_packed_input()
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.set_quant_method(model_spec.QuantMethod.SMOOTH_QUANT)
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
@@ -196,5 +211,15 @@ def generate_outputs(num_beams):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--clean',
+                        action='store_true',
+                        default=False,
+                        help='Clean target folders before building engines')
+    args = parser.parse_args()
+    if args.clean:
+        model_data_dir = get_model_data_dir()
+        print(f'Cleaning target folder {model_data_dir}')
+        shutil.rmtree(model_data_dir, ignore_errors=True)
     generate_outputs(num_beams=1)
     generate_outputs(num_beams=2)

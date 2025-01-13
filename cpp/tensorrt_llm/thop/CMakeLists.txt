@@ -12,7 +12,7 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under
 # the License.
-add_library(th_utils STATIC thUtils.cu)
+add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
@@ -20,18 +20,30 @@ target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
 
 add_library(
   th_common SHARED
+  allgatherOp.cpp
+  allreduceOp.cpp
+  convertSpecDecodingMaskToPackedMaskOp.cpp
+  cutlassScaledMM.cpp
+  cublasScaledMM.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
-  weightOnlyQuantOp.cpp
-  gatherTreeOp.cpp
   fp8Op.cpp
+  gatherTreeOp.cpp
+  moeOp.cpp
   ncclCommunicatorOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
-  convertSpecDecodingMaskToPackedMaskOp.cpp
-  relativeAttentionBiasOp.cpp)
+  redrafterCurandOp.cpp
+  relativeAttentionBiasOp.cpp
+  weightOnlyQuantOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
                                         ${Python3_LIBRARIES} ${SHARED_TARGET})
+
+if(ENABLE_MULTI_DEVICE)
+  target_include_directories(th_common PUBLIC ${MPI_C_INCLUDE_DIRS})
+  target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB}
+                                          CUDA::nvml)
+endif()
 
 if(NOT WIN32)
   set_target_properties(

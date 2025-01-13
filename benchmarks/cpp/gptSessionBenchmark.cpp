@@ -75,8 +75,8 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
     auto const json = GptJsonConfig::parse(jsonFileName);
     auto const modelConfig = json.getModelConfig();
     auto const inputPacked = modelConfig.usePackedInput();
-    auto const worldConfig
-        = WorldConfig::mpi(json.getGpusPerNode(), json.getTensorParallelism(), json.getPipelineParallelism());
+    auto const worldConfig = WorldConfig::mpi(json.getGpusPerNode(), json.getTensorParallelism(),
+        json.getPipelineParallelism(), json.getContextParallelism());
     auto& comm = COMM_SESSION;
     auto const enginePath = dataPath / json.engineFilename(worldConfig);
     auto const dtype = modelConfig.getDataType();
@@ -427,7 +427,8 @@ int main(int argc, char* argv[])
 
     options.add_options()("ctx_micro_batch_size", "Batch size for context phase.", cxxopts::value<int>());
     options.add_options()("gen_micro_batch_size", "Batch size for generation phase.", cxxopts::value<int>());
-    options.add_options()("max_attention_window", "Max kv cache length per sequence.", cxxopts::value<int>());
+    options.add_options()(
+        "max_attention_window", "Max kv cache length per sequence.", cxxopts::value<std::vector<int>>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
     options.add_options()("sink_token_len", "Sink token length in kv cache per sequence.", cxxopts::value<int>());
     options.add_options()(
@@ -535,7 +536,7 @@ int main(int argc, char* argv[])
     // Argument: Max KV Cache Length
     if (result.count("max_attention_window"))
     {
-        sessionConfig.kvCacheConfig.maxAttentionWindow = result["max_attention_window"].as<int>();
+        sessionConfig.kvCacheConfig.maxAttentionWindowVec = result["max_attention_window"].as<std::vector<int>>();
     }
     // Argument: Sink token length
     if (result.count("sink_token_len"))

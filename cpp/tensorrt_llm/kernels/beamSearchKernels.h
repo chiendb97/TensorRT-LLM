@@ -18,70 +18,75 @@
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 
+#include "tensorrt_llm/kernels/topkLastDim.h" // Air TopK
+
 namespace tensorrt_llm
 {
 namespace kernels
 {
-static constexpr int nMaxBeamWidth = 64; // max beam width supported now
-static constexpr int nBlockSizeForSmallBeamWidth = 256;
-static constexpr int nMaxVocabPartForStage1FastKernel = 128;
+static constexpr size_t nMaxBeamWidth = 1024;           // Max beam width supported in TRT-LLM now
+static constexpr size_t nMaxBeamWidthForV1 = 8;         // Max beam width for V1 kernels
+static constexpr size_t nThreadForSmallBeamWidth = 256; // Max count of thread for V1 stage 1
+static constexpr size_t nMaxVPartStage1 = 128;          // Max vocab part count for V1 stage 1
 
 struct BeamHypotheses
 {
     // clang-format off
-
     // MBS: max_batch_size, BS: batch_size, BM: beam_width, MSL: max_seq_length
     // %%: parameter name in file generation.py (python workflow)
-
     // Candidate beams: a beam which generates end_id or its sequence length reaches MSL
     // Candidate-Beam-Array (CBA): The arrays to place the candidate beams and related information
 
     // Scalar values
-    bool bReturnNormedScore{false};     // return normed_score / cum_log_probs, useless yet
-    int nMaxBatchSize{0};               // max batch size by model configuration
-    int nBatchSize{0};                  // batch size by runtime input data
-    int nBeamWidth{0};                  //
-    int nMaxSeqLen{0};                  //
-    int nVocabSize{0};                  // vocab_size_padded
+    bool bReturnNormedScore{false};         // return `normedScore` or `cumLogProbs`, always be `false` now
+    size_t nMaxBatchSize{0};                // buildtime max batch size
+    size_t nBatchSize{0};                   // runtime batch size
+    size_t nBeamWidth{0};                   //
+    size_t nMaxSeqLen{0};                   //
+    size_t nVocabSize{0};                   // vocab_size_padded
+    size_t nVPart{0};                       // Count of vocab_size_padded divided
+    size_t nByteMaxSharedMemoryPerBlock{0};  // Device information
+    size_t nByteSharedMemoryStage1{0};       // Dynamic shared memory size of stage 1
+    size_t nByteSharedMemoryStage3{0};       // Static shared memory size of stage 3
 
     // Pointers from SamplingConfig
-    float const* diversityRates{nullptr};   // [BS]
-    float const* lengthPenalties{nullptr};  // [BS]
-    int const* earlyStoppings{nullptr};     // [BS]
+    float const* diversityRates{nullptr};           // [BS]
+    float const* lengthPenalties{nullptr};          // [BS]
+    int const* earlyStoppings{nullptr};             // [BS]
 
     // Pointers from input
-    int const* inputLengths{nullptr};   // [BS, BM]         %% context_length
-    int const* endIds{nullptr};         // [BS, BM]         %% self.end_ids
+    int const* inputLengths{nullptr};               // [BS, BM]         %% context_length
+    int const* endIds{nullptr};                     // [BS, BM]         %% self.end_ids
     runtime::SizeType32 const* batchSlots{nullptr}; // [BS]
 
     // Pointers for output
-    int* outputIds{nullptr};            // [BS, BM, MSL]    %% self.output_ids                      only used in gather_tree
-    float* logProbs{nullptr};           // [BS, BM, MSL]    %% self.log_probs                       only used in gather_tree
-    float* logProbsTiled{nullptr};      // [MSL, MBS, BM]   %% self.log_probs_tiled
-    int* sequenceLengths{nullptr};      // [BS, BM]         %% self.sequence_length_buffer
-    float* cumLogProbs{nullptr};        // [BS, BM]         %% self.cum_log_probs
+    int* outputIds{nullptr};                        // [BS, BM, MSL]    %% self.output_ids                      only used in gather_tree
+    float* logProbs{nullptr};                       // [BS, BM, MSL]    %% self.log_probs                       only used in gather_tree
+    float* logProbsTiled{nullptr};                  // [MSL, MBS, BM]   %% self.log_probs_tiled
+    int* sequenceLengths{nullptr};                  // [BS, BM]         %% self.sequence_length_buffer
+    float* cumLogProbs{nullptr};                    // [BS, BM]         %% self.cum_log_probs
 
     // Pointers of CBA
-    int* outputIdsCBA{nullptr};         // [BS, BM*2, MSL]  %% self.beam_hyps_output_ids_cba
-    float* logProbsCBA{nullptr};        // [BS, BM*2, MSL]  %% self.beam_hyps_log_probs_cba
-    int* sequenceLengthsCBA{nullptr};   // [BS, BM*2]       %% self.beam_hyps_seq_len_cba
-    float* cumLogProbsCBA{nullptr};     // [BS, BM*2]       %% self.beam_hyps_cum_log_probs_cba
-    float* normedScoresCBA{nullptr};    // [BS, BM*2]       %% self.beam_hyps_normed_scores_cba
-    int* numBeamsCBA{nullptr};          // [BS]             %% self.beam_hyps_num_beams             number of beams in CBA
-    float* minNormedScoresCBA{nullptr}; // [BS]             %% self.beam_hyps_min_normed_scores     worst score in CBA
+    int* outputIdsCBA{nullptr};                     // [BS, BM*2, MSL]  %% self.beam_hyps_output_ids_cba
+    float* logProbsCBA{nullptr};                    // [BS, BM*2, MSL]  %% self.beam_hyps_log_probs_cba
+    int* sequenceLengthsCBA{nullptr};               // [BS, BM*2]       %% self.beam_hyps_seq_len_cba
+    float* cumLogProbsCBA{nullptr};                 // [BS, BM*2]       %% self.beam_hyps_cum_log_probs_cba
+    float* normedScoresCBA{nullptr};                // [BS, BM*2]       %% self.beam_hyps_normed_scores_cba
+    int* numBeamsCBA{nullptr};                      // [BS]             %% self.beam_hyps_num_beams             number of beams in CBA
+    float* minNormedScoresCBA{nullptr};             // [BS]             %% self.beam_hyps_min_normed_scores     worst score in CBA
 
     // Pointers related to beam search process, they are initialized in those two functions:
     // [gptDecoder.cpp] GptDecoder<T>::forward or [dynamicDecodeOp.cpp] FtDynamicDecode<T>::forward
-    bool* batchDones{nullptr};          // [BS]             %% self.beam_hyps_is_done   whether a whole batch is finished
-    FinishedState* finished{nullptr};   // [BS*BM]          %% self.finished            whether and how a beam is finished
+    bool* batchDones{nullptr};                      // [BS]             %% self.beam_hyps_is_done               whether a whole batch is finished
+    FinishedState* finished{nullptr};               // [BS*BM]          %% self.finished                        whether and how a beam is finished
 
     // Pointers for backtrack of the beams, they are relocated in [dynamicDecodeLayer.cpp] DynamicDecodeLayer<T>::prepareIdsPtrs
-    int** outputIdsPtr{nullptr};        // [BS][BM, MSL]        %% self.output_ids
-    int** parentIdsPtr{nullptr};        // [BS][BM, MSL]        %% self.parent_ids
+    int** outputIdsPtr{nullptr};                    // [BS][BM, MSL]    %% self.output_ids
+    int** parentIdsPtr{nullptr};                    // [BS][BM, MSL]    %% self.parent_ids
 
     // Pointers for gather_tree(), read the unfinished beams from them and write to CBA for the final selection
-    int const* outputIdsUnfinish{nullptr};  // [BS, BM, MSL]   %% self.output_ids
-    int const* parentIdsUnfinish{nullptr};  // [BS, BM, MSL]   %% self.parent_ids
+    int const* outputIdsUnfinish{nullptr};          // [BS, BM, MSL]   %% self.output_ids
+    int const* parentIdsUnfinish{nullptr};          // [BS, BM, MSL]   %% self.parent_ids
 
     // clang-format on
 };
@@ -107,8 +112,16 @@ __device__ __forceinline__ T applyLengthPenalty(T const log_prob, int const leng
     return log_prob / static_cast<T>(powf(static_cast<float>(length), length_penalty));
 }
 
+template <typename T, bool IS_V2>
+void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream);
+
 template <typename T>
-void invokeTopkSoftMax(T const* logits, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream);
+__global__ void addCumLogProbs(T* __restrict pStage1Probs, float const* __restrict cumLogProbs,
+    FinishedState const* finished, int const* endIds, float const* diversityRates,
+    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBM);
+
+__global__ void gatherId(
+    int const* __restrict pStage1Id, int* __restrict pStage2Id, size_t const nBS, size_t const nBM, size_t const nV);
 
 } // namespace kernels
 } // namespace tensorrt_llm

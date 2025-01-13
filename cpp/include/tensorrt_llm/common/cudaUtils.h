@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
+#include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
@@ -24,7 +25,9 @@
 #include <cinttypes>
 #include <cublasLt.h>
 #include <cublas_v2.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
+#include <driver_types.h>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -161,7 +164,7 @@ inline std::optional<bool> isCudaLaunchBlocking()
     return result;
 }
 
-inline void syncAndCheck(char const* const file, int const line)
+inline bool doCheckError()
 {
     auto const cudaLaunchBlocking = isCudaLaunchBlocking();
 #ifndef NDEBUG
@@ -170,10 +173,15 @@ inline void syncAndCheck(char const* const file, int const line)
     bool const checkError = cudaLaunchBlocking.value_or(false);
 #endif
 
-    if (checkError)
+    return checkError;
+}
+
+inline void syncAndCheck(char const* const file, int const line)
+{
+    if (doCheckError())
     {
-        cudaError_t result = cudaDeviceSynchronize();
-        check(result, "cudaDeviceSynchronize", file, line);
+        cudaDeviceSynchronize();
+        check(cudaGetLastError(), "cudaGetLastError", file, line);
     }
 }
 
@@ -298,15 +306,28 @@ inline int getDeviceCount()
     return count;
 }
 
+/// @brief Identifies the memory type of the given pointer.
+template <typename T>
+cudaMemoryType getPtrCudaMemoryType(T* ptr)
+{
+    cudaPointerAttributes attributes{};
+    check_cuda_error(cudaPointerGetAttributes(&attributes, ptr));
+    return attributes.type;
+}
+
 /// Get the memory info
 /// \return The free and total amount of memory in bytes
 inline std::tuple<size_t, size_t> getDeviceMemoryInfo(bool const useUvm)
 {
     if (useUvm)
     {
-        size_t freeSysMem, totalSysMem;
+        size_t freeSysMem = 0;
+        size_t totalSysMem = 0;
 #ifndef _WIN32 // Linux
-        struct sysinfo info;
+        struct sysinfo info
+        {
+        };
+
         sysinfo(&info);
         totalSysMem = info.totalram * info.mem_unit;
         freeSysMem = info.freeram * info.mem_unit;
@@ -322,20 +343,38 @@ inline std::tuple<size_t, size_t> getDeviceMemoryInfo(bool const useUvm)
             ((double) totalSysMem / 1e9), ((double) freeSysMem / 1e9));
         return {freeSysMem, totalSysMem};
     }
-    else
-    {
-        size_t free, total;
-        check_cuda_error(cudaMemGetInfo(&free, &total));
-        TLLM_LOG_DEBUG("Using GPU memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
-            ((double) total / 1e9), ((double) free / 1e9));
-        return {free, total};
-    }
+
+    size_t free = 0;
+    size_t total = 0;
+    check_cuda_error(cudaMemGetInfo(&free, &total));
+    TLLM_LOG_DEBUG("Using GPU memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
+        ((double) total / 1e9), ((double) free / 1e9));
+    return {free, total};
+}
+
+/// @brief Gets the memory allocation granularity for the current device.
+///
+/// @return size_t The size of the smallest difference in memory size supported by the current device.
+inline size_t getAllocationGranularity()
+{
+    auto const currentDevice = getDevice();
+    ::CUmemAllocationProp prop = {};
+
+    prop.type = ::CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = ::CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = currentDevice;
+    prop.requestedHandleTypes = ::CU_MEM_HANDLE_TYPE_NONE;
+
+    // Get the minimum granularity supported for allocation with cuMemCreate()
+    size_t granularity = 0;
+    TLLM_CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    return granularity;
 }
 
 inline int getMultiProcessorCount()
 {
-    int device_id;
-    int multi_processor_count;
+    int device_id = 0;
+    int multi_processor_count = 0;
     check_cuda_error(cudaGetDevice(&device_id));
     check_cuda_error(cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, device_id));
     return multi_processor_count;
@@ -343,8 +382,8 @@ inline int getMultiProcessorCount()
 
 inline int getMaxSharedMemoryPerBlockOptin()
 {
-    int device_id;
-    int max_shared_memory_per_block;
+    int device_id = 0;
+    int max_shared_memory_per_block = 0;
     check_cuda_error(cudaGetDevice(&device_id));
     check_cuda_error(
         cudaDeviceGetAttribute(&max_shared_memory_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id));
@@ -354,8 +393,8 @@ inline int getMaxSharedMemoryPerBlockOptin()
 template <typename T1, typename T2>
 inline size_t divUp(const T1& a, const T2& n)
 {
-    size_t tmp_a = static_cast<size_t>(a);
-    size_t tmp_n = static_cast<size_t>(n);
+    auto const tmp_a = static_cast<size_t>(a);
+    auto const tmp_n = static_cast<size_t>(n);
     return (tmp_a + tmp_n - 1) / tmp_n;
 }
 
@@ -487,12 +526,21 @@ inline void print_element_(half x)
 {
     print_float_((float) x);
 }
+
 #ifdef ENABLE_BF16
 inline void print_element_(__nv_bfloat16 x)
 {
     print_float_((float) x);
 }
 #endif
+
+#ifdef ENABLE_FP8
+inline void print_element_(__nv_fp8_e4m3 x)
+{
+    print_float_((float) x);
+}
+#endif
+
 inline void print_element_(uint32_t ul)
 {
     printf("%7" PRIu32, ul);
@@ -563,6 +611,9 @@ template void printMatrix(float const* ptr, int m, int k, int stride, bool is_de
 template void printMatrix(half const* ptr, int m, int k, int stride, bool is_device_ptr);
 #ifdef ENABLE_BF16
 template void printMatrix(__nv_bfloat16 const* ptr, int m, int k, int stride, bool is_device_ptr);
+#endif
+#ifdef ENABLE_FP8
+template void printMatrix(__nv_fp8_e4m3 const* ptr, int m, int k, int stride, bool is_device_ptr);
 #endif
 template void printMatrix(uint32_t const* ptr, int m, int k, int stride, bool is_device_ptr);
 template void printMatrix(uint64_t const* ptr, int m, int k, int stride, bool is_device_ptr);

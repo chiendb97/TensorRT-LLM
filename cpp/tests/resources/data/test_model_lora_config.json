@@ -43,7 +43,6 @@
         },
         "use_parallel_embedding": true,
         "embedding_sharding_dim": 0,
-        "share_embedding_table": false,
         "head_size": 128,
         "qk_layernorm": false,
         "inner_layernorm": false,
@@ -59,10 +58,10 @@
         "max_num_tokens": 2048,
         "opt_num_tokens": null,
         "max_prompt_embedding_table_size": 0,
+        "kv_cache_type": "PAGED",
         "gather_context_logits": false,
         "gather_generation_logits": false,
         "strongly_typed": true,
-        "builder_opt": null,
         "profiling_verbosity": "layer_names_only",
         "enable_debug_output": false,
         "max_draft_len": 0,
@@ -137,7 +136,6 @@
             "layernorm_quantization_plugin": null,
             "rmsnorm_quantization_plugin": null,
             "nccl_plugin": null,
-            "lookup_plugin": null,
             "lora_plugin": "auto",
             "weight_only_groupwise_quant_matmul_plugin": null,
             "weight_only_quant_matmul_plugin": null,
@@ -159,7 +157,6 @@
             "streamingllm": false
         },
         "use_strip_plan": false,
-        "max_encoder_input_len": 1024,
-        "use_fused_mlp": false
+        "max_encoder_input_len": 1024
     }
 }

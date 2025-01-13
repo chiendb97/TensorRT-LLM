@@ -5,7 +5,6 @@ from cuda import cudart
 from mpi4py.futures import MPIPoolExecutor
 from transformers import AutoTokenizer
 
-import tensorrt_llm
 from tensorrt_llm import BuildConfig, Mapping, build, mpi_barrier
 from tensorrt_llm.executor import GenerationExecutor, SamplingParams
 from tensorrt_llm.models import LLaMAForCausalLM
@@ -20,7 +19,7 @@ def dataset():
 
 
 def build_and_run_llama(hf_model_dir, engine_dir, tp_size, rank):
-    tensorrt_llm.logger.set_level('verbose')
+    #tensorrt_llm.logger.set_level('verbose')
     status, = cudart.cudaSetDevice(rank)
     assert status == cudart.cudaError_t.cudaSuccess, f"cuda set device to {rank} errored: {status}"
 
@@ -28,7 +27,6 @@ def build_and_run_llama(hf_model_dir, engine_dir, tp_size, rank):
     build_config = BuildConfig(max_input_len=256,
                                max_seq_len=512,
                                max_batch_size=8)
-    build_config.builder_opt = 0  # fast build for demo, pls avoid using this in production, since inference might be slower
     build_config.plugin_config.gemm_plugin = 'auto'  # for fast build, tune inference perf based on your needs
     mapping = Mapping(world_size=tp_size, rank=rank, tp_size=tp_size)
     llama = LLaMAForCausalLM.from_hugging_face(hf_model_dir, mapping=mapping)
@@ -38,7 +36,7 @@ def build_and_run_llama(hf_model_dir, engine_dir, tp_size, rank):
 
     ## Generation
     tokenizer = AutoTokenizer.from_pretrained(hf_model_dir)
-    sampling_params = SamplingParams(max_new_tokens=20)
+    sampling_params = SamplingParams(max_tokens=20)
 
     with GenerationExecutor.create(engine_dir) as executor:
         if rank == 0:

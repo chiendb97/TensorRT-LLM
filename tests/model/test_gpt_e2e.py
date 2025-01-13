@@ -62,14 +62,12 @@ def build_engine(checkpoint_dir: str, engine_dir: str, *args):
         '--max_input_len=40',
         '--max_seq_len=60',
         '--max_beam_width=2',
-        '--builder_opt=0',
     ]
     legacy_args = [
         "--gpt_attention_plugin=disable",
         "--context_fmha=disable",
         "--paged_kv_cache=disable",
         "--remove_input_padding=disable",
-        "--enable_xqa=disable",
     ]
     build_cmd = build_cmd + legacy_args + list(args)
     run_command(build_cmd)

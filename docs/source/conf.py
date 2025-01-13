@@ -11,7 +11,7 @@ import sys
 
 import pygit2
 
-sys.path.insert(0, os.path.abspath('../..'))
+sys.path.insert(0, os.path.abspath('.'))
 
 project = 'tensorrt_llm'
 copyright = '2024, NVidia'
@@ -33,6 +33,9 @@ extensions = [
     'myst_parser',  # for markdown support
     "breathe",
     'sphinx.ext.todo',
+    'sphinxarg.ext',
+    'sphinx_click',
+    'sphinx_copybutton'
 ]
 
 myst_url_schemes = {
@@ -44,7 +47,16 @@ myst_url_schemes = {
     "https://github.com/NVIDIA/TensorRT-LLM/tree/" + branch_name + "/{{path}}",
 }
 
+myst_heading_anchors = 4
+
+myst_enable_extensions = [
+    "deflist",
+]
+
 autosummary_generate = True
+copybutton_exclude = '.linenos, .gp, .go'
+copybutton_prompt_text = ">>> |$ |# "
+copybutton_line_continuation_character = "\\"
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
@@ -69,6 +81,13 @@ CPP_INCLUDE_DIR = os.path.join(SCRIPT_DIR, '../../cpp/include/tensorrt_llm')
 CPP_GEN_DIR = os.path.join(SCRIPT_DIR, '_cpp_gen')
 print('CPP_INCLUDE_DIR', CPP_INCLUDE_DIR)
 print('CPP_GEN_DIR', CPP_GEN_DIR)
+
+
+def setup(app):
+    from helper import generate_examples, generate_llmapi
+
+    generate_examples()
+    generate_llmapi()
 
 
 def gen_cpp_doc(ofile_name: str, header_dir: str, summary: str):

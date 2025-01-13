@@ -22,10 +22,8 @@
       - [Run 7B inference under SmoothQuant for jax checkpoint](#run-7b-inference-under-smoothquant-for-jax-checkpoint)
       - [Run inference under weight only for keras checkpoint](#run-inference-under-weight-only-for-keras-checkpoint)
       - [Run inference under INT8 KV caches for keras checkpoint](#run-inference-under-int8-kv-caches-for-keras-checkpoint)
-    - [Run Gemma 9B](#run-gemma-2)
-      - [Run inference under bfloat16 for HF checkpoint](#run-inference-under-bfloat16-for-hf-checkpoint)
-    - [Run Gemma 27B](#run-gemma-2)
-      - [Run inference under bfloat16 for HF checkpoint](#run-inference-under-bfloat16-for-hf-checkpoint)
+    - [Run Gemma 2](#run-gemma-2)
+      - [Run inference under bfloat16 for torch checkpoint](#run-inference-under-bfloat16-for-torch-checkpoint-1)
     - [Run Modelopt Quantization](#run-modelopt-quantization)
       - [Requirements](#requirements)
       - [Quantize Checkpoints](#quantize-checkpoints)
@@ -33,7 +31,7 @@
       - [Accuracy Results on MMLU](#accuracy-results-on-mmlu)
 
 ## Support Matrix
-  * FP32/FP16/BF16/INT8 Weight-Only/INT4 Weight-Only/SmoothQuant/FP8
+  * FP32/FP16/BF16/INT8 Weight-Only/INT4 AWQ/SmoothQuant/FP8
     * For SmoothQuant, TRT-LLM only supports FP16 higher precision now.
   * checkpoint type: Jax, Torch, Keras, Huggingface (HF)
   * STRONGLY TYPED
@@ -74,7 +72,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 ```
 
@@ -265,8 +262,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --enable_xqa enable \
-             --lookup_plugin float16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -289,6 +284,8 @@ python3 ../summarize.py --test_trt_llm \
 
 Available precisions: `int8` and `int4`
 
+Note that `int4-weight-only` might not be able to keep the accuracies on all models. If users want to use int4 to run inference, we recommend using `int4_awq`.
+
 * `int8`
 
 ```bash
@@ -310,8 +307,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
                  --max_batch_size 32 \
                  --max_input_len 3000 \
                  --max_seq_len 3100 \
-                 --enable_xqa enable \
-                 --lookup_plugin bfloat16 \
                  --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -328,47 +323,6 @@ python3 ../summarize.py --test_trt_llm \
 [02/08/2024-04:44:54] [TRT-LLM] [I]   rouge2 : 7.240543314565931
 [02/08/2024-04:44:54] [TRT-LLM] [I]   rougeL : 17.857921729984078
 [02/08/2024-04:44:54] [TRT-LLM] [I]   rougeLsum : 21.214162155642896
-```
-
-* `int4`
-
-```bash
-git clone git@hf.co:google/gemma-2b-it-flax
-CKPT_PATH=gemma-2b-it-flax/2b-it/
-UNIFIED_CKPT_PATH=/tmp/checkpoints/tmp_2b_it_tensorrt_llm/w4_a16/tp1/
-ENGINE_PATH=/tmp/gemma/2B/w4_a16/1-gpu/
-VOCAB_FILE_PATH=gemma-2b-it-flax/tokenizer.model
-
-python3 ./convert_checkpoint.py \
-    --ckpt-type jax \
-    --model-dir ${CKPT_PATH} \
-    --use-weight-only-with-precision int4 \
-    --dtype bfloat16 \
-    --output-model-dir ${UNIFIED_CKPT_PATH}
-
-trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-                 --gemm_plugin auto \
-                 --max_batch_size 32 \
-                 --max_input_len 3000 \
-                 --max_seq_len 3100 \
-                 --enable_xqa enable \
-                 --lookup_plugin bfloat16 \
-                 --output_dir ${ENGINE_PATH}
-
-python3 ../summarize.py --test_trt_llm \
-                      --vocab_file ${VOCAB_FILE_PATH} \
-                      --engine_dir ${ENGINE_PATH} \
-                      --batch_size 8 \
-                      --max_ite 5
-
-[02/08/2024-04:48:06] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.1938045024871826 sec)
-[02/08/2024-04:48:06] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1462)
-[02/08/2024-04:48:06] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 457.7612683749003)
-[02/08/2024-04:48:06] [TRT-LLM] [I] TensorRT-LLM beam 0 result
-[02/08/2024-04:48:06] [TRT-LLM] [I]   rouge1 : 25.19118129834017
-[02/08/2024-04:48:06] [TRT-LLM] [I]   rouge2 : 6.284558232487986
-[02/08/2024-04:48:06] [TRT-LLM] [I]   rougeL : 18.133244708843726
-[02/08/2024-04:48:06] [TRT-LLM] [I]   rougeLsum : 20.562024727650662
 ```
 
 #### Run inference under INT8 KV caches for jax checkpoint
@@ -394,8 +348,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 32 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --enable_xqa enable \
-             --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -440,7 +392,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -484,7 +435,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -525,8 +475,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --enable_xqa enable \
-             --lookup_plugin float16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -549,6 +497,8 @@ python3 ../summarize.py --test_trt_llm \
 #### Run inference under weight only for keras checkpoint
 
 Available precisions: `int8` and `int4`
+
+Note that `int4-weight-only` might not be able to keep the accuracies on all models. If users want to use int4 to run inference, we recommend using `int4_awq`.
 
 * `int8`
 
@@ -575,8 +525,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
                  --max_batch_size 32 \
                  --max_input_len 3000 \
                  --max_seq_len 3100 \
-                 --enable_xqa enable \
-                 --lookup_plugin bfloat16 \
                  --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -593,46 +541,6 @@ python3 ../summarize.py --test_trt_llm \
 [02/08/2024-07:38:16] [TRT-LLM] [I]   rouge2 : 5.73302850102211
 [02/08/2024-07:38:16] [TRT-LLM] [I]   rougeL : 16.001683776127507
 [02/08/2024-07:38:16] [TRT-LLM] [I]   rougeLsum : 18.36957526315223
-```
-
-* `int4`
-
-```bash
-CKPT_PATH=/tmp/models/gemma_nv/checkpoints/tmp_7b_it
-UNIFIED_CKPT_PATH=/tmp/checkpoints/tmp_7b_it_tensorrt_llm/w4_a16/tp1/
-ENGINE_PATH=/tmp/gemma/7B/w4_a16/1-gpu/
-VOCAB_FILE_PATH=/tmp/models/gemma_nv/checkpoints/tmp_vocab.model
-
-python3 ./convert_checkpoint.py \
-    --ckpt-type jax \
-    --model-dir ${CKPT_PATH} \
-    --use-weight-only-with-precision int4 \
-    --dtype bfloat16 \
-    --output-model-dir ${UNIFIED_CKPT_PATH}
-
-trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-                 --gemm_plugin auto \
-                 --max_batch_size 32 \
-                 --max_input_len 3000 \
-                 --max_seq_len 3100 \
-                 --enable_xqa enable \
-                 --lookup_plugin bfloat16 \
-                 --output_dir ${ENGINE_PATH}
-
-python3 ../summarize.py --test_trt_llm \
-                      --vocab_file ${VOCAB_FILE_PATH} \
-                      --engine_dir ${ENGINE_PATH} \
-                      --batch_size 8 \
-                      --max_ite 5
-
-[02/08/2024-07:43:32] [TRT-LLM] [I] TensorRT-LLM (total latency: 7.282559156417847 sec)
-[02/08/2024-07:43:32] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2253)
-[02/08/2024-07:43:32] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 309.3692686333369)
-[02/08/2024-07:43:32] [TRT-LLM] [I] TensorRT-LLM beam 0 result
-[02/08/2024-07:43:32] [TRT-LLM] [I]   rouge1 : 27.22556858171486
-[02/08/2024-07:43:32] [TRT-LLM] [I]   rouge2 : 6.889046653923549
-[02/08/2024-07:43:32] [TRT-LLM] [I]   rougeL : 19.07040336076859
-[02/08/2024-07:43:32] [TRT-LLM] [I]   rougeLsum : 22.840545705675858
 ```
 
 #### Run inference under INT8 KV caches for keras checkpoint
@@ -657,8 +565,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 32 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --enable_xqa enable \
-             --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -705,7 +611,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -749,7 +654,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --lookup_plugin float16 \
              --output_dir ${ENGINE_PATH}
 ```
 
@@ -761,8 +665,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --enable_xqa enable \
-             --lookup_plugin float16 \
              --output_dir ${ENGINE_PATH}
 ```
 

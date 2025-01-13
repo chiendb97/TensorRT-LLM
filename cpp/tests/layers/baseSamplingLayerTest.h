@@ -19,6 +19,7 @@
 
 #include <memory>
 
+#include "tensorrt_llm/layers/externalDraftTokensLayer.h"
 #include "tensorrt_llm/layers/samplingLayer.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
@@ -85,7 +86,11 @@ struct TestSamplingParams
     std::vector<float> decay;
     std::vector<float> minTopP;
     std::vector<int32_t> topPResetIds;
+    int32_t batchSize = 6;
     bool useBias = false;
+    bool isExternalDraftTokensLayerTest = false;
+    bool useDraftLogits = false;
+    bool isAirTopPExternalDraftTokensLayer = false;
 };
 
 template <typename T>
@@ -95,23 +100,25 @@ protected:
     using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
     using BufferPtr = tensorrt_llm::runtime::IBuffer::SharedPtr;
 
+    static int32_t constexpr kDoubleBatchIdx = 2;
+
     int32_t seed = 0;
-    static uint64_t const mMaxSeed = 32;
-    int32_t const mBatchSize = 6;
-    int32_t const mMaxBatchSize = 2 * mBatchSize;
+    int32_t mBatchSize = -1; // setup by runTest
+    static int32_t constexpr mBatchSizeBadPad = 512;
+    static uint64_t constexpr mMaxSeed = 32;
     int32_t const mBeamWidth = 1;
-    int32_t const mBatchBeam = mBatchSize * mBeamWidth;
     int32_t const mVocabSize = 8;
     int32_t const mVocabSizePadded = mVocabSize;
 
     int32_t const mMaxInputLen = 0; // has no effect.
     int32_t const mMaxOutputLen = 4;
     int32_t const mMaxSeqLen = mMaxInputLen + mMaxOutputLen;
+    int32_t const mMaxTokensPerEngineStep = mMaxOutputLen;
+
     int32_t mEndId = mVocabSize;
 
     bool mComputeProbs = false;
 
-    TensorPtr mLogitsDevice;
     TensorPtr mContextLengthDevice;
     TensorPtr mSeqLengthsDevice;
     TensorPtr mFinishedDevice;
@@ -128,19 +135,29 @@ protected:
 
     TensorPtr mCurandStatesDevice;
     TensorPtr mPenaltyWorkspaceDevice;
-    BufferPtr mSamplingWorkspaceDevice;
 
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
     std::shared_ptr<tensorrt_llm::layers::BaseLayer> mSamplingLayer;
+    std::shared_ptr<tensorrt_llm::runtime::DecodingLayerWorkspace> mDecodingWorkspace;
 
     std::vector<T> mTestLogitsInit;
+
+    int32_t maxBatchSize() const
+    {
+        return kDoubleBatchIdx * mBatchSize;
+    }
+
+    int32_t batchBeam() const
+    {
+        return mBatchSize * mBeamWidth;
+    }
 
     void setup(uint64_t seed, TestSamplingParams const& params);
 
     virtual void initLayer(TestSamplingParams const& params) = 0;
 
-    std::shared_ptr<tensorrt_llm::layers::SamplingInputs> createInputTensors(int32_t step);
+    virtual std::shared_ptr<tensorrt_llm::layers::DecodingInputs> createInputTensors(int32_t step);
 
     std::shared_ptr<tensorrt_llm::layers::BaseDecodingOutputs> createOutputTensors();
 

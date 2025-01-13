@@ -62,7 +62,16 @@ struct KVBlockArrayForContextFMHA
     // Pointer to block offsets.
     DataType* data;
 
-    KVBlockArrayForContextFMHA() = default;
+    KVBlockArrayForContextFMHA()
+        : mMaxSeqs{0}
+        , mMaxBlocksPerSeq{0}
+        , mTokensPerBlock{0}
+        , mTokensPerBlockLog2{0}
+        , mBytesPerBlock{0}
+        , mPrimaryPoolPtr{nullptr}
+        , data{nullptr}
+    {
+    }
 
     KVBlockArrayForContextFMHA(int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock,
         int32_t bytesPerToken, void* primaryPoolPtr, DataType* data)
@@ -103,10 +112,19 @@ struct KVBlockArray : public KVBlockArrayForContextFMHA
     // Enable one more block to save the kv tokens
     bool mEnableOneMoreBlock;
 
-    KVBlockArray() = default;
+    KVBlockArray()
+        : mSecondaryPoolPtr(nullptr)
+        , mMaxAttentionWindow{0}
+        , mSinkTokens{0}
+        , mCyclicCacheLen{0}
+        , mBubbleLen{0}
+        , mEnableOneMoreBlock{false}
+    {
+    }
 
     KVBlockArray(int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock, int32_t bytesPerToken,
-        int32_t maxAttentionWindow, int32_t sinkTokenLen, void* primaryPoolPtr, void* secondaryPoolPtr, DataType* data)
+        int32_t maxAttentionWindow, int32_t maxAttentionWindowAllLayer, int32_t sinkTokenLen, bool canUseOneMoreBlock,
+        void* primaryPoolPtr, void* secondaryPoolPtr, DataType* data)
         : KVBlockArrayForContextFMHA(batchSize, maxBlocksPerSeq, tokensPerBlock, bytesPerToken, primaryPoolPtr, data)
         , mSecondaryPoolPtr{secondaryPoolPtr}
         , mMaxAttentionWindow(maxAttentionWindow)
@@ -114,7 +132,8 @@ struct KVBlockArray : public KVBlockArrayForContextFMHA
     {
         auto sinkTokensInLastBlock = mSinkTokens % mTokensPerBlock;
         mBubbleLen = sinkTokensInLastBlock == 0 ? 0 : mTokensPerBlock - sinkTokensInLastBlock;
-        mEnableOneMoreBlock = (maxBlocksPerSeq - 1) * tokensPerBlock >= mMaxAttentionWindow + mBubbleLen;
+        mEnableOneMoreBlock = (maxBlocksPerSeq - 1) * tokensPerBlock >= maxAttentionWindowAllLayer + mBubbleLen;
+        mEnableOneMoreBlock &= canUseOneMoreBlock;
         mCyclicCacheLen = (mEnableOneMoreBlock) ? mMaxAttentionWindow + mTokensPerBlock - mSinkTokens
                                                 : mMaxAttentionWindow - mSinkTokens;
     }
@@ -226,7 +245,19 @@ struct KVLinearBuffer
     // NOTE: we have remapped K layout as the same of V.
     DataType* data;
 
-    KVLinearBuffer() = default;
+    KVLinearBuffer()
+        : mMaxSeqs{0}
+        , mMaxSeqLen{0}
+        , mBytesPerSeq{0}
+        , mMaxAttentionWindow{0}
+        , mSinkTokens{0}
+        , mCyclicCacheLen{0}
+        , mBubbleLen{0}
+        , mValidRowsPerSeq{0}
+        , mEnableOneMoreBlock{false}
+        , data{nullptr}
+    {
+    }
 
     KVLinearBuffer(int32_t batchSize, int32_t tokensPerBlock, int32_t sizePerToken, int32_t maxAttentionWindow,
         int32_t sinkTokenLen, bool onlyKorV, DataType* data)

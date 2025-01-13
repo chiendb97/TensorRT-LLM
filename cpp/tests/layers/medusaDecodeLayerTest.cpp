@@ -185,6 +185,9 @@ void MedusaDecodingLayerTest<T>::allocateBuffers()
             mBufferManager->copy(*logitsHeadHostView, *logitsHeadBatchDeviceView);
         }
     }
+
+    mDecodingWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(
+        mBufferManager, decodingDomain, TRTDataType<T>::value, mMedusaDecodingLayer->getWorkspaceSize());
 }
 
 template <typename T>
@@ -252,8 +255,8 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
     setupParams->runtimeTopK = std::make_optional<std::vector<SizeType32>>(params.runtimeTopK);
     setupParams->runtimeHeadsTopK = std::make_optional<std::vector<std::vector<SizeType32>>>(params.runtimeHeadsTopK);
     setupParams->randomSeed = {{0}};
-
-    mMedusaDecodingLayer->setup(mBatchSize, 1, mBatchSlots, setupParams);
+    mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
+    mMedusaDecodingLayer->setup(mBatchSize, 1, mBatchSlots, setupParams, mDecodingWorkspace);
 
     mStream->synchronize();
 }
@@ -261,15 +264,13 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
 template <typename T>
 std::shared_ptr<MedusaDecodingInputs> MedusaDecodingLayerTest<T>::createInputTensors()
 {
-    auto forwardParams = std::make_shared<MedusaDecodingInputs>(mEndIdsDevice, mBatchSize);
+    auto forwardParams = std::make_shared<MedusaDecodingInputs>(mEndIdsDevice, mBatchSlots, mBatchSize);
 
     auto batchSlots = BufferRange<SizeType32>(*mBatchSlots);
 
     forwardParams->logits = mTargetLogitsDevice;
 
     forwardParams->finished = mFinishedDevice;
-
-    forwardParams->batchSlots = mBatchSlots;
 
     forwardParams->paths = mPathsDevice;
 
@@ -396,7 +397,8 @@ void MedusaDecodingLayerTest<T>::runTest(std::vector<std::vector<std::set<TokenI
     auto inputTensors = createInputTensors();
     auto outputTensors = createOutputTensors();
 
-    mMedusaDecodingLayer->forwardAsync(outputTensors, inputTensors);
+    mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
+    mMedusaDecodingLayer->forwardAsync(outputTensors, inputTensors, mDecodingWorkspace);
 
     mStream->synchronize();
 

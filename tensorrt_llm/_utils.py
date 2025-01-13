@@ -19,14 +19,17 @@ import json
 import math
 import struct
 import weakref
+from contextlib import contextmanager
 from dataclasses import asdict
 from enum import EnumMeta
 from functools import partial
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 from packaging import version
 
+from tensorrt_llm.bindings import DataType, GptJsonConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
 # isort: off
@@ -160,6 +163,24 @@ def str_dtype_to_torch(dtype):
     return ret
 
 
+_str_to_binding_dtype_dict = dict(
+    bfloat16=DataType.BF16,
+    float16=DataType.HALF,
+    float32=DataType.FLOAT,
+    int64=DataType.INT64,
+    int32=DataType.INT32,
+    int8=DataType.INT8,
+    bool=DataType.BOOL,
+    fp8=DataType.FP8,
+)
+
+
+def str_dtype_to_binding(dtype):
+    ret = _str_to_binding_dtype_dict.get(dtype)
+    assert ret is not None, f'Unsupported dtype: {dtype}'
+    return ret
+
+
 _torch_dtype_to_str_dict = {v: k for k, v in _str_to_torch_dtype_dict.items()}
 
 
@@ -258,6 +279,29 @@ def torch_dtype_to_np(dtype):
     return ret
 
 
+_np_to_torch_dtype_dict = {
+    np.bool_: torch.bool,
+    np.uint8: torch.uint8,
+    np.int8: torch.int8,
+    np.int16: torch.int16,
+    np.int32: torch.int32,
+    np.int64: torch.int64,
+    np.float16: torch.float16,
+    np_bfloat16: torch.bfloat16,
+    np_float8: torch.float8_e4m3fn,
+    np.float32: torch.float32,
+    np.float64: torch.float64,
+    np.complex64: torch.complex64,
+    np.complex128: torch.complex128,
+}
+
+
+def np_dtype_to_torch(dtype):
+    ret = _np_to_torch_dtype_dict.get(dtype)
+    assert ret is not None, f'Unsupported dtype: {dtype}'
+    return ret
+
+
 _trt_to_torch_dtype_dict = {
     trt.float16: torch.float16,
     trt.float32: torch.float32,
@@ -302,6 +346,25 @@ _torch_to_trt_dtype_dict = {
 
 def torch_dtype_to_trt(dtype):
     ret = _torch_to_trt_dtype_dict.get(dtype)
+    assert ret is not None, f'Unsupported dtype: {dtype}'
+    return ret
+
+
+_torch_dtype_to_np_typestr_dict = {
+    torch.float16: "<f2",
+    torch.float32: "<f4",
+    torch.int64: "<i8",
+    torch.int32: "<i4",
+    torch.int8: "|i1",
+    torch.float8_e4m3fn: "<f1",
+    torch.qint8: "|u1",
+    torch.bool: "|b1",
+    torch.bfloat16: "<f2",
+}
+
+
+def torch_dtype_to_np_typestr(dtype):
+    ret = _torch_dtype_to_np_typestr_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
 
@@ -358,11 +421,12 @@ def mpi_world_size():
 
 
 def mpi_barrier():
-    mpi_comm().Barrier()
+    if ENABLE_MULTI_DEVICE:
+        mpi_comm().Barrier()
 
 
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root)
+    return mpi_comm().bcast(obj, root) if ENABLE_MULTI_DEVICE else obj
 
 
 def pad_vocab_size(vocab_size, tp_size):
@@ -509,3 +573,47 @@ class BaseEnumMeta(EnumMeta):
         except ValueError:
             return False
         return True
+
+
+def supports_inflight_batching(engine_dir):
+    config_path = Path(engine_dir) / "config.json"
+    json_config = GptJsonConfig.parse_file(config_path)
+    model_config = json_config.model_config
+    return model_config.supports_inflight_batching
+
+
+class QuantModeWrapper:
+
+    def __init__(self, objs):
+        self.objs = objs
+
+    def __getattr__(self, name):
+
+        def method_wrapper(*args, **kwargs):
+            result = False
+            for obj in self.objs:
+                attr = getattr(obj, name)
+                if callable(attr):
+                    result = result | attr(*args, **kwargs)
+            return result
+
+        return method_wrapper
+
+    def __repr__(self):
+        return f"QuantModeWrapper: ({self.objs})"
+
+    def __str__(self):
+        obj_strs = [str(obj) for obj in self.objs]
+        return f"[{', '.join(obj_strs)}]"
+
+    def __getitem__(self, index):
+        return self.objs[index]
+
+
+@contextmanager
+def nvtx_range(msg):
+    torch.cuda.nvtx.range_push(msg)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()

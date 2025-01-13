@@ -15,15 +15,19 @@
 # limitations under the License.
 
 import argparse
+import os
 import platform
 import shutil
 import sys
 import typing
 from pathlib import Path
+from typing import Optional
 
 from build_engines_utils import init_model_spec_module, run_command, wincopy
 
 init_model_spec_module()
+import shutil
+
 import model_spec
 
 import tensorrt_llm.bindings as _tb
@@ -35,6 +39,10 @@ bCopyModel = True  # "False" to remove redundant copy of model from model_cache
 
 
 def convert_ckpt(model_dir: str, output_dir: str, world_size: int):
+    if os.path.exists(output_dir):
+        print('Skip ckpt convert - output already exists')
+        return
+
     convert_cmd = [
         sys.executable,
         str(chatglm_example_dir / "convert_checkpoint.py"), "--dtype=float16",
@@ -48,6 +56,10 @@ def build_engine(ckpt_dir: str,
                  engine_dir: str,
                  is_ifb: bool = False,
                  is_chatglm_6b_or_glm_10b: bool = False):
+    if os.path.exists(engine_dir):
+        print('Skip engine build - output already exists')
+        return
+
     build_cmd = [
         "trtllm-build",
         f"--checkpoint_dir={ckpt_dir}",
@@ -59,7 +71,6 @@ def build_engine(ckpt_dir: str,
         "--max_seq_len=384",
         "--gpt_attention_plugin=float16",
         "--gemm_plugin=float16",
-        "--builder_opt=0",
     ]
     if is_ifb:
         build_cmd.extend([
@@ -82,7 +93,8 @@ def build_engine(ckpt_dir: str,
 
 
 def build_engines(model_cache: typing.Optional[str] = None,
-                  world_size: int = 1):
+                  world_size: int = 1,
+                  clean: Optional[bool] = False):
 
     for model_name in ["chatglm-6b", "chatglm2-6b", "chatglm3-6b", "glm-10b"]:
         is_chatglm_6b_or_glm_10b = model_name in ["chatglm-6b", "glm-10b"]
@@ -97,7 +109,7 @@ def build_engines(model_cache: typing.Optional[str] = None,
                             isdir=True,
                             cwd=model_dir)
                 else:
-                    run_command(["rsync", "-av",
+                    run_command(["rsync", "-rlptD",
                                  str(model_cache_dir), "."],
                                 cwd=model_dir)
             else:
@@ -119,7 +131,10 @@ def build_engines(model_cache: typing.Optional[str] = None,
         # Build engines
         print(f"Building {model_name}")
         ckpt_dir = Path(model_dir) / "c-model" / model_name
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        if clean:
+            print('clean up ckpt folder ', ckpt_dir)
+            if ckpt_dir.is_dir():
+                shutil.rmtree(ckpt_dir, ignore_errors=True)
 
         # Fix HF error in ChatGLM-6B, hope to remove this in the future
         if model_name == "chatglm-6b":
@@ -132,22 +147,28 @@ def build_engines(model_cache: typing.Optional[str] = None,
 
         model_spec_obj = model_spec.ModelSpec('input_tokens.npy',
                                               _tb.DataType.HALF)
-        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
         model_spec_obj.use_gpt_plugin()
         engine_dir = Path(
             model_dir
         ) / "rt_engine" / model_name / model_spec_obj.get_model_path(
-        ) / "tp1-pp1-gpu"
-        engine_dir.mkdir(parents=True, exist_ok=True)
+        ) / "tp1-pp1-cp1-gpu"
+        if clean:
+            print('clean up engine folder ', engine_dir)
+            if engine_dir.is_dir():
+                shutil.rmtree(engine_dir, ignore_errors=True)
         build_engine(ckpt_dir, engine_dir, False, is_chatglm_6b_or_glm_10b)
 
         model_spec_obj.use_packed_input()
-        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         engine_dir = Path(
             model_dir
         ) / "rt_engine" / model_name / model_spec_obj.get_model_path(
-        ) / "tp1-pp1-gpu"
-        engine_dir.mkdir(parents=True, exist_ok=True)
+        ) / "tp1-pp1-cp1-gpu"
+        if clean:
+            print('clean up engine folder ', engine_dir)
+            if engine_dir.is_dir():
+                shutil.rmtree(engine_dir, ignore_errors=True)
         build_engine(ckpt_dir, engine_dir, True, is_chatglm_6b_or_glm_10b)
 
     print("Done")
@@ -163,5 +184,10 @@ if __name__ == "__main__":
                         type=int,
                         default=1,
                         help='world size, only support tensor parallelism now')
+
+    parser.add_argument('--clean',
+                        action='store_true',
+                        default=False,
+                        help='Clean target folders before building engines')
 
     build_engines(**vars(parser.parse_args()))

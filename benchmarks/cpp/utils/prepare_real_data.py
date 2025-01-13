@@ -171,9 +171,10 @@ def load_dataset_from_hf(dataset_config: DatasetConfig):
 @click.pass_obj
 def dataset(root_args, **kwargs):
     """Prepare dataset from real dataset."""
-    dataset_config = DatasetConfig(
-        **{k[8:]: v
-           for k, v in kwargs.items() if k.startswith('dataset_')})
+    dataset_config = DatasetConfig(**{
+        k[8:]: v
+        for k, v in kwargs.items() if k.startswith('dataset_')
+    })
 
     input_ids = []
     input_lens = []
@@ -231,8 +232,6 @@ def dataset(root_args, **kwargs):
             }, root_args.output)
     else:
         print_dataset(
-            task_ids,
             input_ids,
             output_lens,
-            tokenizer=None,
         )

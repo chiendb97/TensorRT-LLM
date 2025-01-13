@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
@@ -87,6 +88,16 @@ void reshapeBufferVector(std::vector<ITensor::SharedPtr>& vector, nvinfer1::Dims
     {
         buffer->reshape(shape);
     }
+}
+
+void assertNoVGQA(ModelConfig const& modelConfig, WorldConfig const& worldConfig)
+{
+    auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = modelConfig.getNumKvHeadsPerLayerLocalRange(
+        worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
+    TLLM_CHECK_WITH_INFO(std::all_of(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd,
+                             [firstNumKvHeads = *numKvHeadsPerLayerBegin](SizeType32 numKvHeads)
+                             { return numKvHeads == firstNumKvHeads; }),
+        "Deprecated session API does not support multiple cache pools, use the newer executor API instead");
 }
 
 std::vector<ITensor::SharedPtr> sliceBufferVector(
@@ -206,6 +217,9 @@ void tileCpuBufferReplaceImpl(ITensor::SharedPtr& tensor, SizeType32 beamWidth)
     {
     case MemoryType::kCPU: tiledTensor = std::shared_ptr(BufferManager::cpu(shape, tensor->getDataType())); break;
     case MemoryType::kPINNED: tiledTensor = std::shared_ptr(BufferManager::pinned(shape, tensor->getDataType())); break;
+    case MemoryType::kPINNEDPOOL:
+        tiledTensor = std::shared_ptr(BufferManager::pinnedPool(shape, tensor->getDataType()));
+        break;
     default: TLLM_THROW("Tensor is not using CPU memory."); break;
     }
     auto const src = bufferCast<T>(*tensor);

@@ -44,12 +44,15 @@ namespace tensorrt_llm::runtime
 class ITensor : virtual public IBuffer
 {
 public:
+    friend class ITensorBindings;
+
     using UniquePtr = std::unique_ptr<ITensor>;
     using SharedPtr = std::shared_ptr<ITensor>;
     using UniqueConstPtr = std::unique_ptr<ITensor const>;
     using SharedConstPtr = std::shared_ptr<ITensor const>;
     using Shape = nvinfer1::Dims;
     using DimType64 = std::remove_reference_t<decltype(Shape::d[0])>;
+    using TensorMap = runtime::StringPtrMap<runtime::ITensor>;
 
     static_assert(std::is_same_v<DimType64, std::int64_t>, "This version of TRT-LLM requires TensorRT 10.0 or later.");
 
@@ -402,12 +405,12 @@ public:
         return lhs.nbDims == count && std::equal(lhs.d, lhs.d + lhs.nbDims, dims);
     }
 
-    bool shapeEquals(Shape const& other) const
+    [[nodiscard]] bool shapeEquals(Shape const& other) const
     {
         return shapeEquals(getShape(), other);
     }
 
-    bool shapeEquals(std::initializer_list<SizeType32> const& other) const
+    [[nodiscard]] bool shapeEquals(std::initializer_list<SizeType32> const& other) const
     {
         return shapeEquals(getShape(), other.begin(), other.size());
     }

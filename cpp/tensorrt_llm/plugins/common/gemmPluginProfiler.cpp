@@ -21,6 +21,8 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fused_gated_gemm/fused_gated_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/int8_gemm/int8_gemm.h"
+#include "tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.h"
+#include "tensorrt_llm/plugins/lowLatencyGemmSwigluPlugin/lowLatencyGemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
 
 namespace tensorrt_llm::plugins
@@ -150,7 +152,7 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
                 isAllocated = true;
             }
             initTmpData(m, n, k, mWorkspaceTmp, mTmpWorkspaceSizeInBytes, mStream);
-            const auto tactics = this->getTactics(m, n, k);
+            auto const tactics = this->getTactics(m, n, k);
             // Profile different tactics for particular m and insert best config to the map
             mProfileMap->insert({m, this->profileTacticsForProblem(m, n, k, tactics)});
         }
@@ -330,4 +332,9 @@ template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmC
     std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp8RowwiseGemmRunnerInterface>, GemmIdCore,
     GemmIdCoreHash>;
 
+template class GemmPluginProfiler<LowLatencyGemmPluginProfiler::Config, LowLatencyGemmRunnerPtr, GemmIdCore,
+    GemmIdCoreHash>;
+
+template class GemmPluginProfiler<LowLatencyGemmSwigluPluginProfiler::Config, LowLatencyGemmSwigluRunnerPtr, GemmIdCore,
+    GemmIdCoreHash>;
 } // namespace tensorrt_llm::plugins

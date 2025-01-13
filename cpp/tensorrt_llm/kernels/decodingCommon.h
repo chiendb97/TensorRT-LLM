@@ -16,12 +16,12 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/executor/types.h"
 #include <cstdint>
 #include <curand_kernel.h>
 
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 
 class FinishedState
@@ -62,7 +62,7 @@ public:
         mState |= kFinishedEos;
     }
 
-    __host__ __device__ bool constexpr isFinishedEOS()
+    __host__ __device__ bool constexpr isFinishedEOS() const
     {
         return anyBitSet(kFinishedEos);
     }
@@ -72,7 +72,7 @@ public:
         mState |= kFinishedStopWords;
     }
 
-    __host__ __device__ bool constexpr isFinishedStopWords()
+    __host__ __device__ bool constexpr isFinishedStopWords() const
     {
         return anyBitSet(kFinishedStopWords);
     }
@@ -82,7 +82,7 @@ public:
         mState |= kFinishedMaxLength;
     }
 
-    __host__ __device__ bool constexpr isFinishedMaxLength()
+    __host__ __device__ bool constexpr isFinishedMaxLength() const
     {
         return anyBitSet(kFinishedMaxLength);
     }
@@ -107,7 +107,29 @@ public:
         return anyBitSet(kSkipDecoding);
     }
 
+    [[nodiscard]] constexpr executor::FinishReason toFinishReason() const
+    {
+        if (isFinishedEOS())
+        {
+            return executor::FinishReason::kEND_ID;
+        }
+        if (isFinishedStopWords())
+        {
+            return executor::FinishReason::kSTOP_WORDS;
+        }
+        if (isFinishedMaxLength())
+        {
+            return executor::FinishReason::kLENGTH;
+        }
+        return executor::FinishReason::kNOT_FINISHED;
+    }
+
     using UnderlyingType = uint8_t;
+
+    [[nodiscard]] constexpr UnderlyingType toUnderlying() const noexcept
+    {
+        return mState;
+    }
 
 private:
     // The default state is interpreted as not finished.
@@ -143,6 +165,31 @@ static_assert(FinishedState::finishedEOS().isFinishedEOS());
 static_assert(FinishedState::finishedStopWords().isFinishedStopWords());
 static_assert(FinishedState::finishedMaxLength().isFinishedMaxLength());
 
+template <typename T>
+struct ScatterDecodingParamEntry
+{
+    // Contiguous values to scatter
+    T const* mVector;
+    // Value used to scatter if mVector is nullptr
+    T mScalar;
+    // Target base address to scatter
+    T* mTarget;
+
+    ScatterDecodingParamEntry() = default;
+
+    ScatterDecodingParamEntry(T const* vector, T scalar, T* target)
+        : mVector(vector)
+        , mScalar(scalar)
+        , mTarget(target)
+    {
+    }
+
+    ScatterDecodingParamEntry(void const* vector, T scalar, T* target)
+        : ScatterDecodingParamEntry(static_cast<T const*>(vector), scalar, target)
+    {
+    }
+};
+
 //! \brief Initialize batchSize curand states with given seed.
 //!
 //! \param state output buffer [maxBatchSize]. Curand states to be initialized
@@ -151,7 +198,7 @@ static_assert(FinishedState::finishedMaxLength().isFinishedMaxLength());
 //! \param randomSeed seed to initialize states
 //! \param stream stream
 void invokeCurandInitialize(
-    curandState_t* state, int const* batchSlots, const size_t batchSize, uint64_t randomSeed, cudaStream_t stream);
+    curandState_t* state, int const* batchSlots, size_t const batchSize, uint64_t randomSeed, cudaStream_t stream);
 
 //! \brief Initialize batchSize curand states with given seed per request.
 //!
@@ -160,46 +207,101 @@ void invokeCurandInitialize(
 //! \param batchSize number of states to initialize
 //! \param randomSeeds input buffer [maxBatchSize] with seeds
 //! \param stream stream
-void invokeCurandBatchInitialize(curandState_t* states, int const* batchSlots, const size_t batchSize,
+void invokeCurandBatchInitialize(curandState_t* states, int const* batchSlots, size_t const batchSize,
     uint64_t const* randomSeeds, cudaStream_t stream);
 
-//! \brief Applies mask, adds bias to logits and computes softmax values.
+template <typename T>
+struct BiasSoftmaxParams
+{
+    //! input/output buffer [maxBatchSize, vocabSize]. Logits to be modified by mask and bias.
+    //! If nullptr, logitsPtrs has to be provided.
+    T* logits{nullptr};
+    //! input/output buffer [maxBatchSize][maxBeamWidth, vocabSize] or
+    //! [maxBatchSize, maxBeamWidth][vocabSize] if ptrsForBeams is true.
+    //! Vector of pointers to the logits.
+    //! If nullptr, logits has to be provided.
+    T** logitsPtrs{nullptr};
+    //! output buffer [maxBatchSize, vocabSize]. Probabilities of logits compute by softmax.
+    //! Can be the same pointer as logits
+    T* probs{nullptr};
+    //! output buffer [maxBatchSize], optional. Entropy of the computed probs distribution.
+    //! When specified, skipSoftMax must be false and probs must be specified.
+    float* outputEntropy{nullptr};
+    //! input buffer [vocabSize], optional. Bias to logit per token. Ignored if nullptr.
+    T const* bias{nullptr};
+    //! input buffer [batchSize], optional. Temperature per logit. Ignored if nullptr.
+    float const* temperatures{nullptr};
+    //! input buffer [maxBatchSize], optional. EOS token ids per request
+    int32_t const* endIds{nullptr};
+    //! input buffer [maxBatchSize], optional.
+    //! Flag is set to true if request has finished the generation
+    FinishedState const* finished{nullptr};
+    //! input buffer [maxBatchSize], optional. Actual width of the beam per request.
+    int32_t const* beamWidths{nullptr};
+    //! input buffer[batchSize], optional. Indices of rows of data in memory pool
+    int32_t const* batchSlots{nullptr};
+    //! current batch size
+    int32_t batchSize{0};
+    //! max batch size
+    int32_t maxBatchSize{0};
+    //! max beam width
+    int32_t maxBeamWidth{0};
+    //! unpadded vocab size
+    int32_t vocabSize{0};
+    //! padded vocab size
+    int32_t vocabSizePadded{0};
+    //! flag to skip softmax computation
+    bool skipSoftMax{false};
+    //! flag to use batchSlot as index for logits and probs
+    bool batchSlotsLogits{false};
+    //! flag to indicate the layout of logitsPtrs
+    bool ptrsForBeams{false};
+
+    void checkParams()
+    {
+        TLLM_CHECK(logits || logitsPtrs);
+        TLLM_CHECK(((outputEntropy != nullptr) && (probs != nullptr)) || (outputEntropy == nullptr));
+        TLLM_CHECK(((outputEntropy != nullptr) && !skipSoftMax) || (outputEntropy == nullptr));
+
+        if (batchSlotsLogits)
+        {
+            TLLM_CHECK(batchSlots);
+        }
+
+        if (ptrsForBeams)
+        {
+            TLLM_CHECK(logitsPtrs);
+        }
+
+        TLLM_CHECK(batchSize > 0);
+        TLLM_CHECK(maxBatchSize > 0);
+        TLLM_CHECK(batchSize <= maxBatchSize);
+        TLLM_CHECK(maxBeamWidth > 0);
+        TLLM_CHECK(vocabSize > 0);
+        TLLM_CHECK(vocabSizePadded > 0);
+        TLLM_CHECK(vocabSize <= vocabSizePadded);
+    }
+};
+
+//! \brief Applies mask, applies temperature, adds bias to logits and computes softmax values.
 //! Sets -MAX_FLT value for tokens in range [vocabSize; vocabSizePadded) to prevent them from being chosen.
 //! If request finished the generation, sets MAX_FLT to endId token and -MAX_FLT to all other tokens forcing to choose
 //! endId token. Otherwise, adds bias per token if bias pointer is not nullptr.
-//!
-//! \param logits input/output buffer [maxBatchSize, vocabSize]. Logits to be modified by mask and bias.
-//! If nullptr, logitsPtrs has to be provided.
-//! \param logitsPtrs input/output buffer [maxBatchSize][vocabSize]. Vector of pointers to the logits.
-//! If nullptr, logits has to be provided.
-//! \param probs output buffer [maxBatchSize, vocabSize]. Probabilities of logits compute by softmax.
-//! Can be the same pointer as logits
-//! \param bias input buffer [vocabSize]. Bias to logit per token. Ignored if nullptr
-//! \param endIds input buffer [maxBatchSize]. EOS token ids per request
-//! \param finished input buffer [maxBatchSize] with flags set to true if request has finished the generation
-//! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
-//! \param batchSize current batch size
-//! \param maxBatchSize max batch size
-//! \param beamWidth beam width
-//! \param vocabSize unpadded vocab size
-//! \param vocabSizePadded padded vocab size
-//! \param skipSoftMax flag to skip softmax computation
-//! \param batchSlotsLogits flag to use batchSlot as index for logits and probs
+//! Computes entropy if outputEntropy is not nullptr.
 //! \param stream stream
 template <typename T>
-void invokeAddBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bias, int32_t const* endIds,
-    FinishedState const* finished, int32_t const* batchSlots, int32_t batchSize, int32_t maxBatchSize,
-    int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded, bool skipSoftMax, bool batchSlotsLogits,
-    cudaStream_t stream);
+void invokeAddBiasSoftMax(BiasSoftmaxParams<T> const params, cudaStream_t stream);
 
 //! \brief Distributes values located in src to dst according to the indieces from batchSlots
 //!
-//! \param src input buffer [batchSize].
+//! \param src input buffer [batchSize], optional.
+//! \param scalar value used if src is nullptr.
 //! \param dst output buffer [maxBatchSize].
-//! \param batchSlots input buffer [batchSize], optional. Indices of rows of data in memory pool
+//! \param batchSlots input buffer [batchSize]. Indices of rows of data in memory pool
 //! \param batchSize batch size
 //! \param stream stream
 template <typename T>
-void invokeScatterDecodingParams(T const* src, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
-} // namespace kernels
-} // namespace tensorrt_llm
+void invokeScatterDecodingParams(
+    T const* src, T scalar, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
+
+} // namespace tensorrt_llm::kernels

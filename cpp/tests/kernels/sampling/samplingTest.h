@@ -194,7 +194,7 @@ struct SamplingKernelTestParam
     bool normalizeLogProbs{false};
     bool logitsHasProbs{true};
     int32_t maxTokensPerStep{1};
-    bool returnAllTopK{false};
+    bool returnAllSelectedTokens{false};
     bool useLogitsPtrs{false};
     bool isDeterministicTopP{false};
 
@@ -228,9 +228,9 @@ struct SamplingKernelTestParam
         return *this;
     }
 
-    SamplingKernelTestParam& setReturnAllTopK()
+    SamplingKernelTestParam& setReturnAllSelectedTokens()
     {
-        returnAllTopK = true;
+        returnAllSelectedTokens = true;
         return *this;
     }
 
@@ -283,8 +283,8 @@ private:
 
     void verifyResult(SamplingKernelTestParam const& param);
 
-    std::vector<int32_t> computeTopKTopPVariants(
-        int32_t bi, int32_t batchSlot, int32_t ti, int32_t tokensPerStep, int32_t vocabSize);
+    std::vector<int32_t> computeTopKTopPVariants(SamplingKernelTestParam const& param, int32_t bi, int32_t batchSlot,
+        int32_t ti, int32_t tokensPerStep, int32_t vocabSize);
 
 protected:
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
@@ -331,6 +331,8 @@ protected:
     TensorPtr mBatchSlots;
 
     TensorPtr mExpectedCumLogProbsHost;
+
+    TensorPtr mExpectedLogProbsHost;
 
     TensorPtr mCurandStatesDevice;
 

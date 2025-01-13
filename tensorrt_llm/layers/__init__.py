@@ -13,18 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .activation import Mish
-from .attention import (Attention, AttentionMaskType, AttentionParams,
-                        BertAttention, BlockSparseAttnParams, CogVLMAttention,
-                        KeyValueCacheParams, PositionEmbeddingType,
+from .attention import (Attention, AttentionMaskParams, AttentionMaskType,
+                        AttentionParams, BertAttention, BlockSparseAttnParams,
+                        CogVLMAttention, DeepseekV2Attention,
+                        KeyValueCacheParams, MropeParams, PositionEmbeddingType,
                         SpecDecodingParams)
 from .cast import Cast
 from .conv import Conv1d, Conv2d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
-from .linear import (ColumnLinear, Linear, ParallelLMHead, QKVColumnLinear,
-                     RowLinear)
+from .linear import ColumnLinear, Linear, RowLinear
 from .lora import Lora, LoraParams, LoraRuntimeParams
 from .mlp import MLP, FusedGatedMLP, GatedMLP
-from .moe import MOE, MoeConfig
+from .moe import MOE, MoeConfig, SharedMoE
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 from .pooling import AvgPool2d
 from .recurrent import FusedRgLru, GroupedLinear, Recurrent, RgLru
@@ -36,13 +36,12 @@ __all__ = [
     'ColumnLinear',
     'Linear',
     'RowLinear',
-    'QKVColumnLinear',
-    'ParallelLMHead',
     'AttentionMaskType',
     'PositionEmbeddingType',
     'Attention',
     'BertAttention',
     'CogVLMAttention',
+    'DeepseekV2Attention',
     'GroupNorm',
     'Embedding',
     'PromptTuningEmbedding',
@@ -56,7 +55,9 @@ __all__ = [
     'FusedGatedMLP',
     'Cast',
     'AttentionParams',
+    'AttentionMaskParams',
     'SpecDecodingParams',
+    'MropeParams',
     'KeyValueCacheParams',
     'BlockSparseAttnParams',
     'Lora',
@@ -64,6 +65,7 @@ __all__ = [
     'LoraRuntimeParams',
     'MOE',
     'MoeConfig',
+    'SharedMoE',
     'Mamba',
     'Mamba2',
     'Recurrent',

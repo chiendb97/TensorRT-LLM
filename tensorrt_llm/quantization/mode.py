@@ -25,15 +25,20 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     W4A16 = auto()
     W4A16_AWQ = auto()
     W4A8_AWQ = auto()
+    W8A16_GPTQ = auto()
     W4A16_GPTQ = auto()
     W8A8_SQ_PER_CHANNEL = auto()
     W8A8_SQ_PER_TENSOR_PLUGIN = auto()
     W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN = auto()
     W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN = auto()
     W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN = auto()
+    W4A8_QSERVE_PER_GROUP = auto()
+    W4A8_QSERVE_PER_CHANNEL = auto()
     FP8 = auto()
     FP8_PER_CHANNEL_PER_TOKEN = auto()
     INT8 = auto()
+    MIXED_PRECISION = auto()
+    NO_QUANT = auto()
 
 
 QUANT_ALGO_LIST = list(set(QuantAlgo) - {QuantAlgo.INT8})
@@ -44,6 +49,10 @@ W8A8_SQ_PLUGIN_LIST = [
     QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN,
     QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN,
 ]
+MODELOPT_FLOW_QUANTIZATIONS = {
+    QuantAlgo.W4A16_AWQ, QuantAlgo.FP8, QuantAlgo.W8A8_SQ_PER_CHANNEL,
+    QuantAlgo.W4A8_AWQ
+}
 
 
 class QuantMode(IntFlag):
@@ -69,6 +78,8 @@ class QuantMode(IntFlag):
     FP8_QDQ = auto()
     # FP8 rowwise
     FP8_ROWWISE = auto()
+    # W4A8 qserve
+    W4A8_QSERVE = auto()
 
     # The smallest power-of-two that is not used by a flag. Do not call auto() after that line.
     COUNT = auto()
@@ -77,6 +88,9 @@ class QuantMode(IntFlag):
     WEIGHTS_AND_ACTIVATIONS = INT4_WEIGHTS | INT8_WEIGHTS | ACTIVATIONS
     # The mask of all valid flags.
     VALID_FLAGS = COUNT - 1
+
+    def __deepcopy__(self, memo):
+        return self
 
     # All the bits set? You can restrict the test to the bits indicated by "mask".
     def _all(self, bits, mask=VALID_FLAGS):
@@ -94,6 +108,13 @@ class QuantMode(IntFlag):
 
     def is_weight_only(self):
         return self.is_int4_weight_only() or self.is_int8_weight_only()
+
+    def is_int8_weight_only_per_group(self):
+        return self.is_int8_weight_only() and self._any(self.PER_GROUP)
+
+    # TODO: Using the current flags cannot distinguish between w4aFP8 AWQ and w4a8 QServe.
+    def is_qserve_w4a8(self):
+        return self._any(self.W4A8_QSERVE)
 
     def is_int4_weight_only_per_group(self):
         return self.is_int4_weight_only() and self._any(self.PER_GROUP)
@@ -134,6 +155,9 @@ class QuantMode(IntFlag):
     def has_fp8_rowwise(self):
         return self._any(self.FP8_ROWWISE)
 
+    def has_weight_quant(self):
+        return self._any(self.INT4_WEIGHTS | self.INT8_WEIGHTS)
+
     def has_any_quant(self):
         return self._any(self.INT4_WEIGHTS | self.INT8_WEIGHTS
                          | self.ACTIVATIONS
@@ -162,7 +186,8 @@ class QuantMode(IntFlag):
                          use_int8_kv_cache=False,
                          use_fp8_kv_cache=False,
                          use_fp8_qdq=False,
-                         use_fp8_rowwise=False):
+                         use_fp8_rowwise=False,
+                         use_w4a8_qserve=False):
 
         def raise_error():
             raise ValueError(f"Unsupported combination of QuantMode args: "
@@ -175,7 +200,8 @@ class QuantMode(IntFlag):
                              f"{use_int8_kv_cache=}"
                              f"{use_fp8_kv_cache=}"
                              f"{use_fp8_qdq=}"
-                             f"{use_fp8_rowwise=}")
+                             f"{use_fp8_rowwise=}"
+                             f"{use_w4a8_qserve=}")
 
         # We must quantize weights when we quantize activations.
         if quantize_activations and not quantize_weights:
@@ -220,11 +246,23 @@ class QuantMode(IntFlag):
         if use_fp8_rowwise:
             mode = mode | QuantMode.FP8_ROWWISE | QuantMode.PER_TOKEN | QuantMode.PER_CHANNEL
 
+        # W4A8 QServe
+        if use_w4a8_qserve:
+            mode = mode | QuantMode.W4A8_QSERVE
+
         return mode
 
     @staticmethod
     def use_smooth_quant(per_token=False, per_channel=False):
         return QuantMode.from_description(True, True, per_token, per_channel)
+
+    @staticmethod
+    def use_qserve(per_group):
+        return QuantMode.from_description(quantize_weights=True,
+                                          quantize_activations=True,
+                                          per_group=per_group,
+                                          use_int4_weights=True,
+                                          use_w4a8_qserve=True)
 
     @staticmethod
     def use_weight_only(use_int4_weights=False, per_group=False):
@@ -237,7 +275,7 @@ class QuantMode(IntFlag):
 
     @staticmethod
     def from_quant_algo(
-        quant_algo: Optional[QuantAlgo],
+        quant_algo: Optional[QuantAlgo] = None,
         kv_cache_quant_algo: Optional[QuantAlgo] = None,
     ) -> "QuantMode":
         assert quant_algo is None or quant_algo in QUANT_ALGO_LIST
@@ -255,6 +293,9 @@ class QuantMode(IntFlag):
         elif quant_algo == QuantAlgo.W4A16_GPTQ:
             quant_mode = QuantMode.use_weight_only(use_int4_weights=True,
                                                    per_group=True)
+        elif quant_algo == QuantAlgo.W8A16_GPTQ:
+            quant_mode = QuantMode.use_weight_only(use_int4_weights=False,
+                                                   per_group=True)
         elif quant_algo == QuantAlgo.W8A8_SQ_PER_CHANNEL:
             quant_mode = QuantMode.use_smooth_quant(per_token=False,
                                                     per_channel=True)
@@ -270,6 +311,10 @@ class QuantMode(IntFlag):
         elif quant_algo == QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN:
             quant_mode = QuantMode.use_smooth_quant(per_token=True,
                                                     per_channel=False)
+        elif quant_algo == QuantAlgo.W4A8_QSERVE_PER_GROUP:
+            quant_mode = QuantMode.use_qserve(per_group=True)
+        elif quant_algo == QuantAlgo.W4A8_QSERVE_PER_CHANNEL:
+            quant_mode = QuantMode.use_qserve(per_group=False)
         elif quant_algo == QuantAlgo.FP8:
             quant_mode = QuantMode.from_description(use_fp8_qdq=True)
         elif quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:

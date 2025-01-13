@@ -22,10 +22,10 @@
 
 #pragma once
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
-#endif // #ifndef _WIN32
+#endif // __GNUC__
 
 #include "cute/tensor.hpp"
 #include "cutlass/conv/convolution.h"
@@ -43,9 +43,9 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
-#endif // #ifndef _WIN32
+#endif          // __GNUC__
 
 using namespace cute;
 
@@ -78,11 +78,11 @@ struct DeviceGemmFp8RowwiseSm90
                                                        // matrix in units of elements (up to 16 bytes)
 
     // C/D matrix configuration
-    using ElementC = OutElementType;                   // Element type for C matrix operands
-    using LayoutC = cutlass::layout::RowMajor;         // Layout type for C matrix operands
+    using ElementC = void;                                   // Element type for C matrix operands
+    using LayoutC = cutlass::layout::RowMajor;               // Layout type for C matrix operands
     static constexpr int AlignmentC
-        = 128 / cutlass::sizeof_bits<ElementC>::value; // Memory access granularity/alignment of C matrices in units of
-                                                       // elements (up to 16 bytes)
+        = 128 / cutlass::sizeof_bits<OutElementType>::value; // Memory access granularity/alignment of C matrices in
+                                                             // units of elements (up to 16 bytes)
 
     // Output matrix configuration
     using ElementOutput = OutElementType;           // Element type for output matrix operands
@@ -113,10 +113,10 @@ struct DeviceGemmFp8RowwiseSm90
     using XScale = cutlass::epilogue::fusion::Sm90ColBroadcast<0, TileShape, ElementComputeEpilogue,
         cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
 
-    using WScale = cutlass::epilogue::fusion::Sm90RowBroadcast<1, TileShape, ElementComputeEpilogue,
+    using WScale = cutlass::epilogue::fusion::Sm90RowBroadcast<0, TileShape, ElementComputeEpilogue,
         cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
 
-    using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<1, TileShape, ElementBias,
+    using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<0, TileShape, ElementBias,
         cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
 
     using Accum = cutlass::epilogue::fusion::Sm90AccFetch;

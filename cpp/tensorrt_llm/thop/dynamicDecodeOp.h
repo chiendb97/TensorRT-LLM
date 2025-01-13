@@ -96,7 +96,9 @@ public:
 private:
     tensorrt_llm::runtime::ITensor::SharedPtr mFinishedSum; // [batch_size] pinned
     std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
+    std::shared_ptr<tensorrt_llm::runtime::DecodingLayerWorkspace> mDecodingWorkspace;
     std::optional<size_t> mBeamWidth;
+    tensorrt_llm::runtime::ITensor::SharedConstPtr mBatchSlots;
 };
 
 class DynamicDecodeOp : public th::jit::CustomClassHolder

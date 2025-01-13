@@ -17,21 +17,24 @@
 #include "llmRequest.h"
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/pybind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
-#include <pybind11/functional.h>
-#include <pybind11/operators.h>
-#include <pybind11/stl.h>
+#include <ATen/ATen.h>
 #include <torch/extension.h>
 
 #include <memory>
 
 namespace tb = tensorrt_llm::batch_manager;
 namespace tr = tensorrt_llm::runtime;
+namespace tle = tensorrt_llm::executor;
 
 using namespace tensorrt_llm::pybind::batch_manager;
+
+using LlmRequestPtr = std::shared_ptr<tb::LlmRequest>;
+using RequestList = std::list<LlmRequestPtr>;
 
 namespace
 {
@@ -70,98 +73,22 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
     auto badWordsList = from_torch(mBadWordsList);
     auto stopWordsList = from_torch(mStopWordsList);
     auto promptEmbeddingTable = from_torch(mPromptEmbeddingTable);
+    auto mropeRotaryCosSin = from_torch(mMropeRotaryCosSin);
+
     auto loraWeights = from_torch(mLoraWeights);
     auto loraConfig = from_torch(mLoraConfig);
     auto draftLogits = from_torch(mDraftLogits);
+    auto encoderInputFeatures = from_torch(mEncoderInputFeatures);
+    auto crossAttentionMask = from_torch(mCrossAttentionMask);
+    auto skipCrossAttnBlocks = from_torch(mSkipCrossAttnBlocks);
 
     return std::make_shared<tb::LlmRequest>(mRequestId, mMaxNewTokens,
         std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), mSamplingConfig, mIsStreaming, mEndId, mPadId,
-        embeddingBias, badWordsList, stopWordsList, promptEmbeddingTable, mPromptVocabSize, mLoraTaskId, loraWeights,
-        loraConfig, returnLogProbs(), mReturnContextLogits, mReturnGenerationLogits, mDraftTokens, draftLogits,
-        mExcludeInputFromOutput, callbackAdapter(mLogitsPostProcessor), mApplyLogitsPostProcessorBatched,
-        mEncoderTokens, mReturnEncoderOutput, mClientId, mPriority);
-}
-
-void LlmRequest::initBindings(py::module_& m)
-{
-    py::class_<LlmRequest>(m, "LlmRequest")
-        .def(py::init<LlmRequest::RequestIdType, LlmRequest::SizeType32, LlmRequest::VecTokens, tr::SamplingConfig,
-                 bool, std::optional<LlmRequest::SizeType32>, std::optional<LlmRequest::SizeType32>,
-                 std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
-                 std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
-                 std::optional<LlmRequest::SizeType32>, std::optional<uint64_t>, std::optional<LlmRequest::TensorPtr>,
-                 std::optional<LlmRequest::TensorPtr>, bool, bool, bool, std::optional<LlmRequest::VecTokens>,
-                 std::optional<LlmRequest::TensorPtr>, bool, std::optional<LlmRequest::LogitsPostProcessor>, bool,
-                 std::optional<LlmRequest::VecTokens>, bool, std::optional<RequestIdType>, executor::PriorityType>(),
-            py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
-            py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
-            py::arg("embedding_bias") = std::nullopt, py::arg("bad_words_list") = std::nullopt,
-            py::arg("stop_words_list") = std::nullopt, py::arg("prompt_embedding_table") = std::nullopt,
-            py::arg("prompt_vocab_size") = std::nullopt, py::arg("lora_task_id") = std::nullopt,
-            py::arg("lora_weights") = std::nullopt, py::arg("lora_config") = std::nullopt,
-            py::arg("return_log_probs") = false, py::arg("return_context_logits") = false,
-            py::arg("return_generation_logits") = false, py::arg("draft_tokens") = std::nullopt,
-            py::arg("draft_logits") = std::nullopt, py::arg("exclude_input_from_output") = false,
-            py::arg("logits_post_processor") = std::nullopt, py::arg("apply_logits_post_processor_batched") = false,
-            py::arg("encoder_input_tokens") = std::nullopt, py::arg("return_encoder_output") = false,
-            py::arg("client_id") = std::nullopt, py::arg("priority") = executor::Request::kDefaultPriority)
-        .def("get_num_tokens", &LlmRequest::getNumTokens, py::arg("beam"))
-        .def_property_readonly("max_beam_num_tokens", &LlmRequest::getMaxBeamNumTokens)
-        .def("get_token", &LlmRequest::getToken, py::arg("beam"), py::arg("pos"))
-        .def("get_tokens", py::overload_cast<LlmRequest::SizeType32>(&LlmRequest::getTokens, py::const_),
-            py::arg("beam"))
-        .def("get_tokens", py::overload_cast<>(&LlmRequest::getTokens, py::const_))
-        .def_property_readonly("max_num_generated_tokens", &LlmRequest::getMaxNumGeneratedTokens)
-        .def("add_new_token", &LlmRequest::addNewToken, py::arg("token"), py::arg("beam"))
-        .def("add_new_tokens", &LlmRequest::addNewTokens, py::arg("beam_tokens"))
-        .def("set_generated_tokens", &LlmRequest::setGeneratedTokens, py::arg("generated_beam_tokens"))
-        .def("pause", &LlmRequest::pause, py::arg("max_input_len"))
-        .def_property("max_sent_token_len", &LlmRequest::getMaxSentTokenLen, &LlmRequest::setMaxSentTokenLen)
-        .def_property_readonly("prompt_embedding_table", &LlmRequest::getPromptEmbeddingTable)
-        .def_property_readonly("prompt_vocab_size", &LlmRequest::getPromptVocabSize)
-        .def_property_readonly("lora_task_id", &LlmRequest::getLoraTaskId)
-        .def_property_readonly("lora_weights", &LlmRequest::getLoraWeights)
-        .def_property_readonly("lora_config", &LlmRequest::getLoraConfig)
-        .def_property_readonly("embedding_bias", &LlmRequest::getEmbeddingBias)
-        .def_property_readonly("bad_words_list", &LlmRequest::getBadWordsList)
-        .def_property_readonly("stop_words_list", &LlmRequest::getStopWordsList)
-        .def_property_readonly(
-            "context_current_position", py::overload_cast<>(&LlmRequest::getContextCurrentPosition, py::const_))
-        .def_property("context_chunk_size", &LlmRequest::getContextChunkSize, &LlmRequest::setContextChunkSize)
-        .def_readwrite("request_id", &LlmRequest::mRequestId)
-        .def_readwrite("prompt_len", &LlmRequest::mPromptLen)
-        .def_readwrite("max_new_tokens", &LlmRequest::mMaxNewTokens)
-        .def_readwrite("sampling_config", &LlmRequest::mSamplingConfig)
-        .def_readwrite("state", &LlmRequest::mState)
-        .def_readwrite("is_streaming", &LlmRequest::mIsStreaming)
-        .def_readwrite("end_id", &LlmRequest::mEndId)
-        .def_readwrite("pad_id", &LlmRequest::mPadId)
-        .def_readwrite("seq_slot", &LlmRequest::mSeqSlot)
-        .def_property_readonly("return_log_probs", &LlmRequest::returnLogProbs)
-        .def_property_readonly("return_context_logits", &LlmRequest::setReturnContextLogits)
-        .def_property_readonly("return_generation_logits", &LlmRequest::setReturnGenerationLogits)
-        .def_property_readonly("log_probs", py::overload_cast<>(&LlmRequest::getLogProbs, py::const_))
-        .def("get_log_probs", py::overload_cast<SizeType32>(&LlmRequest::getLogProbs, py::const_))
-        .def("set_log_probs", &LlmRequest::setLogProbs, py::arg("log_probs"), py::arg("beam"))
-        .def("set_return_encoder_output", &LlmRequest::setReturnEncoderOutput, py::arg("return_encoder_output"))
-        .def("get_return_encoder_output", &LlmRequest::getReturnEncoderOutput)
-        .def("priority", py::overload_cast<>(&LlmRequest::priority, py::const_))
-        .def("set_priority", py::overload_cast<executor::PriorityType>(&LlmRequest::setPriority))
-        .def_property_readonly("cum_log_probs", &LlmRequest::getCumLogProbs)
-        .def("set_cum_log_prob", &LlmRequest::setCumLogProb, py::arg("cum_log_prob"), py::arg("beam"))
-        .def_property_readonly("orig_prompt_len", &LlmRequest::getOrigPromptLen)
-        .def("has_draft_tokens", &LlmRequest::hasDraftTokens)
-        .def("move_to_next_context_chunk", &LlmRequest::moveToNextContextChunk)
-        .def("is_full_context_request", py::overload_cast<>(&LlmRequest::isFullContextRequest, py::const_))
-        .def("is_last_context_chunk", py::overload_cast<>(&LlmRequest::isLastContextChunk, py::const_))
-        .def("is_first_context_chunk", py::overload_cast<>(&LlmRequest::isFirstContextChunk, py::const_))
-        .def("get_context_remaining_length", py::overload_cast<>(&LlmRequest::getContextRemainingLength, py::const_))
-        .def_property(
-            "draft_tokens", [](LlmRequest& self) { return *self.getDraftTokens(); },
-            [](LlmRequest& self, LlmRequest::VecTokens& draftTokens)
-            { self.setDraftTokens(std::make_shared<LlmRequest::VecTokens>(std::move(draftTokens))); })
-        .def_property(
-            "draft_logits", [](LlmRequest& self) { return self.getDraftLogits(); },
-            [](LlmRequest& self, LlmRequest::TensorPtr& logits)
-            { self.setDraftLogits(std::make_optional<LlmRequest::TensorPtr>(logits)); });
+        embeddingBias, badWordsList, stopWordsList, mPositionIds, promptEmbeddingTable, mPromptVocabSize,
+        mropeRotaryCosSin, mMropePositionDeltas, mLoraTaskId, loraWeights, loraConfig, mLookaheadConfig,
+        mKvCacheRetentionConfig, returnLogProbs(), mReturnContextLogits, mReturnGenerationLogits, mDraftTokens,
+        draftLogits, mExcludeInputFromOutput, callbackAdapter(mLogitsPostProcessor), mApplyLogitsPostProcessorBatched,
+        mEncoderTokens, mReturnEncoderOutput, mClientId, mPriority, encoderInputFeatures, mEncoderOutputLength,
+        crossAttentionMask, tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, mInputTokenExtraIds,
+        mNumReturnSequences, std::nullopt, skipCrossAttnBlocks);
 }

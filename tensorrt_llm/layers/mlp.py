@@ -17,8 +17,8 @@ from typing import Optional
 import tensorrt as trt
 
 from .._common import default_net
-from ..functional import (ACT2FN, AllReduceFusionParams, cast, concat,
-                          gemm_swiglu, is_gated_activation)
+from ..functional import (ACT2FN, AllReduceParams, cast, concat, gemm_swiglu,
+                          is_gated_activation, low_latency_gemm_swiglu)
 from ..module import Module
 from ..quantization import QuantMode
 from ..quantization.functional import quantize
@@ -46,8 +46,7 @@ def fc_gate_lora(hidden_states, lora, lora_layer_params):
                     mlp_gate_lora_params.lora_weights_pointers[0]
                 ],
                 host_request_types=mlp_fc_lora_params.host_request_types,
-                host_context_lengths=mlp_fc_lora_params.host_context_lengths,
-                max_num_tokens=mlp_fc_lora_params.max_num_tokens)
+                host_context_lengths=mlp_fc_lora_params.host_context_lengths)
 
             mlp_fc_lora, mlp_gate_lora = lora(hidden_states, mlp_in_lora_params)
             mlp_in_result = concat([mlp_gate_lora, mlp_fc_lora],
@@ -59,17 +58,18 @@ def fc_gate_lora(hidden_states, lora, lora_layer_params):
 class MLP(Module):
 
     def __init__(
-            self,
-            hidden_size,
-            ffn_hidden_size,
-            hidden_act,
-            bias=True,
-            dtype=None,
-            tp_group=None,
-            tp_size=1,
-            quant_mode=QuantMode(0),
-            inner_layernorm=False,
-            eps=1e-05,
+        self,
+        hidden_size,
+        ffn_hidden_size,
+        hidden_act,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        quant_mode=QuantMode(0),
+        inner_layernorm=False,
+        eps=1e-05,
+        is_expert=False,
     ):
         super().__init__()
         if hidden_act not in ACT2FN:
@@ -93,7 +93,8 @@ class MLP(Module):
                               bias=bias,
                               dtype=dtype,
                               tp_group=tp_group,
-                              tp_size=tp_size)
+                              tp_size=tp_size,
+                              is_expert=is_expert)
 
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
@@ -104,6 +105,7 @@ class MLP(Module):
         self.tp_size = tp_size
         self.quant_mode = quant_mode
         self.eps = eps
+        self.is_expert = is_expert
         # see optimize_model's add_lora for LoRA initialization
         self.lora = None
 
@@ -139,17 +141,18 @@ class MLP(Module):
 class GatedMLP(MLP):
 
     def __init__(
-            self,
-            hidden_size,
-            ffn_hidden_size,
-            hidden_act,
-            bias=True,
-            dtype=None,
-            tp_group=None,
-            tp_size=1,
-            quant_mode=QuantMode(0),
-            inner_layernorm=False,
-            eps=1e-05,
+        self,
+        hidden_size,
+        ffn_hidden_size,
+        hidden_act,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        quant_mode=QuantMode(0),
+        inner_layernorm=False,
+        eps=1e-05,
+        is_expert=False,
     ):
         super().__init__(hidden_size,
                          ffn_hidden_size,
@@ -160,7 +163,8 @@ class GatedMLP(MLP):
                          tp_size=tp_size,
                          quant_mode=quant_mode,
                          inner_layernorm=inner_layernorm,
-                         eps=eps)
+                         eps=eps,
+                         is_expert=is_expert)
 
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
@@ -178,7 +182,7 @@ class GatedMLP(MLP):
     def forward(self,
                 hidden_states,
                 lora_layer_params=None,
-                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
+                all_reduce_params: Optional[AllReduceParams] = None):
 
         mlp_fc_lora_params = None
         if lora_layer_params is not None:
@@ -203,24 +207,25 @@ class GatedMLP(MLP):
             intermediate = self.inner_layernorm(intermediate)
         output = self.proj(intermediate,
                            lora_runtime_params=mlp_proj_lora_params,
-                           reduce_fusion_params=reduce_fusion_params)
+                           all_reduce_params=all_reduce_params)
         return output
 
 
 class FusedGatedMLP(Module):
 
     def __init__(
-            self,
-            hidden_size,
-            ffn_hidden_size,
-            hidden_act,
-            bias=True,
-            dtype=None,
-            tp_group=None,
-            tp_size=1,
-            quant_mode=QuantMode(0),
-            inner_layernorm=False,
-            eps=1e-05,
+        self,
+        hidden_size,
+        ffn_hidden_size,
+        hidden_act,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        quant_mode=QuantMode(0),
+        inner_layernorm=False,
+        eps=1e-05,
+        is_expert=False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -248,7 +253,8 @@ class FusedGatedMLP(Module):
                               bias=bias,
                               dtype=dtype,
                               tp_group=tp_group,
-                              tp_size=tp_size)
+                              tp_size=tp_size,
+                              is_expert=is_expert)
 
         # see optimize_model's add_lora for LoRA initialization
         self.lora = None
@@ -256,14 +262,18 @@ class FusedGatedMLP(Module):
     def fc_gate_plugin(self, hidden_states, lora_layer_params=None):
         # Combine the following pattern
         #
-        #   SiLU(FC(x)) + Gate(x)
+        #   SiLU(FC(x)) * Gate(x)
         #
         # into:
         #
         #   SwiGLU(FusedFC(x))
-        p_dtype = default_net().plugin_config.gemm_swiglu_plugin
+        if default_net(
+        ).plugin_config.low_latency_gemm_swiglu_plugin is not None:
+            p_dtype = default_net().plugin_config.low_latency_gemm_swiglu_plugin
+        else:
+            p_dtype = default_net().plugin_config.gemm_swiglu_plugin
         use_fp8 = p_dtype == 'fp8'
-        assert use_fp8, "gemm_swiglu_plugin only supports fp8 now"
+        assert use_fp8, "gemm_swiglu_plugin and low_latency_gemm_swiglu_plugin only supports fp8 now"
 
         if lora_layer_params is not None:
             mlp_fc_lora_params = lora_layer_params.get_runtime_params(
@@ -305,15 +315,21 @@ class FusedGatedMLP(Module):
             hidden_states = quantize(hidden_states, activation_scaling_factor,
                                      'fp8')
 
-        inter = gemm_swiglu(hidden_states, self.fused_fc.weight.value, None,
-                            scale_d0, scale_d1, scale_output)
+        if default_net(
+        ).plugin_config.low_latency_gemm_swiglu_plugin is not None:
+            inter = low_latency_gemm_swiglu(hidden_states,
+                                            self.fused_fc.weight.value,
+                                            scale_d0, scale_d1, scale_output)
+        else:
+            inter = gemm_swiglu(hidden_states, self.fused_fc.weight.value, None,
+                                scale_d0, scale_d1, scale_output)
 
         return inter
 
     def fc_gate(self, hidden_states, lora_layer_params=None):
         # Combine the following pattern
         #
-        #   SiLU(FC(x)) + Gate(x)
+        #   SiLU(FC(x)) * Gate(x)
         #
         # into:
         #
@@ -333,16 +349,16 @@ class FusedGatedMLP(Module):
             inter = ACT2FN['geglu'](inter)
         else:
             raise NotImplementedError(
-                f"Activation {self.hidden_act} not yet implemented for FusedGatedMLP"
+                f"Activation {self.hidden_act} not yet implemented for {self.__class__.__name__}."
             )
         return inter
 
     def forward(self,
                 hidden_states,
                 lora_layer_params=None,
-                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
-        if default_net().plugin_config.gemm_swiglu_plugin:
-            assert self.dtype == 'float16', f"Currently limited support, got {self.dtype}"
+                all_reduce_params: Optional[AllReduceParams] = None):
+        if default_net().plugin_config.gemm_swiglu_plugin or default_net(
+        ).plugin_config.low_latency_gemm_swiglu_plugin:
             inter = self.fc_gate_plugin(hidden_states, lora_layer_params)
         else:
             inter = self.fc_gate(hidden_states, lora_layer_params)
@@ -356,5 +372,5 @@ class FusedGatedMLP(Module):
                 0, "mlp_4h_to_h")
         output = self.proj(inter,
                            lora_runtime_params=mlp_proj_lora_params,
-                           reduce_fusion_params=reduce_fusion_params)
+                           all_reduce_params=all_reduce_params)
         return output

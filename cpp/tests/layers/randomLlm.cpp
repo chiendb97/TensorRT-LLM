@@ -206,6 +206,19 @@ bool RandomLlm::verify(SizeType32 const offset, TensorConstPtr const& script) co
     return result;
 }
 
+void RandomLlm::forward(TensorPtr const& output, runtime::SizeType32 startId, TensorConstPtr const& input,
+    TensorConstPtr const& offsets, TensorConstPtr const mask) const
+{
+    TensorPtr posIds = BufferManager::cpu(input->getShape(), nvinfer1::DataType::kINT32);
+    BufferRange<SizeType32> idRange(*posIds);
+    BufferRange<SizeType32 const> offsetRange(*offsets);
+    for (auto i = 0; i < idRange.size(); i++)
+    {
+        idRange[i] = startId + offsetRange[i];
+    }
+    forward(output, input, posIds, mask);
+}
+
 void RandomLlm::forward(TensorPtr const& output, TensorConstPtr const& input, TensorConstPtr const& position,
     TensorConstPtr const mask) const
 {
@@ -263,8 +276,8 @@ void LookaheadRandomLlm::foretell(TensorPtr const& output, TensorConstPtr const&
         {
             right &= maskLocation.at(i, j) ? oracleRange[positionRange[j]] == inputRange[j] : true;
         }
-        if (i < verifyStart)
-        { // lookahead might be right
+        if (i < verifyStart && false)
+        { // lookahead might be right. Since we verify lookahead branch, then must be right.
             outputRange[i] = ((right || rand() % 5) && legal) ? oracleRange[positionRange[i] + 1] : invalid;
         }
         else

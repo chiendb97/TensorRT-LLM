@@ -16,8 +16,10 @@
  */
 
 #pragma once
+
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/pybind/common/customCasters.h"
 #include <pybind11/pybind11.h>
 
 namespace tle = tensorrt_llm::executor;
@@ -34,8 +36,8 @@ public:
     Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
         tle::ModelType modelType, tle::ExecutorConfig const& executorConfig);
 
-    Executor(std::string const& engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
-        tle::ExecutorConfig const& executorConfig);
+    Executor(pybind11::buffer engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
+        tle::ExecutorConfig const& executorConfig, std::optional<pybind11::dict> managedWeights);
 
     Executor(std::string const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
         std::string const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, tle::ModelType modelType,
@@ -46,14 +48,14 @@ public:
         [[maybe_unused]] pybind11::handle traceback);
     void shutdown();
 
-    [[nodiscard]] tle::IdType enqueueRequest(tle::Request request)
+    [[nodiscard]] tle::IdType enqueueRequest(tle::Request const& request)
     {
-        return mExecutor->enqueueRequest(std::move(request));
+        return mExecutor->enqueueRequest(request);
     }
 
-    [[nodiscard]] std::vector<tle::IdType> enqueueRequests(std::vector<tle::Request> requests)
+    [[nodiscard]] std::vector<tle::IdType> enqueueRequests(std::vector<tle::Request> const& requests)
     {
-        return mExecutor->enqueueRequests(std::move(requests));
+        return mExecutor->enqueueRequests(requests);
     }
 
     [[nodiscard]] std::vector<tle::Response> awaitResponses(
@@ -103,9 +105,19 @@ public:
         return mExecutor->getLatestRequestStats();
     }
 
+    std::deque<tle::DebugTensorsPerIteration> getLatestDebugTensors()
+    {
+        return mExecutor->getLatestDebugTensors();
+    }
+
     [[nodiscard]] bool canEnqueueRequests() const
     {
         return mExecutor->canEnqueueRequests();
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<tle::KVCacheEventManager>> getKVCacheEventManager() const
+    {
+        return mExecutor->getKVCacheEventManager();
     }
 
     static void initBindings(pybind11::module_& m);

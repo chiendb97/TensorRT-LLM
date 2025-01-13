@@ -25,6 +25,7 @@ from tensorrt_llm._utils import (trt_dtype_to_torch, str_dtype_to_trt)
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.session import TensorInfo
 from tensorrt_llm.runtime import ModelConfig
+from tensorrt_llm.models.modeling_utils import get_kv_cache_type_from_legacy
 
 
 class EncDecBenchmark(BaseBenchmark):
@@ -56,6 +57,7 @@ class EncDecBenchmark(BaseBenchmark):
         if self.engine_dir is not None:
 
             def read_config(component):
+                # almost same as enc_dec_model_runner.py::read_config()
                 config_path = os.path.join(self.engine_dir, component,
                                            "config.json")
                 with open(config_path, "r") as f:
@@ -65,12 +67,13 @@ class EncDecBenchmark(BaseBenchmark):
                 plugin_config = builder_config['plugin_config']
                 pretrained_config = config['pretrained_config']
                 lora_config = builder_config['lora_config']
-                builder_config['auto_parallel_config']
+                auto_parallel_config = builder_config['auto_parallel_config']
                 use_gpt_attention_plugin = plugin_config["gpt_attention_plugin"]
                 remove_input_padding = plugin_config["remove_input_padding"]
                 use_lora_plugin = plugin_config["lora_plugin"]
                 tp_size = pretrained_config['mapping']['tp_size']
                 pp_size = pretrained_config['mapping']['pp_size']
+                auto_parallel_config['gpus_per_node']
                 world_size = tp_size * pp_size
                 assert world_size == tensorrt_llm.mpi_world_size(), \
                     f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
@@ -90,7 +93,7 @@ class EncDecBenchmark(BaseBenchmark):
 
                 cross_attention = pretrained_config[
                     "architecture"] == "DecoderModel"
-                skip_cross_qkv = pretrained_config.get('skip_cross_qkv', False)
+                skip_cross_kv = pretrained_config.get('skip_cross_kv', False)
                 has_position_embedding = pretrained_config[
                     "has_position_embedding"]
                 has_token_type_embedding = hasattr(pretrained_config,
@@ -98,6 +101,9 @@ class EncDecBenchmark(BaseBenchmark):
                 dtype = pretrained_config["dtype"]
 
                 paged_kv_cache = plugin_config['paged_kv_cache']
+                kv_cache_type = get_kv_cache_type_from_legacy(
+                    True, paged_kv_cache)
+
                 tokens_per_block = plugin_config['tokens_per_block']
 
                 gather_context_logits = builder_config.get(
@@ -106,11 +112,6 @@ class EncDecBenchmark(BaseBenchmark):
                     'gather_generation_logits', False)
                 max_prompt_embedding_table_size = builder_config.get(
                     'max_prompt_embedding_table_size', 0)
-
-                self.max_batch_size = config["build_config"]["max_batch_size"]
-                self.max_input_len = config["build_config"][
-                    "max_encoder_input_len"]
-                self.max_seq_len = config["build_config"]["max_seq_len"]
 
                 model_config = ModelConfig(
                     num_heads=num_heads,
@@ -123,7 +124,7 @@ class EncDecBenchmark(BaseBenchmark):
                     num_layers=num_layers,
                     gpt_attention_plugin=use_gpt_attention_plugin,
                     remove_input_padding=remove_input_padding,
-                    paged_kv_cache=paged_kv_cache,
+                    kv_cache_type=kv_cache_type,
                     tokens_per_block=tokens_per_block,
                     cross_attention=cross_attention,
                     has_position_embedding=has_position_embedding,
@@ -137,8 +138,17 @@ class EncDecBenchmark(BaseBenchmark):
                     lora_target_modules=lora_config.get('lora_target_modules'),
                     trtllm_modules_to_hf_modules=lora_config.get(
                         'trtllm_modules_to_hf_modules'),
-                    skip_cross_qkv=skip_cross_qkv,
+                    skip_cross_kv=skip_cross_kv,
                 )
+
+                # additional info for benchmark
+                self.max_batch_size = config["build_config"]["max_batch_size"]
+                self.max_input_len = config["build_config"][
+                    "max_encoder_input_len"]
+                self.max_seq_len = config["build_config"]["max_seq_len"]
+                if component == "decoder":
+                    self.decoder_start_token_id = pretrained_config[
+                        'decoder_start_token_id']
 
                 return model_config
 
@@ -212,10 +222,11 @@ class EncDecBenchmark(BaseBenchmark):
     def set_weight_streaming(self, config):
         gpu_weights_percent = config[3]
         self.encoder_session._set_weight_streaming(gpu_weights_percent)
-        self.decoder_session._set_weight_streaming(gpu_weights_percent)
+        self.decoder_session.runtime._set_weight_streaming(gpu_weights_percent)
 
     def prepare_inputs(self, config):
-        batch_size, encoder_input_len = config[0], config[1]
+        batch_size, encoder_input_len, output_len = config[0], config[
+            1], config[2]
         attention_mask = None
         whisper_decoder_encoder_input_lengths = None
         outputs = {}
@@ -234,22 +245,23 @@ class EncDecBenchmark(BaseBenchmark):
             decoder_input_ids = decoder_input_ids.repeat(
                 (encoder_input_ids.shape[0], 1))
             output_list = [
-                TensorInfo('x', str_dtype_to_trt(self.dtype),
+                TensorInfo('input_features', str_dtype_to_trt(self.dtype),
                            encoder_input_ids.shape),
                 TensorInfo('input_lengths', str_dtype_to_trt('int32'),
                            encoder_input_lengths.shape)
             ]
             output_info = (self.encoder_session).infer_shapes(output_list)
             outputs = {
-                t.name: torch.empty(tuple(t.shape),
-                                    dtype=trt_dtype_to_torch(t.dtype),
-                                    device='cuda')
+                t.name:
+                torch.empty(tuple(t.shape),
+                            dtype=trt_dtype_to_torch(t.dtype),
+                            device='cuda')
                 for t in output_info
             }
             whisper_decoder_encoder_input_lengths = torch.tensor(
                 [
-                    outputs['output'].shape[1]
-                    for x in range(outputs['output'].shape[0])
+                    outputs['encoder_output'].shape[1]
+                    for x in range(outputs['encoder_output'].shape[0])
                 ],
                 dtype=torch.int32,
                 device='cuda')
@@ -260,39 +272,46 @@ class EncDecBenchmark(BaseBenchmark):
             ],
                                                  dtype=torch.int32,
                                                  device='cuda')
-            cross_attention_mask = torch.ones(
-                [outputs['output'].shape[0], 1,
-                 outputs['output'].shape[1]]).int().cuda()
+            cross_attention_mask = torch.ones([
+                outputs['encoder_output'].shape[0],
+                decoder_input_lengths.max() + output_len,
+                outputs['encoder_output'].shape[1]
+            ]).int().cuda()
         else:
             encoder_input_ids = (torch.randint(
                 100, (batch_size, encoder_input_len)).int().cuda())
-            # For now, just hardcode the decoder_start_token_id to 0 for t5 models.
-            decoder_start_token_id = 0
-            decoder_input_ids = torch.IntTensor([[decoder_start_token_id]
+            decoder_input_ids = torch.IntTensor([[self.decoder_start_token_id]
                                                  ]).to(self.device)
-            decoder_input_ids = decoder_input_ids.repeat(
-                (encoder_input_ids.shape[0], 1))
-            # in padding mode --> keep input, just calculate actual length and max length
-            # Note: 1st token should always count, even if it is pad_token_id (0). e.g., decoder start id in enc-dec models could be a single pad_token_id, we should count
-            encoder_input_lengths = ((
-                1 + (encoder_input_ids[:, 1:] != 0).sum(dim=1).type(
-                    torch.IntTensor).to(self.device)).clone().detach().to(
-                        dtype=torch.int32, device=self.device))
-            decoder_input_lengths = ((
-                1 + (decoder_input_ids[:, 1:] != 0).sum(dim=1).type(
-                    torch.IntTensor).to(self.device)).clone().detach().to(
-                        dtype=torch.int32, device=self.device))
+            decoder_input_ids = decoder_input_ids.repeat((batch_size, 1))
+            encoder_input_lengths = torch.tensor([encoder_input_len] *
+                                                 batch_size,
+                                                 dtype=torch.int32,
+                                                 device=self.device)
+            decoder_input_lengths = torch.tensor([1] * batch_size,
+                                                 dtype=torch.int32,
+                                                 device=self.device)
+
+            if self.encoder_model_config.remove_input_padding:
+                encoder_input_ids = torch.flatten(encoder_input_ids)
+                decoder_input_ids = torch.flatten(decoder_input_ids)
+
             # attention mask, always set 1 as if all are valid tokens
             attention_mask = torch.ones(
                 (batch_size, encoder_input_len)).int().cuda()
             # cross attention mask, always set 1 as if all are valid tokens
             # [batch_size, query_len, encoder_input_len] currently, use query_len=1
-            cross_attention_mask = torch.ones(
-                (batch_size, 1, encoder_input_len)).int().cuda()
+            cross_attention_mask = [
+                torch.ones(decoder_input_lengths.max() + output_len,
+                           encoder_input_len).int().cuda()
+                for _ in range(batch_size)
+            ]
 
             hidden_size = (self.encoder_model_config.hidden_size *
                            self.world_size)  # tp_size
             hidden_states_shape = (
+                encoder_input_ids.shape[0],
+                hidden_size,
+            ) if self.encoder_model_config.remove_input_padding else (
                 encoder_input_ids.shape[0],
                 encoder_input_ids.shape[1],
                 hidden_size,
@@ -339,7 +358,7 @@ class EncDecBenchmark(BaseBenchmark):
         # input tensors
         inputs = {}
         if 'whisper' in self.model_name:
-            inputs['x'] = encoder_input_ids.contiguous()
+            inputs['input_features'] = encoder_input_ids.contiguous()
             inputs["input_lengths"] = encoder_input_lengths
         else:
             inputs["input_ids"] = encoder_input_ids.contiguous()
@@ -369,9 +388,7 @@ class EncDecBenchmark(BaseBenchmark):
         # run decoder
         sampling_config = tensorrt_llm.runtime.SamplingConfig(
             end_id=1, pad_id=0, num_beams=self.num_beams, min_length=output_len)
-        encoder_output = outputs[
-            'output'] if 'whisper' in self.model_name else outputs[
-                "encoder_output"]
+        encoder_output = outputs["encoder_output"]
         encoder_max_input_length = encoder_output.shape[
             1] if 'whisper' in self.model_name else torch.max(
                 encoder_input_lengths).item()
@@ -384,8 +401,6 @@ class EncDecBenchmark(BaseBenchmark):
             max_attention_window_size=None,
             encoder_max_input_length=encoder_max_input_length,
         )
-
-        cross_attention_mask = None if self.decoder_model_config.gpt_attention_plugin else cross_attention_mask
 
         self.decoder_session.decode(
             decoder_input_ids,

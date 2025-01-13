@@ -585,7 +585,7 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
                 if (earlyStop)
                 {
 
-                    int const currentStep = sequenceLengths[batchId];
+                    int const currentStep = sequenceLengths ? sequenceLengths[batchId] : 0;
                     IdxT index = inIdxBuf ? inIdxBuf[i] : i;
                     ids[batchId][currentStep] = index;
                     float valueFloat;
@@ -712,14 +712,15 @@ __device__ void epilogue(T const value, IdxT const index, float* outputLogProbs,
         float res = logf(value);
         if (outputLogProbs)
         {
-            outputLogProbs[sequenceLengths[batchId] * maxBatchSize + batchId] = res;
+            auto const curLen = sequenceLengths ? sequenceLengths[batchId] : 0;
+            outputLogProbs[curLen * maxBatchSize + batchId] = res;
         }
         if (cumLogProbs)
         {
             cumLogProbs[batchId] += res;
         }
     }
-    if (index == endIds[batchId])
+    if (endIds && index == endIds[batchId])
     {
         if (finishedOutput != nullptr)
         {
@@ -727,7 +728,7 @@ __device__ void epilogue(T const value, IdxT const index, float* outputLogProbs,
         }
         // Do not increase seq len when EOS is generated. Seq len should always contain only tokens to be outputted
     }
-    else
+    else if (sequenceLengths != nullptr)
     {
         // We don't need to set output finished state as it is assumed to be in non finished state
         sequenceLengths[batchId] += 1;
@@ -745,7 +746,7 @@ __device__ void lastFilter(T const* inBuf, IdxT const* inIdxBuf, IdxT currentLen
 {
     auto const kthValueBits = counter->kthValueBits;
     auto const equalValue = twiddleOut<T>(kthValueBits, false);
-    int const currentStep = sequenceLengths[batchId];
+    int const currentStep = sequenceLengths ? sequenceLengths[batchId] : 0;
     IdxT* outIdx = &ids[batchId][currentStep];
 
     float equalValueFloat;
@@ -938,13 +939,12 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, HisT* histogra
     float* outputLogProbs, IdxT const* endIds, int const maxBatchSize, bool const* skipDecode, int const pass, T* buf1,
     IdxT* idxBuf1, T* buf2, IdxT* idxBuf2, int32_t const* batchSlots)
 {
-    assert(sequenceLengths != nullptr);
     static_assert(std::is_same_v<T, half> | std::is_same_v<T, float>, "T needs to be either half or float");
     static_assert(std::is_same_v<AccT, float>, "AccT needs to be float");
 
     int const tid = threadIdx.x;
     int const batchId = blockIdx.y;
-    auto const batchSlot = batchSlots == nullptr ? batchId : batchSlots[batchId];
+    auto const batchSlot = batchSlots ? batchSlots[batchId] : batchId;
     auto counter = counters + batchId;
 
     // Skip kernel if this sampling method is not chosen
@@ -1234,11 +1234,11 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, HisT* histogra
  */
 template <typename T, typename IdxT, typename AccT, typename HisT, int BitsPerPass, int BlockSize>
 __global__ void airTopPInitialize(Counter<T, IdxT, AccT>* counters, int const batchSize, int const len, T const* in,
-    IdxT const* inIdx, float const* topPs, curandState_t* curandstate, HisT* histograms, IdxT* countHistograms,
-    int32_t const* batchSlots)
+    IdxT const* inIdx, float const* topPs, curandState_t* curandState, float const* randomVals, HisT* histograms,
+    IdxT* countHistograms, int32_t const* batchSlots)
 {
     auto const batchIdx = blockIdx.x;
-    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    auto const batchSlot = batchSlots ? batchSlots[batchIdx] : batchIdx;
     Counter<T, IdxT, AccT>* counter = counters + batchIdx;
     IdxT offset = batchIdx * len;
     IdxT bufOffset = batchIdx * calcBufLen<T>(len);
@@ -1256,7 +1256,8 @@ __global__ void airTopPInitialize(Counter<T, IdxT, AccT>* counters, int const ba
         counter->previousLen = len;
 
         float const probThreshold = topPs[batchSlot];
-        float const randP = curand_uniform(curandstate + batchSlot) * probThreshold;
+        auto const randomNumber = randomVals ? randomVals[batchSlot] : curand_uniform(curandState + batchSlot);
+        float const randP = randomNumber * probThreshold;
         counter->p = randP;
         counter->sum = 0;
 
@@ -1400,20 +1401,13 @@ void invokeAirTopPSamplingWithDeterministicPara(TopPSamplingKernelParams<T> cons
     IdxT* idxBuf2 = nullptr;
 
     auto const workspaceSizes = getAirTopPWorkspaceSizes<T, isDeterministic>(params.batchSize, vocabSize);
-
-    std::vector<void*> alignedPointers;
-    calcAlignedPointers(alignedPointers, params.workspace, workspaceSizes);
-    counters = static_cast<decltype(counters)>(alignedPointers[0]);
-    histograms = static_cast<decltype(histograms)>(alignedPointers[1]);
-    countHistograms = static_cast<decltype(countHistograms)>(alignedPointers[2]);
-    buf1 = static_cast<decltype(buf1)>(alignedPointers[3]);
-    idxBuf1 = static_cast<decltype(idxBuf1)>(alignedPointers[4]);
-    buf2 = static_cast<decltype(buf2)>(alignedPointers[5]);
-    idxBuf2 = static_cast<decltype(idxBuf2)>(alignedPointers[6]);
+    calcAlignedPointers(params.workspace, workspaceSizes)(
+        counters, histograms, countHistograms, buf1, idxBuf1, buf2, idxBuf2);
 
     airTopPInitialize<T, IdxT, AccT, HisT, BitsPerPass, THREADS_PER_CTA_TOP_P_INIT>
         <<<params.batchSize, THREADS_PER_CTA_TOP_P_INIT, 0, stream>>>(counters, params.batchSize, vocabSize,
-            params.probs, nullptr, params.topPs, params.curandState, histograms, countHistograms, params.batchSlots);
+            params.probs, nullptr, params.topPs, params.curandState, params.randomVals, histograms, countHistograms,
+            params.batchSlots);
 
     dim3 grid(params.blockNum, params.batchSize);
     // Sample with Top P given sorted tokens
@@ -1427,7 +1421,7 @@ void invokeAirTopPSamplingWithDeterministicPara(TopPSamplingKernelParams<T> cons
             kernel = airTopPSampling<T, IdxT, AccT, HisT, BitsPerPass, SAMPLING_BLOCK_SIZE, true, isDeterministic>;
         }
 
-        kernel<<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(counters, histograms, countHistograms, params.outputIds,
+        kernel<<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(counters, histograms, countHistograms, params.outputIdsPtrs,
             params.sequenceLength, params.finishedInput, params.finishedOutput, params.cumLogProbs,
             params.outputLogProbs, params.endIds, params.maxBatchSize, params.skipDecode, pass, buf1, idxBuf1, buf2,
             idxBuf2, params.batchSlots);

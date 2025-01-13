@@ -8,7 +8,7 @@ releases.
 # Overview
 
 This document summarizes performance measurements of TensorRT-LLM on H100
-(Hopper), L40S (Ada) and A100 (Ampere) GPUs for a few key models.
+(Hopper), GH200 (Grace + Hopper), L40S (Ada) and A100 (Ampere) GPUs for a few key models.
 
 The data in the following tables is provided as a reference point to help users
 validate observed performance. It should not be considered as the peak
@@ -18,564 +18,218 @@ performance that can be delivered by TensorRT-LLM.
 
 The following issues are being addressed to improve the efficiency of TensorRT-LLM.
 
-### Unexpected extra GPU memory allocation when enabling `--multiple_profiles`
-
-We observed that enabling multiple profiles can lead to extra
-unexpected GPU memory usage on some cases starting from v0.11.
-The issue will be addressed in future releases.
-
 ### Fused Matmul + Gated-SiLU (LLaMA)
 
 The current implementation combines two Matmul operations into one Matmul followed by
-a separate SwiGLU kernel (when `--use_fused_mlp` is enabled). There is also a more
+a separate SwiGLU kernel (when `--use_fused_mlp=enable` is enabled). There is also a more
 efficient implementation that runs single Matmul + SwiGLU fused kernel for FP8 on Hopper
-(when `--use_fused_mlp --gemm_swiglu_plugin fp8` is enabled). The gemm_swiglu_plugin
+(when `--use_fused_mlp=enable --gemm_swiglu_plugin fp8` is enabled). The gemm_swiglu_plugin
 will support more data types and GPU architectures in the future release.
+
+### Trtllm-bench has known issues on GH200
+
+For release v0.15, on GH200 systems, we recommend using the legacy flow based on *gptManagerBenchmark* to measure performance.
 
 ## Throughput Measurements
 
 The below table shows performance data where a local inference client is fed requests at an infinite rate (no delay between messages),
 and shows the throughput client-server scenario under maximum load.
 
-
 The performance numbers below were collected using the steps described in this document.
 
-**All data in the table below was generated using version 0.11.0 and presents token throughput in tokens/second.**
+Note that for GH200 tests, TRT-LLM engines were built using *trtllm-bench build* but benchmarked with *gptManagerBenchmark*.
 
-|              |                          |               |                 |             |                |                |                |          |
-| ------------ | ------------------------ | ------------- | --------------- | ----------- | -------------- | -------------- | -------------- | -------- |
-|              |                          | **GPU**       | H200 141GB HBM3 | GH200 120GB | H100 80GB HBM3 | H100 80GB HBM3 | A100-SXM4-80GB | L40S     |
-|              |                          | **Precision** | FP8             | FP8         | FP8            | FP16           | FP16           | FP8      |
-| **Model**    | **Input/Output Lengths** | **TP**        |                 |             |                |                |                |          |
-| GPTJ 6B      | 128/128                  | 1             | 25116.54        | 24998.09    | 24456.84       | 13328.96       | 6168.8         | 7737.44  |
-|              | 2048/128                 | 1             | 2845.4          | 2840.46     | 2781.11        | 1410.81        | 662            | 83.46    |
-|              | 128/2048                 | 1             | 8165.91         | 7936.16     | 7643.02        | 3503.41        | 2213.44        | 1927.91  |
-|              | 2048/2048                | 1             | 3560.37         | 3197.21     | 3081.26        | 1326.79        | 893.43         |          |
-| LLaMA v2 7B  | 128/128                  | 1             | 19695.41        | 19509.49    | 17684.88       | 11605.69       | 5286.1         | 6655.52  |
-|              | 2048/128                 | 1             | 2471.89         | 2401.29     | 2342.71        | 1173.81        | 558.56         | 644.72   |
-|              | 128/2048                 | 1             | 7867.28         | 6689.51     | 6814.72        | 3074.4         | 1813.79        | 1591.51  |
-|              | 2048/2048                | 1             | 3215.63         | 3015.84     | 2820.31        | 1289.87        | 716.55         | 653.19   |
-| LLaMA v3 8B  | 128/128                  | 1             | 29084.05        | 29197.48    | 27781.28       | 15225.75       | 6450.88        | 8929.6   |
-|              | 2048/128                 | 1             | 3699.64         | 3780.47     | 3555.57        | 1844.38        | 775.18         | 1052.3   |
-|              | 128/2048                 | 1             | 23723.81        | 22055.94    | 17894.85       | 8415.67        | 4837.47        | 4497.21  |
-|              | 2048/2048                | 1             | 11193.29        | 8877.13     | 8398.71        | 3996.93        | 2271.65        | 1911.63  |
-| Mistral 7B   | 128/128                  | 1             | 31618.59        | 31868.45    | 30400.21       | 16108.11       | 6749.91        | 10237.23 |
-|              | 2048/128                 | 1             | 3791.1          | 3795.27     | 3618.11        | 1896.76        | 783.94         | 1126.08  |
-|              | 128/2048                 | 1             | 25646.02        | 20491.88    | 20518.75       | 10018.54       | 5358.28        | 5441.98  |
-|              | 2048/2048                | 1             | 12068.11        | 9462.96     | 9504.59        | 4383.42        | 2465.77        | 2213.69  |
-| LLaMA v2 70B | 128/128                  | 2             | 6652.29         | 5619.41     | 6502.44        |                |                |          |
-|              |                          | 4             | 10921.65        | 11043       | 10448.46       | 6219.11        | 2487.78        | 1549.09  |
-|              |                          | 8             | 15878.34        |             | 14781.66       | 10093.27       | 4233.24        | 1497.68  |
-|              | 2048/128                 | 2             | 766.38          | 647.73      | 747.14         |                |                |          |
-|              |                          | 4             | 1296.75         | 1298.94     | 1231.26        | 714.07         | 285.9          | 179.19   |
-|              |                          | 8             | 1930.16         |             | 1808.02        | 1230.66        | 494.29         | 176.24   |
-|              | 128/2048                 | 2             | 7014.86         | 4844.17     | 5267.56        |                |                |          |
-|              |                          | 4             | 13365.86        | 11596.55    | 9202.42        | 3787.24        | 2267.02        | 1772.45  |
-|              |                          | 8             | 18861.53        |             | 17085.82       | 7846.64        | 5096.52        | 2290.99  |
-|              | 2048/2048                | 2             | 3554.71         | 2843.31     | 2457.73        |                |                |          |
-|              |                          | 4             | 6604.37         | 5969.11     | 4586.99        | 1994.1         | 1137.22        | 890.83   |
-|              |                          | 8             | 10034.12        |             | 7647.54        | 4347.09        | 2152.35        | 1130.36  |
-| LLaMA v3 70B | 128/128                  | 4             |                 | 9872.81     |                |                |                |          |
-|              |                          | 8             | 15255           |             | 13853.05       |                | 4033.42        |          |
-|              | 2048/128                 | 4             |                 | 1284.88     |                |                |                |          |
-|              |                          | 8             | 1918.47         |             | 1738.94        |                | 476.42         |          |
-|              | 128/2048                 | 4             |                 | 9996.88     |                |                |                |          |
-|              |                          | 8             | 19071.39        |             | 10887.34       |                | 3373.71        |          |
-|              | 2048/2048                | 4             |                 | 4985.31     |                |                |                |          |
-|              |                          | 8             | 9387.81         |             | 6029.39        |                | 1824.06        |          |
-| Mixtral 8x7B | 128/128                  | 2             | 26317.73        | 21768.19    | 24770.44       | 11821.14       | 5522.43        |          |
-|              | 2048/128                 | 2             | 3181.76         | 2545.52     | 2973.11        | 1391.28        | 636.77         |          |
-|              | 128/2048                 | 2             | 30105.61        | 23643.33    | 22120.85       | 6337.02        | 3698.23        |          |
-|              | 2048/2048                | 2             | 15002.42        | 11683.11    | 11486.66       | 3024.95        | 1710.53        |          |
-| Falcon 180B  | 128/128                  | 4             | 5647.01         |             | 5568.91        |                |                |          |
-|              |                          | 8             | 9304.06         |             | 8885.39        |                | 2171.78        |          |
-|              | 2048/128                 | 4             | 670.99          | 693.82      | 667.8          |                |                |          |
-|              |                          | 8             | 1103.18         |             | 1065.16        |                | 238.61         |          |
-|              | 128/2048                 | 4             | 8358.01         | 6655.38     | 6376.89        |                |                |          |
-|              |                          | 8             | 14514.24        |             | 12447.25       |                | 2657.9         |          |
-|              | 2048/2048                | 4             | 4169.39         | 3415.05     | 3412.09        |                |                |          |
-|              |                          | 8             | 7524.11         |             | 6326.46        |                | 1392.31        |          |
+**All data in the table below was generated using version 0.15.0 and presents token throughput in tokens/second.**
+
+|                 |                          |               |                     |                    |                    |                    |                    |           |
+| --------------- | ------------------------ | ------------- | ------------------- | ------------------ | ------------------ | ------------------ | ------------------ | --------- |
+| | GPU| | H100 80GB HBM3| | A100-SXM4-80GB| A100-PCIE-80GB| L40S| GH200 96GB HBM3 CG1 |
+| | Precision| | FP8| Mixed| Mixed| Mixed| FP8| FP8 |
+| Model| TP Size| Runtime Input/Output Lengths| | | | | |
+| LLaMA v3 70B| 1| 128, 128| 3197.73| | | | | 4023.31
+| | | 128, 2048| 826.72| | | | | 1855.98
+| | | 128, 4096| | | | | | 915.15
+| | | 500, 2000| 658.87| | | | | 1483.67
+| | | 1000, 1000| 772.64| | | | | 1587.16
+| | | 2048, 128| 331.26| | | | | 425.89
+| | | 2048, 2048| 383.46| | | | | 823.43
+| | | 5000, 500| 217.12| | | | | 391.38
+| | 2| 128, 128| 6529.47| 3137.86| 1316.68| 792.95| |
+| | | 128, 2048| 6008.16| 783.76| 532.07| | |
+| | | 128, 4096| 3561.24| 404.23| 285.37| | |
+| | | 500, 2000| 4792.7| 658.7| 436.46| | |
+| | | 1000, 1000| 4221.4| 759.56| 484.59| 268.09| |
+| | | 2048, 128| 773.11| 318.58| 147.22| 96.65| |
+| | | 2048, 2048| 2648.62| 373.71| 255.21| | |
+| | | 5000, 500| 905.34| 224.99| 123.5| 75.54| |
+| | 4| 128, 128| 10848.71| 6387.29| 2713.51| 1347.36| 1474|
+| | | 128, 2048| 10973.67| 5767.81| 2684.63| 1414.31| 1912.29|
+| | | 128, 4096| 7426.74| 3421.36| 1914.57| 1140.75| 1357.84|
+| | | 500, 2000| 9575.94| 4311.78| 2181.56| 1276.59| 1602.99|
+| | | 1000, 1000| 7234.67| 4027.52| 1876.99| 927.93| 1193.23|
+| | | 2048, 128| 1318.11| 781.29| 319.91| 161.66| 174.02|
+| | | 2048, 2048| 5185.7| 2584.66| 1339.76| 872.31| 910.92|
+| | | 5000, 500| 1568.88| 855.16| 388.86| 216.5| 242.62|
+| | 8| 128, 128| 15440.55| 10966.81| 4647.93| 962.8| 1381.32|
+| | | 128, 2048| 16416.2| 10270.37| 5046.42| 1487.53| 2120.54|
+| | | 128, 4096| 12247.71| 6932.27| 3672.17| 1391.51| 1855.21|
+| | | 500, 2000| 14561.62| 8967.15| 4379.68| 1205.63| 1879.86|
+| | | 1000, 1000| 11226.01| 6973.77| 3236.83| 883.65| 1244.32|
+| | | 2048, 128| 2057.59| 1341.65| 558.45| 141.12| 164.34|
+| | | 2048, 2048| 7813.57| 4518.75| 2395.15| 769.53| 1091.57|
+| | | 5000, 500| 2564.74| 1612.14| 706.33| 217.62| 243.14|
+| LLaMA v3.1 8B| 1| 128, 128| 27792.16| 16116.63| 6552.62| 5158.57| 8982.97| 30803.29
+| | | 128, 2048| 19965.18| 9894.49| 5220.03| 4640.02| 5297.21| 20770.93
+| | | 128, 4096| 13222.06| 5758.98| 3326.45| 2906.77| 2989.17| 12487.35
+| | | 500, 2000| 15782.2| 7953.1| 4191.62| 3736.1| 4263.97| 19175.02
+| | | 1000, 1000| 14797.28| 7721.07| 3753.46| 3328.02| 4013.95| 15955.43
+| | | 2048, 128| 3496.41| 1972.07| 789.56| 630.86| 1055.55| 4011.99
+| | | 2048, 2048| 8980.42| 4370.61| 2366.86| 2125.4| 2162.8| 9072.93
+| | | 5000, 500| 3477.61| 1802.2| 816.09| 693.38| 972.2| 3957.15
+| | | 20000, 2000| 1378.69| 621.58| 330.47| 298.79| 326.02| 1459.86
+| LLaMA v3.1 70B| 1| 128, 128| 3173.65| | | | | 4108.23
+| | | 128, 2048| 804.73| | | | | 1940.33
+| | | 128, 4096| | | | | | 981.15
+| | | 500, 2000| 652.24| | | | | 1526.49
+| | | 1000, 1000| 775.07| | | | | 1575.4
+| | | 2048, 128| 328.44| | | | | 453.06
+| | | 2048, 2048| 388.02| | | | | 838.55
+| | | 5000, 500| 217.98| | | | | 383.32
+| | | 20000, 2000| | | | | | 124.38
+| | 2| 128, 128| 6399.24| 3143.32| 1330.41| 790.66| |
+| | | 128, 2048| 5920.14| 784.73| 532.31| | |
+| | | 128, 4096| 3580.79| 418.75| 285.01| | |
+| | | 500, 2000| 4775.52| 660.68| 437.64| | |
+| | | 1000, 1000| 4247.38| 785.36| 483.87| 267.63| |
+| | | 2048, 128| 774.11| 315.43| 144.88| 94.83| |
+| | | 2048, 2048| 2667.23| 384.36| 259.65| 137.09| |
+| | | 5000, 500| 901.84| 210.7| 124.33| 76.77| |
+| | | 20000, 2000| 410.93| | | | |
+| | 4| 128, 128| 10589.19| 6392.74| 2716.71| 1192.33| 1469.28|
+| | | 128, 2048| 11063.97| 5742.27| 2663.76| 1385.61| 1911.43|
+| | | 128, 4096| 7428.89| 3457.03| 1913.13| 1206.15| 1357.83|
+| | | 500, 2000| 9504.33| 4375.09| 2193.81| 1248.45| 1599.38|
+| | | 1000, 1000| 7306.35| 4075.52| 1889.72| 999.4| 1187.23|
+| | | 2048, 128| 1316.33| 779.81| 320.96| 162.09| 176.41|
+| | | 2048, 2048| 5166.41| 2609.39| 1341.99| 874.11| 909.3|
+| | | 5000, 500| 1566.63| 874.96| 389.99| 218.29| 242.95|
+| | | 20000, 2000| 915.06| 406.36| 209.39| 141.13| 158.35|
+| | 8| 128, 128| 15427.05| 10959.63| 4595.66| 943.87| 1381.25|
+| | | 128, 2048| 16533.07| 10252.11| 4967.17| 1605.66| 2157.58|
+| | | 128, 4096| 12008.26| 6915.81| 3594.1| 1449.32| 1895.68|
+| | | 500, 2000| 14508.43| 8942.09| 4349.21| 1238.68| 1877.86|
+| | | 1000, 1000| 11086.68| 6983.63| 3285.33| 907.21| 1242.34|
+| | | 2048, 128| 2064.53| 1351.25| 556.48| 140.49| 163.53|
+| | | 2048, 2048| 7768.15| 4515.31| 2464.13| 811.88| 1092.72|
+| | | 5000, 500| 2533.55| 1589.18| 700.7| 212.07| 242.61|
+| | | 20000, 2000| 1447.5| 847.42| 399.8| 140.86| 198.77|
+| Mistral 7B| 1| 128, 128| 30177.4| 17025.15| 6968.4| 5444.55| 9526.7| 33795.78
+| | | 128, 2048| 22060.45| 10324.05| 5556.98| 4960.48| 5669.19| 22724.8
+| | | 128, 4096| 13773.03| 6205.41| 3430.11| 3077.47| 3091.88| 13916.10
+| | | 500, 2000| 17229.29| 8294.02| 4339.77| 3883.38| 4498.74| 20702.51
+| | | 1000, 1000| 15428.87| 7894.2| 3874.65| 3433.27| 4118.6| 17061.12
+| | | 2048, 128| 3546.44| 2001.13| 793.57| 635.46| 1067.47| 4039.02
+| | | 2048, 2048| 9118.64| 4520.74| 2440.45| 2187.82| 2231.66| 9998.65
+| | | 5000, 500| 3493.52| 1838.75| 828.17| 702.36| 999.35| 4042.82
+| | | 20000, 2000| 1267.96| 641| 334.06| 296.1| 336.18| 1521.67
+| Mixtral 8x7B| 1| 128, 128| 15882.61| | | | | 16515.3
+| | | 128, 2048| 8214.24| | | | | 10956.79
+| | | 128, 4096| 4671.49| | | | | 6489.02
+| | | 500, 2000| 6739.79| | | | | 8809.27
+| | | 1000, 1000| 6787.62| | | | | 8402.89
+| | | 2048, 128| 1885.43| | | | | 1932.28
+| | | 2048, 2048| 3725.12| | | | | 5248.95
+| | | 5000, 500| 1762.25| | | | | 2098.53
+| | | 20000, 2000| 670.61| | | | | 870.76
+| | 2| 128, 128| 27155.63| 15904.17| 5758.21| 3788.61| |
+| | | 128, 2048| 23009.9| 7660.05| 4365.92| 2219.51| |
+| | | 128, 4096| 14095.62| 4287.96| 2502.13| 1272.21| |
+| | | 500, 2000| 16785.63| 6454.11| 3618.34| 1633.61| |
+| | | 1000, 1000| 15867.12| 6492.47| 3316.43| 1734.39| |
+| | | 2048, 128| 3367.65| 1895.85| 691.68| 465.45| |
+| | | 2048, 2048| 10464.57| 3642.6| 1990.95| 1038.11| |
+| | | 5000, 500| 3591.62| 1722.61| 755.64| 468.26| |
+| | | 20000, 2000| 1739.08| 655.5| 334.67| 187.43| |
+| | 4| 128, 128| 40731.73| 28272.32| 11612.27| 6075.21| 6756.75|
+| | | 128, 2048| 41117.27| 23327.39| 11755.57| 7851.32| 7989.81|
+| | | 128, 4096| 28143.35| 13906.89| 8052.85| 5920.37| 5655.07|
+| | | 500, 2000| 34507.24| 16964.37| 9185.2| 6243.72| 6605.53|
+| | | 1000, 1000| 27614.12| 16217.64| 7640.13| 4818.03| 5132.48|
+| | | 2048, 128| 5275.25| 3416.82| 1383.85| 740| 811.01|
+| | | 2048, 2048| 18441.12| 10381.54| 5403.69| 3842.39| 3837.68|
+| | | 5000, 500| 6340.27| 3689.37| 1632.92| 966.38| 1072.16|
+| | | 20000, 2000| 3231.36| 1717.02| 856.62| 619.01| 655.74|
+| | 8| 128, 128| 51899.21| 40517.74| 18434.51| 5573.24| 6349.85|
+| | | 128, 2048| 63701.21| 40322.45| 22120.7| 8657.63| 9696.71|
+| | | 128, 4096| 47833.64| 27121.19| 16280.11| 7747.32| 8038.78|
+| | | 500, 2000| 53260.36| 32190.46| 18439.46| 7393.45| 8319.84|
+| | | 1000, 1000| 40321.28| 27487.98| 13842.01| 5041.55| 5593.52|
+| | | 2048, 128| 7609.41| 5396.72| 2295.12| 670.71| 765.2|
+| | | 2048, 2048| 25624.61| 17823.29| 10114.34| 4509.4| 4791.64|
+| | | 5000, 500| 9527.29| 6475.64| 3009.15| 973.63| 1094.62|
+| | | 20000, 2000| 5507.84| 3156.06| 1673.29| 770.41| 872.96|
+| Mixtral 8x22B| 8| 128, 128| 22834.12| 16565.76| 6914.09| | 2470.15|
+| | | 128, 2048| 24975.75| 11676.16| 7170.04| | 3629.98|
+| | | 128, 4096| 17564.49| 7020.49| 5052.47| | 2933.79|
+| | | 500, 2000| 21498.7| 10606.93| 6151.81| | 2959.66|
+| | | 1000, 1000| 16383.52| 9803.47| 4790.88| | 2146.74|
+| | | 2048, 128| 2945.44| 2028.84| 827.34| | 291.53|
+| | | 2048, 2048| 11238.84| 5804.75| 3395| | 1830.44|
+| | | 5000, 500| 3755.98| 2281.8| 1032.41| | 417.12|
+| | | 20000, 2000| 2151.07| 1186.32| 597.81| | 323.37|
 
 *TP stands for Tensor Parallelism*
 
 ## Reproducing Benchmarked Results
 
-### Building the TensorRT-LLM Container
+> [!NOTE] The only models supported in this workflow are those listed in the table above.
 
----
-In order to benchmark TensorRT-LLM, you will need to follow the [Quick Start](../../README.md#quick-start)
-build process to create a baseline container for building a wheel. Additionally, the development
-container needs a copy of the source code to build the wheel and the benchmarking script. Create the
-right build environment, use the following :
-
-```shell
-git clone https://github.com/NVIDIA/TensorRT-LLM.git
-cd TensorRT-LLM
-git submodule update --init --recursive
-git lfs install
-git lfs pull
-make -C docker build
-make -C docker run LOCAL_USER=1
-```
-
-> [!WARNING]
-> If you have elevated privileges on your system, then skip the `make -C docker run LOCAL_USER=1`
-command above as it may make it so that you cannot access some required system libraries within the
-container because the build forces your UID and GID to match those that are set for your non-elevated
-user. There are cases where the container will be booted as root (i.e. on some SLURM systems with
-the pyxis plugin) which will cause libraries to be missing.
-
-If you are benchmarking in a shared environment, you need to specify the GPU indices that you would
-like the container to use, otherwise the Makefile defaults to loading the container with all GPUs on
-the system. For example, if you only have the 4 higher indices of GPUs on your system you can
-configure it using the following example:
-
-```shell
-NV_GPU=0,1,2,3
-make -C docker run LOCAL_USER=1 GPU_OPTS='--gpus \"device=${NV_GPU}\"'
-```
-
-Additionally, if you'd like to mount external storage to access persistent storage, or previously
-built engines, you can mount directories as follows (simply replace `source` and `destination` with
-the appropriate paths):
-
-```shell
-make -C docker run LOCAL_USER=1 DOCKER_RUN_ARGS="-v /source:/destination"
-```
-
-Once the container starts, you'll need to build the wheel and the benchmarking scripts. From the
-code root (the default directory when the container is loaded), the following commands will build
-the TensorRT-LLM wheel, install dependencies, and build the benchmark scripts:
-
-```shell
-python3 ./scripts/build_wheel.py --benchmarks --trt_root /usr/local/tensorrt
-pip install ./build/tensorrt_llm*.whl
-```
-
-## Methodology
-
-The following tables are references for commands that are used as part of the benchmarking process.
+The following tables are references for commands that are used as part of the benchmarking process. For a more detailed
+description of this benchmarking workflow, see the [benchmarking suite documentation](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html).
 
 ### Commands
 
+#### For non GH200 systems
 | Stage | Description | Command |
 | :- | - | - |
-| [Build](#engine-building) | Build a TensorRT-LLM engine | `trtllm-build --model_config $model_cfg --use_fused_mlp --gpt_attention_plugin float16 --output_dir $engine_dir --max_batch_size $max_batch_size --max_input_len 2048 --max_seq_len 2048 --reduce_fusion disable --workers $tp_size --max_num_tokens $max_num_tokens --use_paged_context_fmha enable --multiple_profiles enable` |
-| [Dataset](#preparing-a-dataset) | Create a synthetic dataset | `benchmarks/cpp/prepare_dataset.py --output=$dataset_file --tokenizer=$model_name token-norm-dist --num-requests=2000 --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0` |
-| [Run](#running-the-benchmark) | Run a benchmark with a dataset | `mpirun -n $tp_size --allow-run-as-root --oversubscribe cpp/build/benchmarks/gptManagerBenchmark --engine_dir $engine_dir --type IFB --dataset $dataset_file --eos_id -1 --scheduler_policy guaranteed_no_evict --kv_cache_free_gpu_mem_fraction 0.99 --output_csv result.csv --request_rate -1.0 --enable_chunked_context --warm_up 0` |
+| [Dataset](#preparing-a-dataset) | Create a synthetic dataset | `python benchmarks/cpp/prepare_dataset.py --tokenizer=$model_name --stdout token-norm-dist --num-requests=$num_requests --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0 > $dataset_file` |
+| [Build](#engine-building) | Build a TensorRT-LLM engine | `trtllm-bench --model $model_name build --tp_size $tp_size --pp_size $pp_size --quantization FP8 --dataset $dataset_file` |
+| [Run](#running-the-benchmark) | Run a benchmark with a dataset | `trtllm-bench --model $model_name throughput --dataset $dataset_file --engine_dir $engine_dir` |
+
+#### For GH200 systems only
+For release v0.15, on GH200 systems, the recommendation is to use the legacy flow based on *gptManagerBenchmark* to measure performance.
+
+| Stage | Description | Command |
+| :- | - | - |
+| [Dataset](#preparing-a-dataset) | Create a synthetic dataset for engine building | `python benchmarks/cpp/prepare_dataset.py --tokenizer=$model_name --stdout token-norm-dist --num-requests=$num_requests --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0 > $dataset_file` |
+| [Build](#engine-building) | Build a TensorRT-LLM engine | `trtllm-bench --model $model_name build --tp_size $tp_size --quantization FP8 --dataset $dataset_file` |
+| [Dataset](#preparing-a-dataset) | Create a synthetic dataset for benchmarking in json format | `python benchmarks/cpp/prepare_dataset.py --output=$dataset_file_json --tokenizer=$model_name token-norm-dist --num-requests=$num_requests --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0` |
+| [Run](#running-the-benchmark) | Run a benchmark with a dataset in json format | `/app/tensorrt_llm/benchmarks/cpp/gptManagerBenchmark --engine_dir $engine_dir --type IFB --api executor --dataset $dataset_file_json --eos_id -1 --log_iteration_data --scheduler_policy guaranteed_no_evict --kv_cache_free_gpu_mem_fraction 0.95 --output_csv result.csv --request_rate -1.0 --enable_chunked_context --warm_up 0` |
 
 ### Variables
 
 | Name | Description |
 | :- | - |
 | `$isl` | Benchmark input sequence length. |
-|`$osl` | Benchmark output sequence length. |
-| `$tp_size` | Number of GPUs to run the benchmark with |
+| `$osl` | Benchmark output sequence length. |
+| `$tp_size` | Tensor parallel mapping degree to run the benchmark with |
+| `$pp_size` | Pipeline parallel mapping degree to run the benchmark with |
 | `$engine_dir` | Location to store built engine file (can be deleted after running benchmarks). |
-| `$model_cfg` | Name of the model configuration JSON file to use for building. |
 | `$model_name` | HuggingFace model name eg. meta-llama/Llama-2-7b-hf or use the path to a local weights directory |
 | `$dataset_file` | Location of the dataset file generated by `prepare_dataset.py` |
-| `$results_csv` | Path to store end results to. |
-| `$max_batch_size` | Absolute maximum number of concurrent requests an engine can handle during one iteration. |
-| `$max_num_tokens` | Maximum number of total tokens an engine can handle during one iteration. |
+| `$num_requests` | The number of requests to generate for dataset generation |
+| `$seq_len` | A sequence length of ISL + OSL |
 
-
-### Engine Building
-
-All benchmarks were run using a single engine with a configuration that is capable of handling the
-maximum sequence lengths encountered during benchmarking. For each benchmark, regardless of input/output
-sequence length, you can reuse the single engine to run all tests. Each engine will be built with a paged
-KV cache and in-flight batching enabled. For more information see the
-[documentation about in-flight batching](../overview.md#in-flight-batching-and-paged-attention).
-
-In order to build an engine you will need to run the following command by specifying a configuration file
-for the model that you would like to build (see [below](#network-configuration-files)). The general build
-command is as follows:
-
-```shell
-trtllm-build --model_config $model_cfg --use_fused_mlp --gpt_attention_plugin float16 --output_dir $engine_dir --max_batch_size $max_batch_size --max_input_len 2048 --max_seq_len 2048 --reduce_fusion disable --workers $tp_size --max_num_tokens $max_num_tokens --use_paged_context_fmha enable --multiple_profiles enable
-```
-
-Some notes about the command:
-- `--workers` affects the number of threads that build the engine file and does not necessarily need to match
-the TP size. Make sure to set the tensor parallelism in the `$model_cfg` JSON file. See [below](#network-configuration-files)
-- You can run benchmarks for datasets that fit within the bounds of the `max_input_len` and `max_seq_len` parameters.
-
-### Engine Configuration Files
-
-In order to configure the TensorRT-LLM build process for benchmarking, you need to provide
-`trtllm-build` a configuration file that specifies the following the network configuration, parallelism
-mapping, and quantization options.
-
-Below we document how to benchmark each model on an H100-HBM3-80GB system and reproduce the throughput
-numbers we document on our [Performance section](#performance of-tensorrt-llm).
-
-> [!Important]
-> In order to change the parallelism for a build, you need to modify the `mapping` dictionary in your configuration file. The settings
-must conform to the following condition: `world_size == tp_size * pp_size`.
-
-> [!Note]
-> All configurations below are set to run utilizing FP8 by default. If you would like to run on an A100 system, see our notes about [disabling FP8 quantization](#running-on-a100).
-
-
-### Network Configuration Files and Settings
-
-Each network has its own configuration file. All networks are configured to run using FP8 quantization by default. Additionally, each network has a specific tuning for the
-`$max_batch_size` and `$max_num_tokens` parameters -- at times varying for some
-input and output sequence legnths within the same model.
-
-> ![Note]
-> General settings are specified by "General" in the "ISL/OSL" column. For special
-> cases, specific input and output sequence lengths will be specified.
-
-<table>
-<tr>
-<td> Model </td> <td> Configuration File (FP8) </td>
-</tr>
-<tr>
-<td> EleutherAI/gpt-j-6b </td>
-<td>
-
-```json
-{
-    "architecture": "GPTJForCausalLM",
-    "dtype": "float16",
-    "num_hidden_layers": 28,
-    "num_attention_heads": 16,
-    "hidden_size": 4096,
-    "norm_epsilon": 1e-05,
-    "vocab_size": 50400,
-    "position_embedding_type": "rope_gptj",
-    "max_position_embeddings": 2048,
-    "hidden_act": "gelu_new",
-    "quantization": {
-        "quant_algo": "FP8",
-        "kv_cache_quant_algo": "FP8"
-    },
-    "rotary_dim": 64,
-    "kv_dtype": "float16"
-}
-```
-
-| `$tp_size` | `$max_num_tokens` | `$max_batch_size` |  ISL/OSL |
-| ---------- | ----------------- | ----------------- | -------- |
-| 1          | 2048              | 128               | General  |
-| 1          | 2048              | 2048              | 128, 128 |
-
-
-</td>
-</tr>
-<tr>
-<td> tiiuae/falcon-180B </td>
-<td>
-
-```json
-{
-    "architecture": "FalconForCausalLM",
-    "dtype": "bfloat16",
-    "num_hidden_layers": 80,
-    "num_attention_heads": 232,
-    "num_key_value_heads": 8,
-    "hidden_size": 14848,
-    "norm_epsilon": 1e-05,
-    "vocab_size": 65024,
-    "position_embedding_type": "rope_gpt_neox",
-    "max_position_embeddings": 2048,
-    "hidden_act": "gelu",
-    "use_parallel_embedding": false,
-    "embedding_sharding_dim": 0,
-    "share_embedding_table": false,
-    "quantization": {
-        "quant_algo": "FP8",
-        "kv_cache_quant_algo": "FP8"
-    },
-    "mapping": {
-        "world_size": 8,
-        "tp_size": 8,
-        "pp_size": 1
-    },
-    "bias": false,
-    "parallel_attention": true,
-    "new_decoder_architecture": true,
-    "kv_dtype": "float16"
-}
-```
-
-| `$tp_size` | `$max_num_tokens` | `$max_batch_size` |  ISL/OSL |
-| ---------- | ----------------- | ----------------- | -------- |
-| 4          | 8192              | 4096              | General  |
-| 8          | 8192              | 2048              | General  |
-
-</td>
-</tr>
-<tr>
-<td> meta-llama/Llama-2-7b-hf </td>
-<td>
-
-```json
-{
-    "architecture": "LlamaForCausalLM",
-    "dtype": "float16",
-    "num_hidden_layers": 32,
-    "num_attention_heads": 32,
-    "hidden_size": 4096,
-    "intermediate_size": 11008,
-    "num_key_value_heads": 32,
-    "vocab_size": 32000,
-    "position_embedding_type": "rope_gpt_neox",
-    "max_position_embeddings": 4096,
-    "hidden_act": "silu",
-    "rotary_base": 10000.0,
-    "rotary_scaling": null,
-    "norm_epsilon": 1e-05,
-    "quantization": {
-        "quant_algo": "FP8",
-        "kv_cache_quant_algo": "FP8"
-    },
-    "kv_dtype": "float16"
-}
-```
-
-| `$tp_size` | `$max_num_tokens` | `$max_batch_size` |  ISL/OSL |
-| ---------- | ----------------- | ----------------- | -------- |
-| 1          | 8192              | 4096              | General  |
-
-</td>
-</tr>
-</tr>
-<tr>
-<td> meta-llama/Llama-2-70b-hf </td>
-<td>
-
-```json
-{
-    "architecture": "LlamaForCausalLM",
-    "dtype": "float16",
-    "num_hidden_layers": 80,
-    "num_attention_heads": 64,
-    "hidden_size": 8192,
-    "intermediate_size": 28672,
-    "num_key_value_heads": 8,
-    "vocab_size": 32000,
-    "position_embedding_type": "rope_gpt_neox",
-    "max_position_embeddings": 4096,
-    "hidden_act": "silu",
-    "rotary_base": 10000.0,
-    "rotary_scaling": null,
-    "norm_epsilon": 1e-05,
-    "quantization": {
-        "quant_algo": "FP8",
-        "kv_cache_quant_algo": "FP8"
-    },
-    "mapping": {
-        "world_size": 4,
-        "tp_size": 4,
-        "pp_size": 1
-    },
-    "kv_dtype": "float16"
-}
-```
-
-| `$tp_size` | `$max_num_tokens` | `$max_batch_size` |  ISL/OSL |
-| ---------- | ----------------- | ----------------- | -------- |
-| 2          | 2048              | 2048              | General  |
-| 4          | 8192              | 4096              | General  |
-| 4          | 8192              | 256               | 128, 4096|
-| 8          | 16384             | 8192              | General  |
-| 8          | 16384             | 1024              | 128, 2048|
-
-</td>
-</tr>
-<tr>
-<td> meta-llama/Meta-Llama-3-8B </td>
-<td>
-
-```json
-{
-    "architecture": "LlamaForCausalLM",
-    "num_hidden_layers": 32,
-    "num_attention_heads": 32,
-    "num_key_value_heads": 8,
-    "hidden_size": 4096,
-    "vocab_size": 128256,
-    "max_position_embeddings": 8192,
-    "hidden_act": "silu",
-    "norm_epsilon": 1e-05,
-    "dtype": "float16",
-    "position_embedding_type": "rope_gpt_neox",
-    "intermediate_size": 14336,
-    "rotary_base": 500000.0,
-    "rope_theta": 500000.0,
-    "rotary_scaling": null,
-    "mapping": {
-        "world_size": 1,
-        "tp_size": 1,
-        "pp_size": 1
-    },
-    "quantization": {
-        "quant_algo": "FP8",
-        "kv_cache_quant_algo": "FP8"
-    },
-    "kv_dtype": "float16"
-}
-```
-
-| `$tp_size` | `$max_num_tokens` | `$max_batch_size` |  ISL/OSL |
-| ---------- | ----------------- | ----------------- | -------- |
-| 1          | 8192              | 2048              | General  |
-
-</td>
-</tr>
-<tr>
-<td> meta-llama/Meta-Llama-3-70B </td>
-<td>
-
-```json
-{
-    "architecture": "LlamaForCausalLM",
-    "num_hidden_layers": 80,
-    "num_attention_heads": 64,
-    "num_key_value_heads": 8,
-    "hidden_size": 8192,
-    "vocab_size": 128256,
-    "max_position_embeddings": 8192,
-    "hidden_act": "silu",
-    "dtype": "float16",
-    "norm_epsilon": 1e-05,
-    "position_embedding_type": "rope_gpt_neox",
-    "intermediate_size": 28672,
-    "rotary_base": 500000.0,
-    "rope_theta": 500000.0,
-    "rotary_scaling": null,
-    "mapping": {
-        "world_size": 4,
-        "tp_size": 4,
-        "pp_size": 1
-    },
-    "quantization": {
-        "quant_algo": "FP8",
-        "kv_cache_quant_algo": "FP8"
-    },
-    "kv_dtype": "float16"
-}
-```
-
-| `$tp_size` | `$max_num_tokens` | `$max_batch_size` |  ISL/OSL |
-| ---------- | ----------------- | ----------------- | -------- |
-| 4          | 1024              | 2048              | General  |
-| 8          | 16384             | 8192              | General  |
-
-</td>
-</tr>
-<tr>
-<td> mistralai/Mixtral-8x7B-v0.1 </td>
-<td>
-
-```json
-{
-    "architecture": "MixtralForCausalLM",
-    "num_hidden_layers": 32,
-    "num_attention_heads": 32,
-    "num_key_value_heads": 8,
-    "hidden_size": 4096,
-    "norm_epsilon": 1e-05,
-    "vocab_size": 32000,
-    "max_position_embeddings": 32768,
-    "head_size": 128,
-    "hidden_act": "swiglu",
-    "dtype": "float16",
-    "position_embedding_type": "rope_gpt_neox",
-    "intermediate_size": 14336,
-    "moe_num_experts": 8,
-    "moe_top_k": 2,
-    "rotary_base": 1000000.0,
-    "rope_theta": 1000000.0,
-    "mapping": {
-        "world_size": 1,
-        "tp_size": 1,
-        "pp_size": 1
-    },
-    "quantization": {
-        "quant_algo": "FP8",
-        "kv_cache_quant_algo": "FP8"
-    },
-    "kv_dtype": "float16"
-}
-```
-
-| `$tp_size` | `$max_num_tokens` | `$max_batch_size` |  ISL/OSL |
-| ---------- | ----------------- | ----------------- | -------- |
-| 2          | 3072              | 2048              | General  |
-| 4          | 8192              | 8192              | General  |
-
-</td>
-</tr>
-<tr>
-<td> mistralai/Mistral-7B-v0.1 </td>
-<td>
-
-```json
-{
-    "architecture": "MistralForCausalLM",
-    "num_hidden_layers": 32,
-    "num_attention_heads": 32,
-    "num_key_value_heads": 8,
-    "hidden_size": 4096,
-    "norm_epsilon": 1e-05,
-    "vocab_size": 32000,
-    "max_position_embeddings": 32768,
-    "hidden_act": "silu",
-    "dtype": "float16",
-    "logits_dtype": "float32",
-    "position_embedding_type": "rope_gpt_neox",
-    "use_parallel_embedding": false,
-    "embedding_sharding_dim": 0,
-    "share_embedding_table": false,
-    "intermediate_size": 14336,
-    "use_prompt_tuning": false,
-    "mapping": {
-        "world_size": 1,
-        "tp_size": 1,
-        "pp_size": 1
-    },
-    "quantization": {
-        "quant_algo": "FP8",
-        "kv_cache_quant_algo": "FP8"
-    }
-}
-```
-
-| `$tp_size` | `$max_num_tokens` | `$max_batch_size` |  ISL/OSL |
-| ---------- | ----------------- | ----------------- | -------- |
-| 1          | 8192              | 4098              | General  |
-
-</td>
-</tr>
-</table>
-
-
-
-### Running on A100
-
-To run the benchmarks on A100, you will need to undefine or remove the following
-quantization fields from each config json file, because FP8 computation is a feature in H100 and newer GPUs.
-```json
-"quantization": {
-	"quant_algo": null,
-	"kv_cache_quant_algo": null,
-}
-```
-
-## Preparing a Dataset
+### Preparing a Dataset
 
 In order to prepare a dataset, you can use the provided [script](../../../benchmarks/cpp/prepare_dataset.py).
 To generate a synthetic dataset, run the following command:
 
 ```shell
-benchmarks/cpp/prepare_dataset.py --output=$dataset_file --tokenizer=$model_name token-norm-dist --num-requests=$num_requests --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0
+python benchmarks/cpp/prepare_dataset.py --tokenizer=$model_name --stdout token-norm-dist --num-requests=$num_requests --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0 > $dataset_file
 ```
 
-The command will generate a JSON file located at the path specified `$dataset_file` where all requests are of the same
+The command will generate a text file located at the path specified `$dataset_file` where all requests are of the same
 input/output sequence length combinations. The script works by using the tokenizer to retrieve the vocabulary size and
 randomly sample token IDs from it to create entirely random sequences. In the command above, all requests will be uniform
 because the standard deviations for both input and output sequences are set to 0.
@@ -587,26 +241,198 @@ because requests enter and exit the system at a much faster rate. For longer inp
 remain in the system longer and therefore require less requests to achieve steady state.
 
 
-| Input Length | Output Length | $num_requests      |
-| ------------ | ------------- | ------------------ |
-| 128          | 128           | 30000              |
-| 128          | 2048          | 3000               |
-| 128          | 4096          | 1500               |
-| 2048         | 128           | 3000               |
-| 2048         | 2048          | 1500               |
+| Input Length | Output Length |  $seq_len  | $num_requests      |
+| ------------ | ------------- | ---------- | ------------------ |
+| 128          | 128           | 256        | 30000              |
+| 128          | 2048          | 2176       | 3000               |
+| 128          | 4096          | 4224       | 1500               |
+| 2048         | 128           | 2176       | 3000               |
+| 2048         | 2048          | 4096       | 1500               |
+| 5000         | 500           | 5500       | 1500               |
+| 1000         | 1000          | 2000       | 3000               |
+| 500          | 2000          | 2500       | 3000               |
+| 20000        | 2000          | 22000      | 1000               |
 
+### Engine Building
 
-## Running the Benchmark
+All engines are built using the `trtllm-bench build` subcommand.
+The basic command for FP8 quantized engines is as follows:
 
-To run the benchmark with the generated data set, simply run the following command from the root of the
-TensorRT-LLM repository. See the [variables](#variables) section for reference on variable values.
+```
+trtllm-bench --model $model_name build --tp_size $tp_size --pp_size $pp_size --quantization FP8 --dataset $dataset_file
+```
+When providing `--dataset` in the build subcommand, `trtllm-bench build` uses high-level statistics of the dataset (average ISL/OSL, max sequence length) and tuning heuristics to optimize engine build settings.
 
-```shell
-mpirun -n $tp_size --allow-run-as-root --oversubscribe cpp/build/benchmarks/gptManagerBenchmark --engine_dir $engine_dir --type IFB --dataset $dataset_file --eos_id -1 --scheduler_policy guaranteed_no_evict --kv_cache_free_gpu_mem_fraction 0.99 --output_csv result.csv --request_rate -1.0 --enable_chunked_context --warm_up 0
+Alternatively, if you would like to build the engine with specific settings, you can do so by specifying the values for `max_batch_size` and `max_num_tokens`:
+
+```
+trtllm-bench --model $model_name build --tp_size $tp_size --pp_size $pp_size --quantization FP8 --max_seq_len $seq_len --max_batch_size $max_bs --max_num_tokens $max_token
 ```
 
-> [!Warning] GH200 benchmarks
-> For GH200 benchmarks, the command above must be modified to use `--kv_cache_free_gpu_mem_fraction 0.95` to avoid an out of memory scenario.
+If you would like to build an FP16 engine without any quantization, simply remove the `--quantization FP8` option.
+
+> [!NOTE] If you specify FP8 quantization, the KV cache will automatically be set to FP8 as well!
+
+The `trtllm-bench build` subcommand will output the path where the engine is located upon a successful build. For example,
+
+```shell
+===========================================================
+ENGINE SAVED: /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+===========================================================
+```
+
+### Running the Benchmark
+
+### For non GH200 systems
+To run the benchmark with the generated data set, simply use the `trtllm-bench throughput` subcommand. The benchmarker will
+run an offline maximum throughput scenario such that all requests are queued in rapid succession. You simply need to provide
+the patch to the engine from the [build](#engine-building) phase and a [generated dataset](#preparing-a-dataset).
+
+```shell
+trtllm-bench --model $model_name throughput --dataset $dataset_file --engine_dir $engine_dir
+```
+
+In majority of cases, we also use a higher KV cache percentage by setting `--kv_cache_free_gpu_mem_fraction 0.95` in the benchmark command. This allows us to obtain better performance than the default setting of `0.90`. We fall back to `0.90` if we hit an out of memory issue.
+
+The results will be printed to the terminal upon benchmark completion. For example,
+
+```shell
+===========================================================
+= ENGINE DETAILS
+===========================================================
+Model:                  meta-llama/Llama-2-7b-hf
+Engine Directory:       /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+TensorRT-LLM Version:   0.12.0
+Dtype:                  float16
+KV Cache Dtype:         FP8
+Quantization:           FP8
+Max Input Length:       2048
+Max Sequence Length:    4098
+
+===========================================================
+= WORLD + RUNTIME INFORMATION
+===========================================================
+TP Size:                1
+PP Size:                1
+Max Runtime Batch Size: 4096
+Max Runtime Tokens:     8192
+Scheduling Policy:      Guaranteed No Evict
+KV Memory Percentage:   99.0%
+Issue Rate (req/sec):   3.680275266452667e+18
+===========================================================
+= STATISTICS
+===========================================================
+Number of requests:             3000
+Average Input Length (tokens):  128.0
+Average Output Length (tokens): 128.0
+Token Throughput (tokens/sec):  23405.927228471104
+Request Throughput (req/sec):   182.8588064724305
+Total Latency (seconds):        16.406100739
+===========================================================
+```
+
+> [!WARNING] In some cases, the benchmarker may not print anything at all. This behavior usually
+means that the benchmark has hit an out of memory issue. Try reducing the KV cache percentage
+using the `--kv_cache_free_gpu_mem_fraction` option to lower the percentage of used memory.
+
+## Online Serving Measurements
+
+The [TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend) is used to measure the performance of TensorRT-LLM for online serving.
+
+The below table shows the throughput and latency under a serving scenario.
+
+**All data in the table below was generated using version 0.14.0, with 500 requests and BF16 precision.**
+
+|                 |                    |         |         |         |         |                  |                    |                    |                               |                         |
+| --------------- | -------------------| --------| --------| --------| --------|------------------| ------------------ | ------------------ | ----------------------------- |------------------------ |
+| **Model**       | **GPU**            | **TP**  | **Input Length** | **Output Length** | **QPS** | **Tput(req/s)**  | **Mean TTFT(ms)**  | **Mean ITL(ms)**   | **Total Token Tput (tok/s)**  | **Output Tput (tok/s)** |
+|LLaMA 3.1 70B|H100 80GB HBM3|4|467|256|2|2|62|21|1406|498||
+||||||4|4|68|24|2750|973|
+||||||8|7|92|32|5256|1860|
+||||||16|12|175|66|8941|3164|
+||||||32|16|1229|86|11537|4083|
+||||||INF|16|9123|85|11593|4103|
+||||467|16|2|2|53|18|844|28|
+||||||4|4|58|20|1908|63|
+||||||8|8|71|24|3795|126|
+||||||16|16|109|38|7492|248|
+||||||32|28|1197|482|13655|452|
+||||||INF|28|9126|548|13719|454|
+||||202|214|2|2|48|20|780|401|
+||||||4|4|51|22|1499|771|
+||||||8|7|57|25|2702|1390|
+||||||16|11|74|32|4364|2245|
+||||||32|14|116|42|5837|3003|
+||||||INF|16|4482|50|6725|3459|
+|LLaMA 3.1 8B||1|467|256|2|2|23|8|1423|504|
+||||||4|4|24|9|2624|929|
+||||||8|8|26|9|5535|1959|
+||||||16|15|30|11|10636|3765|
+||||||32|26|50|19|19138|6774|
+||||||INF|37|3335|39|26614|9420|
+||||467|16|2|2|19|7|956|32|
+||||||4|4|20|7|1910|63|
+||||||8|8|22|7|3808|126|
+||||||16|16|24|8|7567|251|
+||||||32|31|29|10|14894|493|
+||||||INF|79|3280|193|38319|1269|
+||||202|214|2|2|19|7|809|416|
+||||||4|4|20|8|1586|816|
+||||||8|7|21|9|3047|1568|
+||||||16|13|23|10|5597|2879|
+||||||32|23|27|11|9381|4825|
+||||||INF|39|1657|21|16117|8291|
+|LLaMA 3.1 70B|H200 131GB HBM3|4|467|256|2|2|58|18|1411|499|
+||||||4|4|63|20|2770|980|
+||||||8|7|84|27|5328|1886|
+||||||16|13|165|60|9224|3264|
+||||||32|16|1279|83|11800|4176|
+||||||INF|16|9222|83|11826|4185|
+||||467|16|2|2|50|15|956|32|
+||||||4|4|55|16|1909|63|
+||||||8|8|67|20|3799|126|
+||||||16|16|103|33|7499|248|
+||||||32|28|1259|485|13586|450|
+||||||INF|29|9074|546|13792|457|
+||||202|214|2|2|43|17|793|408|
+||||||4|4|46|18|1524|784|
+||||||8|7|51|21|2796|1438|
+||||||16|11|67|28|4639|2386|
+||||||32|15|112|39|6288|3235|
+||||||INF|17|4480|48|7230|3719|
+|LLaMA 3.1 8B|H200 131GB HBM3|1|467|256|2|2|21|6|1425|504|
+||||||4|4|23|7|2828|1001|
+||||||8|8|24|7|5567|1971|
+||||||16|15|27|9|10761|3809|
+||||||32|27|44|16|19848|7025|
+||||||INF|40|3237|36|28596|10121|
+||||467|16|2|2|18|5|956|32|
+||||||4|4|19|6|1910|63|
+||||||8|8|20|6|3810|126|
+||||||16|16|22|7|7567|250|
+||||||32|31|27|9|14927|494|
+||||||INF|81|3227|190|39007|1291|
+||||202|214|2|2|17|6|812|418|
+||||||4|4|18|6|1597|822|
+||||||8|7|19|7|3088|1589|
+||||||16|14|20|8|5771|2969|
+||||||32|24|24|9|9931|5109|
+||||||INF|43|1665|19|17861|9189|
+
+*TP stands for Tensor Parallelism*
+
+*TTFT stands for Time To First Token*
+
+*ITL stands for Inter Token Latency*
+
+### For GH200 systems only
+For release v0.15, on GH200 systems, the recommendation is to use *gptManagerBenchmark* to measure performance. Throughput measurements are reported based on the below commands.
+```shell
+ /app/tensorrt_llm/benchmarks/cpp/gptManagerBenchmark  --engine_dir $engine_dir --type IFB --dataset $dataset_file_json --eos_id -1 --scheduler_policy guaranteed_no_evict --kv_cache_free_gpu_mem_fraction 0.95 --output_csv result.csv --request_rate -1.0 --enable_chunked_context --warm_up 0
+```
+
+> [!Warning] CUDA error: out of memory \
+> For benchmarks with large models causing OOM error, the command above must be modified to use `--kv_cache_free_gpu_mem_fraction 0.90` to avoid the scenario.
 
 The command will run the `gptManagerBenchmark` binary that will report the throughput and other metrics as part of its output
-that can be compared with the table in the [Performance section](#peak-throughput) of this README.
+that can be compared with the table in the [Throughput Measurements](#throughput-measurements) of this README.

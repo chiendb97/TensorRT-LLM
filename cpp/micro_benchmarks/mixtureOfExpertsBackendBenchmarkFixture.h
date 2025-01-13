@@ -46,6 +46,7 @@ static BufferManager::CudaStreamPtr streamPtr;
 static std::unique_ptr<BufferManager> bufferManager;
 static int deviceCount;
 static char* workloadFile = nullptr;
+static bool useCudaGraph = true;
 
 enum VERBOSE_LEVEL
 {
@@ -306,8 +307,9 @@ public:
 #ifdef ENABLE_BF16
         if (std::is_same_v<DataType, nv_bfloat16>)
             return nvinfer1::DataType::kBF16;
-#endif
+#else
         TLLM_THROW("Unrecognised format");
+#endif
     };
 
     template <class T>
@@ -421,6 +423,8 @@ public:
     MOEExpertScaleNormalizationMode mNormMode = MOEExpertScaleNormalizationMode::NONE;
 
     QuantParams mQuantParams{};
+    bool mUseLora = false;
+    LoraParams mLoraParams{};
 
     std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mSelectedConfig = std::nullopt;
 
@@ -451,8 +455,8 @@ public:
         mGatedMultiplier = mIsGated ? 2 : 1;
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
-        size_t workspace_size
-            = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, {});
+        size_t workspace_size = mMoERunner.getWorkspaceSize(
+            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, mNormMode, {}, mUseLora);
 
         mWorkspace = allocBuffer<char>(workspace_size);
         size_t const expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
@@ -500,6 +504,34 @@ public:
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
     }
 
+    cudaGraph_t mGraph{};
+    cudaGraphExec_t mGraphInstance{};
+
+    void createGraph(MOEParallelismConfig parallelism_config)
+    {
+        if (!useCudaGraph)
+            return;
+
+        NVTX3_SCOPED_RANGE(BuildGraph);
+
+        check_cuda_error(cudaGraphCreate(&mGraph, 0));
+        check_cuda_error(cudaStreamBeginCapture(streamPtr->get(), cudaStreamCaptureModeThreadLocal));
+        runMoEPermute(parallelism_config);
+        check_cuda_error(cudaStreamEndCapture(streamPtr->get(), &mGraph));
+        check_cuda_error(cudaGraphInstantiate(&mGraphInstance, mGraph, nullptr, nullptr, 0));
+    }
+
+    void destroyGraph()
+    {
+        if (!useCudaGraph)
+            return;
+
+        NVTX3_SCOPED_RANGE(DestroyGraph);
+
+        check_cuda_error(cudaGraphExecDestroy(mGraphInstance));
+        check_cuda_error(cudaGraphDestroy(mGraph));
+    }
+
     float benchmarkLoop(MOEParallelismConfig parallelism_config)
     {
         auto tactic = routingConfigCache.at(mRoutingConfigIndex);
@@ -511,7 +543,14 @@ public:
         {
             NVTX3_SCOPED_RANGE(BenchmarkLoopIteration);
             check_cuda_error(cudaEventRecord(mStartEvent, streamPtr->get()));
-            runMoEPermute(parallelism_config);
+            if (useCudaGraph)
+            {
+                cudaGraphLaunch(mGraphInstance, streamPtr->get());
+            }
+            else
+            {
+                runMoEPermute(parallelism_config);
+            }
             check_cuda_error(cudaEventRecord(mEndEvent, streamPtr->get()));
             check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
         }
@@ -531,7 +570,7 @@ public:
 
         GemmProfilerBackend profiler;
         profiler.init(mMoERunner, gemm_to_profile, typeToDtypeID<DataType>(), typeToDtypeID<WeightType>(),
-            typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize, mActType, mUseBias,
+            typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize, mActType, mUseBias, mUseLora,
             parallelism_config);
         auto workspace_size = profiler.getWorkspaceSize(mTotalTokens);
         auto workspace = bufferManager->gpu(workspace_size);
@@ -638,8 +677,8 @@ public:
         auto stream = streamPtr->get();
         mMoERunner.runMoe(mInputTensor, mInputProbabilities, mExpertWeight1, mExpertBias1, mActType, mExpertWeight2,
             mExpertBias2, mQuantParams, mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace,
-            mFinalOutput, nullptr, mTotalTokens, mScaleProbs, mSourceToExpandedMap, mSelectedExpert, parallelism_config,
-            mNormMode, stream);
+            mFinalOutput, nullptr, mTotalTokens, mScaleProbs, mSourceToExpandedMap, mSelectedExpert, 0.01,
+            parallelism_config, mNormMode, mUseLora, mLoraParams, stream);
     }
 
     void runBenchmark(benchmark::State& state);
@@ -711,6 +750,8 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     state.counters["tactic_idx1"] = tactic_idx1;
     state.counters["tactic_idx2"] = tactic_idx2;
 
+    createGraph(parallelism_config);
+
     {
         NVTX3_SCOPED_RANGE(BenchmarkRun);
         for (auto _ : state)
@@ -719,6 +760,8 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
             state.SetIterationTime(ms / 1000.f);
         }
     }
+
+    destroyGraph();
 
     state.SetItemsProcessed(state.iterations() * num_tokens);
 

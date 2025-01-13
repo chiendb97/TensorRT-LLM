@@ -18,9 +18,9 @@
 
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tensorrt_llm/runtime/loraModule.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
-#include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 
 #include <NvInferRuntime.h>
 #include <array>
@@ -36,6 +36,7 @@ public:
     // users tune that, we can support that by writing and reading the
     // points in `config.json`.
     static constexpr std::array kOPT_PROFILES_SPLIT_POINTS{64, 128, 256, 512, 1024};
+    static constexpr SizeType32 kDEFAULT_NUM_TOKENS_PER_BLOCK = 64;
 
     enum class ModelVariant : std::int32_t
     {
@@ -60,24 +61,58 @@ public:
     {
         kATTENTION,
         kRECURRENT,
+        // NOTE: Linear and noop are attention alternatives introduced in Nemotron-NAS. They do not use the KV cache.
+        kLINEAR,
+        kNOOP,
     };
 
-    explicit ModelConfig(SizeType32 vocabSize, SizeType32 nbAttentionLayers, SizeType32 nbRnnLayers, SizeType32 nbHeads,
-        SizeType32 hiddenSize, nvinfer1::DataType dtype)
+    enum class KVCacheType : std::int32_t
+    {
+        kCONTINUOUS,
+        kPAGED,
+        kDISABLED,
+    };
+
+    static KVCacheType KVCacheTypeFromString(std::string value)
+    {
+        std::transform(value.begin(), value.end(), value.begin(), ::toupper);
+
+        if (value == "CONTINUOUS")
+        {
+            return KVCacheType::kCONTINUOUS;
+        }
+        if (value == "PAGED")
+        {
+            return KVCacheType::kPAGED;
+        }
+        if (value == "DISABLED")
+        {
+            return KVCacheType::kDISABLED;
+        }
+
+        throw std::invalid_argument("Invalid KV cache type: " + value);
+    }
+
+    enum class ManageWeightsType : std::int32_t
+    {
+        kDisabled,
+        kEnabled,
+    };
+
+    explicit ModelConfig(SizeType32 vocabSize, SizeType32 nbLayers, SizeType32 nbAttentionLayers,
+        SizeType32 nbRnnLayers, SizeType32 nbHeads, SizeType32 hiddenSize, nvinfer1::DataType dtype)
         : mVocabSize(vocabSize)
+        , mNbLayers(nbLayers)
         , mNbAttentionLayers(nbAttentionLayers)
         , mNbRnnLayers(nbRnnLayers)
         , mNbHeads(nbHeads)
-        , mNbKvHeads(nbHeads)
         , mHiddenSize(hiddenSize)
         , mSizePerHead(mHiddenSize / mNbHeads)
         , mDataType(dtype)
         , mUseGptAttentionPlugin(false)
         , mUseMambaConv1dPlugin(false)
         , mInputPacked{false}
-        , mPagedKvCache{false}
-        , mPagedState{false}
-        , mTokensPerBlock{64}
+        , mTokensPerBlock{kDEFAULT_NUM_TOKENS_PER_BLOCK}
         , mQuantMode{common::QuantMode::none()}
         , mMaxBatchSize(0)
         , mMaxBeamWidth(0)
@@ -88,9 +123,13 @@ public:
         , mComputeGenerationLogits(false)
         , mModelVariant(ModelVariant::kGpt)
         , mMaxPromptEmbeddingTableSize(0)
+        , mUseMrope{false}
+        , mMaxPositionEmbeddings(0)
+        , mRotaryEmbeddingDim(0)
         , mContextFMHA(false)
         , mPagedContextFMHA(false)
         , mUseXQA{false}
+        , mPpReduceScatter{false}
         , mUseLoraPlugin(false)
         , mMlpHiddenSize(0)
         , mUseCrossAttention(false)
@@ -99,7 +138,13 @@ public:
         , mSpeculativeDecodingMode(SpeculativeDecodingMode::None())
         , mLogitsDtype(nvinfer1::DataType::kFLOAT)
         , mUseShapeInference(true)
+        , mManageWeightsType(ManageWeightsType::kDisabled)
+        , mSkipCrossAttnBlocks(false)
     {
+        TLLM_CHECK_WITH_INFO(mNbLayers >= mNbAttentionLayers + mNbRnnLayers,
+            "Number of layers (%d) expected to be >= number of attention (%d) + number of rnn layers (%d)", mNbLayers,
+            mNbAttentionLayers, mNbRnnLayers);
+        setNbKvHeads(mNbHeads);
     }
 
     [[nodiscard]] static std::vector<SizeType32> getOptProfilesSplitPoints() noexcept
@@ -117,14 +162,55 @@ public:
         return (mVocabSize + worldSize - 1) / worldSize * worldSize;
     }
 
-    [[nodiscard]] SizeType32 constexpr getNbAttentionLayers(SizeType32 pipelineParallelism = 1) const
+    [[nodiscard]] SizeType32 countLocalLayers(
+        LayerType layerType, SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
-        return mNbAttentionLayers / pipelineParallelism;
+        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
+        auto const numLocalLayers = mNbLayers / pipelineParallelism; // WARNING: assume no remainder
+        auto const firstLocalLayerIt = mLayerTypes.cbegin() + (numLocalLayers * pipelineParallelismRank);
+        return std::count(firstLocalLayerIt, firstLocalLayerIt + numLocalLayers, layerType);
     }
 
-    [[nodiscard]] SizeType32 constexpr getNbRnnLayers(SizeType32 pipelineParallelism = 1) const
+    [[nodiscard]] SizeType32 countLowerRankLayers(
+        LayerType layerType, SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
-        return mNbRnnLayers / pipelineParallelism;
+        auto const numLocalLayers = mNbLayers / pipelineParallelism; // WARNING: assume no remainder
+        auto const firstLocalLayer = numLocalLayers * pipelineParallelismRank;
+        // count number of previous non-local attention layers
+        return std::count(mLayerTypes.cbegin(), mLayerTypes.cbegin() + firstLocalLayer, layerType);
+    }
+
+    [[nodiscard]] SizeType32 getNbLayers(SizeType32 pipelineParallelism = 1) const
+    {
+        return mNbLayers / pipelineParallelism; // WARNING: assume no remainder
+    }
+
+    [[nodiscard]] SizeType32 getNbAttentionLayers(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
+    {
+        // TODO(oargov): get rid of this invalid state
+        if (mLayerTypes.empty())
+        {
+            // this assumption might be wrong in a few cases, for example:
+            // layer types: [attention, recurrent, recurrent], pp=2 ==> first rank has 1 attention layer, not 0
+            TLLM_LOG_DEBUG("Assuming uniform distribution of attention layers between ranks");
+            return mNbAttentionLayers / pipelineParallelism;
+        }
+        return countLocalLayers(LayerType::kATTENTION, pipelineParallelism, pipelineParallelismRank);
+    }
+
+    [[nodiscard]] SizeType32 getNbRnnLayers(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
+    {
+        // TODO(oargov): get rid of this invalid state
+        if (mLayerTypes.empty())
+        {
+            // this assumption might be wrong in a few cases, for example:
+            // layer types: [attention, attention, recurrent], pp=2 ==> second rank has 1 rnn layer, not 0
+            TLLM_LOG_DEBUG("Assuming uniform distribution of recurrent layers between ranks");
+            return mNbRnnLayers / pipelineParallelism;
+        }
+        return countLocalLayers(LayerType::kRECURRENT, pipelineParallelism, pipelineParallelismRank);
     }
 
     [[nodiscard]] SizeType32 constexpr getNbHeads() const noexcept
@@ -132,14 +218,22 @@ public:
         return mNbHeads;
     }
 
-    [[nodiscard]] SizeType32 constexpr getNbKvHeads() const noexcept
+    [[nodiscard]] SizeType32 getNbKvHeads(SizeType32 layerIdx) const
     {
-        return mNbKvHeads;
+        TLLM_CHECK_WITH_INFO(layerIdx < mNbAttentionLayers, "Layer index %d is out of bounds", layerIdx);
+        return mNumKvHeadsPerAttentionLayer[layerIdx];
     }
 
-    void constexpr setNbKvHeads(SizeType32 nbKvHeads) noexcept
+    // set the number of kv heads for all layers
+    void setNbKvHeads(SizeType32 nbKvHeads)
     {
-        mNbKvHeads = nbKvHeads;
+        mNumKvHeadsPerAttentionLayer = std::vector<SizeType32>(mNbAttentionLayers, nbKvHeads);
+    }
+
+    // set the number of kv heads for all layers
+    void setNbCrossKvHeads(SizeType32 nbKvHeads)
+    {
+        mNumKvHeadsPerCrossAttentionLayer = std::vector<SizeType32>(mNbAttentionLayers, nbKvHeads);
     }
 
     [[nodiscard]] SizeType32 constexpr getHiddenSize() const noexcept
@@ -202,16 +296,6 @@ public:
         mInputPacked = inputPacked;
     }
 
-    [[nodiscard]] bool constexpr usePagedKvCache() const noexcept
-    {
-        return mPagedKvCache;
-    }
-
-    void constexpr usePagedKvCache(bool pagedKvCache) noexcept
-    {
-        mPagedKvCache = pagedKvCache;
-    }
-
     [[nodiscard]] bool constexpr usePagedState() const noexcept
     {
         return mPagedState;
@@ -244,7 +328,8 @@ public:
 
     [[nodiscard]] bool constexpr supportsInflightBatching() const noexcept
     {
-        return (isTransformerBased() && mUseGptAttentionPlugin && mInputPacked && mPagedKvCache)
+        return (isTransformerBased() && mUseGptAttentionPlugin && mInputPacked
+                   && (mKVCacheType == KVCacheType::kDISABLED || mKVCacheType == KVCacheType::kPAGED))
             || (isRnnBased() && mUseMambaConv1dPlugin && mInputPacked && mPagedState);
     }
 
@@ -311,6 +396,36 @@ public:
     [[nodiscard]] bool constexpr usePromptTuning() const noexcept
     {
         return mMaxPromptEmbeddingTableSize > 0;
+    }
+
+    [[nodiscard]] bool constexpr useMrope() const noexcept
+    {
+        return mUseMrope;
+    }
+
+    void constexpr setUseMrope(bool useMrope) noexcept
+    {
+        mUseMrope = useMrope;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getMaxPositionEmbeddings() const noexcept
+    {
+        return mMaxPositionEmbeddings;
+    }
+
+    void constexpr setMaxPositionEmbeddings(SizeType32 maxPositionEmbeddings) noexcept
+    {
+        mMaxPositionEmbeddings = maxPositionEmbeddings;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getRotaryEmbeddingDim() const noexcept
+    {
+        return mRotaryEmbeddingDim;
+    }
+
+    void constexpr setRotaryEmbeddingDim(SizeType32 rotaryEmbeddingDim) noexcept
+    {
+        mRotaryEmbeddingDim = rotaryEmbeddingDim;
     }
 
     [[nodiscard]] SizeType32 constexpr getMaxPromptEmbeddingTableSize() const noexcept
@@ -383,14 +498,14 @@ public:
         return mPagedContextFMHA;
     }
 
-    void constexpr useXQA(bool useXQA) noexcept
+    void constexpr setPpReduceScatter(bool ppReduceScatter) noexcept
     {
-        mUseXQA = useXQA;
+        mPpReduceScatter = ppReduceScatter;
     }
 
-    [[nodiscard]] bool constexpr useXQA() const noexcept
+    [[nodiscard]] bool constexpr getPpReduceScatter() const noexcept
     {
-        return mUseXQA;
+        return mPpReduceScatter;
     }
 
     [[nodiscard]] bool constexpr useLoraPlugin() const noexcept
@@ -421,6 +536,32 @@ public:
     void constexpr setMlpHiddenSize(SizeType32 mlpHiddenSize) noexcept
     {
         mMlpHiddenSize = mlpHiddenSize;
+    }
+
+    // Utility functions for fast KVCacheType checking.
+    [[nodiscard]] bool constexpr isKVCacheEnabled() const noexcept
+    {
+        return mKVCacheType != KVCacheType::kDISABLED;
+    }
+
+    [[nodiscard]] bool constexpr isPagedKVCache() const noexcept
+    {
+        return mKVCacheType == KVCacheType::kPAGED;
+    }
+
+    [[nodiscard]] bool constexpr isContinuousKVCache() const noexcept
+    {
+        return mKVCacheType == KVCacheType::kCONTINUOUS;
+    }
+
+    [[nodiscard]] KVCacheType constexpr getKVCacheType() const noexcept
+    {
+        return mKVCacheType;
+    }
+
+    void constexpr setKVCacheType(KVCacheType kvCacheType) noexcept
+    {
+        mKVCacheType = kvCacheType;
     }
 
     [[nodiscard]] bool constexpr useCrossAttention() const noexcept
@@ -497,20 +638,35 @@ public:
         mSpeculativeDecodingModule = speculativeDecodingModule;
     }
 
+    void resetSpeculativeDecodingModule() noexcept
+    {
+        mSpeculativeDecodingModule.reset();
+    }
+
+    void enableSeamlessLookaheadDecoding(SizeType32 maxDraftTokens) noexcept
+    {
+        setSpeculativeDecodingMode(SpeculativeDecodingMode::LookaheadDecoding());
+        setSpeculativeDecodingModule(std::make_shared<LookaheadModule>(maxDraftTokens, maxDraftTokens));
+    }
+
+    void disableSeamlessLookaheadDecoding() noexcept
+    {
+        setSpeculativeDecodingMode(SpeculativeDecodingMode::None());
+        resetSpeculativeDecodingModule();
+    }
+
     [[nodiscard]] nvinfer1::DataType getKvDataType() const noexcept
     {
         if (getQuantMode().hasFp8KvCache())
         {
             return nvinfer1::DataType::kFP8;
         }
-        else if (getQuantMode().hasInt8KvCache())
+        if (getQuantMode().hasInt8KvCache())
         {
             return nvinfer1::DataType::kINT8;
         }
-        else
-        {
-            return getDataType();
-        }
+
+        return getDataType();
     }
 
     [[nodiscard]] bool constexpr isTransformerBased() const noexcept
@@ -574,19 +730,97 @@ public:
         return mUseShapeInference;
     }
 
+    [[nodiscard]] ManageWeightsType getManageWeightsType() const noexcept
+    {
+        return mManageWeightsType;
+    }
+
+    void setManageWeightsType(const ManageWeightsType manageWeightType) noexcept
+    {
+        mManageWeightsType = manageWeightType;
+    }
+
+    [[nodiscard]] std::string const& getModelName() const noexcept
+    {
+        return mModelName;
+    }
+
+    void setModelName(std::string const& modelName)
+    {
+        mModelName = modelName;
+    }
+
+    [[nodiscard]] std::vector<SizeType32> const& getNumKvHeadsPerLayer() const
+    {
+        return mNumKvHeadsPerAttentionLayer;
+    }
+
+    [[nodiscard]] std::pair<std::vector<SizeType32>::const_iterator, std::vector<SizeType32>::const_iterator>
+    getNumKvHeadsPerLayerLocalRange(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0, bool isCrossAttention = false) const
+    {
+        TLLM_LOG_TRACE("%s start: %d", __PRETTY_FUNCTION__);
+        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
+
+        // count number of previous non-local attention layers
+        auto const numPrevAttnLayers
+            = countLowerRankLayers(LayerType::kATTENTION, pipelineParallelism, pipelineParallelismRank);
+        auto const firstLocalAttentionLayerIt = isCrossAttention
+            ? mNumKvHeadsPerCrossAttentionLayer.cbegin()
+            : mNumKvHeadsPerAttentionLayer.cbegin() + numPrevAttnLayers;
+        auto const numLocalAttentionLayers
+            = countLocalLayers(LayerType::kATTENTION, pipelineParallelism, pipelineParallelismRank);
+        TLLM_LOG_TRACE("%s stop: %d", __PRETTY_FUNCTION__);
+        return std::make_pair(firstLocalAttentionLayerIt, firstLocalAttentionLayerIt + numLocalAttentionLayers);
+    }
+
+    void setNumKvHeadsPerLayer(std::vector<SizeType32> const& headsPerLayer)
+    {
+        auto const numElems = static_cast<SizeType32>(headsPerLayer.size());
+        TLLM_CHECK_WITH_INFO(numElems == mNbAttentionLayers,
+            "Length of head_per_layer (%d) must match number of attention layers (%d)", numElems, mNbAttentionLayers);
+        mNumKvHeadsPerAttentionLayer = headsPerLayer;
+    }
+
+    void setNumKvHeadsPerCrossLayer(std::vector<SizeType32> const& headsPerLayer)
+    {
+        auto const numElems = static_cast<SizeType32>(headsPerLayer.size());
+        TLLM_CHECK_WITH_INFO(numElems == mNbAttentionLayers,
+            "Length of head_per_layer (%d) must match number of attention layers (%d)", numElems, mNbAttentionLayers);
+        mNumKvHeadsPerCrossAttentionLayer = headsPerLayer;
+    }
+
+    [[nodiscard]] SizeType32 getSumLocalKvHeads(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0, bool isCrossAttention = false) const
+    {
+        auto [cbegin, cend]
+            = getNumKvHeadsPerLayerLocalRange(pipelineParallelism, pipelineParallelismRank, isCrossAttention);
+        auto const sumLocalHeads = std::reduce(cbegin, cend);
+        return sumLocalHeads;
+    }
+
+    [[nodiscard]] bool constexpr skipCrossAttnBlocks() const noexcept
+    {
+        return mSkipCrossAttnBlocks;
+    }
+
+    void constexpr setSkipCrossAttnBlocks(bool skipCrossAttnBlocks) noexcept
+    {
+        mSkipCrossAttnBlocks = skipCrossAttnBlocks;
+    }
+
 private:
     SizeType32 mVocabSize;
+    SizeType32 mNbLayers;
     SizeType32 mNbAttentionLayers;
     SizeType32 mNbRnnLayers;
     SizeType32 mNbHeads;
-    SizeType32 mNbKvHeads;
     SizeType32 mHiddenSize;
     SizeType32 mSizePerHead;
     nvinfer1::DataType mDataType;
     bool mUseGptAttentionPlugin;
     bool mUseMambaConv1dPlugin;
     bool mInputPacked;
-    bool mPagedKvCache;
     bool mPagedState;
     SizeType32 mTokensPerBlock;
     common::QuantMode mQuantMode;
@@ -601,10 +835,14 @@ private:
     ModelVariant mModelVariant;
 
     SizeType32 mMaxPromptEmbeddingTableSize;
+    bool mUseMrope;
+    SizeType32 mMaxPositionEmbeddings;
+    SizeType32 mRotaryEmbeddingDim;
 
     bool mContextFMHA;
     bool mPagedContextFMHA;
     bool mUseXQA;
+    bool mPpReduceScatter;
 
     bool mUseLoraPlugin;
     std::vector<LoraModule> mLoraModules;
@@ -612,6 +850,9 @@ private:
     SizeType32 mMaxLoraRank;
 
     std::optional<RnnConfig> mRnnConfig;
+
+    // Whether kv_cache is enabled. In kv_cache is disabled, it is only intended for context phase only now.
+    KVCacheType mKVCacheType = KVCacheType::kCONTINUOUS;
 
     // Configs related to encoder / enc-dec models
     SizeType32 mMaxEncoderLen{};
@@ -628,6 +869,11 @@ private:
     // Logits datatype
     nvinfer1::DataType mLogitsDtype;
     bool mUseShapeInference;
+    ManageWeightsType mManageWeightsType;
+    std::string mModelName;
+    std::vector<SizeType32> mNumKvHeadsPerAttentionLayer;
+    std::vector<SizeType32> mNumKvHeadsPerCrossAttentionLayer;
+    bool mSkipCrossAttnBlocks;
 };
 
 } // namespace tensorrt_llm::runtime

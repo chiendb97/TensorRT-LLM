@@ -17,9 +17,12 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/executor/tensor.h"
 
 #include <NvInferRuntime.h>
 #include <filesystem>
+#include <map>
+#include <optional>
 
 namespace tensorrt_llm::runtime
 {
@@ -60,8 +63,29 @@ public:
 
     [[nodiscard]] std::filesystem::path getPath() const
     {
-        TLLM_CHECK(mType == FilePath);
+        TLLM_CHECK(mEnginePath.has_value());
+        return mEnginePath.value();
+    }
+
+    [[nodiscard]] std::optional<std::filesystem::path> getPathOpt() const
+    {
         return mEnginePath;
+    }
+
+    void setPath(std::filesystem::path enginePath)
+    {
+        mEnginePath = std::move(enginePath);
+    }
+
+    [[nodiscard]] std::optional<std::map<std::string, tensorrt_llm::executor::Tensor>> const&
+    getManagedWeightsMapOpt() const
+    {
+        return mManagedWeightsMap;
+    }
+
+    void setManagedWeightsMap(std::map<std::string, tensorrt_llm::executor::Tensor> managedWeightsMap)
+    {
+        mManagedWeightsMap = std::move(managedWeightsMap);
     }
 
     [[nodiscard]] void const* getAddress() const
@@ -84,7 +108,7 @@ public:
 
 private:
     Type mType;
-    std::filesystem::path mEnginePath;
+    std::optional<std::filesystem::path> mEnginePath;
 
     struct
     {
@@ -93,6 +117,7 @@ private:
     };
 
     nvinfer1::IHostMemory const* mEngineBuffer{};
+    std::optional<std::map<std::string, tensorrt_llm::executor::Tensor>> mManagedWeightsMap;
 };
 
 } // namespace tensorrt_llm::runtime

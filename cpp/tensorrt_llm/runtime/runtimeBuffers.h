@@ -41,7 +41,7 @@ class RuntimeBuffers
 {
 protected:
     using TensorPtr = ITensor::SharedPtr;
-    using KvCacheManager = batch_manager::kv_cache_manager::KVCacheManager;
+    using BaseKVCacheManager = batch_manager::kv_cache_manager::BaseKVCacheManager;
 
 public:
     using TensorMap = StringPtrMap<ITensor>;
@@ -113,8 +113,8 @@ public:
     void create(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void initFromInput(ITensor const& inputIds, TensorPtr const& inputLengths, bool inputPacked, SizeType32 beamWidth,
-        SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-        BufferManager& manager);
+        std::vector<SizeType32> maxAttentionWindowVec, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength,
+        SizeType32 maxSequenceLength, BufferManager& manager);
 
     //! \brief Reshape buffers based on current GenerationConfig
     void reshape(ModelConfig const& modelConfig, WorldConfig const& worldConfig);
@@ -128,9 +128,9 @@ public:
         ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void prepareContextStep(TensorPtr const& inputIds, TokenIdType padId, BufferManager& manager,
-        KvCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
+        BaseKVCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
-    TensorPtr prepareNextStep(SizeType32 step, BufferManager& manager, KvCacheManager* kvCacheManager,
+    TensorPtr prepareNextStep(SizeType32 step, BufferManager& manager, BaseKVCacheManager* kvCacheManager,
         SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, SizeType32 const step,

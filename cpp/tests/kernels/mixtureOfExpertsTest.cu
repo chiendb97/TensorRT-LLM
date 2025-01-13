@@ -118,7 +118,7 @@ protected:
         // Whether the current results are as tight as they should be requires further investigation
         // They can be much tighter if we use the same value for all experts (so the scaling factors are trivial)
         // But that is hardly representative
-        bool loose_fp8 = mIsGated || mNormMode == MOEExpertScaleNormalizationMode::RENORMALIZE;
+        bool loose_fp8 = mIsGated || moeRoutingNeedsRenorm(mNormMode);
         float tol = std::is_same_v<DataType, float> ? 0.001
             : std::is_same_v<DataType, half>        ? 0.01
             : std::is_same_v<DataType, SafeFP8>     ? (loose_fp8 ? 0.1 : 0.07)
@@ -238,12 +238,15 @@ protected:
     int64_t mActiveRows{};
 
     bool mUseBias = true;
+    bool mUseLora = false;
 
     bool mIsGated = false;
     int64_t mGatedMultiplier = 1;
 
     tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
     MOEExpertScaleNormalizationMode mNormMode = MOEExpertScaleNormalizationMode::NONE;
+
+    float mSparseMixerEpsilon = 0.2f;
 
     // Default this to true. This only matters for K>2, and so by doing this we will test the fused and unfused paths
     bool mUseDeterminsiticHopperReduce = true;
@@ -286,7 +289,7 @@ protected:
         size_t const weight_size = hidden_size * (hidden_size * 4) * num_experts * sizeof(WeightStorage) * num_gemms;
         // Workspace size
         size_t const workspace_size = this->mMoERunner.getWorkspaceSize(
-            num_tokens, hidden_size, hidden_size * 4, num_experts, k, this->mActType, {});
+            num_tokens, hidden_size, hidden_size * 4, num_experts, k, this->mActType, mNormMode, {}, mUseLora);
         // The input/output buffers
         size_t const in_out_size = 2 * num_tokens * hidden_size * sizeof(DataType);
 
@@ -331,7 +334,7 @@ protected:
         }
 
         size_t workspace_size = mMoERunner.getWorkspaceSize(
-            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, parallelism_config);
+            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, mNormMode, parallelism_config, mUseLora);
 
         auto const stream = mStream->get();
 
@@ -772,11 +775,13 @@ protected:
                 static_cast<float const*>(scale2_ptr), static_cast<float const*>(scale3_ptr));
         }
 
+        LoraParams lora_params;
+
         mMoERunner.setTactic(tactic1, tactic2);
         mMoERunner.runMoe(mInputTensor, mInputProbabilities, weight1_ptr, bias1_ptr, mActType, weight2_ptr, bias2_ptr,
             quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK,
             mWorkspace, mFinalOutput, mFinished, mActiveRows, mScaleProbs, mSourceToExpandedMap, mSelectedExpert,
-            parallelism_config, mNormMode, stream);
+            mSparseMixerEpsilon, parallelism_config, mNormMode, mUseLora, lora_params, stream);
 
         check_cuda_error(cudaStreamSynchronize(stream));
     }
@@ -802,7 +807,7 @@ protected:
             {
                 if (entry >= num_experts_per_node * tp_rank && entry < num_experts_per_node * (tp_rank + 1))
                     return entry;
-                return (int) mNumExperts;
+                return (int) mNumExperts + entry;
             });
         return result;
     }
@@ -950,9 +955,9 @@ protected:
                 return res;
             });
 
-        for (int64_t token = 0; token < mTotalTokens; token++)
+        for (int64_t token = 0; token < softmax.size(); token += mNumExperts)
         {
-            auto start = softmax.begin() + token * mNumExperts;
+            auto start = softmax.begin() + token;
             auto end = start + mNumExperts;
             auto sum = std::accumulate(start, end, 0.f);
             std::transform(start, end, start, [=](auto in) { return in / sum; });
@@ -963,7 +968,7 @@ protected:
 
     void renormScales(float* probs, int const* experts)
     {
-        if (mNormMode == MOEExpertScaleNormalizationMode::NONE)
+        if (!moeRoutingNeedsRenorm(mNormMode))
             return;
         float sum = 0;
         for (int k_idx = 0; k_idx < mK; k_idx++)
@@ -977,12 +982,49 @@ protected:
         }
     }
 
+    float sparseMixer(std::vector<float> logits, int token_idx, int k_idx, int expected_expert)
+    {
+        EXPECT_LE(mK, 2);
+        EXPECT_LT(k_idx, mK);
+        EXPECT_LT(token_idx * mNumExperts, logits.size());
+        EXPECT_LE((token_idx + 1) * mNumExperts, logits.size());
+
+        auto start_it = logits.begin() + token_idx * mNumExperts;
+        auto end_it = logits.begin() + (token_idx + 1) * mNumExperts;
+
+        // Mask old maxes and get the kth largest
+        auto max_it = end_it;
+        for (int i = 0; i <= k_idx; i++)
+        {
+            max_it = std::max_element(start_it, end_it);
+            if (i != k_idx)
+            {
+                EXPECT_NE(max_it, end_it);
+                *max_it = -INFINITY;
+            }
+        }
+
+        EXPECT_EQ((max_it - start_it), expected_expert)
+            << "Expected token " << token_idx << " k_idx " << k_idx << " to select expert " << expected_expert;
+
+        std::vector<float> masked;
+        std::transform(start_it, end_it, std::back_inserter(masked),
+            [this, max_it](auto val)
+            {
+                float mask_value = (*max_it - val) / max(abs(val), *max_it);
+                return (mask_value > 2 * mSparseMixerEpsilon) ? -INFINITY : val;
+            });
+        auto output_probs = softmax(masked);
+        return output_probs[expected_expert];
+    }
+
     void compareSoftmax(std::vector<int> const& expected_experts, std::vector<float> const& expected_probs,
         std::vector<float> scale_probs = {})
     {
         if (scale_probs.empty())
             scale_probs = getDataFromDevice(mScaleProbs, mTotalTokens * mK);
-        auto softmax_probs = softmax(expected_probs);
+        auto softmax_probs = moeRoutingNeedsSoftmax(mNormMode) ? softmax(expected_probs) : expected_probs;
+
         for (int64_t token_id = 0; token_id < mTotalTokens; token_id++)
         {
             renormScales(&softmax_probs[token_id * mNumExperts], &expected_experts[token_id * mK]);
@@ -992,8 +1034,13 @@ protected:
                 int selected_expert = expected_experts[token_id * mK + k_idx];
                 if (selected_expert < mNumExperts) // Ignore 'finished' values
                 {
-                    ASSERT_NEAR(softmax_probs[token_id * mNumExperts + selected_expert],
-                        scale_probs[token_id * mK + k_idx], getTolerance())
+                    float expected_value = softmax_probs[token_id * mNumExperts + selected_expert];
+                    if (mNormMode == tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::SPARSE_MIXER)
+                    {
+                        expected_value = sparseMixer(expected_probs, token_id, k_idx, selected_expert);
+                    }
+
+                    ASSERT_NEAR(expected_value, scale_probs[token_id * mK + k_idx], getTolerance())
                         << "Scales mismatched for token: " << token_id << " k: " << k_idx
                         << " selected_expert: " << selected_expert;
                 }
@@ -1007,7 +1054,7 @@ protected:
         if (final_results.empty())
             final_results = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
 
-        auto softmax_probs = softmax(expected_probs);
+        auto softmax_probs = moeRoutingNeedsSoftmax(mNormMode) ? softmax(expected_probs) : expected_probs;
         for (int64_t token_id = 0; token_id < mTotalTokens; token_id++)
         {
             renormScales(&softmax_probs[token_id * mNumExperts], &expected_experts[token_id * mK]);
@@ -1019,9 +1066,16 @@ protected:
                 for (int k_idx = 0; k_idx < mK; k_idx++)
                 {
                     int selected_expert = expected_experts[token_id * mK + k_idx];
+
+                    float scale_value = softmax_probs[token_id * mNumExperts + selected_expert];
+                    if (mNormMode == tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::SPARSE_MIXER)
+                    {
+                        scale_value = sparseMixer(expected_probs, token_id, k_idx, selected_expert);
+                    }
+
                     sum += float(calcMLPValWithFinalBias(
                                static_cast<float>(input_data[token_id * mHiddenSize + hidden_id]), selected_expert))
-                        * softmax_probs[token_id * mNumExperts + selected_expert];
+                        * scale_value;
                 }
 
                 ASSERT_NEAR(OutputType{sum}, final_results[token_id * mHiddenSize + hidden_id], getTolerance(sum))
@@ -1033,11 +1087,37 @@ protected:
     void BasicPermuteTest(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4);
 
     std::vector<int> calcPermuteMapExpertParallel(std::vector<int> const& expected_experts);
-    void ExpertParallelTest(int k = 1);
 
-    void TensorParallelTest(int k = 1);
+    void ExpertParallelTest(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4)
+    {
+        // 2 experts per rank
+        ParallelelismTest(k, 1, num_experts / 2, hidden_size, num_experts);
+        // 1 expert per rank
+        ParallelelismTest(k, 1, num_experts, hidden_size, num_experts);
+    }
 
-    void MixedParallelTest(int k = 1);
+    void TensorParallelTest(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4)
+    {
+        ParallelelismTest(k, 2, 1, hidden_size, num_experts);
+        ParallelelismTest(k, 4, 1, hidden_size, num_experts);
+        ParallelelismTest(k, 8, 1, hidden_size, num_experts);
+    }
+
+    void MixedParallelTest(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4)
+    {
+        // 2 experts per rank
+        ParallelelismTest(k, 2, num_experts / 2, hidden_size, num_experts);
+        ParallelelismTest(k, 4, num_experts / 2, hidden_size, num_experts);
+        ParallelelismTest(k, 8, num_experts / 2, hidden_size, num_experts);
+
+        // 1 expert per rank
+        ParallelelismTest(k, 2, num_experts, hidden_size, num_experts);
+        ParallelelismTest(k, 4, num_experts, hidden_size, num_experts);
+        ParallelelismTest(k, 8, num_experts, hidden_size, num_experts);
+    }
+
+    void ParallelelismTest(int k = 1, int tp_size = 4, int ep_size = 2, int64_t hidden_size = DEFAULT_HIDDEN_SIZE,
+        int64_t num_experts = 4);
 };
 
 template <class WeightParams>
@@ -1167,6 +1247,29 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteRenormalization)
     this->BasicPermuteTest(3);
 }
 
+TYPED_TEST(MixtureOfExpertsTest, PermuteSparseMixer)
+{
+    this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::SPARSE_MIXER;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, PermuteDeviceLimited)
+{
+    this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::DEVICE_LIMITED;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, PermuteDeviceLimitedRenorm)
+{
+    this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::DEVICE_LIMITED_RENORM;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
 TYPED_TEST(MixtureOfExpertsTest, PermuteGeglu)
 {
     this->mActType = tensorrt_llm::ActivationType::Geglu;
@@ -1215,6 +1318,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteMixtral8x7b)
 {
     this->mUseBias = false;
     this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE;
     this->BasicPermuteTest(2, 4096, 8);
 }
 
@@ -1225,7 +1329,7 @@ std::vector<int> MixtureOfExpertsTest<TypeParam_>::calcPermuteMapExpertParallel(
     std::vector<int> map(expected_experts.size());
     auto getInterleavedIndex = [this](int i) { return (i % mK) * mTotalTokens + i / mK; };
     int map_idx = 0;
-    for (int expert = 0; expert <= mNumExperts; expert++)
+    for (int expert = 0; expert < mNumExperts * 2; expert++)
     {
         for (int i = 0; i < map.size(); i++)
         {
@@ -1238,12 +1342,21 @@ std::vector<int> MixtureOfExpertsTest<TypeParam_>::calcPermuteMapExpertParallel(
 }
 
 template <class TypeParam_>
-void MixtureOfExpertsTest<TypeParam_>::ExpertParallelTest(int k)
+void MixtureOfExpertsTest<TypeParam_>::ParallelelismTest(
+    int k, int tp_size, int ep_size, int64_t hidden_size, int64_t num_experts)
 {
     if (FP8)
     {
         // TODO Remove this when bias + FP8 is supported
         mUseBias = false;
+    }
+
+    ASSERT_LE(ep_size, num_experts);
+    if (tp_size == 1)
+    {
+        // Only the first 4 experts are ever used. They should be split across at least 2 ranks
+        ASSERT_LT(num_experts / ep_size, 4)
+            << "Expert parallelism must have less than 4 experts per rank or the test is ineffective";
     }
 
     auto test_archs = getAllTileConfigsToTest();
@@ -1252,9 +1365,6 @@ void MixtureOfExpertsTest<TypeParam_>::ExpertParallelTest(int k)
         mInternalSelectedConfig1 = gemm1;
         mInternalSelectedConfig2 = gemm2;
 
-        int64_t hidden_size = DEFAULT_HIDDEN_SIZE;
-        int parallelism = 2;
-        int64_t num_experts = 4;
         int64_t num_tokens = 3;
 
         std::vector<DataType> hidden_states(hidden_size * num_tokens);
@@ -1266,115 +1376,9 @@ void MixtureOfExpertsTest<TypeParam_>::ExpertParallelTest(int k)
             0.25, 0.21, 0.35, 0.19, //
         };
 
-        std::vector<int> expected_experts{0, 3, 2};
-        if (k == 2)
-            expected_experts = {0, 2, 3, 1, 2, 0};
-        else if (k == 3)
-            expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
-        std::vector<OutputType> results(hidden_states.size(), 0);
-        for (int i = 0; i < parallelism; i++)
-        {
-            if (i == 0)
-            {
-                // Only need to init the inputs on the first iteration
-                runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k, {},
-                    MOEParallelismConfig{1, 0, parallelism, i});
-            }
-            else
-            {
-                runMoEPermute(MOEParallelismConfig{1, 0, parallelism, i});
-            }
-
-            auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
-            // Experts should only be selected when we are on the right node
-            // Note the index is [0,num_experts_per_node), so we offset the experts by the start for this node
-            int const start_expert = i * (mNumExperts / parallelism);
-            std::transform(selected_expert.begin(), selected_expert.end(), selected_expert.begin(),
-                [&](int val) { return val == mNumExperts ? mNumExperts : val + start_expert; });
-            auto masked_expected_experts = maskSelectedExpertsForTP(expected_experts, parallelism, i);
-            ASSERT_EQ(selected_expert, masked_expected_experts);
-
-            auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
-            auto permute_map = calcPermuteMapExpertParallel(masked_expected_experts);
-            ASSERT_EQ(permute_map, proj_map) << "Iteration " << i;
-            compareSoftmax(expected_experts, probs);
-
-            // Do the final reduce
-            auto iter_results = getDataFromDevice(mFinalOutput, num_tokens * hidden_size);
-            std::transform(
-                iter_results.cbegin(), iter_results.cend(), results.cbegin(), results.begin(), std::plus<>{});
-        }
-
-        compareFinal(expected_experts, probs, raw_unquant_input, results);
-    }
-}
-
-TYPED_TEST(MixtureOfExpertsTest, ExpertParallel)
-{
-    this->ExpertParallelTest();
-}
-
-TYPED_TEST(MixtureOfExpertsTest, ExpertParallelK2)
-{
-    this->ExpertParallelTest(2);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, ExpertParallelNoBias)
-{
-    this->mUseBias = false;
-    this->ExpertParallelTest();
-    this->ExpertParallelTest(2);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, ExpertParallelRenorm)
-{
-    this->mNormMode = MOEExpertScaleNormalizationMode::RENORMALIZE;
-    this->ExpertParallelTest();
-    this->ExpertParallelTest(2);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, ExpertParallelGeglu)
-{
-    this->mActType = tensorrt_llm::ActivationType::Geglu;
-    this->ExpertParallelTest();
-    this->ExpertParallelTest(2);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, ExpertParallelSwiglu)
-{
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
-    this->ExpertParallelTest();
-    this->ExpertParallelTest(2);
-}
-
-template <class TypeParam_>
-void MixtureOfExpertsTest<TypeParam_>::TensorParallelTest(int k)
-{
-    if (FP8)
-    {
-        // TODO Remove this when bias + FP8 is supported
-        mUseBias = false;
-    }
-
-    auto test_archs = getAllTileConfigsToTest();
-    for (auto [gemm1, gemm2] : test_archs)
-    {
-        mInternalSelectedConfig1 = gemm1;
-        mInternalSelectedConfig2 = gemm2;
-
-        int64_t hidden_size = DEFAULT_HIDDEN_SIZE;
-        int parallelism = 8;
-        int64_t num_experts = 4;
-        int64_t num_tokens = 3;
-
-        std::vector<DataType> hidden_states(hidden_size * num_tokens);
-        auto raw_unquant_input = populateTokens(hidden_states);
-
-        std::vector<float> probs = {
-            0.5, 0.1, 0.25, 0.15,   //
-            0.03, 0.2, 0.07, 0.7,   //
-            0.25, 0.21, 0.35, 0.19, //
-        };
+        std::vector<std::vector<DataType>> hidden_input = {hidden_states};
+        std::vector<std::vector<float>> router_input = {probs};
+        resizeRouterInputs(router_input, num_experts, num_tokens);
 
         std::vector<int> expected_experts{0, 3, 2};
         if (k == 2)
@@ -1382,152 +1386,34 @@ void MixtureOfExpertsTest<TypeParam_>::TensorParallelTest(int k)
         else if (k == 3)
             expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
         std::vector<OutputType> results(hidden_states.size(), 0);
-        for (int i = 0; i < parallelism; i++)
+        for (int i = 0; i < tp_size; i++)
         {
-            if (i == 0)
-            {
-                // Only need to init the inputs on the first iteration
-                runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k, {},
-                    MOEParallelismConfig{parallelism, i, 1, 0});
-            }
-            else
-            {
-                runMoEPermute(MOEParallelismConfig{parallelism, i, 1, 0});
-            }
-
-            auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
-            EXPECT_EQ(selected_expert, expected_experts);
-
-            auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
-            std::vector<int> permute_map{0, 2, 1};
-            if (k == 2)
-                permute_map = {0, 5, 4, 3, 2, 1};
-            if (k == 3)
-                permute_map = {0, 8, 6, 4, 2, 1, 7, 5, 3};
-
-            ASSERT_EQ(permute_map, proj_map) << "Iteration " << i;
-
-            // Do the final reduce
-            auto iter_results = getDataFromDevice(mFinalOutput, num_tokens * hidden_size);
-            std::transform(
-                iter_results.cbegin(), iter_results.cend(), results.cbegin(), results.begin(), std::plus<>{});
-        }
-
-        compareFinal(expected_experts, probs, raw_unquant_input, results);
-    }
-}
-
-TYPED_TEST(MixtureOfExpertsTest, TensorParallel)
-{
-    this->TensorParallelTest();
-}
-
-TYPED_TEST(MixtureOfExpertsTest, TensorParallelK2)
-{
-    this->TensorParallelTest(2);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, TensorParallelK3)
-{
-    this->TensorParallelTest(3);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, TensorParallelNoBias)
-{
-    this->mUseBias = false;
-    this->TensorParallelTest();
-    this->TensorParallelTest(2);
-    this->TensorParallelTest(3);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, TensorParallelRenorm)
-{
-    this->mNormMode = MOEExpertScaleNormalizationMode::RENORMALIZE;
-    this->TensorParallelTest();
-    this->TensorParallelTest(2);
-    this->TensorParallelTest(3);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, TensorParallelGeglu)
-{
-    this->mActType = tensorrt_llm::ActivationType::Geglu;
-    this->TensorParallelTest();
-    this->TensorParallelTest(2);
-    this->TensorParallelTest(3);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, TensorParallelSwiglu)
-{
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
-    this->TensorParallelTest();
-    this->TensorParallelTest(2);
-    this->TensorParallelTest(3);
-}
-
-template <class TypeParam_>
-void MixtureOfExpertsTest<TypeParam_>::MixedParallelTest(int k)
-{
-    if (FP8)
-    {
-        // TODO Remove this when bias + FP8 is supported
-        mUseBias = false;
-    }
-
-    auto test_archs = getAllTileConfigsToTest();
-    for (auto [gemm1, gemm2] : test_archs)
-    {
-        mInternalSelectedConfig1 = gemm1;
-        mInternalSelectedConfig2 = gemm2;
-
-        int64_t hidden_size = DEFAULT_HIDDEN_SIZE;
-        int tp_parallelism = 2;
-        int ep_parallelism = 2;
-        int64_t num_experts = 4;
-        int64_t num_tokens = 3;
-
-        std::vector<DataType> hidden_states(hidden_size * num_tokens);
-        auto raw_unquant_input = populateTokens(hidden_states);
-
-        std::vector<float> probs = {
-            0.5, 0.1, 0.25, 0.15,   //
-            0.03, 0.2, 0.07, 0.7,   //
-            0.25, 0.21, 0.35, 0.19, //
-        };
-
-        std::vector<int> expected_experts{0, 3, 2};
-        if (k == 2)
-            expected_experts = {0, 2, 3, 1, 2, 0};
-        else if (k == 3)
-            expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
-        std::vector<OutputType> results(hidden_states.size(), 0);
-        for (int i = 0; i < tp_parallelism; i++)
-        {
-            for (int j = 0; j < ep_parallelism; j++)
+            for (int j = 0; j < ep_size; j++)
             {
                 if (i == 0 && j == 0)
                 {
                     // Only need to init the inputs on the first iteration
-                    runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k, {},
-                        MOEParallelismConfig{tp_parallelism, i, ep_parallelism, j});
+                    runMoEPermute(hidden_input, router_input, hidden_size, num_experts, k, {},
+                        MOEParallelismConfig{tp_size, i, ep_size, j});
                 }
                 else
                 {
-                    runMoEPermute(MOEParallelismConfig{tp_parallelism, i, ep_parallelism, j});
+                    runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j});
                 }
 
                 auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
                 // Experts should only be selected when we are on the right node
                 // Note the index is [0,num_experts_per_node), so we offset the experts by the start for this node
-                int const start_expert = j * (mNumExperts / ep_parallelism);
+                int const start_expert = j * (mNumExperts / ep_size);
                 std::transform(selected_expert.begin(), selected_expert.end(), selected_expert.begin(),
-                    [&](int val) { return val == mNumExperts ? mNumExperts : val + start_expert; });
-                auto masked_expected_experts = maskSelectedExpertsForTP(expected_experts, ep_parallelism, j);
+                    [&](int val) { return val >= mNumExperts ? val : val + start_expert; });
+                auto masked_expected_experts = maskSelectedExpertsForTP(expected_experts, ep_size, j);
                 ASSERT_EQ(selected_expert, masked_expected_experts);
 
                 auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
                 auto permute_map = calcPermuteMapExpertParallel(masked_expected_experts);
                 ASSERT_EQ(permute_map, proj_map) << "Iteration " << i << " " << j;
-                compareSoftmax(expected_experts, probs);
+                compareSoftmax(expected_experts, router_input[0]);
 
                 // Do the final reduce
                 auto iter_results = getDataFromDevice(mFinalOutput, num_tokens * hidden_size);
@@ -1536,47 +1422,106 @@ void MixtureOfExpertsTest<TypeParam_>::MixedParallelTest(int k)
             }
         }
 
-        compareFinal(expected_experts, probs, raw_unquant_input, results);
+        compareFinal(expected_experts, router_input[0], raw_unquant_input, results);
     }
 }
 
-TYPED_TEST(MixtureOfExpertsTest, MixedParallel)
-{
-    this->MixedParallelTest();
-}
+#define PARALLEL_TEST_SUITE(ParallelismType)                                                                           \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType)                                                                  \
+    {                                                                                                                  \
+        this->ParallelismType##Test();                                                                                 \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##K2)                                                              \
+    {                                                                                                                  \
+        this->ParallelismType##Test(2);                                                                                \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##K3)                                                              \
+    {                                                                                                                  \
+        this->ParallelismType##Test(3);                                                                                \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NoBias)                                                          \
+    {                                                                                                                  \
+        this->mUseBias = false;                                                                                        \
+        this->ParallelismType##Test();                                                                                 \
+        this->ParallelismType##Test(2);                                                                                \
+        this->ParallelismType##Test(3);                                                                                \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Renorm)                                                          \
+    {                                                                                                                  \
+        this->mNormMode = MOEExpertScaleNormalizationMode::RENORMALIZE;                                                \
+        this->ParallelismType##Test();                                                                                 \
+        this->ParallelismType##Test(2);                                                                                \
+        this->ParallelismType##Test(3);                                                                                \
+    }                                                                                                                  \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##SparseMixer)                                                     \
+    {                                                                                                                  \
+        this->mNormMode = MOEExpertScaleNormalizationMode::SPARSE_MIXER;                                               \
+        this->ParallelismType##Test();                                                                                 \
+        this->ParallelismType##Test(2);                                                                                \
+        /* k=3 is not supported for sparse mixer tests */                                                              \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Geglu)                                                           \
+    {                                                                                                                  \
+        this->mActType = tensorrt_llm::ActivationType::Geglu;                                                          \
+        this->ParallelismType##Test();                                                                                 \
+        this->ParallelismType##Test(2);                                                                                \
+        this->ParallelismType##Test(3);                                                                                \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Swiglu)                                                          \
+    {                                                                                                                  \
+        this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
+        this->ParallelismType##Test();                                                                                 \
+        this->ParallelismType##Test(2);                                                                                \
+        this->ParallelismType##Test(3);                                                                                \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Mixtral8x7b)                                                     \
+    {                                                                                                                  \
+        this->mUseBias = false;                                                                                        \
+        this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
+        this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE;                         \
+        this->ParallelismType##Test(2, 4096, 8);                                                                       \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwo)                                                   \
+    {                                                                                                                  \
+        this->ParallelismType##Test(1, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+        this->ParallelismType##Test(2, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+        this->ParallelismType##Test(3, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwoRenorm)                                             \
+    {                                                                                                                  \
+        this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE;                         \
+        this->ParallelismType##Test(1, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+        this->ParallelismType##Test(2, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+        this->ParallelismType##Test(3, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwoSwiglu)                                             \
+    {                                                                                                                  \
+        this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
+        this->ParallelismType##Test(1, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+        this->ParallelismType##Test(2, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+        this->ParallelismType##Test(3, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##ManyExperts)                                                     \
+    {                                                                                                                  \
+        this->ParallelismType##Test(1, this->MINIMUM_ALIGNMENT, 512);                                                  \
+        this->ParallelismType##Test(2, this->MINIMUM_ALIGNMENT, 512);                                                  \
+        this->ParallelismType##Test(3, this->MINIMUM_ALIGNMENT, 512);                                                  \
+    }
 
-TYPED_TEST(MixtureOfExpertsTest, MixedParallelK2)
-{
-    this->MixedParallelTest(2);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, MixedParallelNoBias)
-{
-    this->mUseBias = false;
-    this->MixedParallelTest();
-    this->MixedParallelTest(2);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, MixedParallelRenorm)
-{
-    this->mNormMode = MOEExpertScaleNormalizationMode::RENORMALIZE;
-    this->MixedParallelTest();
-    this->MixedParallelTest(2);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, MixedParallelGeglu)
-{
-    this->mActType = tensorrt_llm::ActivationType::Geglu;
-    this->MixedParallelTest();
-    this->MixedParallelTest(2);
-}
-
-TYPED_TEST(MixtureOfExpertsTest, MixedParallelSwiglu)
-{
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
-    this->MixedParallelTest();
-    this->MixedParallelTest(2);
-}
+PARALLEL_TEST_SUITE(ExpertParallel)
+PARALLEL_TEST_SUITE(TensorParallel)
+PARALLEL_TEST_SUITE(MixedParallel)
 
 TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
 {
@@ -1727,7 +1672,7 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         for (int ep : {1, 4, 8})
         {
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
-                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, {}, false,
+                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, {}, false, mUseLora,
                 MOEParallelismConfig{1, 0, ep, ep - 1});
 
             auto ws_size = backend.getWorkspaceSize(num_tokens);
@@ -1821,4 +1766,33 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
             }
         }
     }
+}
+
+using MixtureOfExpertsUnitTests = MixtureOfExpertsTest<WeightParams<half, half>>;
+
+TEST_F(MixtureOfExpertsUnitTests, SparseMixerReferenceTest)
+{
+    // Test the sparse mixer reference implementation is doing the correct thing
+    // This makes sure we are testing the correct behaviour
+    this->mNumExperts = 4;
+    this->mK = 2;
+    auto res = this->sparseMixer({1.0f, 1.0f, -INFINITY, -INFINITY}, 0, 0, 0);
+    ASSERT_FLOAT_EQ(res, 0.5f);
+    res = this->sparseMixer({1.0f, 1.0f, -INFINITY, -INFINITY}, 0, 1, 1);
+    ASSERT_FLOAT_EQ(res, 1.0f);
+
+    res = this->sparseMixer({2.0f, 0.0f, -INFINITY, -INFINITY}, 0, 0, 0);
+    ASSERT_FLOAT_EQ(res, 1.0f);
+    res = this->sparseMixer({2.0f, 0.0f, -INFINITY, -INFINITY}, 0, 1, 1);
+    ASSERT_FLOAT_EQ(res, 1.0f);
+
+    res = this->sparseMixer({0.0f, 2.0f, -INFINITY, -INFINITY}, 0, 0, 1);
+    ASSERT_FLOAT_EQ(res, 1.0f);
+    res = this->sparseMixer({0.0f, 2.0f, -INFINITY, -INFINITY}, 0, 1, 0);
+    ASSERT_FLOAT_EQ(res, 1.0f);
+
+    res = this->sparseMixer({1.0f, 1.0f, 1.0f, -INFINITY}, 0, 0, 0);
+    ASSERT_FLOAT_EQ(res, 1.f / 3.f);
+    res = this->sparseMixer({1.0f, 1.0f, 1.0f, -INFINITY}, 0, 1, 1);
+    ASSERT_FLOAT_EQ(res, 0.5f);
 }

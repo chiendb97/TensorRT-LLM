@@ -22,7 +22,7 @@ set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
                     ${API_INCLUDE_DIR})
 
-if(ENABLE_MULTI_DEVICE EQUAL 1)
+if(ENABLE_MULTI_DEVICE)
   find_package(MPI REQUIRED)
   message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
   message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
@@ -85,6 +85,8 @@ endif()
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
 set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
 
+set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
+
 if(BUILD_BATCH_MANAGER)
   add_subdirectory(batch_manager)
 else()
@@ -111,6 +113,53 @@ else()
     message(
       FATAL_ERROR
         "The batch manager library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
+    )
+  endif()
+
+  add_library(${UCX_WRAPPER_TARGET} SHARED IMPORTED)
+  if(NOT WIN32) # Linux
+    set(UCX_WRAPPER_LIB_SOURCE_REL_LOC
+        "batch_manager/${BATCH_MANAGER_TARGET_ARCH}/libtensorrt_llm_ucx_wrapper.so"
+    )
+    set(UCX_WRAPPER_LIB_BINARY_REL_LOC
+        "batch_manager/libtensorrt_llm_ucx_wrapper.so")
+  else()
+    set(UCX_WRAPPER_LIB_BINARY_REL_DIR "batch_manager/")
+    set(UCX_WRAPPER_DLL_NAME "tensorrt_llm_ucx_wrapper.dll")
+    set(UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper.lib")
+
+    set(UCX_WRAPPER_LIB_SOURCE_REL_LOC
+        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${BATCH_MANAGER_TARGET_ARCH}/${UCX_WRAPPER_DLL_NAME}"
+    )
+    set(UCX_WRAPPER_LIB_BINARY_REL_LOC
+        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${UCX_WRAPPER_DLL_NAME}")
+    set(UCX_WRAPPER_IMPLIB_SOURCE_REL_LOC
+        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${BATCH_MANAGER_TARGET_ARCH}/${UCX_WRAPPER_LIB_NAME}"
+    )
+    set(UCX_WRAPPER_IMPLIB_BINARY_REL_LOC
+        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${UCX_WRAPPER_LIB_NAME}")
+  endif()
+  set(UCX_WRAPPER_LIB_LOC
+      "${CMAKE_CURRENT_SOURCE_DIR}/${UCX_WRAPPER_LIB_SOURCE_REL_LOC}")
+  # Copy the .so to build directory, which is needed in build_wheel.py.
+  configure_file(${UCX_WRAPPER_LIB_SOURCE_REL_LOC}
+                 ${UCX_WRAPPER_LIB_BINARY_REL_LOC} COPYONLY)
+  set_property(TARGET ${UCX_WRAPPER_TARGET} PROPERTY IMPORTED_LOCATION
+                                                     ${UCX_WRAPPER_LIB_LOC})
+  if(WIN32)
+    set(UCX_WRAPPER_IMPLIB_LOC
+        "${CMAKE_CURRENT_SOURCE_DIR}/${UCX_WRAPPER_IMPLIB_SOURCE_REL_LOC}")
+    configure_file(${UCX_WRAPPER_IMPLIB_SOURCE_REL_LOC}
+                   ${UCX_WRAPPER_IMPLIB_BINARY_REL_LOC} COPYONLY)
+    set_property(TARGET ${UCX_WRAPPER_TARGET}
+                 PROPERTY IMPORTED_IMPLIB ${UCX_WRAPPER_IMPLIB_LOC})
+  endif()
+
+  file(SIZE ${UCX_WRAPPER_LIB_LOC} UCX_WRAPPER_LIB_SIZE)
+  if(UCX_WRAPPER_LIB_SIZE LESS 1024)
+    message(
+      FATAL_ERROR
+        "The ucx wrapper library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
     )
   endif()
 endif()
@@ -148,6 +197,40 @@ else()
   endif()
 endif()
 
+set(INTERNAL_CUTLASS_KERNELS_TARGET
+    tensorrt_llm_internal_cutlass_kernels_static)
+set(INTERNAL_CUTLASS_KERNELS_TARGET_ARCH ${TARGET_ARCH})
+if(BUILD_INTERNAL_CUTLASS_KERNELS)
+  add_subdirectory(kernels/internal_cutlass_kernels)
+else()
+  add_library(${INTERNAL_CUTLASS_KERNELS_TARGET} STATIC IMPORTED)
+  if(NOT WIN32) # Linux
+    if(USE_CXX11_ABI)
+      set(INTERNAL_CUTLASS_KERNELS_LIB_LOC
+          "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/${INTERNAL_CUTLASS_KERNELS_TARGET_ARCH}/libtensorrt_llm_internal_cutlass_kernels_static.a"
+      )
+    else()
+      set(INTERNAL_CUTLASS_KERNELS_LIB_LOC
+          "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/${INTERNAL_CUTLASS_KERNELS_TARGET_ARCH}/libtensorrt_llm_internal_cutlass_kernels_static.pre_cxx11.a"
+      )
+    endif()
+  else() # Windows
+    set(INTERNAL_CUTLASS_KERNELS_LIB_LOC
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/${INTERNAL_CUTLASS_KERNELS_TARGET_ARCH}/tensorrt_llm_internal_cutlass_kernels_static.lib"
+    )
+  endif()
+  set_property(TARGET ${INTERNAL_CUTLASS_KERNELS_TARGET}
+               PROPERTY IMPORTED_LOCATION ${INTERNAL_CUTLASS_KERNELS_LIB_LOC})
+  file(SIZE ${INTERNAL_CUTLASS_KERNELS_LIB_LOC}
+       INTERNAL_CUTLASS_KERNELS_LIB_SIZE)
+  if(INTERNAL_CUTLASS_KERNELS_LIB_SIZE LESS 1024)
+    message(
+      FATAL_ERROR
+        "The internal_cutlass_kernels library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
+    )
+  endif()
+endif()
+
 find_package(Threads REQUIRED)
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE Threads::Threads)
@@ -170,6 +253,30 @@ if(NOT WIN32)
                     DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol")
 else()
   add_custom_target(check_symbol)
+endif()
+
+if(NOT WIN32)
+  if(USE_CXX11_ABI)
+    add_custom_command(
+      OUTPUT
+        "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol_internal_cutlass_kernels"
+      COMMAND nm -C $<TARGET_FILE:${INTERNAL_CUTLASS_KERNELS_TARGET}> | grep -q
+              'std::__cxx11::'
+      DEPENDS ${INTERNAL_CUTLASS_KERNELS_TARGET})
+  else()
+    add_custom_command(
+      OUTPUT
+        "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol_internal_cutlass_kernels"
+      COMMAND nm -C $<TARGET_FILE:${INTERNAL_CUTLASS_KERNELS_TARGET}> | grep -qv
+              'std::__cxx11::'
+      DEPENDS ${INTERNAL_CUTLASS_KERNELS_TARGET})
+  endif()
+  add_custom_target(
+    check_symbol_internal_cutlass_kernels
+    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol_internal_cutlass_kernels"
+  )
+else()
+  add_custom_target(check_symbol_internal_cutlass_kernels)
 endif()
 
 if(NOT WIN32)
@@ -267,18 +374,21 @@ set(TRTLLM_LINK_LIBS
     cutlass_src
     layers_src
     runtime_src
+    userbuffers_src
     ${DECODER_SHARED_TARGET})
 
-if(ENABLE_MULTI_DEVICE EQUAL 1)
+if(ENABLE_MULTI_DEVICE)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})
 endif()
 
 if(NOT WIN32) # Unix-like compilers
   set(UNDEFINED_FLAG "-Wl,--no-undefined")
   set(AS_NEEDED_FLAG "-Wl,--as-needed")
+  set(NO_AS_NEEDED_FLAG "-Wl,--no-as-needed")
 else() # Windows
   set(UNDEFINED_FLAG "")
   set(AS_NEEDED_FLAG "")
+  set(NO_AS_NEEDED_FLAG "")
 endif()
 
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
@@ -307,10 +417,18 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
 link_whole_archive(${SHARED_TARGET} ${BATCH_MANAGER_TARGET})
 link_whole_archive(${SHARED_TARGET} ${EXECUTOR_TARGET})
+link_whole_archive(${SHARED_TARGET} ${INTERNAL_CUTLASS_KERNELS_TARGET})
+
 # Cyclic dependency of batch manager on TRT-LLM
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
 # Cyclic dependency of executor on TRT-LLM
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
+# Cyclic dependency of internal_cutlass_kernels on TRT-LLM
+target_link_libraries(${INTERNAL_CUTLASS_KERNELS_TARGET}
+                      INTERFACE ${SHARED_TARGET})
+# Cyclic dependency of UCX data transceiver on TRT-LLM
+target_link_libraries(${UCX_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
+add_dependencies(${SHARED_TARGET} ${UCX_WRAPPER_TARGET})
 
 if(NOT WIN32)
   set_target_properties(${SHARED_TARGET} PROPERTIES LINK_FLAGS
@@ -321,6 +439,7 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${NVRTC_WRAPPER_TARGET})
 
 add_dependencies(${SHARED_TARGET} check_symbol)
 add_dependencies(${SHARED_TARGET} check_symbol_executor)
+add_dependencies(${SHARED_TARGET} check_symbol_internal_cutlass_kernels)
 
 if(BUILD_PYT)
   add_subdirectory(thop)

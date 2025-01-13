@@ -1,13 +1,18 @@
 import json
+import os
 import pickle
+import sys
 import tempfile
 from pathlib import Path
-from typing import List, Optional
 
 import numpy as np
 import torch
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.mapping import Mapping
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 
 def test_quant_mode():
@@ -40,9 +45,10 @@ def test_model_config():
     num_heads = 16
     hidden_size = 768
     data_type = _tb.DataType.FLOAT
-    model_config = _tb.ModelConfig(vocab_size, num_attention_layers,
-                                   num_rnn_layers, num_heads, hidden_size,
-                                   data_type)
+    model_config = _tb.ModelConfig(vocab_size,
+                                   num_attention_layers + num_rnn_layers,
+                                   num_attention_layers, num_rnn_layers,
+                                   num_heads, hidden_size, data_type)
     assert model_config.vocab_size == vocab_size
     assert model_config.num_attention_layers() == num_attention_layers
     assert model_config.num_rnn_layers() == num_rnn_layers
@@ -53,10 +59,23 @@ def test_model_config():
     assert model_config.vocab_size_padded(1) is not None
     assert model_config.size_per_head == hidden_size // num_heads
 
-    assert model_config.num_kv_heads == num_heads
+    num_kv_heads_per_layer = model_config.num_kv_heads_per_layer
+    for layer_idx in range(num_attention_layers):
+        assert model_config.num_kv_heads(layer_idx) == num_heads
+        assert num_kv_heads_per_layer[layer_idx] == num_heads
+
     num_kv_heads = 1
-    model_config.num_kv_heads = num_kv_heads
-    assert model_config.num_kv_heads == num_kv_heads
+    model_config.set_num_kv_heads(num_kv_heads)
+    num_kv_heads_per_layer = model_config.num_kv_heads_per_layer
+    for layer_idx in range(num_attention_layers):
+        assert model_config.num_kv_heads(layer_idx) == num_kv_heads
+        assert num_kv_heads_per_layer[layer_idx] == num_kv_heads
+
+    num_kv_heads_per_layer[-1] = 2
+    model_config.num_kv_heads_per_layer = num_kv_heads_per_layer
+    for nheads, ref in zip(model_config.num_kv_heads_per_layer,
+                           num_kv_heads_per_layer):
+        assert nheads == ref
 
     assert not model_config.use_gpt_attention_plugin
     model_config.use_gpt_attention_plugin = True
@@ -66,9 +85,13 @@ def test_model_config():
     model_config.use_packed_input = True
     assert model_config.use_packed_input
 
-    assert not model_config.use_paged_kv_cache
-    model_config.use_paged_kv_cache = True
-    assert model_config.use_paged_kv_cache
+    assert model_config.kv_cache_type is not None
+    for enum_val in [
+            _tb.KVCacheType.CONTINUOUS, _tb.KVCacheType.PAGED,
+            _tb.KVCacheType.DISABLED
+    ]:
+        model_config.kv_cache_type = enum_val
+        assert model_config.kv_cache_type == enum_val
 
     assert model_config.tokens_per_block == 64
     tokens_per_block = 1024
@@ -113,16 +136,18 @@ def test_model_config():
 def test_world_config():
     tensor_parallelism = 2
     pipeline_parallelism = 4
+    context_parallelism = 1
     rank = 3
     gpus_per_node = 10
     world_config = _tb.WorldConfig(tensor_parallelism, pipeline_parallelism,
-                                   rank, gpus_per_node)
+                                   context_parallelism, rank, gpus_per_node)
     assert world_config.tensor_parallelism == tensor_parallelism
     assert world_config.pipeline_parallelism == pipeline_parallelism
+    assert world_config.context_parallelism == context_parallelism
     assert world_config.rank == rank
     assert world_config.gpus_per_node == gpus_per_node
     assert world_config.gpus_per_group == gpus_per_node
-    assert world_config.size == tensor_parallelism * pipeline_parallelism
+    assert world_config.size == tensor_parallelism * pipeline_parallelism * context_parallelism
     assert world_config.is_pipeline_parallel
     assert world_config.is_tensor_parallel
     assert world_config.device == rank % gpus_per_node
@@ -132,6 +157,7 @@ def test_world_config():
     world_config = _tb.WorldConfig.mpi(gpus_per_node)
     assert world_config.tensor_parallelism == 1
     assert world_config.pipeline_parallelism == 1
+    assert world_config.context_parallelism == 1
     assert world_config.gpus_per_node == gpus_per_node
     assert world_config.rank == 0
 
@@ -178,6 +204,7 @@ def test_sampling_config():
 def test_gpt_json_config():
     model_config = {
         "vocab_size": 1000,
+        "num_layers": 18,  # >= attn + rnn
         "num_attention_layers": 12,
         "num_rnn_layers": 2,
         "num_heads": 4,
@@ -191,6 +218,7 @@ def test_gpt_json_config():
         "precision": "float32",
         "tensor_parallelism": 1,
         "pipeline_parallelism": 1,
+        "context_parallelism": 1,
         "gpus_per_node": 8,
         "model_config": trt_model_config
     }
@@ -211,6 +239,8 @@ def test_gpt_json_config():
 
     check_properties(gpt_json_config, json_config, model_config)
 
+    assert gpt_json_config.runtime_defaults is None
+
     json_dict = {
         "builder_config": {
             "name": json_config["name"],
@@ -221,6 +251,7 @@ def test_gpt_json_config():
             "precision": json_config["precision"],
             "tensor_parallel": json_config["tensor_parallelism"],
             "pipeline_parallel": json_config["pipeline_parallelism"],
+            "context_parallel": json_config["context_parallelism"],
         },
         "plugin_config": {
             "paged_kv_cache": False,
@@ -245,13 +276,39 @@ def test_gpt_json_config():
     rank = 3
     gpus_per_node = 10
     world_config = _tb.WorldConfig(json_config["tensor_parallelism"],
-                                   json_config["pipeline_parallelism"], rank,
+                                   json_config["pipeline_parallelism"],
+                                   json_config["context_parallelism"], rank,
                                    gpus_per_node)
 
     assert gpt_json_config.engine_filename(
         world_config) == json_config["name"] + "_float32_tp1_rank3.engine"
     assert gpt_json_config.engine_filename(
         world_config, "llama") == "llama_float32_tp1_rank3.engine"
+
+    def parse_runtime_defaults(defaults_dict: dict | None = None):
+        config = _tb.GptJsonConfig.parse(
+            json.dumps({
+                "version": "some.version",
+                "build_config": {
+                    "plugin_config": json_dict["plugin_config"],
+                    "lora_config": {},
+                },
+                "pretrained_config": {
+                    **json_dict["builder_config"],
+                    "architecture": "LlamaForCausalLM",
+                    "mapping": Mapping().to_dict(),
+                    "dtype": "bfloat16",
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 1,
+                    "quantization": {},
+                    "runtime_defaults": defaults_dict,
+                },
+            }))
+        return config.runtime_defaults
+
+    strict_keys = False  # GptJsonConfig is written in cpp, and there is currently no nice way to throw on extra keys
+    assert_runtime_defaults_are_parsed_correctly(parse_runtime_defaults,
+                                                 strict_keys=strict_keys)
 
 
 def test_llm_request():
@@ -262,6 +319,7 @@ def test_llm_request():
         "max_new_tokens": 5,
         "sampling_config": sampling_config,
         "input_tokens": [0, 1, 2],
+        "position_ids": [0, 1, 2],
         "is_streaming": True,
         "pad_id": 99,
         "end_id": 100,
@@ -274,27 +332,28 @@ def test_llm_request():
         "return_context_logits": False,
         "return_generation_logits": False
     }
-    llm_request = _tb.LlmRequest(**kwargs)
+    llm_request = _tb.internal.batch_manager.LlmRequest(**kwargs)
 
     assert llm_request.request_id == 0
     assert llm_request.prompt_len == 3
     assert llm_request.sampling_config.beam_width == sampling_config.beam_width
-    assert llm_request.is_streaming
+    assert llm_request.streaming
     assert llm_request.pad_id == 99
     assert llm_request.end_id == 100
     assert llm_request.seq_slot == None
-    assert torch.equal(llm_request.prompt_embedding_table,
+    assert torch.equal(llm_request.prompt_embedding_table(),
                        kwargs["prompt_embedding_table"])
     assert llm_request.prompt_vocab_size == 2
-    assert torch.equal(llm_request.embedding_bias, kwargs["embedding_bias"])
-    assert torch.equal(llm_request.stop_words_list, kwargs["stop_words_list"])
-    assert torch.equal(llm_request.bad_words_list, kwargs["bad_words_list"])
+    assert torch.equal(llm_request.embedding_bias(), kwargs["embedding_bias"])
+    assert torch.equal(llm_request.stop_words_list(), kwargs["stop_words_list"])
+    assert torch.equal(llm_request.bad_words_list(), kwargs["bad_words_list"])
 
     assert llm_request.get_num_tokens(0) == 3
     assert llm_request.max_beam_num_tokens == 3
     assert llm_request.get_token(1, 2) == 2
     assert llm_request.get_tokens(1) == [0, 1, 2]
     assert llm_request.max_num_generated_tokens == 0
+    assert llm_request.position_ids == [0, 1, 2]
 
     llm_request.add_new_token(42, 0)
     assert llm_request.get_token(0, 3) == 42
@@ -308,7 +367,7 @@ def test_llm_request():
     assert llm_request.max_num_generated_tokens == 2
 
     llm_request.pause(0)
-    assert llm_request.state == _tb.LlmRequestState.REQUEST_STATE_CONTEXT_INIT
+    assert llm_request.state == _tb.LlmRequestState.CONTEXT_INIT
 
     llm_request.max_sent_token_len = 1
     assert llm_request.max_sent_token_len == 1
@@ -345,136 +404,10 @@ def test_llm_request():
     assert torch.equal(llm_request.draft_logits, logits)
 
 
-def test_inference_request():
-    input_ids = torch.tensor((10, 10))
-
-    def logits_post_processor(req_id: int, logits: torch.Tensor,
-                              ids: List[List[int]], client_id: Optional[int]):
-        del req_id, ids
-
-    ir = _tb.InferenceRequest(42, logits_post_processor)
-    setattr(ir, _tb.tensor_names.INPUT_IDS, input_ids)
-
-    assert ir.request_id == 42
-    assert ir.input_ids is not None
-    assert torch.equal(ir.input_ids, input_ids)
-
-    assert not ir.is_streaming
-    ir.is_streaming = True
-    assert ir.is_streaming
-
-    data_tensor = torch.tensor((5, 5))
-
-    assert ir.draft_input_ids is None
-    ir.draft_input_ids = data_tensor
-    assert torch.equal(ir.draft_input_ids, data_tensor)
-
-    assert ir.draft_logits is None
-    ir.draft_logits = data_tensor
-    assert torch.equal(ir.draft_logits, data_tensor)
-
-    assert ir.bad_words_list is None
-    ir.bad_words_list = data_tensor
-    assert torch.equal(ir.bad_words_list, data_tensor)
-
-    assert ir.beam_width is None
-    ir.beam_width = data_tensor
-    assert torch.equal(ir.beam_width, data_tensor)
-
-    assert ir.embedding_bias is None
-    ir.embedding_bias = data_tensor
-    assert torch.equal(ir.embedding_bias, data_tensor)
-
-    assert ir.end_id is None
-    ir.end_id = data_tensor
-    assert torch.equal(ir.end_id, data_tensor)
-
-    assert ir.length_penalty is None
-    ir.length_penalty = data_tensor
-    assert torch.equal(ir.length_penalty, data_tensor)
-
-    assert ir.early_stopping is None
-    ir.early_stopping = data_tensor
-    assert torch.equal(ir.early_stopping, data_tensor)
-
-    assert ir.max_new_tokens is None
-    ir.max_new_tokens = data_tensor
-    assert torch.equal(ir.max_new_tokens, data_tensor)
-
-    assert ir.min_length is None
-    ir.min_length = data_tensor
-    assert torch.equal(ir.min_length, data_tensor)
-
-    assert ir.pad_id is None
-    ir.pad_id = data_tensor
-    assert torch.equal(ir.pad_id, data_tensor)
-
-    assert ir.presence_penalty is None
-    ir.presence_penalty = data_tensor
-    assert torch.equal(ir.presence_penalty, data_tensor)
-
-    assert ir.frequency_penalty is None
-    ir.frequency_penalty = data_tensor
-    assert torch.equal(ir.frequency_penalty, data_tensor)
-
-    assert ir.prompt_embedding_table is None
-    ir.prompt_embedding_table = data_tensor
-    assert torch.equal(ir.prompt_embedding_table, data_tensor)
-
-    assert ir.prompt_vocab_size is None
-    ir.prompt_vocab_size = data_tensor
-    assert torch.equal(ir.prompt_vocab_size, data_tensor)
-
-    assert ir.lora_weights is None
-    ir.lora_weights = data_tensor
-    assert torch.equal(ir.lora_weights, data_tensor)
-
-    assert ir.lora_config is None
-    ir.lora_config = data_tensor
-    assert torch.equal(ir.lora_config, data_tensor)
-
-    assert ir.random_seed is None
-    ir.random_seed = data_tensor
-    assert torch.equal(ir.random_seed, data_tensor)
-
-    assert ir.repetition_penalty is None
-    ir.repetition_penalty = data_tensor
-    assert torch.equal(ir.repetition_penalty, data_tensor)
-
-    assert ir.return_log_probs is None
-    ir.return_log_probs = data_tensor
-    assert torch.equal(ir.return_log_probs, data_tensor)
-
-    assert ir.runtime_top_k is None
-    ir.runtime_top_k = data_tensor
-    assert torch.equal(ir.runtime_top_k, data_tensor)
-
-    assert ir.runtime_top_p is None
-    ir.runtime_top_p = data_tensor
-    assert torch.equal(ir.runtime_top_p, data_tensor)
-
-    assert ir.stop_words_list is None
-    ir.stop_words_list = data_tensor
-    assert torch.equal(ir.stop_words_list, data_tensor)
-
-    assert ir.temperature is None
-    ir.temperature = data_tensor
-    assert torch.equal(ir.temperature, data_tensor)
-
-    ir.logits_post_processor = None
-    serialized = pickle.dumps(ir)
-    deserialized = pickle.loads(serialized)
-
-    assert isinstance(deserialized, _tb.InferenceRequest)
-    assert deserialized.request_id == ir.request_id
-    assert deserialized.is_streaming == ir.is_streaming
-    assert torch.equal(deserialized.input_ids, ir.input_ids)
-
-
 def test_trt_gpt_model_optional_params():
     opt_params = _tb.TrtGptModelOptionalParams()
 
-    kv_cache_config = _tb.KvCacheConfig(10, 10, 0, 0.5, False)
+    kv_cache_config = _tb.KvCacheConfig(10, [10], 0, 0.5, False)
     opt_params.kv_cache_config = kv_cache_config
     assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
 
@@ -513,7 +446,7 @@ def test_trt_gpt_model_optional_params():
 
 
 def test_trt_gpt_model_optional_params_ctor():
-    kv_cache_config = _tb.KvCacheConfig(10, 10, 0, 0.5, False)
+    kv_cache_config = _tb.KvCacheConfig(10, [10], 0, 0.5, False)
     enable_trt_overlap = True
     device_ids = [0, 1]
     normalize_log_probs = False

@@ -25,8 +25,9 @@
     ```
     2. Convert
     ```bash
-    python3 ../qwen/convert_checkpoint.py --model_dir=./Qwen-VL-Chat \
-            --output_dir=./tllm_checkpoint_1gpu
+    python3 ./examples/qwen/convert_checkpoint.py --model_dir=./Qwen-VL-Chat \
+            --output_dir=./tllm_checkpoint_1gpu \
+            --dtype float16
     ```
 
 - Build TensorRT-LLM engine
@@ -35,7 +36,7 @@
     ```bash
     trtllm-build --checkpoint_dir=./tllm_checkpoint_1gpu \
                  --gemm_plugin=float16 --gpt_attention_plugin=float16 \
-                 --lookup_plugin=float16 --max_input_len=2048 --max_seq_len=3072 \
+                 --max_input_len=2048 --max_seq_len=3072 \
                  --max_batch_size=8 --max_prompt_embedding_table_size=2048 \
                  --remove_input_padding=enable \
                  --output_dir=./trt_engines/Qwen-VL-7B-Chat
@@ -50,18 +51,16 @@
     python3 run.py \
         --tokenizer_dir=./Qwen-VL-Chat \
         --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat \
-        --vit_engine_dir=./plan \
-        --images_path='{"image": "./pics/demo.jpeg"}' \
-        --input_dir='{"image": "image.pt"}'
+        --vit_engine_path=./plan/visual_encoder/visual_encoder_fp16.plan \
+        --images_path='{"image": "./pics/demo.jpeg"}'
     ```
     4.2 (Optional) For multiple rounds of dialogue, you can run:
     ```bash
     python3 run_chat.py \
         --tokenizer_dir=./Qwen-VL-Chat \
         --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat \
-        --vit_engine_dir=./plan \
-        --images_path='{"image": "./pics/demo.jpeg"}' \
-        --input_dir='{"image": "image.pt"}'
+        --vit_engine_path=./plan/visual_encoder/visual_encoder_fp16.plan \
+        --images_path='{"image": "./pics/demo.jpeg"}'
     ```
     4.3 (Optional) To show the bounding box result in the demo picture, install OpenCV, ZMQ, and request:
     ```bash
@@ -85,7 +84,7 @@
     python3 run_chat.py \
         --tokenizer_dir=./Qwen-VL-Chat \
         --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat \
-        --vit_engine_dir=./plan \
+        --vit_engine_path=./plan/visual_encoder/visual_encoder_fp16.plan \
         --display \
         --port=8006
     ```
@@ -98,7 +97,7 @@
     python3 run_chat.py \
         --tokenizer_dir=./Qwen-VL-Chat \
         --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat \
-        --vit_engine_dir=./plan \
+        --vit_engine_path=./plan/visual_encoder/visual_encoder_fp16.plan \
         --display \
         --local_machine
     ```

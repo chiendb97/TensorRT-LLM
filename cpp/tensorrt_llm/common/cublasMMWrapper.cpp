@@ -37,21 +37,17 @@ CublasMMWrapper::CublasMMWrapper(std::shared_ptr<cublasHandle_t> cublasHandle,
 {
 }
 
-CublasMMWrapper::~CublasMMWrapper()
-{
-    mMutex = nullptr;
-}
+CublasMMWrapper::~CublasMMWrapper() {}
 
 CublasMMWrapper::CublasMMWrapper(CublasMMWrapper const& wrapper)
     : mCublasHandle(wrapper.mCublasHandle)
     , mCublasLtHandle(wrapper.mCublasLtHandle)
     , mStream(wrapper.mStream)
-    , mMutex(wrapper.mMutex)
 {
 }
 
 void CublasMMWrapper::createDescriptors(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n,
-    int const k, int const lda, int const ldb, int const ldc)
+    int const k, int const lda, int const ldb, int const ldc, int8_t fastAcc)
 {
     // --------------------------------------
     // Create descriptors for the original matrices
@@ -65,6 +61,16 @@ void CublasMMWrapper::createDescriptors(cublasOperation_t transa, cublasOperatio
         mOperationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(cublasOperation_t)));
     check_cuda_error(cublasLtMatmulDescSetAttribute(
         mOperationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(cublasOperation_t)));
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fastAcc, sizeof(int8_t)));
+}
+
+void CublasMMWrapper::setScaleDescriptors(void* scale_a, void* scale_b)
+{
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_a, sizeof(void*)));
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scale_b, sizeof(void*)));
 }
 
 void CublasMMWrapper::destroyDescriptors()
@@ -135,8 +141,6 @@ void CublasMMWrapper::Gemm(cublasOperation_t transa, cublasOperation_t transb, i
     half h_alpha = (half) (f_alpha);
     half h_beta = (half) (f_beta);
 
-    std::lock_guard<std::mutex> lock(*mMutex);
-
     // TODO: default cublas libs
     usingCublasLt = usingCublasLt && (mAType == CUDA_R_16F || mAType == CUDA_R_8F_E4M3);
     bool isFp16ComputeType = mComputeType == CUBLAS_COMPUTE_16F;
@@ -179,8 +183,6 @@ void CublasMMWrapper::stridedBatchedGemm(cublasOperation_t transa, cublasOperati
     half h_alpha = (half) f_alpha;
     half h_beta = (half) f_beta;
 
-    std::lock_guard<std::mutex> lock(*mMutex);
-
     int isFp16ComputeType = mComputeType == CUBLAS_COMPUTE_16F ? 1 : 0;
     void const* alpha = isFp16ComputeType ? reinterpret_cast<void*>(&h_alpha) : reinterpret_cast<void const*>(&f_alpha);
     void const* beta = isFp16ComputeType ? reinterpret_cast<void*>(&h_beta) : reinterpret_cast<void const*>(&f_beta);
@@ -198,7 +200,6 @@ void CublasMMWrapper::stridedBatchedGemm(cublasOperation_t transa, cublasOperati
     half h_alpha = (half) f_alpha;
     half h_beta = (half) f_beta;
 
-    std::lock_guard<std::mutex> lock(*mMutex);
     bool isFp16ComputeType = mComputeType == CUBLAS_COMPUTE_16F ? 1 : 0;
     void const* alpha = isFp16ComputeType ? reinterpret_cast<void*>(&h_alpha) : reinterpret_cast<void const*>(&f_alpha);
     void const* beta = isFp16ComputeType ? reinterpret_cast<void*>(&h_beta) : reinterpret_cast<void const*>(&f_beta);

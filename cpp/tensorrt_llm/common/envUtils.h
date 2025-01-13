@@ -18,9 +18,12 @@
 #pragma once
 #include <cstdint>
 #include <optional>
+#include <string>
 
 namespace tensorrt_llm::common
 {
+// Useful when you want to inject some debug code controllable with env var.
+std::optional<int32_t> getIntEnv(char const* name);
 
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels();
@@ -37,7 +40,21 @@ int getEnvMmhaBlocksPerSequence();
 
 int getEnvMmhaKernelBlockSize();
 
-// Whether FDL is enabled.
-bool getEnvEnableFDL();
+// Whether PDL is enabled.
+bool getEnvEnablePDL();
+
+bool getEnvUseUCXKvCache();
+
+std::string getEnvUCXInterface();
+
+bool getEnvDisaggLayerwise();
+
+bool getEnvParallelCacheSend();
+
+bool getEnvRequestKVCacheSerial();
+
+bool getEnvDisableKVCacheTransferOverlap();
+
+bool getEnvDisableReceiveKVCacheParallel();
 
 } // namespace tensorrt_llm::common

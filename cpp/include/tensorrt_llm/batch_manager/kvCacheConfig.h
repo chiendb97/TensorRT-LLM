@@ -38,47 +38,62 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     explicit KvCacheConfig(std::optional<SizeType32> maxTokens = std::nullopt,
-        std::optional<SizeType32> maxAttentionWindow = std::nullopt,
+        std::optional<std::vector<SizeType32>> maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> sinkTokenLength = std::nullopt,
         std::optional<float> freeGpuMemoryFraction = std::nullopt, bool enableBlockReuse = false, bool useUvm = false,
-        std::optional<size_t> hostCacheSize = std::nullopt, bool onboardBlocks = true)
+        std::optional<size_t> hostCacheSize = std::nullopt, bool onboardBlocks = true,
+        std::optional<float> crossKvCacheFraction = std::nullopt,
+        std::optional<SizeType32> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0)
         : maxTokens{maxTokens}
-        , maxAttentionWindow{maxAttentionWindow}
+        , maxAttentionWindowVec{std::move(maxAttentionWindowVec)}
         , sinkTokenLength{sinkTokenLength}
         , freeGpuMemoryFraction{freeGpuMemoryFraction}
         , enableBlockReuse(enableBlockReuse)
         , useUvm(useUvm)
         , hostCacheSize(hostCacheSize)
         , onboardBlocks(onboardBlocks)
+        , crossKvCacheFraction{crossKvCacheFraction}
+        , secondaryOffloadMinPriority(secondaryOffloadMinPriority)
+        , eventBufferMaxSize(eventBufferMaxSize)
     {
     }
 
     explicit KvCacheConfig(executor::KvCacheConfig const& kvCacheConfig)
-        : KvCacheConfig(kvCacheConfig.getMaxTokens(), kvCacheConfig.getMaxAttentionWindow(),
+        : KvCacheConfig(kvCacheConfig.getMaxTokens(), kvCacheConfig.getMaxAttentionWindowVec(),
             kvCacheConfig.getSinkTokenLength(), kvCacheConfig.getFreeGpuMemoryFraction(),
             kvCacheConfig.getEnableBlockReuse(), false, kvCacheConfig.getHostCacheSize(),
-            kvCacheConfig.getOnboardBlocks())
+            kvCacheConfig.getOnboardBlocks(), kvCacheConfig.getCrossKvCacheFraction(),
+            kvCacheConfig.getSecondaryOffloadMinPriority(), kvCacheConfig.getEventBufferMaxSize())
     {
     }
 
     bool operator==(KvCacheConfig const& other) const
     {
-        return maxTokens == other.maxTokens && maxAttentionWindow == other.maxAttentionWindow
+        return maxTokens == other.maxTokens && maxAttentionWindowVec == other.maxAttentionWindowVec
             && sinkTokenLength == other.sinkTokenLength && freeGpuMemoryFraction == other.freeGpuMemoryFraction
             && enableBlockReuse == other.enableBlockReuse && useUvm == other.useUvm
-            && hostCacheSize == other.hostCacheSize && onboardBlocks == other.onboardBlocks;
+            && hostCacheSize == other.hostCacheSize && onboardBlocks == other.onboardBlocks
+            && crossKvCacheFraction == other.crossKvCacheFraction
+            && secondaryOffloadMinPriority == other.secondaryOffloadMinPriority
+            && eventBufferMaxSize == other.eventBufferMaxSize;
     }
 
     friend std::ostream& operator<<(std::ostream& os, KvCacheConfig const& self);
 
     std::optional<SizeType32> maxTokens;
-    std::optional<SizeType32> maxAttentionWindow;
+    std::optional<std::vector<SizeType32>> maxAttentionWindowVec;
     std::optional<SizeType32> sinkTokenLength;
     std::optional<float> freeGpuMemoryFraction;
     bool enableBlockReuse;
-    static constexpr auto kDefaultGpuMemFraction = 0.9f;
+    static constexpr auto kDefaultGpuMemFraction = 0.9F;
     bool useUvm;
     std::optional<size_t> hostCacheSize;
     bool onboardBlocks;
+    // Cross will use crossKvCacheFraction of KV Cache and self attention will use the rest.
+    std::optional<float> crossKvCacheFraction;
+    // The minimum priority level to allow blocks to be offloaded to secondary memory.
+    std::optional<SizeType32> secondaryOffloadMinPriority;
+    // Maximum size of the KV Cache event buffer
+    size_t eventBufferMaxSize;
 };
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

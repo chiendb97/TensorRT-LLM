@@ -28,6 +28,7 @@ from tensorrt_llm import Tensor, str_dtype_to_trt
 from tensorrt_llm._utils import str_dtype_to_torch, torch_dtype_to_trt
 from tensorrt_llm.functional import gpt_attention
 from tensorrt_llm.models.generation_mixin import GenerationMixin
+from tensorrt_llm.models.modeling_utils import get_kv_cache_type_from_legacy
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -66,6 +67,9 @@ class TestPluginNoCache(unittest.TestCase):
         net.plugin_config.gpt_attention_plugin = dtype
         net.plugin_config.set_context_fmha(context_fmha_type)
         net.plugin_config.remove_input_padding = remove_input_padding
+        kv_cache_type = get_kv_cache_type_from_legacy(
+            use_cache, net.plugin_config.paged_kv_cache)
+
         with tensorrt_llm.net_guard(net):
             inputs = GenerationMixin().prepare_attention_inputs(
                 max_batch_size=max_batch_size,
@@ -79,7 +83,7 @@ class TestPluginNoCache(unittest.TestCase):
                 remove_input_padding=remove_input_padding,
                 use_gpt_attention_plugin=True,
                 enable_ctx_gen_opt_profiles=False,
-                use_cache=use_cache,
+                kv_cache_type=kv_cache_type,
             )
 
             if remove_input_padding:
@@ -116,6 +120,7 @@ class TestPluginNoCache(unittest.TestCase):
                 past_key_value = past_key_value[0]
             cache_indirection = inputs['cache_indirection']
             host_runtime_perf_knobs_tensor = inputs['host_runtime_perf_knobs']
+            host_context_progress = inputs['host_context_progress']
 
             outputs = gpt_attention(
                 qkv=qkv,
@@ -136,7 +141,8 @@ class TestPluginNoCache(unittest.TestCase):
                 max_context_length=max_input_len,
                 host_context_lengths=host_context_lengths,
                 use_cache=use_cache,
-                host_runtime_perf_knobs=host_runtime_perf_knobs_tensor)
+                host_runtime_perf_knobs=host_runtime_perf_knobs_tensor,
+                host_context_progress=host_context_progress)
 
             net._mark_output(outputs[0],
                              'output',
@@ -208,6 +214,9 @@ class TestPluginNoCache(unittest.TestCase):
         host_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
                                                dtype=torch.int64,
                                                device='cpu')
+        host_context_progress = torch.tensor([0],
+                                             dtype=torch.int64,
+                                             device='cpu')
 
         engine = TestPluginNoCache.build_engine(
             qkv_shape=qkv_shape,
@@ -229,7 +238,8 @@ class TestPluginNoCache(unittest.TestCase):
             'host_sink_token_length': host_sink_token_length,
             'context_lengths': context_lengths,
             'host_request_types': host_request_types,
-            'host_runtime_perf_knobs': host_runtime_perf_knobs
+            'host_runtime_perf_knobs': host_runtime_perf_knobs,
+            'host_context_progress': host_context_progress
         }
         if remove_input_padding:
             inputs['host_context_lengths'] = host_context_lengths
@@ -270,7 +280,8 @@ class TestPluginNoCache(unittest.TestCase):
             'cache_indirection': cache_indirection,
             'host_request_types': host_request_types,
             'past_key_value_0': present_key_value,
-            'host_runtime_perf_knobs': host_runtime_perf_knobs
+            'host_runtime_perf_knobs': host_runtime_perf_knobs,
+            'host_context_progress': host_context_progress
         }
         if remove_input_padding:
             inputs['host_context_lengths'] = host_context_lengths

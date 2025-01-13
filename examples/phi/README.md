@@ -1,19 +1,16 @@
 # Phi
 
-This document explains how to build the [phi-2](https://huggingface.co/microsoft/phi-2), [Phi-3-mini-4k-instruct](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct),
-[Phi-3-mini-128k-instruct](https://huggingface.co/microsoft/Phi-3-mini-128k-instruct), [Phi-3-small-8k-instruct](https://huggingface.co/microsoft/Phi-3-small-8k-instruct), [Phi-3-small-128k-instruct](https://huggingface.co/microsoft/Phi-3-small-128k-instruct), [Phi-3-medium-4k-instruct](https://huggingface.co/microsoft/Phi-3-medium-4k-instruct/) and [Phi-3-medium-128k-instruct](https://huggingface.co/microsoft/Phi-3-medium-128k-instruct/)
-models using TensorRT-LLM and run on a single GPU.
+This document explains how to build Phi-2, Phi-3 and Phi-3.5 family of models using TensorRT-LLM and run on a single or multiple GPUs.
+For multimodal models (Phi-3-vision-128k-instruct and Phi-3.5-vision-instruct), see `../multimodal/README.md`.
 
-- [Phi](#phi)
-  - [Overview](#overview)
-  - [Support Matrix](#support-matrix)
-  - [Usage](#usage)
-    - [1. Convert weights from HF Transformers to TensorRT-LLM format](#1-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
-    - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
-      - [Fused MultiHead Attention (FMHA)](#fused-multihead-attention-fmha)
-    - [3. Summarization using the Phi model](#3-summarization-using-the-phi-model)
-    - [4. Quantization](#4-quantization)
-    - [5. Run Phi-3 with LoRA](#5-run-phi-3-with-lora)
+- [Overview](#overview)
+- [Support Matrix](#support-matrix)
+- [Usage](#usage)
+  - [1. Convert weights from HF Transformers to TensorRT-LLM format](#1-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+  - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
+  - [3. Summarization using the Phi model](#3-summarization-using-the-phi-model)
+  - [4. Quantization](#4-quantization)
+  - [5. Run Phi-3 with LoRA](#5-run-phi-3-with-lora)
 
 ## Overview
 
@@ -30,13 +27,15 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 
 |    Model Name    | FP16  | BF16  | FP8   | INT8  | TP   |
 | :--------------: | :---: | :---: | :---: | :---: | :---: |
-|    phi-2    |   Y   |   Y    |   |    | Y |
+|    Phi-2    |   Y   |   Y    |   |    | Y |
 | Phi-3-mini-4k-instruct    |   Y   |   Y   | Y   | Y  |
 | Phi-3-mini-128k-instruct  |   Y   |   Y   | Y   | Y  |
 | Phi-3-small-8k-instruct   |   Y   |   Y   | Y   | Y  | Y |
 | Phi-3-small-128k-instruct |   Y   |   Y   | Y   | Y  | Y |
 | Phi-3-medium-8k-instruct  |   Y   |   Y   | Y   | Y  |
 | Phi-3-medium-128k-instruct |  Y   |   Y   | Y   | Y  |
+| Phi-3.5-mini-instruct     |   Y   |   Y   | Y   | Y  |
+| Phi-3.5-MoE-instruct      |   Y   |   Y   | Y   | Y  | Y |
 
 * Model Name: the name of the model, the same as the name on HuggingFace
 * TP: Tensor Parallel
@@ -58,6 +57,11 @@ python ./convert_checkpoint.py \
                     --dtype float16
 ```
 
+If a model supports tensor-parallelism, number of tensor parallel ranks to split the model into can be specified as `--tp_size` argument to `convert_checkpoint.py`.
+
+For Phi-3.5-MoE-instruct model, expert parallelism can be enabled using `--moe_tp_size` and `--moe_ep_size` arguments.
+The section on Parallelism Modes in `../mixtral/README.md` discusses tensor and expert parallelism for Mixture of Experts models in detail.
+
 ### 2. Build TensorRT engine(s)
 
 TensorRT-LLM builds TensorRT engine(s) using a HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) using dummy weights.
@@ -67,25 +71,14 @@ Examples of build invocations:
 ```bash
 # Build a float16 engine using a single GPU and HF weights.
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-# --tp_size and --pp_size are the model shard size
 trtllm-build \
     --checkpoint_dir ./phi-checkpoint \
     --output_dir ./phi-engine \
-    --gemm_plugin float16 \
+    --gemm_plugin auto \
     --max_batch_size 8 \
     --max_input_len 1024 \
-    --max_seq_len 2048 \
-    --tp_size 1 \
-    --pp_size 1
+    --max_seq_len 2048
 ```
-
-#### Fused MultiHead Attention (FMHA)
-
-You can enable the FMHA kernels for phi by adding `--context_fmha enable` to the invocation of `trtllm-build`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
-
-If you find that the default fp16 accumulation (`--context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc` to the inference command (`run.py` or `summarize.py`). However, it is expected to see performance drop.
-
-Note `--context_fmha` has to be used together with `--gpt_attention_plugin float16`.
 
 ### 3. Summarization using the Phi model
 

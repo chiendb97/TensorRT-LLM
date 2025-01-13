@@ -51,7 +51,7 @@ class TrtGptModelV1;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
-class KVCacheManager;
+class BaseKVCacheManager;
 }
 
 namespace tensorrt_llm::runtime
@@ -70,7 +70,7 @@ class TllmRuntime;
 
 class [[deprecated("Use the executor API instead.")]] GptSession
 {
-    using KvCacheManager = batch_manager::kv_cache_manager::KVCacheManager;
+    using BaseKVCacheManager = batch_manager::kv_cache_manager::BaseKVCacheManager;
     using KvCacheConfig = batch_manager::kv_cache_manager::KvCacheConfig;
     using TensorPtr = runtime::ITensor::SharedPtr;
     using TokenGeneratedCallback = std::function<void(SizeType32 step, bool finished)>;
@@ -178,10 +178,7 @@ public:
     }
 
     GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
-        std::string const& engineFile, LoggerPtr logger = nullptr)
-        : GptSession(sessionConfig, modelConfig, worldConfig, RawEngine(engineFile), std::move(logger))
-    {
-    }
+        std::string const& engineFile, LoggerPtr logger = nullptr);
 
     [[nodiscard]] nvinfer1::ILogger& getLogger() const;
 
@@ -211,6 +208,10 @@ public:
     [[nodiscard]] nvinfer1::IEngineInspector& getEngineInspector() const;
 
     [[nodiscard]] nvinfer1::DataType getLogitDataType() const;
+
+    [[nodiscard]] nvinfer1::DataType getTensorDataType(std::string const& name) const;
+
+    [[nodiscard]] nvinfer1::Dims getTensorShape(std::string const& name) const;
 
     //! @brief This function performs the generation loop.
     //! @details Given input tensors to read from, output tensors to populate, that member function
@@ -268,10 +269,10 @@ private:
     void createCustomAllReduceWorkspace(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSequenceLength);
 
     void executeContextStep(std::vector<GenerationInput> const& generationBatchesInputs,
-        std::vector<SizeType32> const& generationBatchesOffsets, KvCacheManager const* kvCacheManager);
+        std::vector<SizeType32> const& generationBatchesOffsets, BaseKVCacheManager const* kvCacheManager);
     SizeType32 executeGenerationStep(SizeType32 step, std::vector<GenerationInput> const& microBatchesInputs,
         std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType32> const& microBatchOffsets,
-        KvCacheManager* kvCacheManager, std::vector<bool>& microBatchesFinished);
+        BaseKVCacheManager* kvCacheManager, std::vector<bool>& microBatchesFinished);
 
     //! @brief Execute decoder on last PP rank, receive decoder output on other PP ranks.
     void decoderStepAsync(SizeType32 decoderStep, SizeType32 microBatchId);
@@ -290,6 +291,8 @@ private:
         SamplingConfig const& samplingConfig, SizeType32 microBatchId) const;
 
     TokenGeneratedCallback createOnTokenGeneratedCallback(GenerationOutput& outputs);
+
+    bool shouldUseKVCacheManager() const;
 
     class CudaGraphExecutor
     {
@@ -369,12 +372,13 @@ private:
     std::shared_ptr<AllReduceBuffers> mAllReduceBuffers;
 
     SizeType32 mDecoderMaxSequenceLength{};
+    std::vector<SizeType32> mDecoderMaxAttentionWindowVec{};
     SizeType32 mDecoderMaxAttentionWindow{};
     SizeType32 mDecoderSinkTokenLength{};
 
     LoggerPtr mLogger;
     std::shared_ptr<TllmRuntime> mRuntime;
-    std::shared_ptr<KvCacheManager> mKvCacheManager;
+    std::shared_ptr<BaseKVCacheManager> mKvCacheManager;
 
     MicroBatchConfig mMicroBatchConfig;
     // for each micro batch

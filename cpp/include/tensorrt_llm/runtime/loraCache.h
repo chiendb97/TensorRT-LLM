@@ -154,6 +154,8 @@ public:
      */
     struct TaskLayerModuleConfig
     {
+        friend class TaskLayerModuleConfigBindings;
+
         std::size_t pageId;
         SizeType32 slotIdx;
         SizeType32 inSize;  // adapterSize * inDim
@@ -234,7 +236,7 @@ public:
      * \param[in] taskId: the task id
      * \returns -- list of Value objects with pointers to task weights
      */
-    [[nodiscard]] std::shared_ptr<std::vector<TaskLayerModuleConfig>> get(TaskIdType taskId);
+    [[nodiscard]] std::vector<TaskLayerModuleConfig> const& get(TaskIdType taskId);
 
     /**
      * \brief bump task and make it the most recently used

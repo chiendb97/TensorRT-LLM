@@ -16,6 +16,7 @@
 import math
 import unittest
 from collections import OrderedDict
+from itertools import product
 
 import numpy as np
 
@@ -32,6 +33,7 @@ import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import (torch_to_numpy, trt_dtype_to_str,
                                  trt_dtype_to_torch)
+from tensorrt_llm.layers.lora import Lora, LoraParams
 from tensorrt_llm.layers.moe import MoeConfig, MoeOOTB
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo, QuantMode
@@ -59,13 +61,17 @@ def make_tuple(num_experts=4,
                dtype='float16',
                weight_dtype=None,
                norm_mode=MoeConfig.ExpertScaleNormalizationMode.NONE,
-               use_plugin=True):
+               use_plugin=True,
+               device_limited_n_group=0,
+               device_limited_topk_group=0,
+               device_limited_routed_scaling_factor=1.0):
     if weight_dtype is None:
         weight_dtype = dtype
     if hidden_size is None:
         hidden_size = default_hidden_size[weight_dtype]
     return (num_experts, topk, hidden_size, actfn, bias, dtype, weight_dtype,
-            norm_mode, use_plugin)
+            norm_mode, use_plugin, device_limited_n_group,
+            device_limited_topk_group, device_limited_routed_scaling_factor)
 
 
 def config_is_allowed(config):
@@ -304,6 +310,36 @@ class TestMoE(unittest.TestCase):
                 use_plugin=False),
         ]
 
+        # Test device-limited routing
+        params += [
+            make_tuple(
+                num_experts=80,
+                topk=3,
+                hidden_size=1280,
+                actfn='swiglu',
+                bias=True,
+                dtype='float16',
+                weight_dtype='float16',
+                norm_mode=MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED,
+                use_plugin=True,
+                device_limited_n_group=8,
+                device_limited_topk_group=3,
+                device_limited_routed_scaling_factor=16.0),
+            make_tuple(num_experts=80,
+                       topk=3,
+                       hidden_size=1280,
+                       actfn='swiglu',
+                       bias=True,
+                       dtype='float16',
+                       weight_dtype='float16',
+                       norm_mode=MoeConfig.ExpertScaleNormalizationMode.
+                       DEVICE_LIMITED_RENORM,
+                       use_plugin=True,
+                       device_limited_n_group=8,
+                       device_limited_topk_group=3,
+                       device_limited_routed_scaling_factor=16.0),
+        ]
+
         # Default configuration for mixtral
         params += [
             make_tuple(
@@ -362,6 +398,145 @@ class TestMoE(unittest.TestCase):
         self.activation_scaling_factor_1 = None
         self.activation_scaling_factor_2 = None
 
+    def create_lora_weights(self, num_experts, hidden_size, ffn_hidden_size,
+                            dtype, num_reqs, lora_rank):
+        genfn = torch.randn
+
+        self.lora_rank = lora_rank
+
+        fc1_weight_rescale_1 = math.sqrt(2.0 / lora_rank)
+        fc1_weight_rescale_2 = math.sqrt(2.0 / ffn_hidden_size)
+        fc2_weight_rescale_1 = math.sqrt(2.0 / lora_rank)
+        fc2_weight_rescale_2 = math.sqrt(2.0 / hidden_size)
+
+        self.lora_fc1_weights_1 = (genfn(
+            (num_experts, lora_rank, hidden_size),
+            dtype=trt_dtype_to_torch(dtype),
+            device="cuda",
+        ) * fc1_weight_rescale_1)
+        self.lora_fc1_weights_2 = (genfn(
+            (num_experts, ffn_hidden_size, lora_rank),
+            dtype=trt_dtype_to_torch(dtype),
+            device="cuda",
+        ) * fc1_weight_rescale_2)
+
+        self.lora_fc1_weights_ptrs = torch.tensor(
+            (self.lora_fc1_weights_1.data_ptr(),
+             self.lora_fc1_weights_2.data_ptr()),
+            dtype=torch.int64,
+        ).repeat(num_reqs, 1)
+        self.lora_fc1_ranks = torch.tensor((lora_rank, ),
+                                           dtype=torch.int32).repeat(num_reqs)
+
+        self.lora_gated_weights_1 = (genfn(
+            (num_experts, lora_rank, hidden_size),
+            dtype=trt_dtype_to_torch(dtype),
+            device="cuda",
+        ) * fc1_weight_rescale_1)
+        self.lora_gated_weights_2 = (genfn(
+            (num_experts, ffn_hidden_size, lora_rank),
+            dtype=trt_dtype_to_torch(dtype),
+            device="cuda",
+        ) * fc1_weight_rescale_2)
+
+        self.lora_gated_weights_ptrs = torch.tensor(
+            (self.lora_gated_weights_1.data_ptr(),
+             self.lora_gated_weights_2.data_ptr()),
+            dtype=torch.int64,
+        ).repeat(num_reqs, 1)
+        self.lora_gated_ranks = torch.tensor((lora_rank, ),
+                                             dtype=torch.int32).repeat(num_reqs)
+
+        self.lora_fc2_weights_1 = (genfn(
+            (num_experts, lora_rank, ffn_hidden_size),
+            dtype=trt_dtype_to_torch(dtype),
+            device="cuda",
+        ) * fc2_weight_rescale_1)
+        self.lora_fc2_weights_2 = (genfn(
+            (num_experts, hidden_size, lora_rank),
+            dtype=trt_dtype_to_torch(dtype),
+            device="cuda",
+        ) * fc2_weight_rescale_2)
+
+        self.lora_fc2_weights_ptrs = torch.tensor(
+            (self.lora_fc2_weights_1.data_ptr(),
+             self.lora_fc2_weights_2.data_ptr()),
+            dtype=torch.int64,
+        ).repeat(num_reqs, 1)
+        self.lora_fc2_ranks = torch.tensor((lora_rank, ),
+                                           dtype=torch.int32).repeat(num_reqs)
+
+    def create_lora_params(self, num_reqs):
+
+        moe_h_to_4h_weights_pointers = Tensor(
+            shape=(num_reqs, 2),
+            dtype=tensorrt_llm.str_dtype_to_trt("int64"),
+            name="moe_h_to_4h_weights_pointers",
+        )
+        moe_h_to_4h_lora_ranks = Tensor(
+            shape=(num_reqs, ),
+            dtype=tensorrt_llm.str_dtype_to_trt("int32"),
+            name="moe_h_to_4h_lora_ranks",
+        )
+        moe_4h_to_h_weights_pointers = Tensor(
+            shape=(num_reqs, 2),
+            dtype=tensorrt_llm.str_dtype_to_trt("int64"),
+            name="moe_4h_to_h_weights_pointers",
+        )
+        moe_4h_to_h_lora_ranks = Tensor(
+            shape=(num_reqs, ),
+            dtype=tensorrt_llm.str_dtype_to_trt("int32"),
+            name="moe_4h_to_h_lora_ranks",
+        )
+        moe_gate_weights_pointers = Tensor(
+            shape=(num_reqs, 2),
+            dtype=tensorrt_llm.str_dtype_to_trt("int64"),
+            name="moe_gate_weights_pointers",
+        )
+        moe_gate_lora_ranks = Tensor(
+            shape=(num_reqs, ),
+            dtype=tensorrt_llm.str_dtype_to_trt("int32"),
+            name="moe_gate_lora_ranks",
+        )
+        host_context_lengths = Tensor(
+            shape=(num_reqs, ),
+            dtype=tensorrt_llm.str_dtype_to_trt("int32"),
+            name="host_context_lengths",
+        )
+        host_request_types = Tensor(
+            shape=(num_reqs, ),
+            dtype=tensorrt_llm.str_dtype_to_trt("int32"),
+            name="host_request_types",
+        )
+
+        self.lora_params = LoraParams(
+            lora_ranks=[{
+                "moe_h_to_4h_lora_ranks": moe_h_to_4h_lora_ranks,
+                "moe_4h_to_h_lora_ranks": moe_4h_to_h_lora_ranks,
+                "moe_gate_lora_ranks": moe_gate_lora_ranks,
+                "mlp_h_to_4h_lora_ranks": moe_h_to_4h_lora_ranks,
+                "mlp_4h_to_h_lora_ranks": moe_4h_to_h_lora_ranks,
+                "mlp_gate_lora_ranks": moe_gate_lora_ranks,
+            }],
+            lora_weights_pointers=[{
+                "moe_h_to_4h_lora_weights_pointers":
+                moe_h_to_4h_weights_pointers,
+                "moe_4h_to_h_lora_weights_pointers":
+                moe_4h_to_h_weights_pointers,
+                "moe_gate_lora_weights_pointers":
+                moe_gate_weights_pointers,
+                "mlp_h_to_4h_lora_weights_pointers":
+                moe_h_to_4h_weights_pointers,
+                "mlp_4h_to_h_lora_weights_pointers":
+                moe_4h_to_h_weights_pointers,
+                "mlp_gate_lora_weights_pointers":
+                moe_gate_weights_pointers,
+            }],
+            host_context_lengths=host_context_lengths,
+            host_request_types=host_request_types,
+            weight_index=0,
+        )
+
     def create_fp8_scaling_factors(self, max_act1, max_act2):
         self.activation_scaling_factor_1 = torch.tensor([max_act1
                                                          ]).float() / 440.
@@ -379,7 +554,9 @@ class TestMoE(unittest.TestCase):
     @parameterized.expand(get_params(), name_func=unittest_name_func)
     def test_mixture_of_experts(self, num_experts, top_k, hidden_size, actfn,
                                 bias, dtype_str, weight_dtype_str, norm_mode,
-                                use_plugin):
+                                use_plugin, device_limited_n_group,
+                                device_limited_topk_group,
+                                device_limited_routed_scaling_factor):
         """ This test compares the MOE result to a simple reference implementation using torch """
 
         # Build time is also proportional to the size of these (more plugin profiler runs) so dont make them too big
@@ -420,7 +597,9 @@ class TestMoE(unittest.TestCase):
 
         for i, input in enumerate(inputs):
             result, act2_quant_values = self.generate_reference(
-                input, top_k, actfn, weight_dtype, quant_mode, norm_mode)
+                input, top_k, actfn, weight_dtype, quant_mode, norm_mode,
+                device_limited_n_group, device_limited_topk_group,
+                device_limited_routed_scaling_factor)
             reference_values.append(result)
             act_2_quant = max(act_2_quant, act2_quant_values)
 
@@ -440,7 +619,11 @@ class TestMoE(unittest.TestCase):
             quant_mode=quant_mode,
             norm_mode=norm_mode,
             use_plugin=use_plugin,
-            max_sizes=[max_num_seq, max_seq_len, hidden_size])
+            max_sizes=[max_num_seq, max_seq_len, hidden_size],
+            device_limited_n_group=device_limited_n_group,
+            device_limited_topk_group=device_limited_topk_group,
+            device_limited_routed_scaling_factor=
+            device_limited_routed_scaling_factor)
 
         for input, ref in zip(inputs, reference_values):
             # run trt output
@@ -580,10 +763,176 @@ class TestMoE(unittest.TestCase):
             'int8': 2e-1,
             'int4': 2e-1,
         }
-        torch.testing.assert_close(outputs['output'],
-                                   outputs['mlp_output'],
-                                   rtol=tolerances[dtype_str],
-                                   atol=tolerances[dtype_str])
+        torch.testing.assert_close(
+            outputs["output"],
+            outputs["mlp_output"],
+            rtol=tolerances[dtype_str],
+            atol=tolerances[dtype_str],
+        )
+
+    @parameterized.expand(list(
+        product(["float16", "bfloat16", "int4", "int8"], ["gelu", "geglu"],
+                [True], [32, 64])),
+                          name_func=unittest_name_func)
+    def test_mlp_lora_comparison(self, dtype_str, actfn, use_plugin, lora_rank):
+        """This test uses one expert and compares the result to a plain MLP"""
+        skip_bf16_pre_ampere(dtype_str)
+
+        use_int4_weights = dtype_str == "int4"
+        weight_dtype = (trt.int8 if use_int4_weights else
+                        tensorrt_llm.str_dtype_to_trt(dtype_str))
+
+        dtype = weight_dtype
+        quant_mode = QuantMode(0)
+        hidden_size = 8
+        if dtype_str == "int8" or dtype_str == "int4":
+            dtype = tensorrt_llm.str_dtype_to_trt("float16")
+            hidden_size = 64
+            quant_mode = QuantMode.use_weight_only(
+                use_int4_weights=use_int4_weights)
+
+        num_sequences = 4
+        sequence_lengths = 4
+        num_experts = 1
+        top_k = 1
+        bias = False
+        ffn_hidden_size = 4 * hidden_size
+        self.create_weights(
+            num_experts,
+            hidden_size,
+            ffn_hidden_size,
+            bias,
+            dtype,
+            weight_dtype,
+            is_gated=is_gated_activation(actfn),
+        )
+
+        self.create_lora_weights(
+            num_experts,
+            hidden_size,
+            ffn_hidden_size,
+            dtype,
+            num_sequences,
+            lora_rank,
+        )
+
+        input_data = gen_uniform_weights(
+            (num_sequences, sequence_lengths, hidden_size),
+            dtype=trt_dtype_to_torch(dtype),
+        )
+
+        def MLP(network, trt_key, lora_params):
+            mlp_type = (tensorrt_llm.layers.GatedMLP if
+                        is_gated_activation(actfn) else tensorrt_llm.layers.MLP)
+            mlp = mlp_type(
+                hidden_size=hidden_size,
+                ffn_hidden_size=ffn_hidden_size,
+                hidden_act=gated2act(actfn),
+                bias=bias,
+                quant_mode=quant_mode,
+                dtype=dtype,
+            )
+
+            mlp.fc.lora = Lora(
+                in_hidden_size=hidden_size,
+                out_hidden_sizes=[ffn_hidden_size],
+                max_low_rank=lora_rank,
+            )
+
+            mlp.proj.lora = Lora(
+                in_hidden_size=ffn_hidden_size,
+                out_hidden_sizes=[hidden_size],
+                max_low_rank=lora_rank,
+            )
+
+            if is_gated_activation(actfn):
+                mlp.gate.lora = Lora(
+                    in_hidden_size=hidden_size,
+                    out_hidden_sizes=[ffn_hidden_size],
+                    max_low_rank=lora_rank,
+                )
+            # Quantize the weights manually so the results are comparable
+            fc1_qd = quant_dequant(self.fc1_weights[0].cpu(), quant_mode)
+            if is_gated_activation(actfn):
+                # Note that the MLP uses the opposite convention to the GLU paper for naming,
+                #  the gate is the matrix the activations are NOT applied to
+                gate, fc1_qd = fc1_qd.chunk(2, dim=0)
+                mlp.gate.weight.value = np.ascontiguousarray(
+                    torch_to_numpy(gate))
+
+            mlp.fc.weight.value = np.ascontiguousarray(torch_to_numpy(fc1_qd))
+            fc2_qd = quant_dequant(self.fc2_weights[0].cpu(), quant_mode)
+            mlp.proj.weight.value = np.ascontiguousarray(torch_to_numpy(fc2_qd))
+            if bias:
+                fc1_bias = self.fc1_bias[0].cpu()
+
+                if is_gated_activation(actfn):
+                    gate, fc1_bias = fc1_bias.chunk(2, dim=0)
+                    mlp.gate.bias.value = np.ascontiguousarray(
+                        torch_to_numpy(gate))
+
+                mlp.fc.bias.value = np.ascontiguousarray(
+                    torch_to_numpy(fc1_bias))
+                mlp.proj.bias.value = np.ascontiguousarray(
+                    torch_to_numpy(self.fc2_bias[0].cpu()))
+
+            output = mlp(trt_key, lora_params)
+            output.mark_output("mlp_output", dtype)
+
+        session = self.create_trt_session(
+            tuple(input_data.shape),
+            num_experts,
+            top_k,
+            hidden_size,
+            ffn_hidden_size,
+            actfn,
+            bias,
+            dtype,
+            weight_dtype,
+            quant_mode,
+            norm_mode=MoeConfig.ExpertScaleNormalizationMode.NONE,
+            custom_network=MLP,
+            use_plugin=use_plugin,
+            use_lora=True,
+        )
+
+        inputs = {
+            "input_hidden_states":
+            input_data,
+            "moe_h_to_4h_weights_pointers":
+            self.lora_fc1_weights_ptrs,
+            "moe_h_to_4h_lora_ranks":
+            self.lora_fc1_ranks,
+            "moe_4h_to_h_weights_pointers":
+            self.lora_fc2_weights_ptrs,
+            "moe_4h_to_h_lora_ranks":
+            self.lora_fc2_ranks,
+            "moe_gate_weights_pointers":
+            self.lora_gated_weights_ptrs,
+            "moe_gate_lora_ranks":
+            self.lora_gated_ranks,
+            "host_context_lengths":
+            torch.tensor((sequence_lengths, ),
+                         dtype=torch.int32).repeat(num_sequences),
+            "host_request_types":
+            torch.tensor((0, ), dtype=torch.int32).repeat(num_sequences),
+        }
+        outputs = run_session(session, inputs)
+
+        tolerances = {
+            "float32": 1e-2,
+            "float16": (2e-2 if getSMVersion() >= 75 else
+                        1e-1),  # Some issues for geglu on volta
+            "bfloat16": 1e-1,
+            "int8": 2e-1,
+            "int4": 2e-1,
+        }
+        torch.testing.assert_close(
+            outputs["output"],
+            outputs["mlp_output"],
+            rtol=tolerances[dtype_str],
+            atol=tolerances[dtype_str],
+        )
 
     def set_weight_layer(self,
                          input_weights,
@@ -614,21 +963,27 @@ class TestMoE(unittest.TestCase):
             moe_weight_wrapper.weight.value = np.ascontiguousarray(
                 torch_to_numpy(input_weights))
 
-    def create_trt_session(self,
-                           input_shape,
-                           num_experts,
-                           top_k,
-                           hidden_size,
-                           ffn_hidden_size,
-                           actfn,
-                           bias,
-                           dtype: trt.DataType,
-                           weight_dtype: trt.DataType,
-                           quant_mode,
-                           norm_mode,
-                           custom_network=None,
-                           use_plugin=True,
-                           max_sizes=None):
+    def create_trt_session(
+        self,
+        input_shape,
+        num_experts,
+        top_k,
+        hidden_size,
+        ffn_hidden_size,
+        actfn,
+        bias,
+        dtype: trt.DataType,
+        weight_dtype: trt.DataType,
+        quant_mode,
+        norm_mode,
+        custom_network=None,
+        use_plugin=True,
+        max_sizes=None,
+        use_lora=False,
+        device_limited_n_group=0,
+        device_limited_topk_group=0,
+        device_limited_routed_scaling_factor=1.0,
+    ):
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
 
@@ -649,9 +1004,21 @@ class TestMoE(unittest.TestCase):
 
             network.plugin_config.moe_plugin = trt_dtype_to_str(dtype)
 
-            moe_config = MoeConfig(num_experts=num_experts,
-                                   top_k=top_k,
-                                   normalization_mode=norm_mode)
+            lora_params = None
+            if use_lora:
+                network.plugin_config.lora_plugin = trt_dtype_to_str(dtype)
+                network.plugin_config.remove_input_padding = False
+                self.create_lora_params(input_shape[0])
+                lora_params = self.lora_params
+
+            moe_config = MoeConfig(
+                num_experts=num_experts,
+                top_k=top_k,
+                normalization_mode=norm_mode,
+                device_limited_n_group=device_limited_n_group,
+                device_limited_topk_group=device_limited_topk_group,
+                device_limited_routed_scaling_factor=
+                device_limited_routed_scaling_factor)
 
             moe = tensorrt_llm.layers.MOE(moe_config=moe_config,
                                           hidden_size=hidden_size,
@@ -661,6 +1028,9 @@ class TestMoE(unittest.TestCase):
                                           dtype=dtype,
                                           quant_mode=quant_mode)
             moe.router.weight.value = torch_to_numpy(self.router_weights.cpu())
+
+            if use_lora:
+                moe.max_low_rank = self.lora_rank
 
             self.set_weight_layer(self.fc1_weights, moe.fc, quant_mode,
                                   self.weight_scaling_factor_1)
@@ -682,7 +1052,10 @@ class TestMoE(unittest.TestCase):
                 moe.proj.bias.value = torch_to_numpy(self.fc2_bias.cpu())
 
             if custom_network:
-                custom_network(network, trt_key)
+                if use_lora:
+                    custom_network(network, trt_key, lora_params)
+                else:
+                    custom_network(network, trt_key)
 
             if not use_plugin:
                 quant_config = None
@@ -692,20 +1065,19 @@ class TestMoE(unittest.TestCase):
                         kv_cache_quant_algo=QuantAlgo.FP8)
                 moe = moe.to(MoeOOTB, quant_config=quant_config)
 
-            output = moe(trt_key)
-            output.mark_output('output', dtype)
-
+            output = moe(trt_key, lora_layer_params=lora_params)
+            output.mark_output("output", dtype)
         # trt run
         session = create_session(builder,
                                  network,
                                  precision=trt_dtype_to_str(dtype),
                                  int8=weight_dtype == trt.int8,
-                                 quant_mode=quant_mode,
-                                 opt_level=4)
+                                 quant_mode=quant_mode)
         return session
 
     def generate_reference(self, inputs, k, actfn, weight_dtype, quant_mode,
-                           norm_mode):
+                           norm_mode, n_group, topk_group,
+                           routed_scaling_factor):
         # Always run the ref implementation at full precision TODO is this a good choice?
         inputs = inputs.cuda().float()
         inputs_merged = inputs.view(-1, inputs.shape[-1])
@@ -715,11 +1087,41 @@ class TestMoE(unittest.TestCase):
         router_probs = torch.softmax(routing, 1, dtype=inputs.dtype)
         assert routing.shape == router_probs.shape
 
-        topk = torch.topk(router_probs, k)
-        assert topk.indices.shape == (router_probs.shape[0], k)
+        if norm_mode not in [
+                MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED,
+                MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED_RENORM
+        ]:
+            topk_values, topk_indices = torch.topk(router_probs, k)
+        else:
+            scores = router_probs
+            group_scores = (scores.view(scores.shape[0], n_group,
+                                        -1).max(dim=-1).values)  # [n, n_group]
+            group_idx = torch.topk(group_scores,
+                                   k=topk_group,
+                                   dim=-1,
+                                   sorted=False)[1]  # [n, top_k_group]
+            group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+            group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+            score_mask = (group_mask.unsqueeze(-1).expand(
+                group_mask.shape[0], n_group,
+                self.router_weights.shape[0] // n_group).reshape(
+                    group_mask.shape[0], -1))  # [n, e]
+            scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
+            topk_values, topk_indices = torch.topk(scores,
+                                                   k=k,
+                                                   dim=-1,
+                                                   sorted=False)
+
+            if k > 1 and norm_mode == MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED_RENORM:
+                denominator = topk_values.sum(dim=-1, keepdim=True) + 1e-20
+                topk_values = topk_values / denominator
+            else:
+                topk_values = topk_values * routed_scaling_factor
+
+        assert topk_indices.shape == (router_probs.shape[0], k)
         max_act_2 = 0.0
         results = torch.zeros_like(inputs_merged)
-        for i, (scales, experts) in enumerate(zip(topk.values, topk.indices)):
+        for i, (scales, experts) in enumerate(zip(topk_values, topk_indices)):
             if norm_mode == MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE:
                 scales /= sum(scales)
             input = inputs_merged[i, :]

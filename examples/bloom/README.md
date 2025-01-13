@@ -106,7 +106,6 @@ python convert_checkpoint.py --model_dir ./bloom/176B/ \
                 --embedding_sharding_dim 0
 trtllm-build --checkpoint_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
                 --gemm_plugin float16 \
-                --lookup_plugin float16 \
                 --output_dir ./bloom/176B/trt_engines/fp16/8-gpu/ \
                 --workers 2
 
@@ -123,17 +122,14 @@ trtllm-build --checkpoint_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
                 --workers 2
 
 # share embedding table between embedding() and lm_head() layers
-# To reduce the generated engine size, we has to use gemm and lookup plugin (--use_gemm_plugin --use_lookup_plugin) and must shard the embedding table in the vocab dimension.
+# To reduce the generated engine size, we can turn off gemm plugin and shard the embedding table in the vocab dimension.
 python convert_checkpoint.py --model_dir ./bloom/176B/ \
                 --dtype float16 \
                 --output_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
                 --tp_size 8 \
                 --use_parallel_embedding \
-                --embedding_sharding_dim 0 \
-                --use_embedding_sharing
+                --embedding_sharding_dim 0
 trtllm-build --checkpoint_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
-                --gemm_plugin float16 \
-                --lookup_plugin float16 \
                 --output_dir ./bloom/176B/trt_engines/fp16/8-gpu/ \
                 --workers 2
 ```

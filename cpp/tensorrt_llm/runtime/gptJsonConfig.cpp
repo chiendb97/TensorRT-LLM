@@ -20,9 +20,13 @@
 #include "modelConfig.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/eagleModule.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensModule.h"
+#include "tensorrt_llm/runtime/jsonSerialization.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tensorrt_llm/runtime/medusaModule.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
+#include "tensorrt_llm/runtime/runtimeDefaults.h"
 
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -42,7 +46,10 @@ FieldType parseJsonFieldOr(Json const& json, std::string_view name, FieldType de
     auto value = defaultValue;
     try
     {
-        value = json.at(name).template get<FieldType>();
+        if (json.find(name) != json.end() && !json.at(name).is_null())
+        {
+            value = json.at(name).template get<FieldType>();
+        }
     }
     catch (nlohmann::json::out_of_range& e)
     {
@@ -84,6 +91,8 @@ std::vector<ModelConfig::LayerType> buildLayerTypes(
 
     auto constexpr layerNameAttention = "attention";
     auto constexpr layerNameRecurrent = "recurrent";
+    auto constexpr layerNameLinear = "linear";
+    auto constexpr layerNameNoop = "no_op";
 
     // The json field specifies a "group" of layers, which gets repeated multiple times
     // Note that the total number of layers does not need to be a multiple of a layer
@@ -101,9 +110,17 @@ std::vector<ModelConfig::LayerType> buildLayerTypes(
         {
             result[i] = ModelConfig::LayerType::kRECURRENT;
         }
+        else if (layerStringTypes[i % groupSize] == layerNameLinear)
+        {
+            result[i] = ModelConfig::LayerType::kLINEAR;
+        }
+        else if (layerStringTypes[i % groupSize] == layerNameNoop)
+        {
+            result[i] = ModelConfig::LayerType::kNOOP;
+        }
         else
         {
-            TLLM_LOG_ERROR("Unknown layer type: %s", layerStringTypes[i % groupSize].c_str());
+            TLLM_LOG_WARNING("Unknown layer type: %s, assuming attention", layerStringTypes[i % groupSize].c_str());
         }
     }
 
@@ -122,7 +139,23 @@ ModelConfig createModelConfig(
     auto const* const mlpHiddenSizeField = engineVersionNone ? "mlp_hidden_size" : "intermediate_size";
 
     auto const arch = engineVersionNone ? std::string("none") : config.at(archField).template get<std::string>();
-    auto const numLayers = config.at(numLayersField).template get<SizeType32>();
+    auto numLayers = config.at(numLayersField).template get<SizeType32>();
+
+    if (!engineVersionNone)
+    {
+        auto const speculativeDecodingModeOpt = parseJsonFieldOptional<SpeculativeDecodingMode::UnderlyingType>(
+            json.at("build_config"), "speculative_decoding_mode");
+
+        if (speculativeDecodingModeOpt.has_value()
+            && SpeculativeDecodingMode(speculativeDecodingModeOpt.value()).isEagle())
+        {
+            auto const& eagleConfig = json.at("pretrained_config").at("eagle_net_config");
+            auto const numEagleNetLayers = eagleConfig.at("num_hidden_layers").template get<SizeType32>();
+
+            numLayers += numEagleNetLayers;
+        }
+    }
+
     auto const numHeads = config.at(numHeadsField).template get<SizeType32>() / tensorParallelism;
     auto const layerStringTypes
         = parseJsonFieldOr<std::vector<std::string>>(config, "layer_types", std::vector<std::string>());
@@ -146,29 +179,90 @@ ModelConfig createModelConfig(
 
     auto const mlpHiddenSize = parseJsonFieldOptional<SizeType32>(config, mlpHiddenSizeField);
 
-    auto modelConfig = ModelConfig{vocabSize, numAttentionLayers, numRnnLayers, numHeads, hiddenSize, dataType};
+    auto numKvHeadsPerAttentionLayer
+        = parseJsonFieldOr<std::vector<SizeType32>>(config, "num_kv_heads_per_layer", std::vector<SizeType32>());
+
+    auto numKvHeadsPerCrossAttentionLayer = parseJsonFieldOr<std::vector<SizeType32>>(
+        config, "num_kv_heads_per_cross_attn_layer", std::vector<SizeType32>());
+    auto modelConfig
+        = ModelConfig{vocabSize, numLayers, numAttentionLayers, numRnnLayers, numHeads, hiddenSize, dataType};
+
+    if (!numKvHeadsPerAttentionLayer.empty())
+    {
+        std::transform(numKvHeadsPerAttentionLayer.cbegin(), numKvHeadsPerAttentionLayer.cend(),
+            numKvHeadsPerAttentionLayer.begin(),
+            [tensorParallelism](SizeType32 const numKvHeads)
+            { return ((numKvHeads + tensorParallelism - 1) / tensorParallelism); });
+        modelConfig.setNumKvHeadsPerLayer(numKvHeadsPerAttentionLayer);
+    }
+    else
+    {
+        modelConfig.setNbKvHeads(numKvHeads);
+    }
+
+    if (!numKvHeadsPerCrossAttentionLayer.empty())
+    {
+        std::transform(numKvHeadsPerCrossAttentionLayer.cbegin(), numKvHeadsPerCrossAttentionLayer.cend(),
+            numKvHeadsPerCrossAttentionLayer.begin(),
+            [tensorParallelism](SizeType32 const numKvHeads)
+            { return ((numKvHeads + tensorParallelism - 1) / tensorParallelism); });
+        modelConfig.setNumKvHeadsPerCrossLayer(numKvHeadsPerCrossAttentionLayer);
+    }
+    else
+    {
+        modelConfig.setNbCrossKvHeads(numKvHeads);
+    }
+
     modelConfig.setSizePerHead(sizePerHead);
-    modelConfig.setNbKvHeads(numKvHeads);
     modelConfig.setLayerTypes(layerTypes);
 
     // Set logits datatype
     auto logitsDtype = nvinfer1::DataType::kFLOAT;
     if (logitsDtypeStr == "float32")
+    {
         logitsDtype = nvinfer1::DataType::kFLOAT;
+    }
     else if (logitsDtypeStr == "float16")
+    {
         logitsDtype = nvinfer1::DataType::kHALF;
+    }
     else
+    {
         TLLM_THROW("Unsupported logits data type");
+    }
     modelConfig.setLogitsDtype(logitsDtype);
 
     // only enable cross attention for the decoder in encoder-decoder model
     // TODO: add cross_attention and has_token_type_embedding as fields in pretrained config
-    auto const useCrossAttention = arch == std::string("DecoderModel") ? true : false;
+    auto const useCrossAttention
+        = arch == std::string("DecoderModel") || parseJsonFieldOr(config, "cross_attention", false);
+    if (useCrossAttention)
+    {
+        // For an encoder-decoder model, this would be overwritten in executorImpl.cpp with correct encoder config
+        // The parameters set here will only be used when encoder model is skipped for enc-dec models
+        TLLM_LOG_INFO("Setting encoder max input length and hidden size for accepting visual features.");
+        auto const maxEncoderLen = parseJsonFieldOr<SizeType32>(json.at("build_config"), "max_encoder_input_len", 0);
+        modelConfig.setMaxEncoderLen(maxEncoderLen);
+        modelConfig.setEncoderHiddenSize(hiddenSize * tensorParallelism);
+    }
+
     auto const usePositionEmbedding = parseJsonFieldOr<bool>(config, "has_position_embedding", false);
     auto const useTokenTypeEmbedding = parseJsonFieldOr<bool>(config, "has_token_type_embedding", false);
+    auto const skipCrossAttnBlocks
+        = useCrossAttention && parseJsonFieldOr<bool>(config, "skip_cross_attn_blocks", false);
     modelConfig.setUseCrossAttention(useCrossAttention);
     modelConfig.setUsePositionEmbedding(usePositionEmbedding);
     modelConfig.setUseTokenTypeEmbedding(useTokenTypeEmbedding);
+    if (json.count("pretrained_config"))
+    {
+        auto const maxPositionEmbeddings
+            = parseJsonFieldOr<SizeType32>(json.at("pretrained_config"), "max_position_embeddings", 0);
+        modelConfig.setMaxPositionEmbeddings(maxPositionEmbeddings);
+        auto const rotaryEmbeddingDim
+            = parseJsonFieldOr<SizeType32>(json.at("pretrained_config"), "rotary_embedding_dim", 0);
+        modelConfig.setRotaryEmbeddingDim(rotaryEmbeddingDim);
+    }
+    modelConfig.setSkipCrossAttnBlocks(skipCrossAttnBlocks);
 
     if (mlpHiddenSize.has_value())
     {
@@ -191,6 +285,17 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
     auto const computeGenerationLogits = parseJsonFieldOr(builderConfig, "gather_generation_logits", false);
     auto const speculativeDecodingModeOpt
         = parseJsonFieldOptional<SpeculativeDecodingMode::UnderlyingType>(builderConfig, "speculative_decoding_mode");
+    auto const kvCacheTypeStr = parseJsonFieldOr<std::string>(builderConfig, "kv_cache_type", "continuous");
+    auto const kvCacheType = ModelConfig::KVCacheTypeFromString(kvCacheTypeStr);
+    auto const useMrope = parseJsonFieldOr(builderConfig, "use_mrope", false);
+
+    auto it = builderConfig.find("kv_cache_type");
+    if (it == builderConfig.end())
+    {
+        TLLM_LOG_ERROR(
+            "Missing kv_cache_type field in builder_config, you need to rebuild engine. Default to continuous kv "
+            "cache.");
+    }
 
     modelConfig.setMaxBatchSize(maxBatchSize);
     modelConfig.setMaxBeamWidth(maxBeamWidth);
@@ -203,6 +308,8 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
     modelConfig.setSpeculativeDecodingMode(speculativeDecodingModeOpt.has_value()
             ? SpeculativeDecodingMode(speculativeDecodingModeOpt.value())
             : SpeculativeDecodingMode::None());
+    modelConfig.setKVCacheType(kvCacheType);
+    modelConfig.setUseMrope(useMrope);
 }
 
 void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
@@ -216,7 +323,10 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     auto const contextFMHA = pluginConfig.at("context_fmha").template get<bool>();
     auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
     auto const pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
-    auto const useXQA = parseJsonFieldOr(pluginConfig, "enable_xqa", false);
+    auto const manageWeightsType = parseJsonFieldOr<bool>(pluginConfig, "manage_weights", false)
+        ? ModelConfig::ManageWeightsType::kEnabled
+        : ModelConfig::ManageWeightsType::kDisabled;
+    auto const ppReduceScatter = parseJsonFieldOr<bool>(pluginConfig, "pp_reduce_scatter", false);
 
     TLLM_CHECK_WITH_INFO(
         !removeInputPadding || modelConfig.getMaxNumTokens(), "Padding removal requires max_num_tokens to be set.");
@@ -224,12 +334,16 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
     modelConfig.useMambaConv1dPlugin(useMambaConv1dPlugin);
     modelConfig.usePackedInput(removeInputPadding);
-    modelConfig.usePagedKvCache(pagedKvCache);
     modelConfig.usePagedState(pagedState);
+    if (pagedKvCache)
+    {
+        modelConfig.setKVCacheType(ModelConfig::KVCacheType::kPAGED);
+    }
     modelConfig.setTokensPerBlock(tokensPerBlock);
     modelConfig.setContextFMHA(contextFMHA);
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
-    modelConfig.useXQA(useXQA);
+    modelConfig.setManageWeightsType(manageWeightsType);
+    modelConfig.setPpReduceScatter(ppReduceScatter);
 }
 
 void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginConfig, bool engineVersionNone,
@@ -252,9 +366,24 @@ void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginCon
             }
         }
 
+        auto const& loraModuleNames = loraTargetModules.value();
+        auto const& numKvHeadsPerLayer = modelConfig.getNumKvHeadsPerLayer();
+        if (!loraModuleNames.empty())
+        {
+            TLLM_CHECK_WITH_INFO(std::all_of(numKvHeadsPerLayer.cbegin(), numKvHeadsPerLayer.cend(),
+                                     [firstNumKvHeads = numKvHeadsPerLayer[0]](SizeType32 numKvHeads)
+                                     { return numKvHeads == firstNumKvHeads; }),
+                "LORA with a VGQA model is not supported");
+        }
+        // TODO(oargov): don't assume all layers have the same num_kv_heads to support VGQA
+        auto const numKvHeads = numKvHeadsPerLayer.empty() ? modelConfig.getNbHeads() : numKvHeadsPerLayer[0];
+        bool hasMoE = !engineVersionNone && json.at("pretrained_config").contains("moe");
+        auto const numExperts = hasMoE
+            ? json.at("pretrained_config").at("moe").at("num_experts").template get<SizeType32>()
+            : SizeType32{0};
         modelConfig.setLoraModules(LoraModule::createLoraModules(loraTargetModules.value(), modelConfig.getHiddenSize(),
-            mlp_hidden_size, modelConfig.getNbHeads(), modelConfig.getNbKvHeads(),
-            modelConfig.getSizePerHead(), tensorParallelism));
+            mlp_hidden_size, modelConfig.getNbHeads(), numKvHeads, modelConfig.getSizePerHead(),
+            tensorParallelism, numExperts));
     }
 
     modelConfig.setMaxLoraRank(loraMaxRank);
@@ -303,6 +432,9 @@ GptJsonConfig parseJson(InputType&& input)
     auto const pipelineParallelism = engineVersionNone
         ? parseJsonFieldOr(builderConfig, "pipeline_parallel", 1)
         : parseJsonFieldOr(json.at("pretrained_config").at("mapping"), "pp_size", 1);
+    auto const contextParallelism = engineVersionNone
+        ? parseJsonFieldOr(builderConfig, "context_parallel", 1)
+        : parseJsonFieldOr(json.at("pretrained_config").at("mapping"), "cp_size", 1);
     auto const gpusPerNode = engineVersionNone ? WorldConfig::kDefaultGpusPerNode
                                                : parseJsonFieldOr(json.at("pretrained_config").at("mapping"),
                                                    "gpus_per_node", WorldConfig::kDefaultGpusPerNode);
@@ -312,17 +444,23 @@ GptJsonConfig parseJson(InputType&& input)
 
     auto const dataType = [&precision]()
     {
-        if (!precision.compare("float32"))
+        if (precision == "float32")
+        {
             return nvinfer1::DataType::kFLOAT;
-        else if (!precision.compare("float16"))
+        }
+        if (precision == "float16")
+        {
             return nvinfer1::DataType::kHALF;
-        else if (!precision.compare("bfloat16"))
+        }
+        if (precision == "bfloat16")
+        {
             return nvinfer1::DataType::kBF16;
-        else
-            TLLM_THROW("Model data type '%s' not supported", precision.c_str());
+        }
+        TLLM_THROW("Model data type '%s' not supported", precision.c_str());
     }();
 
     auto modelConfig = createModelConfig(json, engineVersionNone, tensorParallelism, dataType);
+    modelConfig.setModelName(name);
 
     parseBuilderConfig(modelConfig, builderConfig);
 
@@ -330,6 +468,10 @@ GptJsonConfig parseJson(InputType&& input)
     parsePluginConfig(modelConfig, pluginConfig);
 
     parseLora(modelConfig, json, pluginConfig, engineVersionNone, tensorParallelism);
+
+    auto runtimeDefaults = engineVersionNone
+        ? std::nullopt
+        : parseJsonFieldOptional<RuntimeDefaults>(json.at("pretrained_config"), "runtime_defaults");
 
     if (engineVersionNone)
     {
@@ -424,6 +566,24 @@ GptJsonConfig parseJson(InputType&& input)
                     = std::make_shared<SpeculativeDecodingModule>(maxDraftLen, maxDraftLen, 1);
                 modelConfig.setSpeculativeDecodingModule(speculativeDecodingModule);
             }
+            else if (modelConfig.getSpeculativeDecodingMode().isEagle())
+            {
+                auto const& pretrainedConfig = json.at("pretrained_config");
+
+                auto const numEagleLayers = parseJsonFieldOr(pretrainedConfig, "num_eagle_layers", 0);
+                auto const& eagleConfig = pretrainedConfig.at("eagle_net_config");
+                auto const numEagleNetLayers = eagleConfig.at("num_hidden_layers").template get<SizeType32>();
+                auto const maxNonLeafNodesPerLayer
+                    = pretrainedConfig.at("max_non_leaves_per_layer").template get<SizeType32>();
+
+                TLLM_CHECK_WITH_INFO(maxDraftLen > 0, "max_draft_len has to be larger than 0 for eagle decoding");
+                TLLM_CHECK_WITH_INFO(numEagleLayers > 0, "num_eagle_layers has to be larger than 0 for eagle decoding");
+                TLLM_CHECK_WITH_INFO(
+                    maxNonLeafNodesPerLayer > 0, "max_non_leaves_per_layer has to be larger than 0 for eagle decoding");
+                auto eagleModule = std::make_shared<EagleModule>(
+                    numEagleLayers, maxDraftLen, numEagleNetLayers, maxNonLeafNodesPerLayer);
+                modelConfig.setSpeculativeDecodingModule(eagleModule);
+            }
         }
     }
 
@@ -488,8 +648,8 @@ GptJsonConfig parseJson(InputType&& input)
             modelConfig.setRnnConfig(rnnConfig);
         }
     }
-    return GptJsonConfig{
-        name, engineVersion, precision, tensorParallelism, pipelineParallelism, gpusPerNode, modelConfig};
+    return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, contextParallelism,
+        gpusPerNode, modelConfig, runtimeDefaults};
 }
 
 } // namespace
@@ -499,16 +659,17 @@ std::string GptJsonConfig::engineFilename(WorldConfig const& worldConfig, std::s
     TLLM_CHECK_WITH_INFO(getTensorParallelism() == worldConfig.getTensorParallelism(), "tensor parallelism mismatch");
     TLLM_CHECK_WITH_INFO(
         getPipelineParallelism() == worldConfig.getPipelineParallelism(), "pipeline parallelism mismatch");
+    TLLM_CHECK_WITH_INFO(
+        getContextParallelism() == worldConfig.getContextParallelism(), "Context parallelism mismatch");
     auto pp = worldConfig.isPipelineParallel() ? "_pp" + std::to_string(worldConfig.getPipelineParallelism()) : "";
+    auto cp = worldConfig.isContextParallel() ? "_cp" + std::to_string(worldConfig.getContextParallelism()) : "";
     if (getVersion() == std::string("none"))
     {
-        return model + "_" + getPrecision() + "_tp" + std::to_string(worldConfig.getTensorParallelism()) + pp + "_rank"
-            + std::to_string(worldConfig.getRank()) + ".engine";
+        return model + "_" + getPrecision() + "_tp" + std::to_string(worldConfig.getTensorParallelism()) + pp + cp
+            + "_rank" + std::to_string(worldConfig.getRank()) + ".engine";
     }
-    else
-    {
-        return "rank" + std::to_string(worldConfig.getRank()) + ".engine";
-    }
+
+    return "rank" + std::to_string(worldConfig.getRank()) + ".engine";
 }
 
 GptJsonConfig GptJsonConfig::parse(std::string const& json)

@@ -40,8 +40,8 @@ public:
         SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig) override;
 
     //! @brief Initialize the decoder with new batch of inputs.
-    void newBatch(
-        GenerationInput const& input, GenerationOutput const& output, SamplingConfig const& samplingConfig) override;
+    void newBatch(GenerationInput const& input, GenerationOutput const& output, SamplingConfig const& samplingConfig,
+        ModelConfig const& modelConfig) override;
 
     void forwardAsync(decoder::Output& output, decoder::Input const& input) override;
 
@@ -53,7 +53,13 @@ public:
     //! @param step index within tokens generated in one step
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
     //! ids without padding, on gpu
-    [[nodiscard]] TensorPtr getOutputIds() const override
+    [[nodiscard]] TensorPtr getIds() const override
+    {
+        return mDecodingOutput->ids;
+    }
+
+    // This implementation is here to satisfy the interface requirement. Returns ids instead
+    [[nodiscard]] TensorPtr getGatheredIds() const override
     {
         return mDecodingOutput->ids;
     }
@@ -113,6 +119,7 @@ private:
     CudaEvent mDecodedEvent{};
 
     TensorPtr mFinishedSum;
+    TensorPtr mSetupBatchSlots;
 
     SizeType32 mNbSteps;
     SizeType32 mMaxSequenceLength{};

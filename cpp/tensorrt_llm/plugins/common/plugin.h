@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
@@ -58,10 +59,47 @@ protected:
     std::string mNamespace{api::kDefaultNamespace};
 };
 
+class BasePluginV3 : public nvinfer1::IPluginV3,
+                     public nvinfer1::IPluginV3OneCore,
+                     public nvinfer1::IPluginV3OneBuild,
+                     public nvinfer1::IPluginV3OneRuntime
+{
+public:
+    void setPluginNamespace(char const* libNamespace) noexcept
+    {
+        mNamespace = libNamespace;
+    }
+
+    [[nodiscard]] char const* getPluginNamespace() const noexcept override
+    {
+        return mNamespace.c_str();
+    }
+
+protected:
+    std::string mNamespace{api::kDefaultNamespace};
+};
+
 class BaseCreator : public nvinfer1::IPluginCreator
 {
 public:
     void setPluginNamespace(char const* libNamespace) noexcept override
+    {
+        mNamespace = libNamespace;
+    }
+
+    [[nodiscard]] char const* getPluginNamespace() const noexcept override
+    {
+        return mNamespace.c_str();
+    }
+
+protected:
+    std::string mNamespace{api::kDefaultNamespace};
+};
+
+class BaseCreatorV3 : public nvinfer1::IPluginCreatorV3One
+{
+public:
+    void setPluginNamespace(char const* libNamespace) noexcept
     {
         mNamespace = libNamespace;
     }
@@ -179,6 +217,8 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 //! Get cublas and cublasLt handle for current cuda context
 std::shared_ptr<cublasHandle_t> getCublasHandle();
 std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
+std::shared_ptr<tensorrt_llm::common::CublasMMWrapper> getCublasMMWrapper(std::shared_ptr<cublasHandle_t> cublasHandle,
+    std::shared_ptr<cublasLtHandle_t> cublasltHandle, cudaStream_t stream, void* workspace);
 
 #ifndef DEBUG
 
@@ -281,6 +321,8 @@ public:
     ~PluginFieldParser();
     template <typename T>
     std::optional<T> getScalar(std::string_view const& name);
+    template <typename T>
+    std::optional<std::set<T>> getSet(std::string_view const& name);
 
 private:
     nvinfer1::PluginField const* mFields;

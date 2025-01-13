@@ -184,13 +184,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
     parser.add_argument('--use_prompt_tuning',
                         action="store_true",
                         default=False)
@@ -267,14 +260,12 @@ def create_config_from_args(args: argparse.Namespace):
         'intermediate_size': args.inter_size,
         'num_key_value_heads': args.n_kv_head,
         'vocab_size': args.vocab_size,
-        'position_embedding_type': 'rope_gpt_neox',
+        'position_embedding_type': 'learned_absolute',
         'max_position_embeddings': args.n_positions,
         'hidden_act': args.hidden_act,
         'rotary_base': args.rotary_base,
         'rotary_scaling': args.rotary_scaling,
         'norm_epsilon': args.rms_norm_eps,
-        'vision_start': args.vision_start,
-        'vision_length': args.vision_length,
         'quantization': {
             'quant_algo': None,
             'kv_cache_quant_algo': None,
@@ -286,7 +277,6 @@ def create_config_from_args(args: argparse.Namespace):
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'use_prompt_tuning': args.use_prompt_tuning,
         'enable_pos_shift': args.enable_pos_shift,
         'dense_context_fmha': args.dense_context_fmha,
@@ -367,8 +357,6 @@ def main():
         args.n_positions = hf_config.max_position_embeddings
 
         args.architecture = hf_config.architectures[0]
-        args.vision_start = 1
-        args.vision_length = hf_config.vision_config['num_positions'] - 1
 
     elif args.meta_ckpt_dir is not None:
         with open(Path(args.meta_ckpt_dir, "params.json")) as fp:
@@ -471,7 +459,6 @@ def main():
                     plugin_weight_only_quant_type=plugin_weight_only_quant_type,
                     use_parallel_embedding=args.use_parallel_embedding,
                     sharding_dim=args.embedding_sharding_dim,
-                    share_embedding_table=args.use_embedding_sharing,
                     use_smooth_quant=args.smoothquant,
                     per_channel=args.per_channel,
                     per_token=args.per_token,

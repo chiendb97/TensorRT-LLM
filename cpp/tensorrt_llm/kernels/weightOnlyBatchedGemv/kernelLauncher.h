@@ -44,12 +44,7 @@ inline void kernel_launcher(int arch, Params& params, cudaStream_t s)
             params, s);                                                                                                \
         return;                                                                                                        \
     }
-    if (arch >= 70 && arch < 75)
-    {
-        EXEC(KernelType::FP16Int8PerChannel, FP16DetailsA, Int8DetailsW, ColumnMajor, true);
-        EXEC(KernelType::FP16Int4PerChannel, FP16DetailsA, Int4DetailsW, ColumnMajor, true);
-    }
-    else if (arch >= 75 && arch < 80)
+    if (arch >= 75 && arch < 80)
     {
         EXEC(KernelType::FP16Int4Groupwise, FP16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
         EXEC(KernelType::FP16Int8PerChannel, FP16DetailsA, Int8DetailsW, ColumnMajorInterleaved, true);
@@ -60,7 +55,10 @@ inline void kernel_launcher(int arch, Params& params, cudaStream_t s)
         if (arch >= 89)
         {
             EXEC_W4A8(KernelType::FP16Int4Groupwise, FP16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
+            EXEC_W4A8(KernelType::BF16Int4Groupwise, BF16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
         }
+        EXEC(KernelType::FP16Int8Groupwise, FP16DetailsA, Int8DetailsW, ColumnMajorInterleaved, true);
+        EXEC(KernelType::BF16Int8Groupwise, BF16DetailsA, Int8DetailsW, ColumnMajorInterleaved, true);
         EXEC(KernelType::FP16Int4Groupwise, FP16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
         EXEC(KernelType::BF16Int4Groupwise, BF16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
         EXEC(KernelType::FP16Int8PerChannel, FP16DetailsA, Int8DetailsW, ColumnMajorInterleaved, true);
@@ -70,6 +68,8 @@ inline void kernel_launcher(int arch, Params& params, cudaStream_t s)
     }
     else if (arch >= 90)
     {
+        EXEC(KernelType::FP16Int8Groupwise, FP16DetailsA, Int8DetailsW, ColumnMajor, false);
+        EXEC(KernelType::BF16Int8Groupwise, BF16DetailsA, Int8DetailsW, ColumnMajor, false);
         EXEC(KernelType::FP16Int4Groupwise, FP16DetailsA, Int4DetailsW, ColumnMajor, false);
         EXEC(KernelType::BF16Int4Groupwise, BF16DetailsA, Int4DetailsW, ColumnMajor, false);
         EXEC(KernelType::FP16Int8PerChannel, FP16DetailsA, Int8DetailsW, ColumnMajor, false);
@@ -85,12 +85,7 @@ inline bool is_supported(int arch, KernelType kernel_type)
 #define SUPPORT(Type)                                                                                                  \
     if (kernel_type == Type)                                                                                           \
         return true;
-    if (arch >= 70 && arch < 75)
-    {
-        SUPPORT(KernelType::FP16Int8PerChannel);
-        SUPPORT(KernelType::FP16Int4PerChannel);
-    }
-    else if (arch >= 75 && arch < 80)
+    if (arch >= 75 && arch < 80)
     {
         SUPPORT(KernelType::FP16Int4Groupwise);
         SUPPORT(KernelType::FP16Int8PerChannel);
@@ -98,6 +93,8 @@ inline bool is_supported(int arch, KernelType kernel_type)
     }
     else if (arch >= 80 && arch < 90)
     {
+        SUPPORT(KernelType::FP16Int8Groupwise);
+        SUPPORT(KernelType::BF16Int8Groupwise);
         SUPPORT(KernelType::FP16Int4Groupwise);
         SUPPORT(KernelType::BF16Int4Groupwise);
         SUPPORT(KernelType::FP16Int8PerChannel);
@@ -107,6 +104,8 @@ inline bool is_supported(int arch, KernelType kernel_type)
     }
     else if (arch >= 90)
     {
+        SUPPORT(KernelType::FP16Int8Groupwise);
+        SUPPORT(KernelType::BF16Int8Groupwise);
         SUPPORT(KernelType::FP16Int4Groupwise);
         SUPPORT(KernelType::BF16Int4Groupwise);
         SUPPORT(KernelType::FP16Int8PerChannel);

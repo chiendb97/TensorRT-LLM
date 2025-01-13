@@ -208,14 +208,12 @@ class TestLLaMA(unittest.TestCase):
              dict()))  # GQA
         test_cases.append((False, True, ContextFMHAType.enabled_with_fp32_acc,
                            False, 'float16', 4, 'silu', dict()))  # GQA
-        test_cases.append((False, True, ContextFMHAType.disabled, False,
-                           'float16', 2, 'gelu', {
-                               "use_fused_mlp": True
-                           }))  # GQA
-        test_cases.append((False, True, ContextFMHAType.disabled, False,
-                           'float16', 2, 'silu', {
-                               "use_fused_mlp": True
-                           }))  # GQA
+        test_cases.append(
+            (False, True, ContextFMHAType.disabled, False, 'float16', 2, 'gelu',
+             dict()))  # GQA
+        test_cases.append(
+            (False, True, ContextFMHAType.disabled, False, 'float16', 2, 'silu',
+             dict()))  # GQA
         return test_cases
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
@@ -246,6 +244,7 @@ class TestLLaMA(unittest.TestCase):
         llama_config.vocab_size = 128
         llama_config.num_attention_heads = 2 if num_kv_heads <= 1 else 2 * num_kv_heads
         llama_config.hidden_size = llama_config.num_attention_heads * head_size
+        llama_config.head_dim = head_size
         llama_config.intermediate_size = ((
             (llama_config.hidden_size * 4 * 2 // 3) + head_size - 1) //
                                           head_size) * head_size
@@ -258,7 +257,7 @@ class TestLLaMA(unittest.TestCase):
         llama_config.eos_token_id = self.EOS_TOKEN
         seed_idx = random.randint(0, len(PRECHECKED_GOOD_RANDOM_SEEDS) - 1)
         torch.manual_seed(PRECHECKED_GOOD_RANDOM_SEEDS[seed_idx])
-        hf_llama = LlamaForCausalLM(llama_config).cuda()
+        hf_llama = LlamaForCausalLM(llama_config).cuda().eval()
         runtime, _ = self._gen_tensorrt_llm_runtime(
             log_level, dtype, world_size, rank, llama_config, hf_llama, model,
             use_plugin, batch_size, beam_width, input_len, output_len,
@@ -332,6 +331,8 @@ class TestLLaMA(unittest.TestCase):
         if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
             context_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
+        host_context_progress = torch.tensor([0], dtype=torch.int64)
+
         ctx_buffer = {
             'input_ids': ctx_ids,
             'context_lengths': ctx_context_lengths,
@@ -340,6 +341,7 @@ class TestLLaMA(unittest.TestCase):
             'cache_indirection': cache_indirections[0],
             'host_request_types': ctx_host_request_types,
             'host_runtime_perf_knobs': context_runtime_perf_knobs,
+            'host_context_progress': host_context_progress,
         }
         if enable_remove_input_padding:
             ctx_buffer['host_context_lengths'] = ctx_context_lengths.cpu()
@@ -412,6 +414,7 @@ class TestLLaMA(unittest.TestCase):
             'host_request_types': gen_host_request_types,
             'cache_indirection': cache_indirections[1],
             'host_runtime_perf_knobs': gen_runtime_perf_knobs,
+            'host_context_progress': host_context_progress,
         }
         if enable_remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()
@@ -553,7 +556,6 @@ class TestLLaMA(unittest.TestCase):
             },
             'use_parallel_embedding': use_parallel_embedding,
             'embedding_sharding_dim': embedding_sharding_dim,
-            'use_fused_mlp': False,
         }
 
         config = PretrainedConfig.from_dict(config)

@@ -13,22 +13,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
+import subprocess
+import sys
+from functools import partial
+from os.path import abspath, dirname
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
+import torch
 from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
 
-from tensorrt_llm.bindings import GptJsonConfig
+from tensorrt_llm._utils import supports_inflight_batching  # noqa
+from tensorrt_llm._utils import (mpi_barrier, mpi_rank, mpi_world_size,
+                                 str_dtype_to_torch)
 from tensorrt_llm.builder import get_engine_version
 
 DEFAULT_HF_MODEL_DIRS = {
     'BaichuanForCausalLM': 'baichuan-inc/Baichuan-13B-Chat',
+    'BaiChuanForCausalLM': 'baichuan-inc/Baichuan-13B-Chat',
     'BloomForCausalLM': 'bigscience/bloom-560m',
     'GLMModel': 'THUDM/glm-10b',
     'ChatGLMModel': 'THUDM/chatglm3-6b',
     'ChatGLMForCausalLM': 'THUDM/chatglm3-6b',
+    'RWForCausalLM': 'tiiuae/falcon-rw-1b',
     'FalconForCausalLM': 'tiiuae/falcon-rw-1b',
-    'GPTForCausalLM': 'gpt2-medium',
+    'GPT2LMHeadModel': 'gpt2',
+    'GPT2LMHeadCustomModel': 'gpt2',
+    'Starcoder2ForCausalLM': 'bigcode/starcoder2-3b',
+    'GPTForCausalLM': 'gpt2',
     'GPTJForCausalLM': 'EleutherAI/gpt-j-6b',
     'GPTNeoXForCausalLM': 'EleutherAI/gpt-neox-20b',
     'InternLMForCausalLM': 'internlm/internlm-chat-7b',
@@ -60,13 +73,6 @@ DEFAULT_PROMPT_TEMPLATES = {
     'Qwen2ForCausalLM': QWEN_PROMPT_TEMPLATE,
     'Qwen2MoeForCausalLM': QWEN_PROMPT_TEMPLATE,
 }
-
-
-def supports_inflight_batching(engine_dir):
-    config_path = Path(engine_dir) / "config.json"
-    json_config = GptJsonConfig.parse_file(config_path)
-    model_config = json_config.model_config
-    return model_config.supports_inflight_batching
 
 
 def read_decoder_start_token_id(engine_dir):
@@ -102,23 +108,31 @@ def throttle_generator(generator, stream_interval):
         yield out
 
 
-def load_tokenizer(tokenizer_dir: Optional[str] = None,
-                   vocab_file: Optional[str] = None,
-                   model_name: str = 'GPTForCausalLM',
-                   model_version: Optional[str] = None,
-                   tokenizer_type: Optional[str] = None):
+# Load tokenizer impl, it will be called in external wrapper to avoid loading tokenizer bug under MPI env.
+def _load_tokenizer(tokenizer_dir: Optional[str] = None,
+                    vocab_file: Optional[str] = None,
+                    model_name: str = 'GPTForCausalLM',
+                    model_version: Optional[str] = None,
+                    tokenizer_type: Optional[str] = None):
     if vocab_file is None:
-        use_fast = True
-        if tokenizer_type is not None and tokenizer_type == "llama":
-            use_fast = False
-        # Should set both padding_side and truncation_side to be 'left'
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
-                                                  legacy=False,
-                                                  padding_side='left',
-                                                  truncation_side='left',
-                                                  trust_remote_code=True,
-                                                  tokenizer_type=tokenizer_type,
-                                                  use_fast=use_fast)
+        if 'whisper' in model_name.lower():
+            tokenizer = AutoTokenizer.from_pretrained('openai/whisper-large-v3',
+                                                      language='english',
+                                                      task='transcribe',
+                                                      predict_timestamps=False)
+        else:
+            use_fast = True
+            if tokenizer_type is not None and tokenizer_type == "llama":
+                use_fast = False
+            # Should set both padding_side and truncation_side to be 'left'
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_dir,
+                legacy=False,
+                padding_side='left',
+                truncation_side='left',
+                trust_remote_code=True,
+                tokenizer_type=tokenizer_type,
+                use_fast=use_fast)
     elif model_name == 'GemmaForCausalLM' or model_name == 'RecurrentGemmaForCausalLM':
         from transformers import GemmaTokenizer
 
@@ -156,12 +170,77 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
     return tokenizer, pad_id, end_id
 
 
+def load_tokenizer(tokenizer_dir: Optional[str] = None,
+                   vocab_file: Optional[str] = None,
+                   model_name: str = 'GPTForCausalLM',
+                   model_version: Optional[str] = None,
+                   tokenizer_type: Optional[str] = None):
+    func = partial(_load_tokenizer, tokenizer_dir, vocab_file, model_name,
+                   model_version, tokenizer_type)
+    if mpi_world_size() > 1:
+        # Under MPI env, load tokenizer will result in multiple processes to download the same file to the same folder.
+        # This will result some random bug. Force loading on rank0 to warmup the tokenizer to avoid this issue.
+        if mpi_rank() == 0:
+            func()
+        mpi_barrier()
+    return func()
+
+
+def prepare_enc_dec_inputs(batch_input_ids: List[torch.Tensor], model_name: str,
+                           engine_dir: str,
+                           multimodal_input_file: Optional[str]):
+    encoder_input_features = None
+    encoder_input_ids = None
+    if 'whisper' in model_name.lower():
+        tllm_path = dirname(dirname(abspath(__file__)))
+        sys.path.insert(0, tllm_path)
+
+        from examples.whisper.whisper_utils import \
+            log_mel_spectrogram  # cannot directly import whisper due to name collision
+
+        config_path = os.path.join(engine_dir, 'encoder', 'config.json')
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        n_mels = config['pretrained_config']['n_mels']
+        dtype = config['pretrained_config']['dtype']
+
+        # download mel filters file
+        subprocess.run([
+            "wget", "-nc", f"--directory-prefix={engine_dir}",
+            "https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz"
+        ],
+                       check=True)
+
+        mel, total_duration = log_mel_spectrogram(multimodal_input_file,
+                                                  n_mels,
+                                                  return_duration=True,
+                                                  mel_filters_dir=engine_dir)
+        mel = mel.type(str_dtype_to_torch(dtype))  # [featureDim, seqLen]
+        decoder_input_ids = batch_input_ids
+        encoder_input_features = [torch.einsum('DL->LD', mel)]
+        encoder_output_lengths = [encoder_input_features[0].shape[0] // 2]
+    else:
+        encoder_input_ids = batch_input_ids
+        decoder_start_token_id = read_decoder_start_token_id(
+            os.path.join(engine_dir, "decoder"))
+        decoder_input_ids = [
+            torch.tensor([decoder_start_token_id], dtype=torch.int32)
+            for _ in batch_input_ids
+        ]
+        encoder_output_lengths = None
+    return encoder_input_ids, encoder_input_features, encoder_output_lengths, decoder_input_ids
+
+
 def add_common_args(parser):
     # sampling arguments
     parser.add_argument('--num_beams',
                         type=int,
                         help="Use beam search if num_beams > 1",
                         default=1)
+    parser.add_argument('--num_return_sequences',
+                        type=int,
+                        help="Number of sequences to generate for each input.",
+                        default=None)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--top_k', type=int, default=1)
     parser.add_argument('--top_p', type=float, default=0.0)
@@ -173,7 +252,7 @@ def add_common_args(parser):
     parser.add_argument('--random_seed', type=int, default=0)
     parser.add_argument('--early_stopping',
                         type=int,
-                        help='Use early stopping if num_beams > 1'
+                        help='Use early stopping if num_beams > 1, '
                         '1 for early-stopping, 0 for non-early-stopping'
                         'other values for stopping by length',
                         default=1)
@@ -213,19 +292,30 @@ def add_common_args(parser):
         '--max_attention_window_size',
         type=int,
         default=None,
+        nargs="+",
         help=
         'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
     )
     parser.add_argument(
         '--multi_block_mode',
-        action='store_true',
+        type=lambda s: s.lower() in
+        ("yes", "true", "t", "1"
+         ),  # custom boolean function to convert input string to boolean
+        default=True,
         help=
         "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
     )
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         action='store_true',
                         help="Enable FMHA runner FP32 accumulation.")
-    parser.add_argument('--log_level', type=str, default='info')
+    parser.add_argument('--cuda_graph_mode',
+                        action='store_true',
+                        help="Enable cuda graphs in the inference.")
+    parser.add_argument(
+        '--log_level',
+        type=str,
+        choices=['verbose', 'info', 'warning', 'error', 'internal_error'],
+        default='info')
     parser.add_argument(
         '--no_prompt_template',
         dest='use_prompt_template',
@@ -277,13 +367,49 @@ def add_common_args(parser):
         " For example, '--num_prepend_vtokens=10' will prepend the tokens"
         " [vocab_size, vocab_size + 1, ..., vocab_size + 9] to the sentence.")
     parser.add_argument(
+        '--draft_target_model_config',
+        type=str,
+        default=None,
+        help=
+        "Configuration of Draft-Target-Model decoding, see `examples/draft_target_model/README.md` for more information."
+        "   E.g.: [4, [0], [1], False] for [draft_len, draft_model_device_list, target_model_device_list, use_logits]."
+    )
+    parser.add_argument(
+        '--prompt_lookup_config',
+        type=str,
+        default=None,
+        help=
+        "Configuration of Prompt-Lookup decoding, see `examples/prompt_lookup/README.md` for more information."
+        "   E.g.: [10,2,[0]] for [prompt_lookup_num_tokens, max_matching_ngram_size, device_list].",
+    )
+    parser.add_argument(
         '--medusa_choices',
         type=str,
         default=None,
-        help="Medusa choice to use, if not none, will use Medusa decoding."
+        help="Configuration of Medusa decoding."
         "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
     )
-
+    parser.add_argument(
+        '--eagle_choices',
+        type=str,
+        default=None,
+        help="Configuration of Eagle-1 decoding."
+        "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 draft tokens."
+    )
+    parser.add_argument(
+        '--eagle_posterior_threshold',
+        type=float,
+        default=None,
+        help="Minimum token probability threshold for typical acceptance. "
+        "Enables typical acceptance in Eagle. "
+        "Corresponds to epsilon in https://arxiv.org/pdf/2401.10774.")
+    parser.add_argument(
+        '--lookahead_config',
+        type=str,
+        default=None,
+        help="Configuration of executor and request lookahead decoding."
+        "   E.g.: [5, 6, 7] for [max_window_size, max_ngram_size, max_verification_set_size]."
+    )
     # model arguments
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')
     parser.add_argument(
@@ -330,6 +456,13 @@ def add_common_args(parser):
         default=0.9,
         type=float,
         help='Specify the free gpu memory fraction.',
+    )
+    parser.add_argument(
+        '--cross_kv_cache_fraction',
+        default=0.5,
+        type=float,
+        help=
+        'Specify the kv cache fraction reserved for cross attention. Only applicable for encoder-decoder models. By default 0.5 for self and 0.5 for cross.',
     )
     parser.add_argument(
         '--enable_chunked_context',

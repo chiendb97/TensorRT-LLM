@@ -15,18 +15,13 @@
  */
 #pragma once
 
-#include <gtest/gtest.h>
-
-#include <memory>
-
 #include "tensorrt_llm/layers/explicitDraftTokensLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
-#include "tensorrt_llm/runtime/runtimeKernels.h"
-#include "tensorrt_llm/runtime/tllmLogger.h"
+#include <gtest/gtest.h>
 
-#include "tensorrt_llm/common/tllmException.h"
+#include <memory>
 
 namespace tensorrt_llm::tests::layers
 {
@@ -315,7 +310,8 @@ private:
 
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
-    std::shared_ptr<tensorrt_llm::layers::ExplicitDraftTokensLayer<T>> mExplicitDraftTokensLayer;
+    std::shared_ptr<tensorrt_llm::layers::ExplicitDraftTokensLayer<typename T::LayerType>> mExplicitDraftTokensLayer;
+    std::shared_ptr<runtime::DecodingLayerWorkspace> mDecodingWorkspace;
 
     ExplicitDraftTokensDummyNetwork mNetwork;
 
@@ -339,6 +335,17 @@ public:
         DraftLettersVec const& nextDraftLetters, DraftLettersVec const& lastDraftLetters, SamplingParams& params);
 };
 
-typedef testing::Types<float, half> FloatAndHalfTypes;
+template <typename T, typename U>
+struct TypePair
+{
+    using LayerType = T;
+    using DataType = U;
+};
+
+#ifdef ENABLE_BF16
+using TestTypes = testing::Types<TypePair<float, float>, TypePair<half, half>, TypePair<half, __nv_bfloat16>>;
+#else
+using TestTypes = testing::Types<TypePair<float, float>, TypePair<half, half>>;
+#endif // ENABLE_BF16
 
 } // namespace tensorrt_llm::tests::layers

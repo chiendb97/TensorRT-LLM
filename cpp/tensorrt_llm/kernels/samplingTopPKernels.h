@@ -15,15 +15,12 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <curand_kernel.h>
 
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 template <typename T>
 struct TopPSamplingKernelParams
@@ -31,8 +28,13 @@ struct TopPSamplingKernelParams
     //! input buffer [batchSize, vocabSizePadded], required. Probabilities of each token in the vocab.
     T const* probs{nullptr};
 
-    //! output buffer [maxBatchSize][maxSeqLen], required. Contains pointers to rows with output tokens per request.
-    runtime::TokenIdType** outputIds{nullptr};
+    //! output buffer [maxBatchSize][maxSeqLen]. Contains pointers to rows with output tokens per request.
+    //! If nullptr, outputIds must be provided.
+    runtime::TokenIdType** outputIdsPtrs{nullptr};
+
+    //! output buffer [maxBatchSize, maxSeqLen], optional. Tensor to store output tokens.
+    //! Not used if outputIdsPtrs != nullptr
+    runtime::TokenIdType* outputIds{nullptr};
 
     //! pointer to the workspace. Has to be pre-allocated by caller.
     //! Function does not take ownership of the buffer.
@@ -48,7 +50,7 @@ struct TopPSamplingKernelParams
     //! input buffer [maxBatchSize], optional. EOS token ids per request
     runtime::TokenIdType const* endIds{nullptr};
     //! input buffer[batchSize], optional. Indices of rows of data in memory pool.
-    runtime::SizeType32 const* batchSlots;
+    runtime::SizeType32 const* batchSlots{nullptr};
 
     //! input buffer [maxBatchSize], optional. Exit early if true.
     FinishedState const* finishedInput{nullptr};
@@ -62,9 +64,12 @@ struct TopPSamplingKernelParams
     //! output buffer [maxBatchSize], optional. Log probs is the probability induced by the TopP sampling.
     //! I.e., log_prob = log P(i | i is in vocab).
     float* outputLogProbs{nullptr};
-    //! input buffer [maxBatchSize], required. Curand states properly initialized using
-    //! invokeCurandInitialize per request.
+    //! input buffer [maxBatchSize], optional. Curand states properly initialized using
+    //! invokeCurandInitialize per request. Either curandState or randomVals should be specified.
     curandState_t* curandState{nullptr};
+    //! input buffer [maxBatchSize], optional. Precomputed random values per request.
+    //! Either curandState or randomVals should be specified.
+    float const* randomVals{nullptr};
 
     //! The appropriate block configuration calculated based on the number of multiprocessors, occupancy,
     //! batchSize and vocabSizePadded. Required for AirTopP
@@ -76,6 +81,16 @@ struct TopPSamplingKernelParams
     runtime::SizeType32 batchSize{-1};
     runtime::SizeType32 maxBatchSize{-1};
     runtime::SizeType32 vocabSizePadded{-1};
+    runtime::SizeType32 maxSeqLen{-1};
+
+    bool returnAllSelectedTokens{false};
+
+    //! output buffer [maxBatchSize], optional.
+    //! Store the multinomial sampled target token id in TopK/TopP sampled tokens when returnAllSelectedTokens==True.
+    //! Only return when skipOutputIdCurrentStep != nullptr && skipOutputIdCurrentStep == False
+    runtime::TokenIdType* outputIdCurrentStep{nullptr};
+    //! input buffer [maxBatchSize]. Determine if multinomial sampling is required when returnAllSelectedTokens==True.
+    bool const* skipOutputIdCurrentStep{nullptr};
 
     void checkParams() const
     {
@@ -84,13 +99,20 @@ struct TopPSamplingKernelParams
         TLLM_CHECK(maxBatchSize >= batchSize);
         TLLM_CHECK(vocabSizePadded > 0);
         TLLM_CHECK(probs);
-        TLLM_CHECK(outputIds);
+        TLLM_CHECK(outputIds || outputIdsPtrs);
         TLLM_CHECK(workspace);
-        TLLM_CHECK(sequenceLength);
-        TLLM_CHECK(curandState);
+        TLLM_CHECK((curandState != nullptr) || (randomVals != nullptr));
+        TLLM_CHECK(((curandState != nullptr) & (randomVals != nullptr)) == 0);
         TLLM_CHECK(topPs);
 
+        if (outputIds)
+        {
+            TLLM_CHECK(maxSeqLen > 0);
+        }
+
         TLLM_CHECK(((finishedOutput == nullptr) ^ (endIds == nullptr)) == 0);
+        TLLM_CHECK((skipOutputIdCurrentStep && outputIdCurrentStep && returnAllSelectedTokens)
+            || (skipOutputIdCurrentStep == nullptr && outputIdCurrentStep == nullptr));
     }
 };
 
@@ -99,6 +121,10 @@ struct TopPSamplingKernelParams
 //! \param vocabSizePadded size of padded vocab
 template <typename T>
 [[nodiscard]] size_t getTopPWorkspaceSize(runtime::SizeType32 batchSize, runtime::SizeType32 vocabSizePadded);
+
+//! \brief Returns workspace size in bytes needed for initialization of sampling TopP
+//! \param batchSize batch size
+[[nodiscard]] std::vector<size_t> getTopPInitWorkspaceSizes(runtime::SizeType32 batchSize);
 
 // clang-format off
 //! \brief Given probs, performs Top P sampling. Fills sampled tokens to outputIds.
@@ -155,5 +181,8 @@ uint32_t calcAirTopPBlockNum(int batchSize, int len, int smCnt, bool isDetermini
 template <typename T>
 [[nodiscard]] size_t getAirTopPWorkspaceSize(int32_t batchSize, int32_t vocabSizePadded, bool isDeterministic = false);
 
-} // namespace kernels
-} // namespace tensorrt_llm
+void invokeSetTopPRuntimeArgs(runtime::SizeType32 batchSize, ScatterDecodingParamEntry<runtime::SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, bool* skipDecodePtr, float* initialTopPPtr,
+    runtime::SizeType32 const* batchSlotsPtr, bool onDevice, cudaStream_t stream = nullptr);
+
+} // namespace tensorrt_llm::kernels

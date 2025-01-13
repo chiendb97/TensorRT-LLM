@@ -59,7 +59,7 @@ class LoraManagerTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-t
 {
 protected:
     LoraManagerTest()
-        : mModelConfig(1, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT)
+        : mModelConfig(1, 2, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT)
     {
     }
 
@@ -70,7 +70,7 @@ protected:
 
         mWorldConfig = WorldConfig(2);
 
-        mModelConfig.setLoraModules(LoraModule::createLoraModules({"attn_dense", "attn_qkv"}, 4, 4, 1, 1, 2, 2));
+        mModelConfig.setLoraModules(LoraModule::createLoraModules({"attn_dense", "attn_qkv"}, 4, 4, 1, 1, 2, 2, 0));
     }
 
     std::unique_ptr<BufferManager> mManager;
@@ -80,9 +80,9 @@ protected:
 
     PeftTable getPeftTable(SizeType32 tpRank = 0)
     {
-        auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
+        auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
         modelConfig.setMlpHiddenSize(32);
-        auto worldConfig = WorldConfig(2, 2, 3);
+        auto worldConfig = WorldConfig(2, 2, 1, 3);
         std::vector<LoraModule> modules{
             LoraModule(LoraModule::ModuleType::kATTN_QKV, 16, 3 * 16, false, true, -1, 0),
             LoraModule(LoraModule::ModuleType::kATTN_Q, 16, 16, false, true, -1, 0),
@@ -255,7 +255,6 @@ static std::tuple<std::vector<int32_t>, std::vector<int64_t>, PeftTable> createF
         {
             continue;
         }
-        peftTable.try_emplace(reqIds[bid], valuesWorkspace[bid]);
         if (config->getShape().nbDims == 3)
         {
             config->squeeze(0);
@@ -284,17 +283,18 @@ static std::tuple<std::vector<int32_t>, std::vector<int64_t>, PeftTable> createF
                     = outPointer;
             }
         }
+        peftTable.try_emplace(reqIds[bid], *valuesWorkspace[bid]);
     }
 
-    return std::make_tuple(targetAdapterSizes, targetPointers, peftTable);
+    return std::make_tuple(std::move(targetAdapterSizes), std::move(targetPointers), std::move(peftTable));
 }
 
 TEST_F(LoraManagerTest, fillInputTensors)
 {
     LoraManager loraManager;
-    auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
-    auto worldConfig = WorldConfig(1, 1, 0);
+    auto worldConfig = WorldConfig(1, 1, 1, 0);
     std::vector<LoraModule> modules{
         LoraModule(LoraModule::ModuleType::kATTN_QKV, 16, 3 * 16, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kATTN_Q, 16, 16, false, true, -1, 0),

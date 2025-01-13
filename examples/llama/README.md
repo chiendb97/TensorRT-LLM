@@ -18,10 +18,12 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
     - [Groupwise quantization (AWQ/GPTQ)](#groupwise-quantization-awqgptq)
       - [AWQ](#awq)
       - [GPTQ](#gptq)
+    - [w4aINT8 quantization (QServe)](#w4aint8-quantization-qserve)
     - [Run](#run)
     - [Multi-GPU multi-node (MGMN) support](#multi-gpu-multi-node-mgmn-support)
     - [Summarization using the LLaMA model](#summarization-using-the-llama-model)
       - [Mistral v0.1](#mistral-v01)
+      - [Mistral Nemo](#mistral-nemo)
   - [Running CodeLlama](#running-codellama)
     - [Build](#build)
     - [Run](#run-1)
@@ -47,14 +49,15 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
-  * FP16
+  * BF16/FP16
   * FP8
   * INT8 & INT4 Weight-Only
   * SmoothQuant
   * Groupwise quantization (AWQ/GPTQ)
+  * w4aINT8 quantization (QServe)
   * FP8 KV CACHE
   * INT8 KV CACHE (+ AWQ/per-channel weight-only)
-  * Tensor Parallel
+  * Tensor Parallel + Pipeline Parallel, Tensor Parallel + Context Parallel
   * STRONGLY TYPED
 
 ## Usage
@@ -66,7 +69,7 @@ The TensorRT-LLM LLaMA example code locates at [examples/llama](./). It takes HF
 Please install required packages first to make sure the example uses matched `tensorrt_llm` version:
 
 ```bash
-pip install -r requirements.txt
+pip install --upgrade -r requirements.txt
 ```
 
 Need to prepare the HF LLaMA checkpoint by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/llama.
@@ -85,9 +88,9 @@ The defaults have been carefully tuned for better performance. For example, `gpt
 
 Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed for inference, you could enable parallel building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
 
-`--use_fused_mlp` enables GEMM horizontal fusion in gated MLP layer, which reduces input traffic and potentially improves performance. For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded (accuracy 0.45734 vs 0.45755 for LLaMA-v2 7B using modelopt/examples/hf/instruct_eval/mmlu.py).
+`--use_fused_mlp=enable` enables GEMM horizontal fusion in gated MLP layer, which reduces input traffic and potentially improves performance. For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded (accuracy 0.45734 vs 0.45755 for LLaMA-v2 7B using modelopt/examples/hf/instruct_eval/mmlu.py).
 
-`--use_fused_mlp --gemm_swiglu_plugin <dtype>` fuses 2 GEMMs without biases and SwiGLU into one kernel. This is a preview feature and is only supported for dtype `fp8`. The supported architecture is SM90.
+`--use_fused_mlp=enable --gemm_swiglu_plugin <dtype>` fuses 2 GEMMs without biases and SwiGLU into one kernel. This is a preview feature and is only supported for dtype `fp8`. The supported architecture is SM90.
 
 Here're some examples:
 
@@ -154,6 +157,16 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_tp2_pp2 \
             --output_dir ./tmp/llama/7B/trt_engines/fp16/4-gpu/ \
             --gemm_plugin auto
 
+# Build LLaMA 7B using 2-way tensor parallelism and 2-way context parallelism.
+python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
+                            --output_dir ./tllm_checkpoint_4gpu_tp2_cp2 \
+                            --dtype float16 \
+                            --tp_size 2 \
+                            --cp_size 2
+trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_tp2_cp2 \
+            --output_dir ./tmp/llama/7B/trt_engines/fp16/4-gpu/ \
+            --gemm_plugin auto
+
 # Build LLaMA 30B using 2-way tensor parallelism.
 python convert_checkpoint.py --model_dir ./tmp/llama/30B/hf/ \
                             --output_dir ./tllm_checkpoint_2gpu_tp2 \
@@ -211,11 +224,13 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
 Same instructions can be applied to fine-tuned versions of the LLaMA v2 models (e.g. 7Bf or llama-2-7b-chat).
 
 #### LLaMA v3 Updates
-The LLaMA v3 models with 8B and 70b are compatible with the LLaMA v2 implementation. The above
+The LLaMA 3.0 models with 8B and 70b are compatible with the LLaMA v2 implementation. The above
 commands still work.
 
 Note that the `rope_theta` and `vocab_size` are larger in LLaMA v3 models and these values are now inferred
 or pickup up from the `params.json` when using the `meta_ckpt_dir`.
+
+LLaMA 3.2 models are also supported now. For text only model like [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B), the steps are same to v3.0. For vision model like [Llama-3.2-11B-Vision](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision), please refer to the [examples/mllama/README.md](../mllama/README.md)
 
 ```bash
 # Build LLaMA v3 8B TP=1 using HF checkpoints directly.
@@ -273,7 +288,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
 Same instructions can be applied to fine-tuned versions of the LLaMA v2 models (e.g. 7Bf or llama-2-7b-chat).
 
 ### Long context length
-To use the model with Long context lengths, it is necessary to add `--multi_block_mode` in the runtime command to enable faster decoding in multi-head attention.
+With long context lengths, multi_block_mode is turned on by default to enable faster decoding in multi-head attention. To disable this feature, add `--multi_block_mode=False` to the runtime command.
 
 
 A few LLaMA models are fine-tuned for long context length that TRT-LLM can support today. For example https://huggingface.co/Yukang/LongAlpaca-70B employs rotary scaling plus fine-tuning to support up to 32K context length. The following show the steps for running LongAlpaca-70B in TRT-LLM:
@@ -702,6 +717,13 @@ AWQ/GPTQ examples below involves 2 steps:
                                        --output_dir ./quantized_int4-awq \
                                        --calib_size 32
     ```
+    HF checkpoints generated with [AutoAWQ](https://github.com/casper-hansen/AutoAWQ) are also supported through the following conversion script:
+
+    ```bash
+    # Convert AutoAWQ HF checkpoints into TRT-LLM checkpoint
+    python convert_checkpoint.py --model_dir ./tmp/Llama-2-7B-AWQ \
+                                 --output_dir ./quantized_int4-awq
+    ```
 
 2. Build TRT-LLM engine:
 
@@ -716,19 +738,41 @@ To run the GPTQ LLaMa example, the following steps are required:
 
 1. Weight quantization:
 
-    Quantized weights for GPTQ are generated using [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa.git) as follow:
+    Quantized weights for GPTQ are generated using [AutoGPTQ](https://github.com/AutoGPTQ/AutoGPTQ) as follow:
 
     ```bash
-    git clone https://github.com/qwopqwop200/GPTQ-for-LLaMa.git
-    cd GPTQ-for-LLaMa
-    pip install -r requirements.txt
+    git clone https://github.com/AutoGPTQ/AutoGPTQ
+    cd AutoGPTQ
+    pip install .
+
+    # Download the quant_autogptq script
+    wget https://gist.githubusercontent.com/TheBloke/b47c50a70dd4fe653f64a12928286682/raw/ebcee019d90a178ee2e6a8107fdd7602c8f1192a/quant_autogptq.py
 
     # Quantize weights into INT4 and save as safetensors
     # Quantized weight with parameter "--act-order" is not supported in TRT-LLM
-    python llama.py ./tmp/llama/7B/ c4 --wbits 4 --true-sequential --groupsize 128 --save_safetensors ./llama-7b-4bit-gs128.safetensors
+    python quant_autogptq.py ./tmp/llama/7B ./llama-7b-4bit-gs128.safetensors wikitext --bits 4 --group_size 128 --desc_act 0 --damp 0.1 --dtype float16 --seqlen 4096 --num_samples 3 --use_fast
     ```
+    Then we can convert the saved `./llama-7b-4bit-gs128.safetensors` into TRT-LLM checkpoints by:
+    ```bash
+    # Build the LLaMA 7B model using 2-way tensor parallelism and apply INT4 GPTQ quantization.
+    # Compressed checkpoint safetensors are generated separately from GPTQ.
+    python convert_checkpoint.py --model_dir /tmp/llama-7b-hf \
+                                 --output_dir ./tllm_checkpoint_2gpu_gptq \
+                                 --dtype float16 \
+                                 --quant_ckpt_path ./llama-7b-4bit-gs128.safetensors  \
+                                 --use_weight_only \
+                                 --weight_only_precision int4_gptq \
+                                 --per_group \
+                                 --tp_size 2
+    ```
+    HF checkpoints generated with AutoGPTQ are also supported through the following conversion script:
 
-    Let us build the TRT-LLM engine with the saved `./llama-7b-4bit-gs128.safetensors`.
+    ```bash
+    # Convert AutoGPTQ HF checkpoints into 2-way tensor parallelism TRT-LLM checkpoint
+    python convert_checkpoint.py --model_dir ./tmp/Llama-2-7B-GPTQ \
+                                 --output_dir ./tllm_checkpoint_2gpu_gptq \
+                                 --tp_size 2
+    ```
 
 2. Build TRT-LLM engine:
 
@@ -748,6 +792,44 @@ To run the GPTQ LLaMa example, the following steps are required:
                 --output_dir ./tmp/llama/7B/trt_engines/int4_GPTQ/2-gpu/ \
                 --gemm_plugin auto
     ```
+
+### w4aINT8 quantization (QServe)
+
+TensorRT-LLM integrates the quantized GEMM from [QServe](https://arxiv.org/abs/2405.04532), which employs 4-bit quantization for weights and 8-bit quantization for activations. This technique offers versatile performance benefits across different scenarios. When the GEMM's m dimension is small, as in small batch-size decoding, it achieves performance comparable to w4a16 by reducing the memory bandwidth required for weight access. Conversely, for larger m dimensions, such as during prefilling or large batch-size decoding, it matches the performance of w8a8 by leveraging INT8 Tensor Cores.
+
+Please follow the steps to run the model using QServe w4aINT8:
+
+1. Weight quantization:
+
+   Currently we rely on the 3rd-party repo [deepcompressor](https://github.com/mit-han-lab/deepcompressor) to prepare the fake-quantized checkpoint. Follow the [instructions](https://github.com/mit-han-lab/deepcompressor/blob/main/examples/llm/README.md#usage) to quantize the model. Please use the `configs/qoq-g128.yaml` for per-group quantization, and `configs/qoq-gchn.yaml` for the per-channel quantization. Do not forget to add the flag `--save-model path/to/deepcompressor/ckpt` so that the quantized model is dumped to the disk.
+
+   After quantization, the weights in the original Hugging Face checkpoint (assume under `path/to/huggingface/ckpt/`) will be quantized and the following files are obtained under your `path/to/deepcompressor/ckpt`:
+
+   - `model.pt`: fake-quantized fp16 weights.
+   - `scale.pt`: quantization scales and zeros.
+
+2. Checkpoint conversion:
+
+   Convert the DeepCompressor checkpoint into TensorRT-LLM checkpoint, potentially with tensor parallelism:
+
+   ```bash
+   export TRTLLM_DISABLE_UNIFIED_CONVERTER=1  # The current checkpoint conversion code requires legacy path
+   python convert_checkpoint.py --model_dir path/to/huggingface/ckpt/  \
+                                --output_dir path/to/trtllm/ckpt/  \
+                                --dtype float16  \
+                                --quant_ckpt_path path/to/deepcompressor/ckpt  \
+                                --use_qserve  \
+                                --per_group  \  # Add this option if using per-group quantization
+                                --tp_size 2
+   ```
+
+3. Build engine:
+
+   ```bash
+   trtllm-build --checkpoint_dir path/to/trtllm/ckpt/ \
+               --output_dir path/to/trtllm/engine \
+               --gemm_plugin auto
+   ```
 
 ### Run
 
@@ -862,6 +944,31 @@ Note that if you are comparing TRT-LLM with Huggingface,
 you should install `transformers` with version >= 4.34.1 in order to have Mistral model supported.
 And upgrade `flash-attn` package by `pip install --upgrade flash-attn` or you may see wrong results generated by the huggingface implementation.
 
+#### Mistral Nemo
+[Mistral Nemo](https://mistral.ai/news/mistral-nemo/) is compatible with LLaMA interface and can be built and run using the same instructions.
+Please upgrade the [transformers](https://pypi.org/project/transformers/) to 4.43.0.dev0 or higher release for running this model.
+
+```bash
+# Build Mistral Nemo with max input length 10240
+python convert_checkpoint.py --model_dir ./Mistral-Nemo-Instruct-2407 \
+                             --output_dir ./tllm_checkpoint_1gpu_mistral_nemo \
+                             --dtype bfloat16 \
+                             --smoothquant 0.5 \
+                             --per_channel \
+                             --per_token
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_mistral_nemo \
+             --output_dir ./tmp/mistral_nemo/trt_engines/bf16/1-gpu/ \
+             --gemm_plugin bfloat16 \
+             --max_input_len 10240
+
+# Run summarization using the Mistral Nemo model quantized to INT8.
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir ./Mistral-Nemo-Instruct-2407 \
+                       --data_type bf16 \
+                       --engine_dir ./tmp/mistral_nemo/trt_engines/bf16/1-gpu//
+```
+
 ## Running CodeLlama
 Those examples can be used to build and run the CodeLlama models. All 7b, 13b, and 34b sizes and variants are supported.
 
@@ -881,6 +988,24 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_codellama \
             --output_dir ./tmp/codellama/trt_engines/fp16/1-gpu/ \
             --gemm_plugin auto
 ```
+The example below uses the NVIDIA ModelOpt (AlgorithMic Model Optimization) toolkit for the model quantization process.
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+
+```bash
+# Quantize HF CodeLlama 7B into FP8 and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir /tmp/CodeLlama-7b-Instruct-hf \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ./tllm_checkpoint_1gpu_fp8 \
+                                   --calib_size 512
+
+# Build trtllm engines from the trtllm checkpoint
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
+             --output_dir ./engine_outputs \
+             --gemm_plugin auto
+```
+
 Use the following command to build `CodeLlama-34b-Instruct` for 4 GPUs (TP=4):
 ```bash
 python convert_checkpoint.py --model_dir /tmp/CodeLlama-34b-Instruct-hf  \
@@ -1206,7 +1331,6 @@ python3 ../run.py --max_output_len=50 \
 
 Note that the sink tokens is included in the sliding attention tokens, and there are at most `max_attention_window_size` tokens are stored in the KV cache.
 
-
 ## Run LLaMA-3.1 405B Model
 
 Currently, TensorRT-LLM supports Meta checkpoint and Huggingface checkpoint for LLaMA-3.1. In this section, we demonstrate how to run the LLaMA-3.1 405B model via TensorRT-LLM. Here, we assume users have downloaded the checkpoints and placed them at `llama_3.1_405B_meta_model/` (Meta BF16 checkpoint), `llama_3.1_405B_HF_model/` (HF BF16 checkpoint) and `llama_3.1_405B_HF_FP8_model/` (HF FP8 checkpoint). Before converting the checkpoints to TensorRT-LLM unified checkpoints, **please check that `{"rope_scaling": {"rope_type": "llama3"}}` is set in the configuration file**. With this flag, TensorRT-LLM will enable the rope scaling of LLaMA-3.1. If not, please add it to the config file.
@@ -1218,7 +1342,7 @@ Users can run the LLaMA-3.1 model with higher precision (bf16/fp16) or fp8. Here
 To use the fp8 quantization, please add the `--use_fp8_rowwise` flag during the checkpoint conversion. In this demonstration, we convert the Meta checkpoint to bfloat16 with TP8-PP2 and the HF checkpoint to FP8 with TP8.
 
 Note: You may need to update your transformers installation via `pip install --upgrade transformers`.
-Note: For 405B HF model, there are duplicated kv head weights. Users could use `--remove_duplicated_kv_heads` to remove them.
+Note: For 405B HF model cloned before 09 Aug 2024, there are duplicated kv head weights (The `num_key_value_heads` in `config.json` is 16). Users could use `--remove_duplicated_kv_heads` to remove them. The new checkpoint without duplicated kv heads is uploaded on 09 Aug 2024 and the `num_key_value_heads` is 8 now. For the new checkpoint, adding the flag `--remove_duplicated_kv_heads` would lead to error.
 
 ```bash
 # Run BF16 model by BF16
@@ -1239,17 +1363,20 @@ python examples/llama/convert_checkpoint.py --model_dir llama_3.1_405B_HF_model/
                             --pp_size 1 \
                             --load_by_shard \
                             --workers 8 \
-                            --remove_duplicated_kv_heads
 
 # Run FP8 model by FP8
+# The source HF model is in FP8 format, so --use_fp8_rowwise is enabled automatically
+# Optionally enable --use_meta_fp8_rowwise_recipe to strictly follow the original Meta's LLaMA 3.1 recipe:
+# (1) Skip quantization for the first and last Transformer layers
+# (2) Skip quantization for the Attention layers
 python examples/llama/convert_checkpoint.py --model_dir llama_3.1_405B_HF_FP8_model/ \
                             --output_dir llama_3.1_405B_HF_FP8_model/trt_ckpts/tp8-pp1/ \
                             --dtype bfloat16 \
                             --tp_size 8 \
                             --pp_size 1 \
+                            --use_meta_fp8_rowwise_recipe \
                             --load_by_shard \
-                            --workers 8 \
-                            --remove_duplicated_kv_heads
+                            --workers 8
 ```
 
 ### Build Engine

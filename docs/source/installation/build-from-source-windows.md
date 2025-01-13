@@ -11,7 +11,7 @@ This section is for advanced users. Skip this section if you plan to use the pre
 1. Install prerequisites listed in our [Installing on Windows](https://nvidia.github.io/TensorRT-LLM/installation/windows.html) document.
 2. Install [CMake](https://cmake.org/download/), version 3.27.7 is recommended, and select the option to add it to the system path.
 3. Download and install [Visual Studio 2022](https://visualstudio.microsoft.com/).
-4. Download and unzip [TensorRT 10.2.0.19](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.2.0/zip/TensorRT-10.2.0.19.Windows.win10.cuda-12.5.zip).
+4. Download and unzip [TensorRT 10.7.0.23](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.7.0/zip/TensorRT-10.7.0.23.Windows.win10.cuda-12.6.zip).
 
 ## Building a TensorRT-LLM Docker Image
 
@@ -65,7 +65,7 @@ git submodule update --init --recursive
 2. Build TensorRT-LLM. This command generates `build\tensorrt_llm-*.whl`.
 
 ```bash
-python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-10.2.0.19\
+python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-10.7.0.23\
 ```
 
 3. Copy or move `build\tensorrt_llm-*.whl` into your mounted folder so it can be accessed on your host machine. If you intend to use the C++ runtime, you'll also need to gather various DLLs from the build into your mounted folder. For more information, refer to [C++ Runtime Usage](#c-runtime-usage).
@@ -77,7 +77,7 @@ python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-10
 **Prerequisites**
 
 1. Install all prerequisites (`git`, `python`, `CUDA`) listed in our [Installing on Windows](https://nvidia.github.io/TensorRT-LLM/installation/windows.html) document.
-2. Install Nsight NVTX. TensorRT-LLM on Windows currently depends on NVTX assets that do not come packaged with the CUDA 12.5.1 installer. To install these assets, download the [CUDA 11.8 Toolkit](https://developer.nvidia.com/cuda-11-8-0-download-archive?target_os=Windows&target_arch=x86_64).
+2. Install Nsight NVTX. TensorRT-LLM on Windows currently depends on NVTX assets that do not come packaged with the CUDA 12.6.3 installer. To install these assets, download the [CUDA 11.8 Toolkit](https://developer.nvidia.com/cuda-11-8-0-download-archive?target_os=Windows&target_arch=x86_64).
 
     1. During installation, select **Advanced installation**.
 
@@ -103,7 +103,7 @@ python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-10
 
         1. Install [CMake](https://cmake.org/download/), version 3.27.7 is recommended, and select the option to add it to the system path.
         2. Download and install [Visual Studio 2022](https://visualstudio.microsoft.com/). When prompted to select more Workloads, check **Desktop development with C++**.
-        3. Download and unzip [TensorRT 10.2.0.19](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.2.0/zip/TensorRT-10.2.0.19.Windows.win10.cuda-12.5.zip). Move the folder to a location you can reference later, such as `%USERPROFILE%\inference\TensorRT`.
+        3. Download and unzip [TensorRT 10.7.0.23](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.7.0/zip/TensorRT-10.7.0.23.Windows.win10.cuda-12.6.zip). Move the folder to a location you can reference later, such as `%USERPROFILE%\inference\TensorRT`.
 
             1. Add the libraries for TensorRT  to your system's `Path` environment variable. Your `Path` should include a line like this:
 
@@ -185,12 +185,15 @@ Building from source produces the following library files.
     - `th_common.exp`
     - `th_common.lib`
 
-The locations of the DLLs, in addition to some `torch` DLLs, must be added to the Windows `Path` in order to use the TensorRT-LLM C++ runtime. Append the locations of these libraries to your `Path`. When complete, your `Path` should include lines similar to these:
+The locations of the DLLs, in addition to some `torch` DLLs and `TensorRT` DLLs, must be added to the Windows `Path` in order to use the TensorRT-LLM C++ runtime. Append the locations of these libraries to your `Path`. When complete, your `Path` should include lines similar to these:
 
 ```bash
+%USERPROFILE%\inference\TensorRT\lib
 %USERPROFILE%\inference\TensorRT-LLM\cpp\build\tensorrt_llm
 %USERPROFILE%\AppData\Local\Programs\Python\Python310\Lib\site-packages\tensorrt_llm\libs
 %USERPROFILE%\AppData\Local\Programs\Python\Python310\Lib\site-packages\torch\lib
 ```
 
 Your `Path` additions may differ, particularly if you used the Docker method and copied all the relevant DLLs into a single folder.
+
+Again, close and re-open any existing PowerShell or Git Bash windows so they pick up the new `Path`.

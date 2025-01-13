@@ -1,5 +1,5 @@
 -r requirements-windows.txt
---extra-index-url https://download.pytorch.org/whl/cu121
+--extra-index-url https://download.pytorch.org/whl/
 datasets
 einops
 graphviz
@@ -10,6 +10,7 @@ pybind11
 pybind11-stubgen
 pytest-cov
 pytest-forked
+pytest-timeout
 pytest-xdist
 rouge_score
 cloudpickle

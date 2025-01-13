@@ -11,6 +11,9 @@ from transformers import AutoModelForCausalLM, Blip2ForConditionalGeneration
 
 import tensorrt_llm
 from tensorrt_llm._utils import pad_vocab_size
+from tensorrt_llm.models.convert_utils import (get_weight, get_weight_and_bias,
+                                               split, split_matrix_tp,
+                                               split_qkv_bias_tp, split_qkv_tp)
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -70,13 +73,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
@@ -89,39 +85,6 @@ def parse_arguments():
     args = parser.parse_args()
 
     return args
-
-
-def split(v, tp_size, idx, dim=0):
-    if tp_size == 1:
-        return v
-    if len(v.shape) == 1:
-        return torch.chunk(v, tp_size)[idx].contiguous()
-    else:
-        return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
-
-
-def split_qkv_tp(v, n_head, n_hidden, tensor_parallel, rank):
-    """
-    Splits the QKV matrix according to tensor parallelism
-    """
-    v = v.reshape(3, n_hidden, n_hidden)
-    split_v = split(v, tensor_parallel, rank, dim=1)
-    split_v = split_v.reshape(3 * (n_hidden // tensor_parallel), n_hidden)
-    return split_v.contiguous()
-
-
-def split_qkv_bias_tp(v, n_head, n_hidden, tensor_parallel, rank):
-    """
-    Splits the QKV bias according to tensor parallelism
-    """
-    v = v.reshape(3, n_hidden)
-    split_v = split(v, tensor_parallel, rank, dim=1)
-    split_v = split_v.reshape(3 * (n_hidden // tensor_parallel))
-    return split_v.contiguous()
-
-
-def split_matrix_tp(v, tensor_parallel, rank, dim):
-    return split(v, tensor_parallel, rank, dim=dim)
 
 
 def split_embedding(
@@ -146,18 +109,6 @@ def split_embedding(
         else:
             assert hidden_size % tp_size == 0
     return split(param, tp_size, tp_rank, dim=sharding_dim)
-
-
-def get_weight(config, prefix, dtype):
-    return config[prefix + '.weight'].to(dtype).detach()
-
-
-def get_bias(config, prefix, dtype):
-    return config[prefix + '.bias'].to(dtype).detach()
-
-
-def get_weight_and_bias(config, prefix, dtype):
-    return get_weight(config, prefix, dtype), get_bias(config, prefix, dtype)
 
 
 def get_tllm_linear_weight(weight,
@@ -188,7 +139,6 @@ def convert_hf_opt(hf_model,
                    dtype='float32',
                    use_parallel_embedding=False,
                    sharding_dim=0,
-                   share_embedding_table=False,
                    use_weight_only=False,
                    plugin_weight_only_quant_type=torch.int8):
 
@@ -272,14 +222,15 @@ def convert_hf_opt(hf_model,
         lm_head_w = torch.matmul(embed_w.float(), project_out.float()).to(dtype)
         embed_w = torch.matmul(embed_w.float(),
                                project_in.t().float()).to(dtype)
+    elif 'lm_head.weight' in model_params.keys():
+        lm_head_w = get_weight(model_params, 'lm_head', dtype)
     else:
         lm_head_w = embed_w.clone()
 
-    if not share_embedding_table:
-        weights['lm_head.weight'] = split_matrix_tp(lm_head_w,
-                                                    tensor_parallel,
-                                                    rank,
-                                                    dim=0)
+    weights['lm_head.weight'] = split_matrix_tp(lm_head_w,
+                                                tensor_parallel,
+                                                rank,
+                                                dim=0)
 
     weights['transformer.vocab_embedding.weight'] = split_embedding(
         embed_w,
@@ -334,7 +285,6 @@ if __name__ == '__main__':
 
     hf_config = hf_model.config
     if hf_config.hidden_size != hf_config.word_embed_proj_dim:
-        args.use_embedding_sharing = False
         args.use_parallel_embedding = False
 
     quant_algo = None
@@ -366,7 +316,6 @@ if __name__ == '__main__':
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'do_layer_norm_before': hf_config.do_layer_norm_before,
     }
 
@@ -382,8 +331,7 @@ if __name__ == '__main__':
             use_weight_only=args.use_weight_only,
             plugin_weight_only_quant_type=plugin_weight_only_quant_type,
             use_parallel_embedding=args.use_parallel_embedding,
-            sharding_dim=args.embedding_sharding_dim,
-            share_embedding_table=args.use_embedding_sharing)
+            sharding_dim=args.embedding_sharding_dim)
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))
 

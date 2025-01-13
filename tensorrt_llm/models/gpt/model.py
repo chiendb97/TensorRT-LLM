@@ -24,9 +24,11 @@ from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
 from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
-from ...quantization import W8A8_SQ_PLUGIN_LIST, QuantAlgo, QuantMode
+from ...quantization import QuantMode
+from ...quantization.functional import quantize_fp8_per_token
+from ...quantization.layers import Fp8RowwiseMLP
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, check_share_embedding)
+                              QuantConfig)
 from .config import GPTConfig
 from .convert import (load_hf_gpt, load_weights_from_hf_model,
                       load_weights_from_nemo)
@@ -170,6 +172,10 @@ class GPTDecoderLayer(Module):
 
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
+
+        # Quantize per-token for fp8
+        if isinstance(self.mlp, Fp8RowwiseMLP):
+            hidden_states = quantize_fp8_per_token(hidden_states)
 
         hidden_states = self.mlp(hidden_states,
                                  lora_layer_params=lora_layer_params)
@@ -315,7 +321,6 @@ class GPTForCausalLM(DecoderModelForCausalLM):
             hf_model = load_hf_gpt(hf_model_dir, load_model_on_cpu)
         weights = load_weights_from_hf_model(hf_model, config)
 
-        check_share_embedding(weights, config)
         model = cls(config)
         model.load(weights)
         return model
@@ -338,22 +343,13 @@ class GPTForCausalLM(DecoderModelForCausalLM):
         tokenizer_max_seq_length: int = 2048,
         **kwargs,
     ):
-        DEFAULT_MODELOPT_FLOW = [
-            QuantAlgo.W4A16_AWQ, QuantAlgo.FP8, QuantAlgo.W8A8_SQ_PER_CHANNEL,
-            QuantAlgo.W4A8_AWQ
-        ]
-        config = GPTConfig.from_hugging_face(hf_model_dir,
-                                             dtype=dtype,
-                                             mapping=mapping,
-                                             quant_config=quant_config,
-                                             **kwargs)
-
-        if quant_config.quant_algo in DEFAULT_MODELOPT_FLOW:
+        if quant_config.requires_modelopt_quantization:
+            # modelopt quantization flow
             super().quantize(hf_model_dir,
                              output_dir,
-                             dtype=config.dtype,
-                             mapping=config.mapping,
-                             quant_config=config.quantization,
+                             dtype=dtype,
+                             mapping=mapping,
+                             quant_config=quant_config,
                              device=device,
                              calib_dataset=calib_dataset,
                              calib_batches=calib_batches,
@@ -361,23 +357,24 @@ class GPTForCausalLM(DecoderModelForCausalLM):
                              calib_max_seq_length=calib_max_seq_length,
                              random_seed=random_seed,
                              tokenizer_max_seq_length=tokenizer_max_seq_length)
-        else:
-            # non-modelopt, the legacy TRT-LLM native quantization algorithm:
-            # sq, int4/int8 weights only, int8 kv cache
-            NATIVE_QUANT_FLOW = [QuantAlgo.W4A16, QuantAlgo.W8A16, None
-                                 ] + W8A8_SQ_PLUGIN_LIST
-            is_valid_native_quant = (quant_config.quant_algo in NATIVE_QUANT_FLOW) and \
-                (quant_config.kv_cache_quant_algo in [QuantAlgo.INT8, None])
-            assert quant_config.quant_algo is not None or quant_config.kv_cache_quant_algo is not None, \
-                "There is no point to call the quantize function if both quant_algo and kv_cache_quant_algo is None"
-            assert is_valid_native_quant, f"Internal error: shall call Modelopt for this quantization {quant_config}"
-
+        elif quant_config.requires_calibration:
+            # non-modelopt quantization flow
             from . import convert
+
+            config = GPTConfig.from_hugging_face(hf_model_dir,
+                                                 dtype=dtype,
+                                                 mapping=mapping,
+                                                 quant_config=quant_config,
+                                                 **kwargs)
             convert.quantize(hf_model_dir,
                              output_dir,
                              config=config,
                              device=device,
                              calib_dataset=calib_dataset)
+        else:
+            raise ValueError(
+                f"The quant_config ({quant_config}) does not require calibration, try {cls.__name__}.from_hugging_face instead."
+            )
 
     @classmethod
     def from_nemo(cls,
@@ -394,7 +391,6 @@ class GPTForCausalLM(DecoderModelForCausalLM):
 
         weights = load_weights_from_nemo(nemo_ckpt_dir, config, **kwargs)
 
-        check_share_embedding(weights, config)
         model = cls(config)
         model.load(weights)
         return model

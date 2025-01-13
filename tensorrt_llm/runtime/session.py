@@ -206,6 +206,10 @@ class Session(object):
         return outputs
 
     def _set_weight_streaming(self, gpu_weights_percent):
+        if not self.engine.streamable_weights_size:
+            assert gpu_weights_percent == 1, "Engine built without weight streaming. Cannot set gpu_weights_percent to a value other than 1."
+            return
+
         assert self.engine is not None
 
         self._context = None
@@ -220,16 +224,15 @@ class Session(object):
             f"Set gpu weights percent to {gpu_weights_percent}, which is {budget} bytes. Valid range: {min} bytes ~ {max} bytes."
         )
 
-        if self.engine.streamable_weights_size:
-            try:
-                self.__prepare_execution_contexts()
-            except:
-                free_mem = torch.cuda.mem_get_info()[0]
-                if free_mem < budget:
-                    raise torch.cuda.OutOfMemoryError(
-                        f"Out of Memory: Memory budget is {budget} bytes but only {free_mem} bytes are available on the GPU."
-                    )
-                raise
+        try:
+            self.__prepare_execution_contexts()
+        except:
+            free_mem = torch.cuda.mem_get_info()[0]
+            if free_mem < budget:
+                raise torch.cuda.OutOfMemoryError(
+                    f"Out of Memory: Memory budget is {budget} bytes but only {free_mem} bytes are available on the GPU."
+                )
+            raise
 
     def run(self,
             inputs: Dict[str, Any],
@@ -276,9 +279,10 @@ class Session(object):
         ]
         outputs_info = self.infer_shapes(inputs_info)
         outputs = {
-            t.name: torch.empty(tuple(t.shape),
-                                dtype=trt_dtype_to_torch(t.dtype),
-                                device='cuda')
+            t.name:
+            torch.empty(tuple(t.shape),
+                        dtype=trt_dtype_to_torch(t.dtype),
+                        device='cuda')
             for t in outputs_info
         }
         with _scoped_stream() as stream:

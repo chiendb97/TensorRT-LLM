@@ -28,12 +28,15 @@ batch_input_text = [
 def test_int4_awq_quantization():
 
     max_batch_size, max_isl, max_osl = 8, 256, 256
-    hf_model_dir = llm_models_root() / "llama-models/llama-7b-hf"
+    hf_model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
+    cnn_dailymail_path = str(llm_models_root() / "datasets/cnn_dailymail")
+
     checkpoint_dir = tempfile.TemporaryDirectory("llama-checkpoint").name
     quant_config = QuantConfig(QuantAlgo.W4A16_AWQ)
     LLaMAForCausalLM.quantize(hf_model_dir,
                               checkpoint_dir,
                               quant_config=quant_config,
+                              calib_dataset=cnn_dailymail_path,
                               calib_batches=32,
                               calib_batch_size=32)
     llama = LLaMAForCausalLM.from_checkpoint(checkpoint_dir)
@@ -55,7 +58,7 @@ def test_int4_awq_quantization():
     with GenerationExecutor.create(engine_dir) as executor:
         batch_input_ids = [tokenizer.encode(inp) for inp in batch_input_text]
         outputs = executor.generate(
-            batch_input_ids, sampling_params=SamplingParams(max_new_tokens=10))
+            batch_input_ids, sampling_params=SamplingParams(max_tokens=10))
         for idx, output in enumerate(outputs):
             print(f"Input: {batch_input_text[idx]}")
             output_text = tokenizer.decode(output.outputs[0].token_ids)
@@ -68,12 +71,14 @@ def test_int4_awq_quantization():
 def test_fp8_quantization():
     max_batch_size, max_isl, max_osl = 8, 256, 256
     hf_model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
+    cnn_dailymail_path = str(llm_models_root() / "datasets/cnn_dailymail")
 
     checkpoint_dir = tempfile.TemporaryDirectory("llama-checkpoint").name
     quant_config = QuantConfig(QuantAlgo.FP8)
     LLaMAForCausalLM.quantize(hf_model_dir,
                               checkpoint_dir,
                               quant_config=quant_config,
+                              calib_dataset=cnn_dailymail_path,
                               calib_batches=32)
     llama = LLaMAForCausalLM.from_checkpoint(checkpoint_dir)
 
@@ -93,7 +98,7 @@ def test_fp8_quantization():
     with GenerationExecutor.create(engine_dir) as executor:
         batch_input_ids = [tokenizer.encode(inp) for inp in batch_input_text]
         outputs = executor.generate(
-            batch_input_ids, sampling_params=SamplingParams(max_new_tokens=10))
+            batch_input_ids, sampling_params=SamplingParams(max_tokens=10))
 
         for idx, output in enumerate(outputs):
             print(f"Input: {batch_input_text[idx]}")

@@ -23,6 +23,9 @@
 #else
 #include "3rdparty/cub/cub.cuh"
 #endif
+#if ENABLE_BF16
+#include <cuda_bf16.h>
+#endif // ENABLE_BF16
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
@@ -111,6 +114,7 @@ __global__ void getPackedMask(SizeType32 const* __restrict__ cumGenerationLength
 
     auto const maxGenerationLength = maxGenerationLengths[0];
     auto const numPackedMasks = divUp(maxDraftTokens + 1, 32);
+
     auto const outputStartId = batchSlots ? (batchSlots[batchIdx] * (maxDraftTokens + 1))
                                           : ((batchIdx == 0) ? 0 : cumGenerationLengths[batchIdx - 1]);
     auto* outputPtr = packedMask + (outputStartId + tokenIdx) * numPackedMasks;
@@ -198,7 +202,7 @@ template <typename T>
 __global__ void fillContextBuffers(FillContextExplicitDraftTokensParams<T> params)
 {
     auto const bid = static_cast<SizeType32>(blockIdx.x);
-    auto const batchSlot = params.batchSlots ? params.batchSlots[bid] : bid;
+    auto const batchSlot = params.batchSlots[bid];
 
     if (threadIdx.x == 0)
     {
@@ -220,6 +224,58 @@ void invokeFillContextBuffers(FillContextExplicitDraftTokensParams<T> const& par
 
 template void invokeFillContextBuffers(FillContextExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokeFillContextBuffers(FillContextExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokeFillContextBuffers(
+    FillContextExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
+
+namespace
+{
+// params.skipVerification == true must be similar to fillContextBuffers
+// params.skipVerification == false must be similar to extractExplicitDraftTokens
+template <typename T>
+__global__ void fillRandData(FillRandDataExplicitDraftTokensParams<T> const params)
+{
+    if (threadIdx.x == 0)
+    {
+        auto const bid = static_cast<SizeType32>(blockIdx.x);
+        auto const batchSlot = params.batchSlots ? params.batchSlots[bid] : bid;
+
+        auto curandState = params.curandState[batchSlot];
+
+        // Generate new random data for sampling.
+        params.randDataSample[batchSlot] = static_cast<T>(curand_uniform(&curandState));
+
+        if (!params.skipVerification)
+        {
+            for (auto idx = 0; idx < params.numPaths * params.draftLength; idx++)
+            {
+                // Generate new random data for token verification.
+                auto const offset = flat_index2(batchSlot, idx, params.numPaths * params.draftLength);
+                params.randDataVerification[offset] = static_cast<T>(curand_uniform(&curandState));
+            }
+        }
+
+        params.curandState[batchSlot] = curandState;
+    }
+}
+} // namespace
+
+template <typename T>
+void invokeFillRandData(FillRandDataExplicitDraftTokensParams<T> const& params, cudaStream_t stream)
+{
+    params.checkParams();
+
+    SizeType32 constexpr BLOCK_SIZE = 32;
+    fillRandData<<<params.batchSize, BLOCK_SIZE, 0, stream>>>(params);
+}
+
+template void invokeFillRandData(FillRandDataExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
+template void invokeFillRandData(FillRandDataExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokeFillRandData(
+    FillRandDataExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
 
 namespace
 {
@@ -227,7 +283,7 @@ template <typename T>
 __global__ void extractExplicitDraftTokens(ExtractExplicitDraftTokensParams<T> params)
 {
     auto const bid = static_cast<SizeType32>(blockIdx.x);
-    auto const batchSlot = params.batchSlots ? params.batchSlots[bid] : bid;
+    auto const batchSlot = params.batchSlots[bid];
 
     // Get accepted path len.
     // This tensor comes directly from engine and has linear batch index.
@@ -325,14 +381,16 @@ __global__ void extractExplicitDraftTokens(ExtractExplicitDraftTokensParams<T> p
         // Set number of tokens passed to the engine per request for the next iteration.
         params.outputGenerationLengths[batchSlot] = numNextDraftTokens;
 
+        auto curandState = params.curandState[batchSlot];
         // Generate new random data for sampling.
-        params.randDataSample[batchSlot] = static_cast<T>(curand_uniform(params.curandState + batchSlot));
+        params.randDataSample[batchSlot] = static_cast<T>(curand_uniform(&curandState));
         for (auto idx = 0; idx < params.numPaths * (params.maxPathLength - 1); idx++)
         {
             // Generate new random data for token verification.
             auto const offset = flat_index2(batchSlot, idx, params.numPaths * (params.maxPathLength - 1));
-            params.randDataVerification[offset] = static_cast<T>(curand_uniform(params.curandState + batchSlot));
+            params.randDataVerification[offset] = static_cast<T>(curand_uniform(&curandState));
         }
+        params.curandState[batchSlot] = curandState;
 
         // Increase seqLen by accepted len.
         params.sequenceLengths[batchSlot] = curSeqLen + bestPathLength;
@@ -357,6 +415,10 @@ template void invokeExtractExplicitDraftTokens(
     ExtractExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokeExtractExplicitDraftTokens(
     ExtractExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokeExtractExplicitDraftTokens(
+    ExtractExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
 
 namespace
 {
@@ -428,6 +490,9 @@ void invokeCopyProbs(ExtractExplicitDraftTokensParams<T> const& params, cudaStre
 
 template void invokeCopyProbs(ExtractExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokeCopyProbs(ExtractExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokeCopyProbs(ExtractExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
 
 namespace
 {
@@ -435,7 +500,7 @@ template <typename T>
 __global__ void packGenerationLengths(PackExplicitDraftTokensParams<T> params)
 {
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
-    auto const batchSlot = params.batchSlots ? params.batchSlots[batchIdx] : batchIdx;
+    auto const batchSlot = params.batchSlots[batchIdx];
 
     auto const isGenerationRequest = batchIdx >= params.numContextRequests;
     auto const genIdx = batchIdx - params.numContextRequests;
@@ -456,6 +521,10 @@ void invokePackGenerationLengths(PackExplicitDraftTokensParams<T> const& params,
 
 template void invokePackGenerationLengths(PackExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokePackGenerationLengths(PackExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokePackGenerationLengths(
+    PackExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
 
 namespace
 {
@@ -463,7 +532,7 @@ template <typename T>
 __global__ void packExplicitDraftTokens(PackExplicitDraftTokensParams<T> params)
 {
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
-    auto const batchSlot = params.batchSlots ? params.batchSlots[batchIdx] : batchIdx;
+    auto const batchSlot = params.batchSlots[batchIdx];
 
     auto const isGenerationRequest = batchIdx >= params.numContextRequests;
     auto const genIdx = batchIdx - params.numContextRequests;
@@ -544,6 +613,10 @@ void invokePackExplicitDraftTokens(PackExplicitDraftTokensParams<T> const& param
 
 template void invokePackExplicitDraftTokens(PackExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokePackExplicitDraftTokens(PackExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokePackExplicitDraftTokens(
+    PackExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
 
 template <typename T>
 void invokeCopyProbs(PackExplicitDraftTokensParams<T> const& params, cudaStream_t stream)
@@ -559,4 +632,8 @@ void invokeCopyProbs(PackExplicitDraftTokensParams<T> const& params, cudaStream_
 
 template void invokeCopyProbs(PackExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokeCopyProbs(PackExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokeCopyProbs(PackExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
+
 } // namespace tensorrt_llm::kernels::speculative_decoding

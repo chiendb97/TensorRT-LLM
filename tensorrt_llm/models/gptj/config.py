@@ -1,9 +1,7 @@
 from typing import Mapping, Optional, Union
 
-import torch
-
-from ..._utils import torch_dtype_to_str
 from ...mapping import Mapping
+from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 
@@ -30,22 +28,16 @@ class GPTJConfig(PretrainedConfig):
             quant_config: Optional[QuantConfig] = None,
             **kwargs):
         import transformers
+        trust_remote_code = kwargs.pop('trust_remote_code', True)
 
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
         else:
             hf_config_dir = str(hf_config_or_dir)
             hf_config = transformers.AutoConfig.from_pretrained(
-                hf_config_dir, trust_remote_code=True)
+                hf_config_dir, trust_remote_code=trust_remote_code)
 
-        if dtype == 'auto':
-            dtype = getattr(hf_config, 'torch_dtype', None)
-            if dtype is None:
-                dtype = 'float16'
-            if isinstance(dtype, torch.dtype):
-                dtype = torch_dtype_to_str(dtype)
-            if dtype == 'float32':
-                dtype = 'float16'
+        dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
         return cls(architecture=hf_config.architectures[0],
                    dtype=dtype,
