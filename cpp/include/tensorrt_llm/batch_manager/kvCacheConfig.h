@@ -29,6 +29,7 @@ enum class CacheType
 {
     kSELF = 0,
     kCROSS = 1,
+    kSELFKONLY = 2,
 };
 
 //! @brief Encapsulates parameters to configure paged KV cache.
@@ -40,7 +41,7 @@ public:
     explicit KvCacheConfig(std::optional<SizeType32> maxTokens = std::nullopt,
         std::optional<std::vector<SizeType32>> maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> sinkTokenLength = std::nullopt,
-        std::optional<float> freeGpuMemoryFraction = std::nullopt, bool enableBlockReuse = false, bool useUvm = false,
+        std::optional<float> freeGpuMemoryFraction = std::nullopt, bool enableBlockReuse = true, bool useUvm = false,
         std::optional<size_t> hostCacheSize = std::nullopt, bool onboardBlocks = true,
         std::optional<float> crossKvCacheFraction = std::nullopt,
         std::optional<SizeType32> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0)

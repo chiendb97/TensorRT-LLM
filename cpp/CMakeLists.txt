@@ -38,6 +38,7 @@ option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
+option(COMPRESS_FATBIN "Compress everything in fatbin" ON)
 
 # Always use static NVRTC for IP protection reasons.
 set(USE_SHARED_NVRTC OFF)
@@ -169,7 +170,16 @@ configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
 
 # Determine CUDA version before enabling the language extension
+# check_language(CUDA) clears CMAKE_CUDA_HOST_COMPILER if CMAKE_CUDA_COMPILER is
+# not set
+if(NOT CMAKE_CUDA_COMPILER AND CMAKE_CUDA_HOST_COMPILER)
+  set(CMAKE_CUDA_HOST_COMPILER_BACKUP ${CMAKE_CUDA_HOST_COMPILER})
+endif()
 check_language(CUDA)
+if(CMAKE_CUDA_HOST_COMPILER_BACKUP)
+  set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CUDA_HOST_COMPILER_BACKUP})
+  check_language(CUDA)
+endif()
 if(CMAKE_CUDA_COMPILER)
   message(STATUS "CUDA compiler: ${CMAKE_CUDA_COMPILER}")
   if(NOT WIN32) # Linux
@@ -211,14 +221,19 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS CUDA_REQUIRED_VERSION)
   )
 endif()
 
-# Initialize CMAKE_CUDA_ARCHITECTURES before enabling CUDA
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.8")
-    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89-real 90-real)
-  else()
-    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real)
-  endif()
-endif()
+# cmake-format: off
+# Initialize and normalize CMAKE_CUDA_ARCHITECTURES before enabling CUDA.
+# Special values:
+# * `native` is resolved to HIGHEST available architecture.
+#   * Fallback to `all` if detection failed.
+# * `all`/unset is resolved to a set of architectures we optimized for and compiler supports.
+# * `all-major` is unsupported.
+# Numerical architectures:
+# * PTX is never included in result binary.
+#   * `*-virtual` architectures are therefore rejected.
+#   * `-real` suffix is automatically added to exclude PTX.
+# * Always use accelerated (`-a` suffix) target for supported architectures.
+# cmake-format: on
 
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
   # Detect highest available compute capability
@@ -234,17 +249,74 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
   if(NOT ${CUDA_RETURN_CODE} EQUAL 0)
     message(WARNING "Detecting native CUDA compute capability - fail")
     message(
-      WARNING "CUDA compute capability detection failed, compiling for 'all'")
-    set(CMAKE_CUDA_ARCHITECTURES_ORIG "all")
+      WARNING
+        "CUDA compute capability detection failed, compiling for all optimized architectures"
+    )
+    unset(CMAKE_CUDA_ARCHITECTURES)
   else()
     message(STATUS "Detecting native CUDA compute capability - done")
-    set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CUDA_ARCH_OUTPUT}")
+    set(CMAKE_CUDA_ARCHITECTURES "${CUDA_ARCH_OUTPUT}")
   endif()
+elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "all")
+  unset(CMAKE_CUDA_ARCHITECTURES)
+  message(
+    STATUS
+      "Setting CMAKE_CUDA_ARCHITECTURES to all enables all architectures TensorRT-LLM optimized for, "
+      "not all architectures CUDA compiler supports.")
+elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "all-major")
+  message(
+    FATAL_ERROR
+      "Setting CMAKE_CUDA_ARCHITECTURES to all-major does not make sense for TensorRT-LLM. "
+      "Please enable all architectures you intend to run on, so we can enable optimized kernels for them."
+  )
 else()
-  # Store CMAKE_CUDA_ARCHITECTURES for later use since torch sets this to "OFF"
-  set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES}")
+  unset(CMAKE_CUDA_ARCHITECTURES_CLEAN)
+  foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+    if(CUDA_ARCH MATCHES "^([1-9])([0-9])+a?-virtual$")
+      message(FATAL_ERROR "Including PTX in compiled binary is unsupported.")
+    elseif(CUDA_ARCH MATCHES "^(([1-9])([0-9])+)a?(-real)?$")
+      list(APPEND CMAKE_CUDA_ARCHITECTURES_CLEAN ${CMAKE_MATCH_1})
+    else()
+      message(FATAL_ERROR "Unrecognized CUDA architecture: ${CUDA_ARCH}")
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES CMAKE_CUDA_ARCHITECTURES_CLEAN)
+  set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_CLEAN})
 endif()
+
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES "80" "86")
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.8")
+    list(APPEND CMAKE_CUDA_ARCHITECTURES "89" "90")
+  endif()
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.7")
+    list(APPEND CMAKE_CUDA_ARCHITECTURES "100" "120")
+  endif()
+endif()
+
+# CMAKE_CUDA_ARCHITECTURES_ORIG contains all architectures enabled, without
+# automatically added -real or -a suffix.
+set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES_ORIG}")
+
+set(ARCHITECTURES_WITH_KERNELS "80" "86" "89" "90" "100" "120")
+foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
+  if(NOT "${CUDA_ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+    add_definitions("-DEXCLUDE_SM_${CUDA_ARCH}")
+    message(STATUS "Excluding SM ${CUDA_ARCH}")
+  endif()
+endforeach()
+
+set(ARCHITECTURES_WITH_ACCEL "90" "100" "101" "120")
+unset(CMAKE_CUDA_ARCHITECTURES_NORMALIZED)
+foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  if("${CUDA_ARCH}" IN_LIST ARCHITECTURES_WITH_ACCEL)
+    list(APPEND CMAKE_CUDA_ARCHITECTURES_NORMALIZED "${CUDA_ARCH}a-real")
+  else()
+    list(APPEND CMAKE_CUDA_ARCHITECTURES_NORMALIZED "${CUDA_ARCH}-real")
+  endif()
+endforeach()
+set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_NORMALIZED})
 
 enable_language(C CXX CUDA)
 
@@ -318,7 +390,9 @@ get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 add_subdirectory(${3RDPARTY_DIR}/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
 
+# include as system to suppress warnings
 include_directories(
+  SYSTEM
   ${CUDAToolkit_INCLUDE_DIRS}
   ${CUDNN_ROOT_DIR}/include
   ${NCCL_INCLUDE_DIR}
@@ -358,6 +432,14 @@ if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11.8")
   )
 endif()
 
+if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "12.8")
+  add_definitions("-DENABLE_FP4")
+  message(
+    STATUS
+      "CUDAToolkit_VERSION ${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR} is greater or equal than 12.8, enable -DENABLE_FP4 flag"
+  )
+endif()
+
 if(ENABLE_MULTI_DEVICE)
   # MPI MPI isn't used until tensorrt_llm/CMakeLists.txt is invoked. However, if
   # it's not called before "CMAKE_CXX_FLAGS" is set, it breaks on Windows for
@@ -379,8 +461,11 @@ endif()
 # Note: The following are desirable settings that should be enabled if we
 # decrease shared library size. See e.g.
 # https://github.com/rapidsai/cudf/pull/6134 for a similar issue in another
-# project. set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO
-# "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
+# project.
+
+# set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}
+# --generate-line-info")
+
 # set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
 
 set(CMAKE_CXX_FLAGS
@@ -391,7 +476,9 @@ set(CMAKE_CXX_FLAGS
 # be found in
 # https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html#index-mcmodel_003dmedium-1
 if(CMAKE_SYSTEM_PROCESSOR STREQUAL x86_64)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcmodel=medium  -Wl,--no-relax")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcmodel=medium")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-relax")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--no-relax")
 endif()
 
 # Disable deprecated declarations warnings
@@ -441,8 +528,11 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 if(FAST_MATH)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
-  message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 endif()
+if(COMPRESS_FATBIN)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --fatbin-options -compress-all")
+endif()
+message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 
 set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
 message(STATUS "COMMON_HEADER_DIRS: ${COMMON_HEADER_DIRS}")
@@ -467,16 +557,8 @@ if(BUILD_PYT)
   # Build TORCH_CUDA_ARCH_LIST
   set(TORCH_CUDA_ARCH_LIST "")
   foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-    if(CUDA_ARCH MATCHES "^([0-9])([0-9])(-real)*$")
-      set(TORCH_ARCH "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
-    elseif(CUDA_ARCH STREQUAL "native")
-      set(TORCH_ARCH "Auto")
-    else()
-      message(FATAL_ERROR "${CUDA_ARCH} is not supported")
-    endif()
-    if(NOT CUDA_ARCH MATCHES "-real$" AND NOT CUDA_ARCH STREQUAL "native")
-      string(APPEND TORCH_ARCH "+PTX")
-    endif()
+    string(REGEX REPLACE "^([1-9][0-9]*)([0-9]a?)-real$" "\\1.\\2" TORCH_ARCH
+                         ${CUDA_ARCH})
     list(APPEND TORCH_CUDA_ARCH_LIST ${TORCH_ARCH})
   endforeach()
 
@@ -534,11 +616,13 @@ print(os.path.dirname(torch.__file__),end='');"
     endif()
   endif()
 
-elseif(NOT WIN32)
-  if(NOT USE_CXX11_ABI)
-    add_compile_options("-D_GLIBCXX_USE_CXX11_ABI=0")
+else()
+  if(NOT WIN32)
+    if(NOT USE_CXX11_ABI)
+      add_compile_options("-D_GLIBCXX_USE_CXX11_ABI=0")
+    endif()
+    message(STATUS "Build without PyTorch, USE_CXX11_ABI=${USE_CXX11_ABI}")
   endif()
-  message(STATUS "Build without PyTorch, USE_CXX11_ABI=${USE_CXX11_ABI}")
 endif()
 
 # Defer UCX/UCXX setup until after USE_CXX11_ABI is well defined, as UCXX will
@@ -556,11 +640,17 @@ if(ENABLE_UCX)
     # that change in USE_CXX11_ABI will not be ignored.
     execute_process(
       COMMAND
+        ${CMAKE_COMMAND} -E env LIB_BUILD_DIR=${CMAKE_BINARY_DIR}/ucxx/build
         ${3RDPARTY_DIR}/ucxx/build.sh libucxx -n
         --cmake-args=\"-DBUILD_SHARED_LIBS=OFF
         -DCMAKE_CXX_FLAGS=-D_GLIBCXX_USE_CXX11_ABI=${USE_CXX11_ABI}\"
-        COMMAND_ECHO STDOUT)
-    find_package(ucxx REQUIRED PATHS ${3RDPARTY_DIR}/ucxx/cpp/build
+      OUTPUT_VARIABLE UCXX_BUILD_OUTPUT
+      RESULT_VARIABLE UCXX_BUILD_RESULT)
+    if(UCXX_BUILD_RESULT)
+      message(${UCXX_BUILD_OUTPUT})
+      message(FATAL_ERROR "ucxx build failed")
+    endif()
+    find_package(ucxx REQUIRED PATHS ${CMAKE_BINARY_DIR}/ucxx/build
                  NO_DEFAULT_PATH)
   endif()
 endif()

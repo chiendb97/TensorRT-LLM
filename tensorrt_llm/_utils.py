@@ -24,18 +24,20 @@ from dataclasses import asdict
 from enum import EnumMeta
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
+from cuda import cuda
+from mpi4py import MPI
 from packaging import version
-
-from tensorrt_llm.bindings import DataType, GptJsonConfig
-from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
 # isort: off
 import torch
 import tensorrt as trt
 # isort: on
+
+from tensorrt_llm.bindings import DataType, GptJsonConfig
+from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
@@ -109,6 +111,29 @@ def copy_torch_to_numpy(x: torch.Tensor, ndarray: np.array):
     else:
         torch.from_numpy(ndarray).copy_(x)
     return ndarray
+
+
+# ref: https://github.com/NVIDIA/cuda-python/blob/main/examples/extra/jit_program_test.py
+def get_sm_version():
+    # Init
+    err, = cuda.cuInit(0)
+    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
+
+    # Device
+    err, cuDevice = cuda.cuDeviceGet(0)
+    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
+
+    # Get target architecture
+    err, sm_major = cuda.cuDeviceGetAttribute(
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        cuDevice)
+    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
+    err, sm_minor = cuda.cuDeviceGetAttribute(
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        cuDevice)
+    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
+
+    return sm_major * 10 + sm_minor
 
 
 def trt_version():
@@ -195,10 +220,18 @@ _str_to_trt_dtype_dict = dict(float16=trt.float16,
                               int8=trt.int8,
                               bool=trt.bool,
                               bfloat16=trt.bfloat16,
-                              fp8=trt.fp8)
+                              fp8=trt.fp8,
+                              nvfp4=trt.fp4)
 
 
 def str_dtype_to_trt(dtype):
+    if dtype == "fp4":
+        # Special handling for FP4 since CI's trt version is not recent enough.
+        if not hasattr(trt, 'fp4'):
+            raise ValueError(
+                "fp4 unsupported, trt version needs to be upgraded.")
+        return trt.fp4
+
     ret = _str_to_trt_dtype_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
@@ -356,7 +389,7 @@ _torch_dtype_to_np_typestr_dict = {
     torch.int64: "<i8",
     torch.int32: "<i4",
     torch.int8: "|i1",
-    torch.float8_e4m3fn: "<f1",
+    torch.float8_e4m3fn: "|i1",
     torch.qint8: "|u1",
     torch.bool: "|b1",
     torch.bfloat16: "<f2",
@@ -406,14 +439,28 @@ def dim_resolve_negative(dim, ndim):
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
+comm = MPI.COMM_WORLD
+
+
+def set_mpi_comm(new_comm):
+    global comm
+    comm = new_comm
+
 
 def mpi_comm():
-    from mpi4py import MPI
-    return MPI.COMM_WORLD
+    return comm
 
 
 def mpi_rank():
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
+
+
+def global_mpi_rank():
+    return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
+
+
+def global_mpi_size():
+    return MPI.COMM_WORLD.Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
 def mpi_world_size():
@@ -427,6 +474,10 @@ def mpi_barrier():
 
 def mpi_broadcast(obj, root=0):
     return mpi_comm().bcast(obj, root) if ENABLE_MULTI_DEVICE else obj
+
+
+def mpi_allgather(obj):
+    return mpi_comm().allgather(obj) if ENABLE_MULTI_DEVICE else obj
 
 
 def pad_vocab_size(vocab_size, tp_size):
@@ -533,6 +584,11 @@ def release_gc():
         torch.cuda.ipc_collect()
 
 
+def get_sm_version():
+    prop = torch.cuda.get_device_properties(0)
+    return prop.major * 10 + prop.minor
+
+
 class DictConversion:
 
     @classmethod
@@ -540,7 +596,7 @@ class DictConversion:
         obj = cls()
         fields = obj.__dataclass_fields__
         for key, value in config.items():
-            assert hasattr(obj, key)
+            assert hasattr(obj, key), f"cannot find {key} in {obj}"
             field_cls = fields[key].type
             if (isinstance(field_cls, type)
                     and issubclass(field_cls, DictConversion)
@@ -617,3 +673,84 @@ def nvtx_range(msg):
         yield
     finally:
         torch.cuda.nvtx.range_pop()
+
+
+def volume(d: Sequence[int]):
+    return np.prod(d)
+
+
+class TensorWrapper:
+    """
+    A wrapper wraps raw data pointer to a tensor-like object. Could be compatibale with openai triton kernel and be converted to `torch.Tensor` with zero-copy overhead.
+    """
+
+    def __init__(
+        self,
+        data_ptr: int,
+        dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
+        shape: Sequence[int],
+    ):
+        self._data_ptr = data_ptr
+        self.dtype = dtype
+        self.shape = shape
+
+    def data_ptr(self):
+        return self._data_ptr
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    @property
+    def shape(self):
+        return getattr(self, "_shape", None)
+
+    @dtype.setter
+    def dtype(self, dtype: Union[torch.dtype, str, np.dtype, trt.DataType]):
+        if isinstance(dtype, torch.dtype):
+            self._dtype = dtype
+        elif isinstance(dtype, str):
+            self._dtype = str_dtype_to_torch(dtype)
+        elif isinstance(dtype, np.dtype):
+            self._dtype = np_dtype_to_torch(dtype)
+        elif isinstance(dtype, trt.DataType):
+            self._dtype = trt_dtype_to_torch(dtype)
+        else:
+            raise TypeError(f"Unsupported dtype: {dtype}")
+
+    @shape.setter
+    def shape(self, shape: Sequence[int]):
+        self._shape = tuple(int(i) for i in shape)
+
+    def numel(self):
+        return volume(self.shape)
+
+    @property
+    def __cuda_array_interface__(self):
+        return {
+            "shape": self.shape,
+            "typestr": torch_dtype_to_np_typestr(self.dtype),
+            "data": (self.data_ptr() if self.numel() > 0 else 0, False),
+            "version": 3,
+        }
+
+    @staticmethod
+    def from_trt_desc(desc: trt.PluginTensorDesc, pointer: int):
+        return TensorWrapper(pointer, trt_dtype_to_torch(desc.type), desc.dims)
+
+
+def convert_to_torch_tensor(
+        tensor: Union[TensorWrapper, torch.Tensor]) -> torch.Tensor:
+    """
+    This function is to convert the `TensorWrapper` to torch.Tensor.
+    """
+    if isinstance(tensor, torch.Tensor):
+        return tensor
+
+    old_ptr = tensor.data_ptr()
+    new_tensor = torch.as_tensor(tensor).view(tensor.dtype)
+    new_ptr = new_tensor.data_ptr()
+    if old_ptr != new_ptr:
+        raise RuntimeError(
+            "Data pointer mismatch after converting to torch.Tensor")
+    return new_tensor

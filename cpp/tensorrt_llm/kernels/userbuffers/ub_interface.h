@@ -21,7 +21,8 @@
 
 namespace tensorrt_llm::runtime::ub
 {
-void ub_initialize(int tp);
+void ub_initialize(tensorrt_llm::runtime::WorldConfig const& world_config);
+void ub_initialize(int tp_size);
 bool ub_is_initialized();
 void* ub_allocate(int idx, size_t bytes);
 void ub_deallocate(void* addr);
@@ -43,4 +44,8 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_launcher(int const handler, size_t
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
     float* scalefactor, void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm,
     cudaStream_t stream);
+int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(int const handler, size_t const offset,
+    int const out_handler, size_t const out_offset, int const scale_handler, size_t const scale_offset,
+    size_t const elements, int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor,
+    void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream);
 } // namespace tensorrt_llm::kernels::ub

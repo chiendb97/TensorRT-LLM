@@ -27,24 +27,33 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-struct mlaMetaParams
+struct MlaMetaParams
 {
-    int32_t q_lora_rank;
-    int32_t kv_lora_rank;
-    int32_t qk_nope_head_dim;
-    int32_t qk_rope_head_dim;
-    int32_t v_head_dim;
+    int32_t q_lora_rank = 0;
+    int32_t kv_lora_rank = 0;
+    int32_t qk_nope_head_dim = 0;
+    int32_t qk_rope_head_dim = 0;
+    int32_t v_head_dim = 0;
+
+    auto data() const
+    {
+        return std::make_tuple(q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim);
+    }
 };
 
 template <typename T>
-struct mlaParams
+struct MlaParams
 {
-    T const* fused_a_input;      // [b, s, c_q + c_k + r]
-    T* attention_input_buf;      // [b, s, 3, h, d_h + r]
+    T const* fused_a_input;  // [b, s, c_q + c_k + r]
+    T* attention_input_buf;  // [b, s, 3, h, d_h + r]
     T* context_buf;
-    T const* fused_q_proj;       // [c_k + r, d]
-    T const* q_b_proj;           // [(d_h + r) * h, c_q]
-    T const* kv_b_proj;          // [h * d_h * 2, c_k]
+    T* q_buf;                // [b, h, d_h + r]
+    T const* q_b_proj;       // [(d_h + r) * h, c_q]
+    T const* kv_b_proj;      // [h * d_h * 2, c_k]
+    T const* k_b_proj_trans; // [h * c_k, d_h]
+    float const* q_b_scale;
+    float const* kv_b_scale;
+    float const* k_b_trans_scale;
     float2 const* cos_sin_cache; // [s, rope]
     int32_t batch_size;
     int32_t acc_q_len;
@@ -56,14 +65,14 @@ struct mlaParams
     int32_t max_input_seq_len;
     int* cu_q_seqlens;
     int* cu_kv_seqlens;
-    mlaMetaParams meta;
+    MlaMetaParams meta;
 };
 
 template <typename T, typename KVCacheBuffer>
-void invokeMLARopeContext(mlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
+void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 
 template <typename T, typename KVCacheBuffer>
-void invokeMLARopeGeneration(mlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
+void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

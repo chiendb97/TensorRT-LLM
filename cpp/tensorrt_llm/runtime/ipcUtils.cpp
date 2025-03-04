@@ -15,11 +15,10 @@
  */
 
 #include "tensorrt_llm/runtime/ipcUtils.h"
-
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/workspace.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <NvInferRuntimeBase.h>
 #include <cstddef>
@@ -161,14 +160,18 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
         auto const isP2pSupported = canAccessPeer(worldConfig);
 
         auto const tpSize = worldConfig.getTensorParallelism();
-        auto const bufferSize = tpSize
+        bool const forceDeterministic = common::getEnvForceDeterministicAllReduce();
+        // Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.
+        auto const bufferSize = (forceDeterministic ? 1 : tpSize)
             * std::min(
                 static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength * hiddenSize * sizeof(float),
                 utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(tpSize));
         size_t realHiddenSize = tpSize * hiddenSize;
         // PUSH_MODE need TP_SIZE times the activation tensor size
-        auto const lamportBufferSize = tpSize * tensorrt_llm::kernels::reduce_fusion::details::kLamportTokenNumThreshold
-            * realHiddenSize * sizeof(half);
+        auto const lamportBufferSize = forceDeterministic
+            ? 1 // zero size is not allowed for IpcMemory::allocateIpcMemory.
+            : (tpSize * tensorrt_llm::kernels::reduce_fusion::details::kLamportTokenNumThreshold * realHiddenSize
+                * sizeof(half));
         auto const flagsSize = IpcMemory::FLAGS_SIZE * tpSize * 2;
 
         for (auto size :

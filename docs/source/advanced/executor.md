@@ -50,9 +50,9 @@ The executor can process requests with different beam widths if the following co
 - The model was built with a `max_beam_width > 1`.
 - The executor is configured with a `maxBeamWidth > 1` (the configured `maxBeamWidth` must be less than or equal to the model's `max_beam_width`).
 - The requested beam widths are less than or equal to the configured `maxBeamWidth`.
-- For requests with two different beam widths, `x` and `y`, requests with beam width `y` are not enqueued until all responses for requests with beam width `x` have been awaited.
 
-The request queue of the executor must be empty to allow it to reconfigure itself for a new beam width. This reconfiguration will happen automatically when requests with a new beam width are enqueued. If requests with different beam widths are enqueued at the same time, the executor will encounter an error and terminate all requests prematurely.
+The executor may schedule successive requests with the same beam width at the same time. For successive requests with two different beam widths, `x` and `y`, requests with beam width `y` are not scheduled until all requests with beam width `x` have been processed.
+This allows the runtime to reconfigure itself for a new beam width when no requests are in flight. The reconfiguration happens automatically each time requests with a different beam width than currently configured are detected. Waiting for previous requests to finish and reconfiguring the runtime may cause significant overhead and reduce overall throughput.
 
 ### Controlling output with Logits Post-Processor
 
@@ -106,7 +106,7 @@ The latter three types should be used with the schema/regex/grammar provided to 
 The executor API gives the user the possibility to read the arbitrary outputs from the model. For example, it is possible to obtain hidden states or logits.
 
 #### Mark Tensors As Output
-For a tensor to be obtainable using this feature, it needs to be marked as an output in your TensorRT engine, as part of the engine building process.
+For a tensor to be obtainable using this feature, it needs to be marked as an output in the model definition (e.g. add `topk_logits.mark_output("TopKLogits")`) before building the TRT engine.
 
 #### Configure The Executor
 Assuming the TensorRT engine you are planning to use has a tensor named `TopKLogits` marked as output, you should then configure the `Executor` to read from this output tensor by passing its name to the `ExecutorConfig` configuration object:
@@ -131,6 +131,10 @@ executor.enqueueRequest(request);
 ```
 
 The output can be found at the `additionalOutputs` property of each response.
+
+#### Note on context outputs
+
+Note that context outputs require to build the engine with `--gather_context_logits`. If KV cache reuse is enabled, context outputs will not contain outputs for the part of the context that has been reused. This part of the outputs can only be obtained from the prior request with the same prefix that generated this part of the KV cache.
 
 ## C++ Executor API Example
 

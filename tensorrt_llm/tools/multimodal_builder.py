@@ -28,6 +28,8 @@ from PIL import Image
 from safetensors.torch import save_file
 from transformers import CLIPImageProcessor
 
+from ..runtime.session import Session
+
 
 def add_multimodal_arguments(parser):
 	parser.add_argument('--model_type',
@@ -51,6 +53,7 @@ def add_multimodal_arguments(parser):
 							'mllama',
 							'internvl',
 							'qwen2_vl',
+							'internlm-xcomposer2',
 						],
 						help="Model type")
 	parser.add_argument(
@@ -107,6 +110,8 @@ class VisionEngineBuilder:
 		args = self.args
 		if args.model_type == 'blip2':
 			build_blip2_engine(args)
+		elif args.model_type == 'internlm-xcomposer2':
+			build_interlm_xcomposer2_engine(args)
 		elif args.model_type == 'pix2struct':
 			build_pix2struct_engine(args)
 		elif 'llava' in args.model_type:
@@ -187,7 +192,9 @@ def build_trt_engine(model_type,
 	config_args = {
 		"precision": torch_dtype_to_str(dtype),
 		"model_type": model_type,
-		"strongly_typed": False
+		"strongly_typed": False,
+		"max_batch_size": max_batch_size,
+		"model_name": "multiModal"
 	}
 	if num_frames is not None:
 		config_args["num_frames"] = num_frames
@@ -278,6 +285,15 @@ def build_trt_engine(model_type,
 	else:
 		logger.log(trt.Logger.INFO,
 				   "Succeeded building %s in %d s" % (engine_file, t1 - t0))
+
+		logger.log(trt.Logger.INFO, 'Recording engine output shape in config')
+		engine_session = Session.from_serialized_engine(engine_string)
+		output_tensor_name = network.get_output(0).name
+		output_shape = engine_session.engine.get_tensor_shape(
+			output_tensor_name)
+		output_shape = list(output_shape)
+		config_wrapper.output_shape = output_shape
+
 		os.makedirs(engine_dir, exist_ok=True)
 		with open(engine_file, 'wb') as f:
 			f.write(engine_string)
@@ -335,6 +351,34 @@ def build_blip2_engine(args):
 		f'{args.output_dir}/onnx',
 		args.output_dir,
 		args.max_batch_size)
+
+
+def build_interlm_xcomposer2_engine(args):
+    model = AutoModel.from_pretrained(args.model_path,
+                                      trust_remote_code=True).to(torch.float16)
+    raw_image = Image.new('RGB', [10, 10])
+    image = model.vis_processor(raw_image).unsqueeze(0).to(
+        args.device, torch.float16)
+
+    class InternLMXComposer2VisionWrapper(torch.nn.Module):
+
+        def __init__(self, vision_model, vision_proj):
+            super().__init__()
+            self.vision_model = vision_model
+            self.vision_proj = vision_proj
+
+        def forward(self, image):
+            return self.vision_proj(self.vision_model(image))
+
+    wrapper = InternLMXComposer2VisionWrapper(model.vit, model.vision_proj)
+    wrapper.to(args.device)
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
+    build_trt_engine(
+        args.model_type,
+        [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        f'{args.output_dir}/onnx',
+        args.output_dir,
+        args.max_batch_size)
 
 
 def build_pix2struct_engine(args):
@@ -407,18 +451,20 @@ def build_llava_engine(args):
 
 		hf_config = AutoConfig.from_pretrained(args.model_path)
 		hf_config.vision_config._attn_implementation = "eager"
+		# Need to setup at hf_config._attn_implementation after transformers >= 4.46
+		hf_config._attn_implementation = "eager"
 		model = LlavaForConditionalGeneration.from_pretrained(
-			args.model_path, torch_dtype=torch.float16, config=hf_config)
+            args.model_path, torch_dtype=torch.float16, config=hf_config)
 		wrapper = LlavaVisionWrapper(
-			model.vision_tower.to(args.device),
-			model.multi_modal_projector.to(args.device),
-			model.config.vision_feature_layer)
+            model.vision_tower.to(args.device),
+            model.multi_modal_projector.to(args.device),
+            model.config.vision_feature_layer)
 	elif args.model_type == "llava_next":
 		from transformers import LlavaNextForConditionalGeneration
 		raw_image = Image.new('RGB', [512, 512])
 		image = processor(text="dummy", images=raw_image,
-						  return_tensors="pt")['pixel_values'].to(
-			args.device, torch.float16)[0]
+                          return_tensors="pt")['pixel_values'].to(
+                              args.device, torch.float16)[0]
 
 		class LlavaNextVisionWrapper(torch.nn.Module):
 
@@ -888,12 +934,13 @@ def build_phi_engine(args):
 	return
 
 	processor = AutoProcessor.from_pretrained(args.model_path,
-											  trust_remote_code=True)
+											  trust_remote_code=True,
+											  num_crops=16)
 	raw_image = Image.new('RGB', [10, 10])  # dummy image
 	image = processor(text="<|image_1|>\ndummy",
-					  images=raw_image,
-					  return_tensors="pt")['pixel_values'].to(
-		args.device, torch.float16)
+                      images=raw_image,
+                      return_tensors="pt")['pixel_values'].to(
+                          args.device, torch.float16)
 	image = image.flatten(0, 1)
 
 	class Phi3VisionWrapper(torch.nn.Module):
@@ -961,20 +1008,21 @@ def build_mllama_engine(args):
 	part_name = 'visual_encoder'
 	onnx_dir = f"{args.output_dir}/{part_name}/onnx"
 
+
 	# inputs["pixel_values"]: torch.Size([1, 1, 4, 3, 448, 448])
-	# inputs["aspect_ratio_ids"]: torch.Size([1, 1])
-	# inputs["aspect_ratio_mask"]: torch.Size([1, 1, 4])
+    # inputs["aspect_ratio_ids"]: torch.Size([1, 1])
+    # inputs["aspect_ratio_mask"]: torch.Size([1, 1, 4])
 	export_onnx(
 		wrapper,
-		input=tuple([value for key, value in inputs.items()]),
-		onnx_dir=onnx_dir,
-		input_names=[key for key in inputs],
-		output_names=['output'],
-		dynamic_axes={key: {
-			0: "batch"
-		}
-			for key in inputs},
-	)
+        input=tuple([value for key, value in inputs.items()]),
+        onnx_dir=onnx_dir,
+        input_names=[key for key in inputs],
+        output_names=['encoder_output'],
+        dynamic_axes={key: {
+            0: "batch"
+        }
+                      for key in inputs},
+    )
 
 	build_trt_engine(
 		args.model_type,
@@ -1244,7 +1292,7 @@ def build_qwen2_vl_engine(args):
 	export_onnx(wrapper, (image, rotary_pos_emb, attention_mask),
 				f'{args.output_dir}/onnx',
 				input_names=['input', 'rotary_pos_emb', 'attention_mask'],
-				output_names=['output'],
+				output_names=['encoder_output'],
 				dynamic_axes=dynamic_axes)
 	rotary_pos_emb_dim = hf_config.vision_config.embed_dim // hf_config.vision_config.num_heads // 2
 	build_trt_engine(args.model_type, [rotary_pos_emb_dim],

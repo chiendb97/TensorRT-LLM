@@ -9,13 +9,13 @@ from ..layers import (MLP, Attention, ColumnLinear, Embedding, GatedMLP,
 from ..layers.moe import MixtureOfExperts
 from ..models.modeling_utils import LayerQuantConfig, QuantConfig
 from ..parameter import Parameter
-from .layers import (FP8Linear, FP8RowLinear, Fp8RowwiseAttention,
-                     Fp8RowwiseGatedMLP, Fp8RowwiseMLP, Fp8RowwiseRmsNorm,
-                     Int8SmoothQuantLinear, Int8SmoothQuantRowLinear,
-                     QServeAttention, QServeGatedMLP, QServeMLP, QServeRmsNorm,
-                     SmoothQuantAttention, SmoothQuantGatedMLP,
-                     SmoothQuantLayerNorm, SmoothQuantMLP, SmoothQuantRmsNorm,
-                     WeightOnlyGroupwiseQuantColumnLinear,
+from .layers import (FP4Linear, FP4RowLinear, FP8Linear, FP8RowLinear,
+                     Fp8RowwiseAttention, Fp8RowwiseGatedMLP, Fp8RowwiseMLP,
+                     Fp8RowwiseRmsNorm, Int8SmoothQuantLinear,
+                     Int8SmoothQuantRowLinear, QServeAttention, QServeGatedMLP,
+                     QServeMLP, QServeRmsNorm, SmoothQuantAttention,
+                     SmoothQuantGatedMLP, SmoothQuantLayerNorm, SmoothQuantMLP,
+                     SmoothQuantRmsNorm, WeightOnlyGroupwiseQuantColumnLinear,
                      WeightOnlyGroupwiseQuantRowLinear,
                      WeightOnlyQuantColumnLinear, WeightOnlyQuantEmbedding,
                      WeightOnlyQuantRowLinear)
@@ -28,44 +28,45 @@ def quantize_layers(
         quant_map,
         preprocess_init_params=None,
 ):
-    import os
-    enable_quantize_lm_head = os.getenv("ENABLE_QUANTIZE_LM_HEAD", 'False').lower() in ('true', '1', 't')
-    if enable_quantize_lm_head:
-        exclude_modules = quant_config.exclude_modules or [
-            '*router',
-            '*vocab_embedding',
-            '*position_embedding',
-            '*block_embedding',
-            '*shared_expert_gate',
-        ]
-    else:
-        exclude_modules = quant_config.exclude_modules or [
-            '*lm_head',
-            '*router',
-            '*vocab_embedding',
-            '*position_embedding',
-            '*block_embedding',
-            '*shared_expert_gate',
-        ]
+    exclude_modules = quant_config.exclude_modules or [
+        '*lm_head',
+        '*router',
+        '*vocab_embedding',
+        '*position_embedding',
+        '*block_embedding',
+        '*shared_expert_gate',
+    ]
 
     for name, module, parent in model.named_modules_with_parent():
         module_name = name.rsplit('.', 1)[-1]
         is_excluded = False
+
+        # handle exclusion
         for exclude_module in exclude_modules:
             if fnmatch.fnmatchcase(name, exclude_module):
                 is_excluded = True
-                # MOE module will be quantize when initialization.
-                # We need to re-initialize a FP version of MOE module.
-                if isinstance(module, MixtureOfExperts):
-                    init_params = get_init_params(module, MixtureOfExperts)
-                    init_params["quant_mode"] = QuantMode(0)
-                    original_layer = MixtureOfExperts(**init_params)
-                    if parent is not None:
-                        setattr(parent, module_name, original_layer)
-                    else:
-                        model = original_layer
                 break
-        if not is_excluded:
+
+        # MOE module will be quantize when initialization.
+        # We need to handle it specially, we may want to redesign MoE implementation
+        if isinstance(module, MixtureOfExperts):
+            # We need to re-initialize a correct version of MOE module.
+            if is_excluded:
+                quant_mode = QuantMode(0)
+            else:
+                quant_mode = quant_config.quant_mode
+
+            init_params = get_init_params(module, MixtureOfExperts)
+            init_params["quant_mode"] = quant_mode
+            if preprocess_init_params is not None:
+                preprocess_init_params(init_params, name, module)
+
+            original_layer = MixtureOfExperts(**init_params)
+            if parent is not None:
+                setattr(parent, module_name, original_layer)
+            else:
+                model = original_layer
+        elif not is_excluded:
             quant_cls = None
             for cls in quant_map:
                 if isinstance(module, cls):
@@ -76,7 +77,8 @@ def quantize_layers(
                 continue
 
             init_params = get_init_params(module, quant_cls)
-            if "bias" in init_params:
+            if "bias" in init_params and not isinstance(module,
+                                                        MixtureOfExperts):
                 init_params["bias"] = init_params["bias"] is not None
             if isinstance(module, ColumnLinear):
                 init_params[
@@ -114,7 +116,8 @@ def weight_only_quantize(model, quant_config: QuantConfig, model_config=None):
         if isinstance(module, ColumnLinear):
             module_name = name.rsplit('.', 1)[-1]
             init_params["transb"] = module_name == "lm_head"
-        init_params["tp_rank"] = model_cfg.mapping.tp_rank
+        if "tp_rank" in init_params:
+            init_params["tp_rank"] = model_cfg.mapping.tp_rank
 
     model = quantize_layers(
         model,
@@ -138,6 +141,7 @@ def weight_only_groupwise_quantize(model,
     quant_map = {
         ColumnLinear: WeightOnlyGroupwiseQuantColumnLinear,
         RowLinear: WeightOnlyGroupwiseQuantRowLinear,
+        MixtureOfExperts: MixtureOfExperts,
     }
 
     def preprocess_init_params(init_params, name, module):
@@ -148,7 +152,8 @@ def weight_only_groupwise_quantize(model,
             "use_w4a8_awq"] = quant_config.quant_algo == QuantAlgo.W4A8_AWQ
         init_params[
             "use_int8_weight"] = quant_config.quant_algo == QuantAlgo.W8A16_GPTQ
-        init_params["tp_rank"] = model_cfg.mapping.tp_rank
+        if "tp_rank" in init_params:
+            init_params["tp_rank"] = model_cfg.mapping.tp_rank
 
     model = quantize_layers(
         model,
@@ -227,6 +232,7 @@ def fp8_quantize(model, quant_config: QuantConfig):
     quant_map = {
         ColumnLinear: FP8Linear,
         RowLinear: FP8RowLinear,
+        MixtureOfExperts: MixtureOfExperts,
     }
 
     model = quantize_layers(
@@ -524,38 +530,57 @@ def qserve_quantize(model, quant_config: QuantConfig):
     return model
 
 
+def fp4_quantize(model, quant_config: QuantConfig):
+    assert quant_config.quant_mode.has_nvfp4()
+    quant_map = {
+        ColumnLinear: FP4Linear,
+        RowLinear: FP4RowLinear,
+        MixtureOfExperts: MixtureOfExperts,
+    }
+
+    model = quantize_layers(
+        model,
+        quant_config,
+        quant_map,
+    )
+    return model
+
+
 # Now consider the kv cache is enabled for all layers
 def kv_cache_quantize(model):
     for name, module in model.named_modules():
         if isinstance(module,
                       (Attention, SmoothQuantAttention, Fp8RowwiseAttention)):
+            # for dequant
             module.kv_cache_scaling_factor = Parameter(shape=(1, ),
                                                        dtype='float32')
+            # for quant
+            module.kv_cache_rcp_scaling_factor = Parameter(shape=(1, ),
+                                                           dtype='float32')
     return model
 
 
 def quantize(model, quant_config: Union[QuantConfig, LayerQuantConfig]):
-    quant_mode = quant_config.layer_quant_mode
 
     for name, module, parent in model.named_modules_with_parent():
+
         if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
-            if name in quant_mode.keys():
-                layer_quant_mode = quant_mode[name]
-            else:
-                continue
+            layer_quant_mode = quant_config.layer_quant_mode(name)
         else:
-            layer_quant_mode = quant_mode
+            layer_quant_mode = quant_config.layer_quant_mode
         if layer_quant_mode == QuantMode(0):
             continue
 
-        layer_quant_cfg = quant_config.get_quant_cfg(name)
+        layer_quant_cfg = quant_config._get_quant_cfg(name)
 
         if layer_quant_mode.has_fp8_qdq():
             module = fp8_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.has_fp8_rowwise():
             module = fp8_rowwise_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.is_qserve_w4a8():
-            model = qserve_quantize(model, quant_config)
+            module = qserve_quantize(module, quant_config)
+        elif layer_quant_mode.has_nvfp4():
+            module = fp4_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.has_act_and_weight_quant():
             module = smooth_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.is_weight_only():

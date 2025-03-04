@@ -41,9 +41,8 @@ from tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager import \
     PoolsKVCacheManager
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (getSMVersion, skip_bf16_fp32_accum,
-                        skip_bf16_pre_ampere, skip_fp8_pre_ada,
-                        skip_fp32_accum_pre_ampere, unittest_name_func)
+from utils.util import (getSMVersion, skip_bf16_fp32_accum, skip_fp8_pre_ada,
+                        unittest_name_func)
 
 from tensorrt_llm.runtime.memory_pools.memory_pools_allocator import \
     MemoryPoolsAllocator
@@ -888,15 +887,13 @@ class TestFunctional(unittest.TestCase):
             kv_cache_dtype = dtype
         # skip tests based on the gpu_arch_lists
         if gpu_arch != 'all':
-            assert gpu_arch in [70, 80, 86, 89, 90]
+            assert gpu_arch in [80, 86, 89, 90]
             if getSMVersion() != gpu_arch:
                 pytest.skip(
                     "Skip the test as the target gpu arch doesn't match this gpu arch."
                 )
 
         # Skip tests that are not supported or duplicate
-        skip_bf16_pre_ampere(dtype)
-        skip_fp32_accum_pre_ampere(context_fmha_type)
         skip_bf16_fp32_accum(dtype, context_fmha_type)
         skip_fp8_pre_ada(use_fp8_kv_cache)
 
@@ -1039,7 +1036,7 @@ class TestFunctional(unittest.TestCase):
                         dtype=tensorrt_llm.str_dtype_to_trt('int64'))
                     host_kv_cache_pool_mapping_tensor = Tensor(
                         name='host_kv_cache_pool_mapping',
-                        shape=(1, ),
+                        shape=(1, 1),
                         dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 else:
                     past_key_value_tensor = Tensor(
@@ -1138,7 +1135,7 @@ class TestFunctional(unittest.TestCase):
                     # position_ids=position_ids_tensor,
                     # q_a_proj=q_a_proj_tensor,
                     # q_a_layernorm=q_a_layernorm_tensor,
-                    fused_q_proj=kv_a_proj_with_mqa_tensor,
+                    k_b_proj_trans=kv_a_proj_with_mqa_tensor,
                     q_b_proj=q_b_proj_tensor,
                     # kv_a_proj_with_mqa=kv_a_proj_with_mqa_tensor,
                     # kv_a_layernorm=kv_a_layernorm_tensor,
@@ -1589,9 +1586,6 @@ class TestFunctional(unittest.TestCase):
                     configuration, context_host_runtime_perf_knobs)
                 del session
                 session = None
-                # Note: Volta has larger errors.
-                # We speculate it’s because Volta’s TC is smaller and more calculations are required,
-                # which may lead to more error accumulation.
                 print("===================context===========================")
                 if enable_remove_input_padding:
                     torch_output = remove_input_padding(torch_output)
@@ -1601,35 +1595,35 @@ class TestFunctional(unittest.TestCase):
                     # np.testing.assert_allclose(
                     #     output.to(torch.float32).cpu().numpy(),
                     #     torch_output.to(torch.float32).cpu().numpy(),
-                    #     atol=5e-3 if getSMVersion() > 70 else 5e-2)
+                    #     atol=5e-3)
 
                     # np.testing.assert_allclose(
                     #     base_tensor[:, :, 0, :, :].to(torch.float32).cpu().numpy(),
                     #     new_tensor[:, :, 0, :, :].to(torch.float32).cpu().numpy(),
-                    #     atol=5e-3 if getSMVersion() > 70 else 5e-2)
+                    #     atol=5e-3)
                     # np.testing.assert_allclose(
                     #     base_tensor[:, :, 1, :, :].to(torch.float32).cpu().numpy(),
                     #     new_tensor[:, :, 1, :, :].to(torch.float32).cpu().numpy(),
-                    #     atol=5e-3 if getSMVersion() > 70 else 5e-2)
+                    #     atol=5e-3)
                     # np.testing.assert_allclose(
                     #     base_tensor[:, :, 2, :, :128].to(torch.float32).cpu().numpy(),
                     #     new_tensor[:, :, 2, :, :128].to(torch.float32).cpu().numpy(),
-                    #     atol=5e-3 if getSMVersion() > 70 else 5e-2)
+                    #     atol=5e-3)
                     # np.testing.assert_allclose(
                     #     base_tensor[:, :, 1, :, 128:].to(torch.float32).cpu().numpy(),
                     #     new_tensor[:, :, 1, :, 128:].to(torch.float32).cpu().numpy(),
-                    #     atol=5e-3 if getSMVersion() > 70 else 5e-2)
+                    #     atol=5e-3)
                     # np.testing.assert_allclose(
                     #     base_tensor[:, :, 1, :, :128].to(torch.float32).cpu().numpy(),
                     #     new_tensor[:, :, 1, :, :128].to(torch.float32).cpu().numpy(),
-                    #     atol=5e-3 if getSMVersion() > 70 else 5e-2)
+                    #     atol=5e-3)
                 else:
                     np.testing.assert_allclose(
                         output[:, :in_len // 2, :].to(
                             torch.float32).cpu().numpy(),
                         torch_output[:, :in_len // 2, :].to(
                             torch.float32).cpu().numpy(),
-                        atol=5e-3 if getSMVersion() > 70 else 5e-2)
+                        atol=5e-3)
 
                 verify_kv_cache(torch_present[0])
 

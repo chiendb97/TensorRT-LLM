@@ -15,19 +15,18 @@
  */
 
 #pragma once
-#include "tensorrt_llm/runtime/iBuffer.h"
+
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "torch/csrc/cuda/Stream.h"
-#include "torch/extension.h"
+
 #include <ATen/cuda/CUDAContext.h>
-#include <cstdio>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <iostream>
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #include <torch/custom_class.h>
+#include <torch/extension.h>
 #include <torch/script.h>
-#include <vector>
+
+#include <cstdio>
 
 #define CHECK_TYPE(x, st) TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type: " #x)
 #define CHECK_TH_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
@@ -56,6 +55,12 @@
 
 namespace torch_ext
 {
+
+// TODO: switch to use torch native fp4 dtype when ready
+constexpr auto FLOAT4_E2M1X2 = torch::ScalarType::Byte; // uint8_t
+constexpr auto SF_DTYPE = torch::ScalarType::Byte;      // uint8_t
+
+constexpr auto FP8_BLOCK_SCALING_SF_DTYPE = torch::ScalarType::Float;
 
 template <typename T>
 inline T* get_ptr(torch::Tensor& t)

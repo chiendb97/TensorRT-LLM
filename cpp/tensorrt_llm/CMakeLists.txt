@@ -30,7 +30,8 @@ if(ENABLE_MULTI_DEVICE)
 endif()
 
 if(NOT WIN32)
-  set(DECODER_SHARED_TARGET decoder_attention)
+  set(DECODER_SHARED_TARGET_0 decoder_attention_0)
+  set(DECODER_SHARED_TARGET_1 decoder_attention_1)
 endif()
 
 add_subdirectory(common)
@@ -85,8 +86,6 @@ endif()
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
 set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
 
-set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
-
 if(BUILD_BATCH_MANAGER)
   add_subdirectory(batch_manager)
 else()
@@ -115,57 +114,11 @@ else()
         "The batch manager library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
     )
   endif()
-
-  add_library(${UCX_WRAPPER_TARGET} SHARED IMPORTED)
-  if(NOT WIN32) # Linux
-    set(UCX_WRAPPER_LIB_SOURCE_REL_LOC
-        "batch_manager/${BATCH_MANAGER_TARGET_ARCH}/libtensorrt_llm_ucx_wrapper.so"
-    )
-    set(UCX_WRAPPER_LIB_BINARY_REL_LOC
-        "batch_manager/libtensorrt_llm_ucx_wrapper.so")
-  else()
-    set(UCX_WRAPPER_LIB_BINARY_REL_DIR "batch_manager/")
-    set(UCX_WRAPPER_DLL_NAME "tensorrt_llm_ucx_wrapper.dll")
-    set(UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper.lib")
-
-    set(UCX_WRAPPER_LIB_SOURCE_REL_LOC
-        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${BATCH_MANAGER_TARGET_ARCH}/${UCX_WRAPPER_DLL_NAME}"
-    )
-    set(UCX_WRAPPER_LIB_BINARY_REL_LOC
-        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${UCX_WRAPPER_DLL_NAME}")
-    set(UCX_WRAPPER_IMPLIB_SOURCE_REL_LOC
-        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${BATCH_MANAGER_TARGET_ARCH}/${UCX_WRAPPER_LIB_NAME}"
-    )
-    set(UCX_WRAPPER_IMPLIB_BINARY_REL_LOC
-        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${UCX_WRAPPER_LIB_NAME}")
-  endif()
-  set(UCX_WRAPPER_LIB_LOC
-      "${CMAKE_CURRENT_SOURCE_DIR}/${UCX_WRAPPER_LIB_SOURCE_REL_LOC}")
-  # Copy the .so to build directory, which is needed in build_wheel.py.
-  configure_file(${UCX_WRAPPER_LIB_SOURCE_REL_LOC}
-                 ${UCX_WRAPPER_LIB_BINARY_REL_LOC} COPYONLY)
-  set_property(TARGET ${UCX_WRAPPER_TARGET} PROPERTY IMPORTED_LOCATION
-                                                     ${UCX_WRAPPER_LIB_LOC})
-  if(WIN32)
-    set(UCX_WRAPPER_IMPLIB_LOC
-        "${CMAKE_CURRENT_SOURCE_DIR}/${UCX_WRAPPER_IMPLIB_SOURCE_REL_LOC}")
-    configure_file(${UCX_WRAPPER_IMPLIB_SOURCE_REL_LOC}
-                   ${UCX_WRAPPER_IMPLIB_BINARY_REL_LOC} COPYONLY)
-    set_property(TARGET ${UCX_WRAPPER_TARGET}
-                 PROPERTY IMPORTED_IMPLIB ${UCX_WRAPPER_IMPLIB_LOC})
-  endif()
-
-  file(SIZE ${UCX_WRAPPER_LIB_LOC} UCX_WRAPPER_LIB_SIZE)
-  if(UCX_WRAPPER_LIB_SIZE LESS 1024)
-    message(
-      FATAL_ERROR
-        "The ucx wrapper library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
-    )
-  endif()
 endif()
 
 set(EXECUTOR_TARGET tensorrt_llm_executor_static)
 set(EXECUTOR_TARGET_ARCH ${TARGET_ARCH})
+set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
 
 if(BUILD_EXECUTOR)
   add_subdirectory(executor)
@@ -193,6 +146,53 @@ else()
     message(
       FATAL_ERROR
         "The executor library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
+    )
+  endif()
+
+  add_library(${UCX_WRAPPER_TARGET} SHARED IMPORTED)
+  if(NOT WIN32) # Linux
+    set(UCX_WRAPPER_LIB_SOURCE_REL_LOC
+        "executor/cache_transmission/ucx_utils/${EXECUTOR_TARGET_ARCH}/libtensorrt_llm_ucx_wrapper.so"
+    )
+    set(UCX_WRAPPER_LIB_BINARY_REL_LOC
+        "executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so")
+  else()
+    set(UCX_WRAPPER_LIB_BINARY_REL_DIR "executor/cache_transmission/ucx_utils/")
+    set(UCX_WRAPPER_DLL_NAME "tensorrt_llm_ucx_wrapper.dll")
+    set(UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper.lib")
+
+    set(UCX_WRAPPER_LIB_SOURCE_REL_LOC
+        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${EXECUTOR_TARGET_ARCH}/${UCX_WRAPPER_DLL_NAME}"
+    )
+    set(UCX_WRAPPER_LIB_BINARY_REL_LOC
+        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${UCX_WRAPPER_DLL_NAME}")
+    set(UCX_WRAPPER_IMPLIB_SOURCE_REL_LOC
+        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${EXECUTOR_TARGET_ARCH}/${UCX_WRAPPER_LIB_NAME}"
+    )
+    set(UCX_WRAPPER_IMPLIB_BINARY_REL_LOC
+        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${UCX_WRAPPER_LIB_NAME}")
+  endif()
+  set(UCX_WRAPPER_LIB_LOC
+      "${CMAKE_CURRENT_SOURCE_DIR}/${UCX_WRAPPER_LIB_SOURCE_REL_LOC}")
+  # Copy the .so to build directory, which is needed in build_wheel.py.
+  configure_file(${UCX_WRAPPER_LIB_SOURCE_REL_LOC}
+                 ${UCX_WRAPPER_LIB_BINARY_REL_LOC} COPYONLY)
+  set_property(TARGET ${UCX_WRAPPER_TARGET} PROPERTY IMPORTED_LOCATION
+                                                     ${UCX_WRAPPER_LIB_LOC})
+  if(WIN32)
+    set(UCX_WRAPPER_IMPLIB_LOC
+        "${CMAKE_CURRENT_SOURCE_DIR}/${UCX_WRAPPER_IMPLIB_SOURCE_REL_LOC}")
+    configure_file(${UCX_WRAPPER_IMPLIB_SOURCE_REL_LOC}
+                   ${UCX_WRAPPER_IMPLIB_BINARY_REL_LOC} COPYONLY)
+    set_property(TARGET ${UCX_WRAPPER_TARGET}
+                 PROPERTY IMPORTED_IMPLIB ${UCX_WRAPPER_IMPLIB_LOC})
+  endif()
+
+  file(SIZE ${UCX_WRAPPER_LIB_LOC} UCX_WRAPPER_LIB_SIZE)
+  if(UCX_WRAPPER_LIB_SIZE LESS 1024)
+    message(
+      FATAL_ERROR
+        "The ucx wrapper library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
     )
   endif()
 endif()
@@ -358,6 +358,7 @@ else()
 endif()
 
 set(TRTLLM_LINK_LIBS
+    ${CUDA_DRV_LIB}
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
     ${CMAKE_DL_LIBS}
@@ -366,16 +367,21 @@ set(TRTLLM_LINK_LIBS
     kernels_src
     context_attention_src
     decoder_attention_src
+    trtllm_gen_fmha
+    trtllm_gen_blockscale_gemm
     selective_scan_src
+    ws_layernorm_src
     fpA_intB_gemm_src
-    moe_gemm_src
+    # moe_gemm_src
     fb_gemm_src
+    ar_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src
     layers_src
     runtime_src
     userbuffers_src
-    ${DECODER_SHARED_TARGET})
+    ${DECODER_SHARED_TARGET_0}
+    ${DECODER_SHARED_TARGET_1})
 
 if(ENABLE_MULTI_DEVICE)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})
@@ -419,6 +425,9 @@ link_whole_archive(${SHARED_TARGET} ${BATCH_MANAGER_TARGET})
 link_whole_archive(${SHARED_TARGET} ${EXECUTOR_TARGET})
 link_whole_archive(${SHARED_TARGET} ${INTERNAL_CUTLASS_KERNELS_TARGET})
 
+# Link kernel_src and cutlass_src. static internal cutlass lib overridden.
+target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
+
 # Cyclic dependency of batch manager on TRT-LLM
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
 # Cyclic dependency of executor on TRT-LLM
@@ -426,9 +435,12 @@ target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
 # Cyclic dependency of internal_cutlass_kernels on TRT-LLM
 target_link_libraries(${INTERNAL_CUTLASS_KERNELS_TARGET}
                       INTERFACE ${SHARED_TARGET})
+
 # Cyclic dependency of UCX data transceiver on TRT-LLM
-target_link_libraries(${UCX_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
-add_dependencies(${SHARED_TARGET} ${UCX_WRAPPER_TARGET})
+if(TARGET ${UCX_WRAPPER_TARGET})
+  target_link_libraries(${UCX_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
+  add_dependencies(${SHARED_TARGET} ${UCX_WRAPPER_TARGET})
+endif()
 
 if(NOT WIN32)
   set_target_properties(${SHARED_TARGET} PROPERTIES LINK_FLAGS

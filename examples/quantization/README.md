@@ -58,6 +58,7 @@ Checkpoint saved in `output_dir` can be directly passed to `trtllm-build`.
 
 - model_dir: Hugging Face model path.
 - qformat: Specify the quantization algorithm applied to the checkpoint.
+    - nvfp4: Weights are quantized to NVFP4 block-wise with size 16. Actiavation global scale are calibrated.
     - fp8: Weights are quantized to FP8 tensor wise. Activation ranges are calibrated tensor wise.
     - int8_sq: Weights are smoothed and quantized to INT8 channel wise. Activation ranges are calibrated tensor wise.
     - int4_awq: Weights are re-scaled and block-wise quantized to INT4. Block size is specified by `awq_block_size`.
@@ -79,6 +80,7 @@ Checkpoint saved in `output_dir` can be directly passed to `trtllm-build`.
 - tp_size: Checkpoint is tensor paralleled by tp_size. Default is 1.
 - pp_size: Checkpoint is pipeline paralleled by pp_size. Default is 1.
 - awq_block_size: AWQ algorithm specific parameter. Indicate the block size when quantizing weights. 64 and 128 are supported by TRTLLM.
+- quantize_lm_head: Enable quantization of lm_head layer. This is only supported for FP8 quantization. Default is false.
 
 #### NeMo model specific arguments:
 

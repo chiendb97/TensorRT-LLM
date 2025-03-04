@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -669,6 +669,7 @@ class PositionEmbeddingType(IntEnum):
     chatglm = 7
     yarn = 8
     mrope = 9
+    deferred = 10  # Apply customized positional embedding by using an external embedder. K will be cached before embedding.
 
     def is_rope(self) -> bool:
         return self in [
@@ -680,6 +681,9 @@ class PositionEmbeddingType(IntEnum):
 
     def is_alibi(self) -> bool:
         return self in [self.alibi, self.alibi_with_scale]
+
+    def is_deferred(self) -> bool:
+        return self in [self.deferred]
 
     @staticmethod
     def choices() -> List[str]:
@@ -1140,7 +1144,9 @@ def gemm_swiglu(input: Tensor,
     return _create_tensor(layer.get_output(0), layer)
 
 
-def constant(ndarray: np.ndarray) -> Tensor:
+def constant(ndarray: np.ndarray,
+             as_dtype: trt.DataType | None = None,
+             as_shape=None) -> Tensor:
     '''
     Add a constant layer.
 
@@ -1156,13 +1162,18 @@ def constant(ndarray: np.ndarray) -> Tensor:
     Returns:
         The tensor produced by the inserted layer.
     '''
-    weights = trt.Weights(np_dtype_to_trt(ndarray.dtype), ndarray.ctypes.data,
-                          ndarray.size)
+    trt_dtype = np_dtype_to_trt(ndarray.dtype) if as_dtype is None else as_dtype
+    trt_shape = trt.Dims(
+        ndarray.shape) if as_shape is None else trt.Dims(as_shape)
+    trt_count = 1
+    for i in range(len(trt_shape)):
+        trt_count *= trt_shape[i]
+    weights = trt.Weights(trt_dtype, ndarray.ctypes.data, trt_count)
     # Prevent underlying numpy array from going out of scope
     default_net().register_ndarray(ndarray)
-    layer = default_trtnet().add_constant(trt.Dims(ndarray.shape), weights)
+    layer = default_trtnet().add_constant(trt_shape, weights)
     if not default_net().strongly_typed:
-        layer.set_output_type(0, np_dtype_to_trt(ndarray.dtype))
+        layer.set_output_type(0, trt_dtype)
     tensor = _create_tensor(layer.get_output(0), layer)
     # TODO: remove this WAR after https://nvbugs/4359151 fixed.
     set_np_weight(default_trtnet(), layer.name, ndarray)
@@ -2418,7 +2429,7 @@ def masked_scatter(input: Tensor, mask: Tensor, source: Tensor) -> Tensor:
     '''
     Add the masked_scatter base on PyTorch definition.
 
-    See https://pytorch.org/docs/stable/generated/torch.Tensor.masked_scatter_.html#torch.Tensor.masked_scatter_ for a
+    See https://pytorch.org/docs/stable/generated/torch.Tensor.masked_scatter_.html#torch-tensor-masked-scatter for a
     description of that function.
 
     Parameters:
@@ -3343,7 +3354,7 @@ def softplus(input: Tensor, beta: float, threshold: float) -> Tensor:
     '''
     Add the softplus activation base on PyTorch definition.
 
-    See https://pytorch.org/docs/stable/generated/torch.nn.functional.softplus.html for a
+    See https://pytorch.org/docs/stable/generated/torch.nn.functional.softplus.html#torch-nn-functional-softplus for a
     description of that function.
 
     Parameters:
@@ -3727,6 +3738,8 @@ class AllReduceFusionOp(IntFlag):
     RESIDUAL_RMS_NORM = 1
     LAST_PROCESS_FOR_UB = 2
     RESIDUAL_RMS_PREPOST_NORM = 3
+    RESIDUAL_RMS_NORM_QUANT_FP8 = 4
+    RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
 
 
 class AllReduceParams():
@@ -3908,8 +3921,9 @@ def allreduce(
                                       layer).cast(tensor.dtype)
         if all_reduce_params.strategy == AllReduceStrategy.UB and all_reduce_params.has_scale(
         ) == 1:
-            # data type: trt.DataType.FP8
             final_output = _create_tensor(layer.get_output(0), layer)
+            if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+                scale_factor = _create_tensor(layer.get_output(2), layer)
         else:
             final_output = _create_tensor(layer.get_output(0),
                                           layer).cast(tensor.dtype)
@@ -3917,6 +3931,10 @@ def allreduce(
             if all_reduce_params.has_scale() == 1:
                 final_output.mark_output("allreduce_ub_1_" +
                                          str(allreduce_ub_counter))
+                if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+                    scale_factor.mark_output("allreduce_ub_2_" +
+                                             str(allreduce_ub_counter))
+                    return (final_output, scale_factor), inter_output
             else:
                 assert all_reduce_params.fusion_op == AllReduceFusionOp.LAST_PROCESS_FOR_UB
                 inter_output.mark_output("allreduce_ub_1_" +
@@ -4125,6 +4143,152 @@ def recv(tensor: Tensor, src: int) -> Tensor:
     return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
 
 
+def gemm_allreduce(a: Tensor,
+                   b: Tensor,
+                   group: List[int],
+                   transa: bool = False,
+                   transb: bool = False,
+                   alpha: Optional[Union[np.ndarray, Tensor]] = None,
+                   output_dtype: Optional[trt.DataType] = None,
+                   fp8_inputs_override: bool = False,
+                   a_sf: Optional[Tensor] = None,
+                   b_sf: Optional[Tensor] = None):
+    '''
+    Add an operation that performs fused GEMM+AllReduce.
+
+    Parameters:
+        a: Tensor
+            Input tensor A
+        b: Tensor
+            Input tensor B
+        a_sf: Optional[Tensor]
+            Input tensor for scaling input A
+        b_sf: Optional[Tensor]
+            Input tensor for scaling input B
+        group: List[int]
+            Ranks participating in collective
+        transa: bool
+            Whether or not input tensor A is transposed
+        transb: bool
+            Whether or not input tensor B is transposed
+        alpha: float
+            Alpha for GEMM -> beta * C + (alpha * acc)
+        output_dtype: trt.DataType
+            Output type for plugin. If it is None, we
+            will use type set in plugin_config.
+        fp8_inputs_override: bool
+            TRT graph does not detect FP8 inputs correctly. This
+            flag is used to override the derived input tensor
+            types so that our plugin knows to issue FP8 MMAs.
+
+    Returns:
+        Returns GEMM output tensor which has been reduced across ranks.
+    '''
+
+    # Output tensor needs to be bound to externally managed
+    # memory so keep track of layer index so we can assign
+    # output tensor unique label.
+    if not hasattr(gemm_allreduce, 'layer_idx'):
+        gemm_allreduce.layer_idx = 0
+
+    # Check inputs
+    assert isinstance(a.dtype, trt.DataType)
+    assert isinstance(b.dtype, trt.DataType)
+
+    if fp8_inputs_override:
+        assert (
+            isinstance(alpha, np.ndarray) and alpha.dtype == np.float32
+            and alpha.size == 1
+        ), "`alpha` must be passed as a float32 ndarray if `fp8_inputs_override` is enabled for gemm_allreduce_plugin"
+        assert a.dtype == trt.fp8
+        assert b.dtype == trt.fp8
+
+    if output_dtype == None:
+        output_dtype = str_dtype_to_trt(
+            default_net().plugin_config.gemm_allreduce_plugin)
+    assert output_dtype in [trt.float16, trt.bfloat16]
+
+    alpha_is_tensor = isinstance(alpha, Tensor)
+    if alpha is None or alpha_is_tensor:
+        alpha_value = np.array(1.0, dtype=np.float32)
+    else:
+        alpha_value = alpha
+
+    plugin_creator = trt.get_plugin_registry().get_plugin_creator(
+        'GemmAllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plugin_creator is not None
+
+    trt_type_a = trt.fp8 if fp8_inputs_override else a.dtype
+    trt_type_b = trt.fp8 if fp8_inputs_override else b.dtype
+
+    # create plugin fields
+    field_list = []
+    field_list.append(
+        trt.PluginField('type_a', np.array([int(trt_type_a)], np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('type_b', np.array([int(trt_type_b)], np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('type_d', np.array([int(output_dtype)], np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('transa', np.array(transa, dtype=np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('transb', np.array(transb, dtype=np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('group', np.array(group, dtype=np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('has_sfa', np.array([int(a_sf is not None)], np.int8),
+                        trt.PluginFieldType.INT8))
+    field_list.append(
+        trt.PluginField('has_sfb', np.array([int(b_sf is not None)], np.int8),
+                        trt.PluginFieldType.INT8))
+    field_list.append(
+        trt.PluginField('alpha_is_ptr', np.array([int(alpha_is_tensor)],
+                                                 np.int8),
+                        trt.PluginFieldType.INT8))
+    field_list.append(
+        trt.PluginField('alpha', alpha_value.flatten(),
+                        trt.PluginFieldType.FLOAT32))
+
+    # create plugin
+    fields = trt.PluginFieldCollection(field_list)
+    plugin = plugin_creator.create_plugin("gemm_allreduce", fields)
+    # define symbolic input tensors.
+    # note this does NOT allocate memory.
+    inputs = [a.trt_tensor, b.trt_tensor]
+    if a_sf is not None:
+        inputs += [a_sf.trt_tensor]
+    if b_sf is not None:
+        inputs += [b_sf.trt_tensor]
+    if alpha_is_tensor:
+        inputs += [alpha.trt_tensor]
+
+    layer = default_trtnet().add_plugin_v2(inputs, plugin)
+    _add_plugin_info(layer, plugin_creator, "gemm_allreduce", fields)
+    # define symbolic output tensors
+    # both output tensors point to same physical memory but
+    # one has unicast address and other has multicast address
+    uc_output = _create_tensor(layer.get_output(0), layer)
+    mc_output = _create_tensor(layer.get_output(1), layer)
+    ipc_output = _create_tensor(layer.get_output(2), layer)
+    assert uc_output is not None
+    assert mc_output is not None
+    assert ipc_output is not None
+    # mark outputs so that we can bind our own allocated memory in runtime
+    # (see generation.py)
+    uc_output.mark_output(f'gemm_allreduce_uc_out_{gemm_allreduce.layer_idx}')
+    mc_output.mark_output(f'gemm_allreduce_mc_out_{gemm_allreduce.layer_idx}')
+    ipc_output.mark_output(f'gemm_allreduce_ipc_out_{gemm_allreduce.layer_idx}')
+    gemm_allreduce.layer_idx += 1
+
+    return uc_output
+
+
 def bert_attention(tensor: Tensor,
                    input_lengths: Tensor,
                    num_heads: int,
@@ -4133,7 +4297,11 @@ def bert_attention(tensor: Tensor,
                    relative_attention: bool = False,
                    relative_attention_bias: Tensor = None,
                    max_distance: int = 0,
-                   max_input_length: Tensor = None) -> Tuple[Tensor]:
+                   max_input_length: Tensor = None,
+                   sage_attn: bool = False,
+                   sage_attn_q_block_size: int = 0,
+                   sage_attn_k_block_size: int = 0,
+                   sage_attn_v_block_size: int = 0) -> Tuple[Tensor]:
     '''
     Add an operation that performs the multi-head attention in BERT.
 
@@ -4187,6 +4355,19 @@ def bert_attention(tensor: Tensor,
         max_input_length: Tensor = None
             The maximum input sequence length represented by Tensor shape. Requires for remove_input_padding to pre-define plugin workspace size.
 
+        sage_attn: bool = False
+            SageAttention is a 8-bit implementation of attention kernel. It's input q, k, v and output datatypes are 16-bit. It performance dynamic quantization for q, k, v
+            tensor every time before attention. https://github.com/thu-ml/SageAttention
+
+        sage_attn_q_quant_size: int = 0
+            dynamic quant block size along sequence dimension of q tensor. Each quant block will share one scale.
+
+        sage_attn_k_quant_size: int = 0
+            dynamic quant block size along sequence dimension of k tensor. Each quant block will share one scale.
+
+        sage_attn_v_quant_size: int = 0
+            dynamic quant block size along sequence dimension of v tensor. Each quant block will share one scale.
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -4221,9 +4402,30 @@ def bert_attention(tensor: Tensor,
         "remove_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
+
+    sage_attn = trt.PluginField("sage_attn",
+                                np.array(np.int8(sage_attn), dtype=np.int8),
+                                trt.PluginFieldType.INT8)
+
+    sage_attn_q_block_size = trt.PluginField(
+        "sage_attn_q_block_size",
+        np.array(sage_attn_q_block_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    sage_attn_k_block_size = trt.PluginField(
+        "sage_attn_k_block_size",
+        np.array(sage_attn_k_block_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    sage_attn_v_block_size = trt.PluginField(
+        "sage_attn_v_block_size",
+        np.array(sage_attn_v_block_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
     pfc = trt.PluginFieldCollection([
         nheads, head_size, q_scaling, context_fmha_type, pf_type,
-        do_relative_attention, max_distance, remove_padding
+        do_relative_attention, max_distance, remove_padding, sage_attn,
+        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)
@@ -4792,6 +4994,7 @@ def gpt_attention(
     kv_orig_quant_scale: Optional[Tensor] = None,
     kv_quant_orig_scale: Optional[Tensor] = None,
     attention_output_orig_quant_scale: Optional[Tensor] = None,
+    attention_output_sf_scale: Optional[Tensor] = None,
     kv_cache_quant_mode: Union[QuantModeWrapper, QuantMode] = QuantMode(0),
     max_context_length: Optional[int] = None,
     mask_type: AttentionMaskType = AttentionMaskType.causal,
@@ -4830,16 +5033,15 @@ def gpt_attention(
     mrope_position_deltas: Tensor = None,
     host_runtime_perf_knobs: Optional[Tensor] = None,
     host_context_progress: Tensor = None,
-    layer_idx_in_cache_pool: Optional[int] = None,
     is_mla_enabled_flag: bool = False,
     q_lora_rank: int = 0,
     kv_lora_rank: int = 0,
     qk_nope_head_dim: int = 0,
     qk_rope_head_dim: int = 0,
     v_head_dim: int = 0,
-    fused_q_proj: Optional[Tensor] = None,
     q_b_proj: Optional[Tensor] = None,
     kv_b_proj: Optional[Tensor] = None,
+    k_b_proj_trans: Optional[Tensor] = None,
     skip_attn=None,
     cp_group: List[int] = [0],
     cp_size: int = 1,
@@ -4858,7 +5060,7 @@ def gpt_attention(
 
     Parameters:
         qkv: Tensor (On GPU)
-            The input QKV tensor. Its shape is [batch_beam_size, max_seqlen, qkv_dim] in padded mode and [1, num_tokens, qkv_dim] in
+            The input QKV tensor. Its shape is [batch_beam_size, max_seqlen, qkv_dim] in padded mode and [num_tokens, qkv_dim] in
             packed mode. Where qkv_dim depends on using MQA, GQA, or MHA. See QKV Input in docs/source/advanced/gpt-attention.md,
 
         past_key_value: Tensor (On GPU)
@@ -5028,7 +5230,7 @@ def gpt_attention(
             See KV cache section in docs/source/advanced/gpt-attention.md, on gpu,
 
         host_kv_cache_pool_mapping:
-            The tensor of pool mapping for the different memory pools. Its shape is [num_layers,],
+            The tensor of pool mapping for the different memory pools. Its shape is [num_layers,2] - for each layer, the index of the pool, and the index of the layer within the pool,
 
         do_cross_attention: bool = False
             Do we use this as cross attention instead of self attention,
@@ -5122,9 +5324,6 @@ def gpt_attention(
     assert host_max_attention_window_sizes is not None
     assert host_sink_token_length is not None
 
-    if layer_idx_in_cache_pool is None:
-        layer_idx_in_cache_pool = layer_idx
-
     paged_kv_cache_flag = default_net().plugin_config.paged_kv_cache
     if isinstance(qkv, list):
         is_unfuse_qkv_gemm = 1
@@ -5157,10 +5356,6 @@ def gpt_attention(
     num_kv_heads = trt.PluginField("num_kv_heads",
                                    np.array(num_kv_heads, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
-    layer_idx_in_cache_pool = trt.PluginField(
-        "layer_idx_in_cache_pool",
-        np.array(layer_idx_in_cache_pool, dtype=np.int32),
-        trt.PluginFieldType.INT32)
     head_size = trt.PluginField("head_size",
                                 np.array(hidden_size_per_head, dtype=np.int32),
                                 trt.PluginFieldType.INT32)
@@ -5334,6 +5529,10 @@ def gpt_attention(
     use_cache_pf = trt.PluginField("use_cache",
                                    np.array([use_cache], dtype=np.int32),
                                    trt.PluginFieldType.INT32)
+    fuse_fp4_quant = default_net().plugin_config.fuse_fp4_quant
+    fuse_fp4_quant_pf = trt.PluginField(
+        "fuse_fp4_quant", np.array(np.int8(fuse_fp4_quant), dtype=np.int8),
+        trt.PluginFieldType.INT8)
     skip_attn_pf = trt.PluginField(
         "skip_attn", np.array([skip_attn is not None], dtype=np.int8),
         trt.PluginFieldType.INT8)
@@ -5348,10 +5547,9 @@ def gpt_attention(
         trt.PluginFieldType.INT8)
 
     pfc = trt.PluginFieldCollection([
-        layer_idx, nheads, vision_start, vision_length, num_kv_heads,
-        layer_idx_in_cache_pool, head_size, unidirectional, q_scaling,
-        attn_logit_softcapping_scale, position_embedding_type,
-        rotary_embedding_dim, rotary_embedding_base,
+        layer_idx, nheads, vision_start, vision_length, num_kv_heads, head_size,
+        unidirectional, q_scaling, attn_logit_softcapping_scale,
+        position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
         rotary_embedding_max_positions, rotary_embedding_original_max_positions,
@@ -5366,7 +5564,8 @@ def gpt_attention(
         is_spec_decoding_enabled, spec_decoding_is_generation_length_variable,
         spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
         kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
-        skip_attn_pf, cp_size, cp_rank, cp_group, use_logn_scaling
+        fuse_fp4_quant_pf, skip_attn_pf, cp_size, cp_rank, cp_group,
+        use_logn_scaling
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -5416,6 +5615,10 @@ def gpt_attention(
         ).plugin_config.use_fp8_context_fmha, "FP8 Context FMHA needs to be enabled"
         plug_inputs += [attention_output_orig_quant_scale]
 
+    if fuse_fp4_quant:
+        assert attention_output_sf_scale is not None, "attention_output_sf_scale must be provided when fuse_fp4_quant is enabled."
+        plug_inputs += [attention_output_sf_scale]
+
     if rotary_inv_freq is not None:
         plug_inputs += [rotary_inv_freq]
     if rotary_cos_sin is not None:
@@ -5463,10 +5666,10 @@ def gpt_attention(
         plug_inputs += [host_context_progress]
 
     if is_mla_enabled_flag:
-        assert fused_q_proj is not None
         assert q_b_proj is not None
         assert kv_b_proj is not None
-        plug_inputs += [fused_q_proj, q_b_proj, kv_b_proj]
+        assert k_b_proj_trans is not None
+        plug_inputs += [q_b_proj, kv_b_proj, k_b_proj_trans]
 
     if skip_attn is not None:
         plug_inputs += [skip_attn]
@@ -5481,13 +5684,20 @@ def gpt_attention(
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
     _add_plugin_info(layer, attn_plg_creator, "causal_attn", pfc)
     output = _create_tensor(layer.get_output(0), layer)
+    expected_outputs = 1
+
+    # The output scaling factor tensor.
+    output_sf = None
+    if fuse_fp4_quant:
+        output_sf = _create_tensor(layer.get_output(expected_outputs), layer)
+        expected_outputs += 1
+
     present_key_value = None
     if use_cache and not paged_kv_cache_flag:
-        present_key_value = _create_tensor(layer.get_output(1), layer)
+        present_key_value = _create_tensor(layer.get_output(expected_outputs),
+                                           layer)
         assert present_key_value is not None
-        expected_outputs = 2
-    else:
-        expected_outputs = 1
+        expected_outputs += 1
 
     assert layer.num_outputs == expected_outputs, \
         f"Plugin outputs number mismatch with expected, got {layer.num_outputs}, expected {expected_outputs}"
@@ -5498,13 +5708,16 @@ def gpt_attention(
             # past key value
             layer.get_input(8).set_dynamic_range(-127, 127)
             # present key value
-            layer.get_output(1).set_dynamic_range(-127, 127)
+            layer.get_output(expected_outputs - 1).set_dynamic_range(-127, 127)
         else:
             layer.get_input(0).set_dynamic_range(-127, 127)
             layer.get_input(1).set_dynamic_range(-127, 127)
-            layer.get_output(0).set_dynamic_range(-127, 127)
+            layer.get_output(expected_outputs - 1).set_dynamic_range(-127, 127)
 
     assert output is not None
+    if fuse_fp4_quant:
+        assert output_sf is not None
+        return (output, output_sf), present_key_value
     return output, present_key_value
 
 
@@ -5906,6 +6119,7 @@ ACT2FN = {
     'identity': identity,
     'silu': silu,
     'softplus': softplus,
+    'relu2': squared_relu,
     'squared-relu': squared_relu,
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
@@ -5999,8 +6213,8 @@ def lora_plugin(
         lora_ranks : cpu Tensor with shape [batch_size]
             The low_rank of each request
 
-        lora_weights_pointers : cpu int64 Tensor with shape [batch_size, 2]
-            The weights pointers of each request. Consist of in_pointer and out_pointer.
+        lora_weights_pointers : cpu int64 Tensor with shape [batch_size, 3]
+            The weights pointers of each request. Consist of in_pointer, out_pointer and possibly a scales vector pointer.
 
         weight_index : int
             The index of weight if the weight pointer pointing to multiple weights.
@@ -6073,6 +6287,75 @@ def lora_plugin(
             _create_tensor(layer.get_output(i), layer).cast(input.dtype)
             for i in range(num_lora_modules)
         ]
+
+
+def dora_plugin(activations: Tensor,
+                out_hidden_sizes: list[int],
+                lora_weights_pointers: list[Tensor],
+                host_request_types: Tensor,
+                host_context_lengths: Tensor | None = None) -> Tensor:
+    '''
+    The DoRA plugin applies column-wise scaling to the output of a LoRA layer.
+
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+
+        out_hidden_sizes : list[int]
+            The output hidden size of each adapter in the related LoRA module.
+            For example, for a qkv projection out_hidden_sizes should be [q_dim, k_dim, v_dim].
+
+        host_request_types : Tensor = None
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/source/advanced/gpt-attention.md,
+
+        host_context_lengths: cpu Tensor = None
+            A host tensor that contains the lengths of the different inputs,
+
+    Return:
+        The tensor produced by that layer.
+
+    '''
+    assert host_context_lengths is not None or not default_net(
+    ).plugin_config.remove_input_padding
+
+    dora_plg_creator = trt.get_plugin_registry().get_creator(
+        'Dora', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert dora_plg_creator is not None
+
+    out_hidden_sizes = trt.PluginField(
+        f"out_hidden_sizes", np.array(out_hidden_sizes, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    remove_input_padding = trt.PluginField(
+        "remove_input_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+
+    lora_dtype = default_net().plugin_config.lora_plugin
+    type_id = trt.PluginField(
+        "type", np.array(int(str_dtype_to_trt(lora_dtype)), np.int32),
+        trt.PluginFieldType.INT32)
+
+    pfc = trt.PluginFieldCollection(
+        [type_id, remove_input_padding, out_hidden_sizes])
+
+    dora_plug = dora_plg_creator.create_plugin("dora", pfc,
+                                               trt.TensorRTPhase.BUILD)
+
+    plug_inputs = [activations.cast(lora_dtype), host_request_types
+                   ] + lora_weights_pointers
+
+    if default_net().plugin_config.remove_input_padding:
+        plug_inputs += [host_context_lengths]
+
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+
+    layer = default_trtnet().add_plugin_v3(plug_inputs, [], dora_plug)
+    _add_plugin_info(layer, dora_plg_creator, "dora", pfc)
+    output = _create_tensor(layer.get_output(0), layer).cast(activations.dtype)
+    return output
 
 
 def mamba_conv1d(input: Tensor,

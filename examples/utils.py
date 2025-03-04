@@ -16,8 +16,8 @@ import json
 import os
 import subprocess
 import sys
+from argparse import BooleanOptionalAction
 from functools import partial
-from os.path import abspath, dirname
 from pathlib import Path
 from typing import List, Optional
 
@@ -192,11 +192,9 @@ def prepare_enc_dec_inputs(batch_input_ids: List[torch.Tensor], model_name: str,
     encoder_input_features = None
     encoder_input_ids = None
     if 'whisper' in model_name.lower():
-        tllm_path = dirname(dirname(abspath(__file__)))
-        sys.path.insert(0, tllm_path)
-
-        from examples.whisper.whisper_utils import \
-            log_mel_spectrogram  # cannot directly import whisper due to name collision
+        # cannot directly import whisper due to name collision
+        sys.path.append(f"{os.path.dirname(__file__)}/whisper")
+        from whisper_utils import log_mel_spectrogram
 
         config_path = os.path.join(engine_dir, 'encoder', 'config.json')
         with open(config_path, 'r') as f:
@@ -248,6 +246,7 @@ def add_common_args(parser):
     parser.add_argument('--repetition_penalty', type=float, default=1.0)
     parser.add_argument('--presence_penalty', type=float, default=0.0)
     parser.add_argument('--frequency_penalty', type=float, default=0.0)
+    parser.add_argument('--min_p', type=float, default=0.0)
     parser.add_argument('--beam_search_diversity_rate', type=float, default=0.0)
     parser.add_argument('--random_seed', type=int, default=0)
     parser.add_argument('--early_stopping',
@@ -403,6 +402,16 @@ def add_common_args(parser):
         help="Minimum token probability threshold for typical acceptance. "
         "Enables typical acceptance in Eagle. "
         "Corresponds to epsilon in https://arxiv.org/pdf/2401.10774.")
+    parser.add_argument('--eagle_use_dynamic_tree',
+                        action='store_true',
+                        help="Whether to use Ealge-2")
+    parser.add_argument(
+        '--eagle_dynamic_tree_max_top_k',
+        default=None,
+        type=int,
+        help=
+        "The maximum number of draft tokens to expand for each node in Eagle-2."
+    )
     parser.add_argument(
         '--lookahead_config',
         type=str,
@@ -447,7 +456,8 @@ def add_common_args(parser):
     )
     parser.add_argument(
         '--kv_cache_enable_block_reuse',
-        action='store_true',
+        default=True,
+        action=BooleanOptionalAction,
         help=
         'Enables block reuse in kv cache (only available with cpp session).',
     )
@@ -494,5 +504,6 @@ def add_common_args(parser):
         "It is automatically enabled for num_beams>1 (only available with cpp session). "
         "WARNING: using this option may increase network usage significantly (quadratically w.r.t output length)."
     )
+    parser.add_argument('--backend', type=str, default=None)
 
     return parser

@@ -23,7 +23,6 @@ import inspect
 
 from utils.cpp_paths import *
 from utils.llm_data import llm_models_root
-from utils.util import skip_pre_ampere
 
 
 @pytest.fixture
@@ -51,14 +50,12 @@ def get_expected_num_tokens(prompt_len, max_tokens, streaming,
     return max_tokens
 
 
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_executor_valid_ctor(model_files, model_path):
     executor_config = trtllm.ExecutorConfig(1)
     executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
                                executor_config)
 
 
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_executor_from_memory(model_files, model_path):
     executor_config = trtllm.ExecutorConfig(1)
     engine_buffer = open(model_path / "rank0.engine", mode="rb").read()
@@ -78,7 +75,6 @@ def test_executor_invalid_ctor():
         assert "File does not exist" in str(e)
 
 
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_shutdown(model_files, model_path):
 
     beam_width = 1
@@ -117,7 +113,6 @@ def test_shutdown(model_files, model_path):
         executor.get_num_responses_ready(req_id)
 
 
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_embedding_bias(model_files, model_path):
     streaming = False
     exclude_input_from_output = False
@@ -174,7 +169,6 @@ def test_embedding_bias(model_files, model_path):
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("exclude_input_from_output", [False])
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_single_request(streaming: bool, exclude_input_from_output: bool,
                         model_files, model_path):
     output_config = trtllm.OutputConfig()
@@ -224,7 +218,6 @@ def test_single_request(streaming: bool, exclude_input_from_output: bool,
     executor.get_latest_debug_tensors()
 
 
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_single_request_lora(model_files, model_path_lora, lora_config_paths):
     streaming = False
     exclude_input_from_output = False
@@ -281,7 +274,6 @@ def test_single_request_lora(model_files, model_path_lora, lora_config_paths):
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("exclude_input_from_output", [False])
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_multi_request(streaming: bool, exclude_input_from_output: bool,
                        model_files, model_path):
     output_config = trtllm.OutputConfig()
@@ -350,7 +342,6 @@ def test_multi_request(streaming: bool, exclude_input_from_output: bool,
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("exclude_input_from_output", [False])
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_multi_request_with_ids(streaming: bool,
                                 exclude_input_from_output: bool, model_files,
                                 model_path):
@@ -426,7 +417,6 @@ def test_multi_request_with_ids(streaming: bool,
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("exclude_input_from_output", [False])
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_get_num_responses_ready(streaming: bool,
                                  exclude_input_from_output: bool, model_files,
                                  model_path):
@@ -478,6 +468,7 @@ def test_get_num_responses_ready(streaming: bool,
     assert executor.get_num_responses_ready() == num_expected_responses
 
 
+@pytest.mark.skip("https://nvbugs/5028235")
 @pytest.mark.parametrize("batching_type", [trtllm.BatchingType.INFLIGHT])
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("beam_width", [1])
@@ -485,7 +476,6 @@ def test_get_num_responses_ready(streaming: bool,
 @pytest.mark.parametrize("exclude_input_from_output", [False])
 @pytest.mark.parametrize("return_context_logits", [False, True])
 @pytest.mark.parametrize("return_generation_logits", [False, True])
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
                           beam_width: int, compute_log_probs: bool,
                           exclude_input_from_output: bool,
@@ -598,6 +588,8 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
     executor_config = trtllm.ExecutorConfig(beam_width)
     executor_config.batching_type = batching_type
     executor_config.kv_cache_config = kv_cache_config
+    if return_generation_logits:
+        executor_config.gather_generation_logits = True
 
     if return_context_logits or return_generation_logits:
         model_path = model_path_return_logits
@@ -668,7 +660,6 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("beam_width", [1])
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_finish_reason(streaming: bool, beam_width: int, model_files,
                        model_path):
     if streaming and beam_width > 1:
@@ -738,7 +729,6 @@ def test_finish_reason(streaming: bool, beam_width: int, model_files,
     assert i < max_wait_ms
 
 
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_gpt_executor_timed_out(model_files, model_path):
     beam_width = 1
     executor_config = trtllm.ExecutorConfig(beam_width)
@@ -754,7 +744,6 @@ def test_gpt_executor_timed_out(model_files, model_path):
     assert len(responses) == 0
 
 
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_single_request_invalid_inputs(model_files, model_path):
     streaming = True
     beam_width = 1
@@ -916,7 +905,6 @@ def test_lora_config():
     assert (lora_config.config == config).all()
 
 
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_wakeup(model_files, model_path):
     import threading
 
@@ -963,7 +951,7 @@ def test_guided_decoding_params():
         trtllm.GuidedDecodingParams(
             trtllm.GuidedDecodingParams.GuideType.JSON_SCHEMA)
 
-    regex = "\d+"
+    regex = r"\d+"
     guided_decoding_params = trtllm.GuidedDecodingParams(
         trtllm.GuidedDecodingParams.GuideType.REGEX, guide=regex)
     assert guided_decoding_params.guide_type == trtllm.GuidedDecodingParams.GuideType.REGEX
@@ -1121,7 +1109,7 @@ def test_scheduler_config():
 
 def test_kv_cache_config():
     config = trtllm.KvCacheConfig()
-    assert config.enable_block_reuse == False
+    assert config.enable_block_reuse == True
     assert config.max_tokens is None
     assert config.max_attention_window is None
     assert config.sink_token_length is None
@@ -1132,7 +1120,7 @@ def test_kv_cache_config():
     assert config.secondary_offload_min_priority == None
     assert config.event_buffer_max_size == 0
 
-    config.enable_block_reuse = True
+    config.enable_block_reuse = False
     config.max_tokens = 1
     config.max_attention_window = [2]
     config.sink_token_length = 3
@@ -1142,7 +1130,7 @@ def test_kv_cache_config():
     config.onboard_blocks = False
     config.secondary_offload_min_priority = 50
     config.event_buffer_max_size = 1024
-    assert config.enable_block_reuse == True
+    assert config.enable_block_reuse == False
     assert config.max_tokens == 1
     assert config.max_attention_window == [2]
     assert config.sink_token_length == 3
@@ -1265,26 +1253,61 @@ def test_eagle_config():
     assert config.eagle_choices == [[0, 0], [0, 1]]
     assert config.greedy_sampling == False
     assert config.posterior_threshold == 0.5
+    assert config.use_dynamic_tree == False
+    assert config.dynamic_tree_max_topK == None
 
     config = trtllm.EagleConfig([[0, 0], [0, 1, 0]], True)
     assert config.eagle_choices == [[0, 0], [0, 1, 0]]
     assert config.greedy_sampling == True
     assert config.posterior_threshold == None
+    assert config.use_dynamic_tree == False
+    assert config.dynamic_tree_max_topK == None
 
     config = trtllm.EagleConfig(None, True, 0.5)
     assert config.eagle_choices == None
     assert config.greedy_sampling == True
     assert config.posterior_threshold == 0.5
+    assert config.use_dynamic_tree == False
+    assert config.dynamic_tree_max_topK == None
 
-    kwargs = {
+    config = trtllm.EagleConfig(None, False, 0.5, True, 3)
+    assert config.eagle_choices == None
+    assert config.greedy_sampling == False
+    assert config.posterior_threshold == 0.5
+    assert config.use_dynamic_tree == True
+    assert config.dynamic_tree_max_topK == 3
+
+    kwargs1 = {
         "eagle_choices": [[0, 0], [0, 1], [0, 2]],
         "greedy_sampling": True,
         "posterior_threshold": 0.5
     }
 
-    config = trtllm.EagleConfig(**kwargs)
-    for k, v in kwargs.items():
+    config = trtllm.EagleConfig(**kwargs1)
+    for k, v in kwargs1.items():
         assert getattr(config, k) == v
+
+    kwargs2 = {
+        "eagle_choices": None,
+        "greedy_sampling": True,
+        "posterior_threshold": 0.5,
+        "use_dynamic_tree": True,
+        "dynamic_tree_max_topK": 3,
+    }
+
+    config = trtllm.EagleConfig(**kwargs2)
+    for k, v in kwargs2.items():
+        assert getattr(config, k) == v
+
+
+def test_eagle_config_pickle():
+    config = trtllm.EagleConfig([[0, 0], [0, 1]], False, 0.5)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config.dynamic_tree_max_topK == config_copy.dynamic_tree_max_topK
+    assert config.eagle_choices == config_copy.eagle_choices
+    assert config.posterior_threshold == config_copy.posterior_threshold
+    assert config.use_dynamic_tree == config_copy.use_dynamic_tree
+    assert config.greedy_sampling == config_copy.greedy_sampling
 
 
 def test_decoding_mode():
@@ -1518,11 +1541,12 @@ def test_peft_cache_config():
     max_pages_per_block_device = 9
     device_cache_percent = 0.9
     host_cache_size = 1024
+    lora_prefetch_dir = "/tmp/lora_prefetch"
     peft_cache_config = trtllm.PeftCacheConfig(
         num_host_module_layer, num_device_module_layer, optimal_adapter_size,
         max_adapter_size, num_put_workers, num_ensure_workers, num_copy_streams,
         max_pages_per_block_host, max_pages_per_block_device,
-        device_cache_percent, host_cache_size)
+        device_cache_percent, host_cache_size, lora_prefetch_dir)
 
     assert peft_cache_config.num_host_module_layer == num_host_module_layer
     assert peft_cache_config.num_device_module_layer == num_device_module_layer
@@ -1536,9 +1560,9 @@ def test_peft_cache_config():
     assert np.isclose(peft_cache_config.device_cache_percent,
                       device_cache_percent)
     assert peft_cache_config.host_cache_size == host_cache_size
+    assert peft_cache_config.lora_prefetch_dir == lora_prefetch_dir
 
 
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_logits_post_processor(model_files, model_path):
 
     # Define the logits post-processor callback
@@ -1595,7 +1619,6 @@ def test_logits_post_processor(model_files, model_path):
     assert tokens[-max_tokens:] == [42] * max_tokens
 
 
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_logits_post_processor_batched(model_files, model_path):
 
     # Define the logits post-processor callback
@@ -1657,6 +1680,7 @@ def test_logits_post_processor_batched(model_files, model_path):
         assert len(tokens[req_id]) == expected_num_tokens, f"{req_id}"
 
 
+@pytest.mark.skip("https://nvbugs/5082576")
 def test_kv_event_stream(model_path):
 
     beam_width = 1
@@ -1775,7 +1799,7 @@ def test_request_perf_metrics(streaming: bool, model_path):
         assert kv_cache_metrics.num_total_allocated_blocks == 1
         assert kv_cache_metrics.num_new_allocated_blocks == 1
         assert kv_cache_metrics.num_reused_blocks == 0
-        assert kv_cache_metrics.num_missed_blocks == 0
+        assert kv_cache_metrics.num_missed_blocks == 1
         assert kv_cache_metrics.kv_cache_hit_rate == 0
 
         assert perf_metrics.first_iter == 0
@@ -1811,6 +1835,113 @@ def test_request_perf_metrics(streaming: bool, model_path):
         max_tokens,
         streaming=streaming,
         exclude_input_from_output=False), f"{request_id}"
+
+
+def test_request_perf_metrics_kv_cache(model_path):
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(beam_width)
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create request: model uses 32 tokens per block, so it will fill a full block
+    max_tokens = 32
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens, max_tokens=max_tokens)
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+
+    # Get the response
+    responses = executor.await_responses(request_id)
+    assert not responses[0].has_error()
+    result = responses[0].result
+    assert result.is_final
+
+    # Prepare second request using the first output
+    input_tokens = result.output_token_ids[beam_width - 1] + [1, 2, 3, 4]
+    output_config = trtllm.OutputConfig(return_perf_metrics=True)
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             output_config=output_config)
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+
+    # Get the response
+    responses = executor.await_responses(request_id)
+    assert not responses[0].has_error()
+    result = responses[0].result
+    assert result.is_final
+
+    # Check KV cache metric: one block should be reused from first request
+    # and one newly created -> 50% hit rate
+    kv_cache_metrics = result.request_perf_metrics.kv_cache_metrics
+    assert kv_cache_metrics.num_total_allocated_blocks == 1
+    assert kv_cache_metrics.num_new_allocated_blocks == 1
+    assert kv_cache_metrics.num_reused_blocks == 1
+    assert kv_cache_metrics.num_missed_blocks == 1
+    assert kv_cache_metrics.kv_cache_hit_rate == 0.5
+
+
+@pytest.mark.parametrize("exclude_input_from_output", [False, True])
+def test_request_perf_metrics_draft(model_path_draft_tokens_external,
+                                    exclude_input_from_output: bool):
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(beam_width)
+    executor = trtllm.Executor(model_path_draft_tokens_external,
+                               trtllm.ModelType.DECODER_ONLY, executor_config)
+
+    # Create request
+    max_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+
+    # Only first two tokens will be accepted -> 50% acceptance rate
+    draft_config = trtllm.ExternalDraftTokensConfig([2, 4, 9, 10])
+    output_config = trtllm.OutputConfig(
+        exclude_input_from_output=exclude_input_from_output,
+        return_perf_metrics=True)
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             output_config=output_config,
+                             external_draft_tokens_config=draft_config)
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+
+    # Get the response
+    responses = executor.await_responses(request_id)
+    assert not responses[0].has_error()
+    result = responses[0].result
+    assert result.is_final
+
+    # check the new tokens
+    new_tokens = result.output_token_ids[beam_width - 1]
+    if exclude_input_from_output:
+        assert new_tokens == [2, 4, 2]
+    else:
+        assert new_tokens == [1, 2, 3, 4, 2, 4, 2]
+
+    # Check the perf metrics
+    perf_metrics = result.request_perf_metrics
+    assert perf_metrics is not None
+
+    timing_metrics = perf_metrics.timing_metrics
+    assert timing_metrics.arrival_time < timing_metrics.first_scheduled_time
+    assert timing_metrics.first_scheduled_time < timing_metrics.first_token_time
+    assert timing_metrics.first_token_time == timing_metrics.last_token_time
+
+    assert perf_metrics.first_iter == 0
+    assert perf_metrics.iter == 0
+    assert perf_metrics.last_iter == 0
+
+    spec_dec_metrics = perf_metrics.speculative_decoding
+    assert spec_dec_metrics.acceptance_rate == 0.5
+    assert spec_dec_metrics.total_accepted_draft_tokens == 2
+    assert spec_dec_metrics.total_draft_tokens == 4
 
 
 def test_kv_event_stream_timeout(model_path):
@@ -1924,6 +2055,15 @@ def test_kv_cache_config_pickle():
     assert config.host_cache_size == config_copy.host_cache_size
     assert config.onboard_blocks == config_copy.onboard_blocks
     assert config.event_buffer_max_size == config_copy.event_buffer_max_size
+
+
+def test_kv_cache_retention_config_pickle():
+    config = trtllm.KvCacheRetentionConfig([
+        trtllm.KvCacheRetentionConfig.TokenRangeRetentionConfig(
+            0, 2, 30, datetime.timedelta(seconds=30))
+    ], 80)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config == config_copy
 
 
 def test_peft_cache_config_pickle():
@@ -2055,6 +2195,7 @@ def test_executor_config_pickle():
         if "config" not in k:
             assert getattr(config, k) == v
 
+    config.backend = 'pytorch'
 
     pickle.dumps(config)
     config_copy = pickle.loads(pickle.dumps(config))
@@ -2074,6 +2215,7 @@ def test_executor_config_pickle():
     assert config.extended_runtime_perf_knob_config.multi_block_mode == config_copy.extended_runtime_perf_knob_config.multi_block_mode
     assert config.debug_config.debug_input_tensors == config_copy.debug_config.debug_input_tensors
     assert config.max_seq_idle_microseconds == config_copy.max_seq_idle_microseconds
+    assert config.backend == config_copy.backend
     assert config.spec_dec_config.fast_logits == config_copy.spec_dec_config.fast_logits
 
 
@@ -2145,3 +2287,36 @@ def test_runtime_defaults():
     default_runtime_defaults = trtllm.RuntimeDefaults()
     for key in all_field_names:
         assert getattr(default_runtime_defaults, key) == None
+
+
+def test_DynamicBatchConfig_pickle():
+    config = trtllm.DynamicBatchConfig(enable_batch_size_tuning=True,
+                                       enable_max_num_tokens_tuning=True,
+                                       dynamic_batch_moving_average_window=128)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config.enable_batch_size_tuning == config_copy.enable_batch_size_tuning
+
+
+def test_request_pickle():
+
+    samplingConfig = trtllm.SamplingConfig(beam_width=1,
+                                           top_k=10,
+                                           top_p=0.1,
+                                           num_return_sequences=3)
+
+    request = trtllm.Request(input_token_ids=[1, 2, 3, 4],
+                             max_tokens=5,
+                             streaming=False,
+                             client_id=123,
+                             sampling_config=samplingConfig)
+    request_copy = pickle.loads(pickle.dumps(request))
+
+    assert request.sampling_config.beam_width == request_copy.sampling_config.beam_width
+    assert request.sampling_config.top_k == request_copy.sampling_config.top_k
+    assert request.sampling_config.num_return_sequences == request_copy.sampling_config.num_return_sequences
+    assert request.request_type == request_copy.request_type
+    assert request.input_token_ids == request_copy.input_token_ids
+    assert request.max_new_tokens == request_copy.max_new_tokens
+    assert request.output_config.return_log_probs == request_copy.output_config.return_log_probs
+    assert request.guided_decoding_params == request_copy.guided_decoding_params
+    assert request.kv_cache_retention_config == request_copy.kv_cache_retention_config

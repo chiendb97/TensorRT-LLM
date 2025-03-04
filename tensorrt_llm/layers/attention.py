@@ -20,8 +20,8 @@ import tensorrt as trt
 import torch
 
 from .._common import default_net, precision
-from .._utils import (fp32_array, int32_array, is_same_dtype, set_obj_attrs,
-                      trt_dtype_to_np, trt_dtype_to_str)
+from .._utils import (fp32_array, get_sm_version, int32_array, is_same_dtype,
+                      set_obj_attrs, trt_dtype_to_np, trt_dtype_to_str)
 
 # isort: off
 from ..functional import (
@@ -383,7 +383,6 @@ class Attention(Module):
                  block_sparse_params=None,
                  use_implicit_relative_attention=False,
                  reorder=False,
-                 layer_idx_in_cache_pool=None,
                  enable_qkv=True,
                  cp_group=[0],
                  cp_size=1,
@@ -397,7 +396,6 @@ class Attention(Module):
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         self.num_kv_heads = num_kv_heads
-        self.layer_idx_in_cache_pool = layer_idx_in_cache_pool if layer_idx_in_cache_pool is not None else local_layer_idx
         assert num_attention_heads % tp_size == 0, \
         "num_attention_heads must be divisible by tp_size"
         self.num_attention_heads = num_attention_heads // tp_size
@@ -484,6 +482,7 @@ class Attention(Module):
         self.max_attn_value = max_attn_value
         self.register_parameter('kv_cache_scaling_factor', None)
         self.register_parameter('attention_output_orig_quant_scale', None)
+        self.register_parameter('attention_output_sf_scale', None)
 
         self.block_sparse_params = block_sparse_params if block_sparse_params is not None else BlockSparseAttnParams(
         )
@@ -517,6 +516,7 @@ class Attention(Module):
 
         # see optimize_model's add_lora for LoRA initialization
         self.qkv_lora = None
+        self.qkv_dora = None
 
         # per-layer relative attention table
         if self.use_implicit_relative_attention:
@@ -699,6 +699,16 @@ class Attention(Module):
         # Fill nothing.
         return attention_params
 
+    def _get_output_orig_quant_scale(self):
+        attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
+        if attention_output_orig_quant_scale is not None and (
+                default_net().plugin_config.gemm_plugin == 'nvfp4'
+                or self.quant_mode.has_nvfp4()):
+            # The scale was intended for nvfp4 quantization: max_value * scale = fp4_max * fp8_max
+            # So if we want to quantize the output to fp8, the scale should be divided by fp4_max
+            attention_output_orig_quant_scale = attention_output_orig_quant_scale / 6.0
+        return attention_output_orig_quant_scale
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -719,7 +729,8 @@ class Attention(Module):
         skip_attn=None,
     ):
         attention_input = hidden_states
-        assert isinstance(hidden_states, Tensor)
+
+        assert isinstance(hidden_states, (Tensor, tuple))
 
         spec_decoding_params = SpecDecodingParams(
         ) if spec_decoding_params is None else spec_decoding_params
@@ -807,6 +818,7 @@ class Attention(Module):
                     max_encoder_context_length,
                     host_encoder_input_lengths=q_lora_params.
                     host_encoder_input_lengths,
+                    partial_lora_mask=lora_layer_params.partial_lora_mask,
                 )
 
                 q_lora, k_lora, v_lora = self.qkv_lora(hidden_states,
@@ -814,6 +826,8 @@ class Attention(Module):
                 qkv_lora = concat([q_lora, k_lora, v_lora],
                                   dim=q_lora.rank() - 1)
                 qkv = qkv + qkv_lora
+                if self.qkv_dora is not None:
+                    qkv = self.qkv_dora(qkv, qkv_lora_runtime_params)
         if self.qk_layernorm:
             base_shape = shape(qkv, 0) if qkv.ndim() == 2 else concat(
                 [shape(qkv, 0), shape(qkv, 1)])
@@ -956,6 +970,10 @@ class Attention(Module):
                     cross_kv_lora = concat([cross_k_lora, cross_v_lora],
                                            dim=cross_k_lora.rank() - 1)
                     cross_kv = cross_kv + cross_kv_lora
+                    if self.qkv_dora is not None:
+                        cross_kv = self.qkv_dora(cross_kv,
+                                                 qkv_lora_runtime_params,
+                                                 is_cross_attention=True)
 
                 return cross_kv
 
@@ -988,20 +1006,14 @@ class Attention(Module):
 
             # KV cache scales.
             if self.kv_cache_scaling_factor is not None:
-                kv_orig_quant_scale = constant(fp32_array(
-                    [1.0])) / self.kv_cache_scaling_factor.value
+                kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value
                 kv_quant_orig_scale = self.kv_cache_scaling_factor.value
             else:
                 kv_orig_quant_scale = None
                 kv_quant_orig_scale = None
 
-            # Attention output scales
-            assert (
-                not default_net().plugin_config.use_fp8_context_fmha
-            ) or self.quant_mode.has_fp8_qdq(
-            ), "FP8 Context FMHA must be used together with the fp8 quantization workflow."
-
-            attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
+            # The output SF scale, needed when fuse_fp4_quant is enabled.
+            attention_output_sf_scale = self.attention_output_sf_scale.value if self.attention_output_sf_scale is not None else None
 
             # The rotary inv freq can be pre-computed.
             rotary_inv_freq = getattr(attention_params, "rotary_inv_freq", None)
@@ -1046,7 +1058,6 @@ class Attention(Module):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
-                layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
@@ -1063,8 +1074,9 @@ class Attention(Module):
                 rotary_cos_sin=rotary_cos_sin,
                 kv_orig_quant_scale=kv_orig_quant_scale,
                 kv_quant_orig_scale=kv_quant_orig_scale,
-                attention_output_orig_quant_scale=
-                attention_output_orig_quant_scale,
+                attention_output_orig_quant_scale=self.
+                _get_output_orig_quant_scale(),
+                attention_output_sf_scale=attention_output_sf_scale,
                 kv_cache_quant_mode=self.quant_mode,
                 max_context_length=attention_params.max_context_length,
                 mask_type=self.attention_mask_type,
@@ -1411,7 +1423,12 @@ class Attention(Module):
                 relative_bias = slice(relative_bias, start, size)
 
             key = key.permute([0, 1, 3, 2])
+            model_type = query.dtype
             with precision('float32'):
+                # FIXME the "with precision('float32') does not really work and lead to nan"
+                # in some cases
+                query = cast(query, 'float32')
+                key = cast(key, 'float32')
                 if norm_before_bmm1:
                     # Apply norm on query earlier to prevent matmul fp16 overflow.
                     query /= (self.q_scaling * self.norm_factor)
@@ -1437,7 +1454,8 @@ class Attention(Module):
                 if self.relative_attention:
                     attention_scores = attention_scores + relative_bias
 
-            attention_probs = softmax(attention_scores, dim=-1)
+                attention_probs = softmax(attention_scores, dim=-1)
+                attention_probs = cast(attention_probs, model_type)
 
             # A dummy reshape WAR for mha fusion
             attention_probs = attention_probs.view(
@@ -1496,15 +1514,25 @@ class Attention(Module):
         self.rel_attn_table.value = precomputed_relative_attention
 
     def postprocess(self, tllm_key, weights, **kwargs):
+
         if tllm_key.endswith("kv_cache_scaling_factor"):
             if weights is None:
-                return {tllm_key: torch.ones(1, )}
+                return {tllm_key: torch.ones(1, ).float()}
             elif isinstance(weights, torch.Tensor):
-                return {tllm_key: weights}
+                return {tllm_key: weights.float()}
             elif None in weights:
-                return {tllm_key: torch.ones(1, )}
+                return {tllm_key: torch.ones(1, ).float()}
             else:
-                return {tllm_key: max(weights)}
+                return {tllm_key: max(weights).float()}
+        elif tllm_key.endswith("kv_cache_rcp_scaling_factor"):
+            if weights is None:
+                return {tllm_key: torch.ones(1, ).float()}
+            elif isinstance(weights, torch.Tensor):
+                return {tllm_key: torch.reciprocal(weights.float())}
+            elif None in weights:
+                return {tllm_key: torch.ones(1, ).float()}
+            else:
+                return {tllm_key: torch.reciprocal(max(weights).float())}
         else:
             return {tllm_key: weights}
 
@@ -1645,6 +1673,8 @@ class BertAttention(Module):
             # TRT plugin mode
             assert input_lengths is not None
             assert self.cp_size == 1
+            assert get_sm_version(
+            ) < 100, "bert_attention_plugin does not support SM >= 100"
             context = bert_attention(
                 qkv,
                 input_lengths,
@@ -1816,20 +1846,11 @@ class CogVLMAttention(Attention):
             ], 'Plugin only support masked MHA.'
 
             # KV cache scales.
-            kv_orig_quant_scale = constant(
-                fp32_array([1.0])
-            ) / self.kv_cache_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
+            kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
             ) else None
             kv_quant_orig_scale = self.kv_cache_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
             ) else None
 
-            # Attention output scales
-            assert (
-                not default_net().plugin_config.use_fp8_context_fmha
-            ) or self.quant_mode.has_fp8_qdq(
-            ), "FP8 Context FMHA must be used together with the fp8 quantization workflow."
-
-            attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
             context, past_key_value = gpt_attention(
                 qkv=qkv,
                 past_key_value=past_key_value,
@@ -1850,8 +1871,8 @@ class CogVLMAttention(Attention):
                 position_embedding_type=self.position_embedding_type,
                 kv_orig_quant_scale=kv_orig_quant_scale,
                 kv_quant_orig_scale=kv_quant_orig_scale,
-                attention_output_orig_quant_scale=
-                attention_output_orig_quant_scale,
+                attention_output_orig_quant_scale=self.
+                _get_output_orig_quant_scale(),
                 kv_cache_quant_mode=self.quant_mode,
                 max_context_length=attention_params.max_context_length,
                 mask_type=self.attention_mask_type,
@@ -2004,14 +2025,13 @@ class DeepseekV2Attention(Attention):
 
         self.kv_a_layernorm = RmsNorm(kv_lora_rank, dtype=dtype, eps=eps)
 
-        self.fused_q_proj = Parameter(
-            shape=(self.num_attention_heads *
-                   (self.kv_lora_rank + self.qk_rope_head_dim),
-                   self.q_lora_rank),
-            dtype=dtype)
         self.kv_b_proj = Parameter(
             shape=(self.num_attention_heads * self.qk_nope_head_dim * 2,
                    self.kv_lora_rank),
+            dtype=dtype)
+        self.k_b_proj_trans = Parameter(
+            shape=(self.num_attention_heads * self.kv_lora_rank,
+                   self.qk_nope_head_dim),
             dtype=dtype)
         self.q_b_proj = Parameter(
             shape=(self.num_attention_heads *
@@ -2025,13 +2045,13 @@ class DeepseekV2Attention(Attention):
                                dtype=dtype,
                                tp_group=tp_group,
                                tp_size=tp_size)
-        set_obj_attrs(self.fused_q_proj, {
-            "weight_loader": self.weight_loader,
-        })
         set_obj_attrs(self.q_b_proj, {
             "weight_loader": self.weight_loader,
         })
         set_obj_attrs(self.kv_b_proj, {
+            "weight_loader": self.weight_loader,
+        })
+        set_obj_attrs(self.k_b_proj_trans, {
             "weight_loader": self.weight_loader,
         })
 
@@ -2046,6 +2066,80 @@ class DeepseekV2Attention(Attention):
             loaded_weight = loaded_weight.narrow(sharding_dim, start_idx,
                                                  shard_size)
         param.value = loaded_weight
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+
+        def split_matrix_tp(v, tp_size, idx, dim=0):
+            if tp_size == 1:
+                return v
+            if len(v.shape) == 1:
+                return torch.chunk(v, tp_size)[idx].contiguous()
+            else:
+                return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
+
+        if tllm_key.find("q_b_proj") != -1:
+            q_b_proj_weight = weights.unflatten(
+                0,
+                [
+                    self.num_attention_heads * self.tp_size,
+                    self.qk_nope_head_dim + self.qk_rope_head_dim,
+                ],
+            )
+
+            q_b_proj_weight = split_matrix_tp(
+                q_b_proj_weight,
+                self.tp_size,
+                self.tp_rank,
+                dim=0,
+            )
+            weights = q_b_proj_weight.reshape(
+                self.num_attention_heads * self.tp_size *
+                (self.qk_nope_head_dim + self.qk_rope_head_dim) // self.tp_size,
+                self.q_lora_rank)
+
+        elif tllm_key.find("kv_b_proj") != -1:
+            kv_b_proj_weight = weights.unflatten(
+                0,
+                [
+                    self.num_attention_heads * self.tp_size,
+                    self.qk_nope_head_dim + self.v_head_dim,
+                ],
+            )
+            kv_b_proj_weight = split_matrix_tp(
+                kv_b_proj_weight,
+                self.tp_size,
+                self.tp_rank,
+                dim=0,
+            )
+            k_nope_weight, v_weight = kv_b_proj_weight.split(
+                [self.qk_nope_head_dim, self.v_head_dim],
+                dim=1,
+            )
+            weights = torch.concat([
+                k_nope_weight.reshape(
+                    self.num_attention_heads * self.tp_size *
+                    self.qk_nope_head_dim // self.tp_size, self.kv_lora_rank),
+                v_weight.reshape(
+                    self.num_attention_heads * self.tp_size * self.v_head_dim //
+                    self.tp_size, self.kv_lora_rank)
+            ],
+                                   dim=0)
+
+        elif tllm_key.find("k_b_proj_trans") != -1:
+            kv_b_proj = weights.unflatten(0, [
+                self.num_attention_heads * self.tp_size,
+                self.qk_nope_head_dim + self.v_head_dim
+            ])
+            kv_b_proj = split(kv_b_proj, self.tp_size, self.tp_rank, dim=0)
+            k_nope_weight, v_weight = kv_b_proj.split(
+                [self.qk_nope_head_dim, self.v_head_dim],
+                dim=1,
+            )
+            weights = k_nope_weight.transpose(2, 1).reshape(
+                self.num_attention_heads * self.kv_lora_rank,
+                self.qk_nope_head_dim)
+
+        return {tllm_key: weights}
 
     def forward(self,
                 hidden_states: Tensor,
@@ -2099,20 +2193,11 @@ class DeepseekV2Attention(Attention):
 
             # KV cache scales.
             if self.kv_cache_scaling_factor is not None:
-                kv_orig_quant_scale = constant(fp32_array(
-                    [1.0])) / self.kv_cache_scaling_factor.value
+                kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value
                 kv_quant_orig_scale = self.kv_cache_scaling_factor.value
             else:
                 kv_orig_quant_scale = None
                 kv_quant_orig_scale = None
-
-            # Attention output scales
-            assert (
-                not default_net().plugin_config.use_fp8_context_fmha
-            ) or self.quant_mode.has_fp8_qdq(
-            ), "FP8 Context FMHA must be used together with the fp8 quantization workflow."
-
-            attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
 
             rotary_cos_sin = self.embed_positions_for_gpt_attention.value
 
@@ -2131,7 +2216,6 @@ class DeepseekV2Attention(Attention):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=1,
-                layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
                 hidden_size_per_head=self.kv_lora_rank + self.qk_rope_head_dim,
                 q_scaling=self.q_scaling,
                 position_embedding_type=self.position_embedding_type,
@@ -2139,8 +2223,8 @@ class DeepseekV2Attention(Attention):
                 rotary_cos_sin=rotary_cos_sin,
                 kv_orig_quant_scale=kv_orig_quant_scale,
                 kv_quant_orig_scale=kv_quant_orig_scale,
-                attention_output_orig_quant_scale=
-                attention_output_orig_quant_scale,
+                attention_output_orig_quant_scale=self.
+                _get_output_orig_quant_scale(),
                 kv_cache_quant_mode=self.quant_mode,
                 max_context_length=attention_params.max_context_length,
                 mask_type=self.attention_mask_type,

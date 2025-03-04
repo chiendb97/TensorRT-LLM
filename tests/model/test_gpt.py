@@ -45,12 +45,12 @@ from tensorrt_llm.runtime.kv_cache_manager import GenerationSequence
 from tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager import \
     PoolsKVCacheManager
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.gpt.convert_checkpoint import convert_and_save_hf
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../examples'))
+from gpt.convert_checkpoint import convert_and_save_hf
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
-from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
+from utils.util import unittest_name_func
 
 from tensorrt_llm.runtime.memory_pools.memory_pools_allocator import \
     MemoryPoolsAllocator
@@ -73,8 +73,7 @@ class TestGPT(unittest.TestCase):
                                   batch_size, input_len, output_len, dtype,
                                   gpt_attention_plugin, tensor_parallel,
                                   apply_query_key_layer_scaling,
-                                  gather_context_logits,
-                                  gather_generation_logits):
+                                  gather_context_logits):
         config = {
             'architecture': 'GPTForCausalLM',
             'dtype': dtype,
@@ -111,8 +110,7 @@ class TestGPT(unittest.TestCase):
                 max_num_tokens=batch_size * input_len,
                 use_cache=True,
                 max_beam_width=1,
-                gather_context_logits=gather_context_logits,
-                gather_generation_logits=gather_generation_logits)
+                gather_context_logits=gather_context_logits)
 
             # Prepare
             tensorrt_llm_gpt(**inputs)
@@ -173,8 +171,7 @@ class TestGPT(unittest.TestCase):
                                            batch_size, input_len, output_len,
                                            dtype, use_plugin, world_size,
                                            apply_query_key_layer_scaling,
-                                           gather_context_logits,
-                                           gather_generation_logits)
+                                           gather_context_logits)
 
             engine_buffer = builder.build_engine(network, builder_config)
             runtime = tensorrt_llm.runtime.generation._Runtime(
@@ -432,9 +429,6 @@ class TestGPT(unittest.TestCase):
         # inflight batching mode only works with remove_input_padding and paged_kv_cache
         use_in_flight_batching = enable_remove_input_padding and enable_paged_kv_cache and not (
             gather_context_logits or gather_generation_logits)
-
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_fp32_accum_pre_ampere(context_fmha_type)
 
         torch.manual_seed(0)
         random.seed(0)
@@ -941,6 +935,7 @@ class TestGPT(unittest.TestCase):
         temperature = 1
         top_k = 0
         top_p = 0.0
+        random_seed = 0
         length_penalty = 1
         repetition_penalty = 1
 
@@ -971,6 +966,7 @@ class TestGPT(unittest.TestCase):
                                          temperature=temperature,
                                          top_k=top_k,
                                          top_p=top_p,
+                                         random_seed=random_seed,
                                          length_penalty=length_penalty,
                                          repetition_penalty=repetition_penalty)
         input_ids = torch.randint(100, (batch_size, seq_len)).int().cuda()

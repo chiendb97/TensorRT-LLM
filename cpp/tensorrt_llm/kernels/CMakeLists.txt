@@ -19,24 +19,25 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
 # Exclude files in the cutlass_kernels, decoderMaskedMultiheadAttention and
-# selectiveScan folder
+# selectiveScan trtllmGenKernels folder
 list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "cutlass_kernels/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "trtllmGenKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "trtllmGenKernels/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "selectiveScan/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "selectiveScan/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "userbuffers/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "userbuffers/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "fusedLayernormKernels/.*")
 
 function(filter_cuda_archs ARCH SOURCES_VAR)
-  if(NOT "${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-     AND NOT "${ARCH}-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-     AND NOT "all" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-     AND NOT "all-major" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
-    set(FILTER_REGEX ".*_sm(_)?${ARCH}[.]cubin[.]cpp")
+  if(NOT "${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+    set(FILTER_REGEX
+        ".*_sm(_)?${ARCH}[.]cubin[.]cpp|^.*Sm(_)?${ARCH}.*cubin.cpp$")
     list(APPEND SOURCES ${${SOURCES_VAR}})
     list(APPEND SOURCES_FILTERED ${SOURCES})
     list(FILTER SOURCES_FILTERED INCLUDE REGEX "${FILTER_REGEX}")
@@ -52,9 +53,7 @@ function(filter_cuda_archs ARCH SOURCES_VAR)
     set(${SOURCES_VAR}
         "${SOURCES}"
         PARENT_SCOPE)
-    if(SOURCES_FILTERED_LEN GREATER 0)
-      add_compile_definitions("EXCLUDE_SM_${ARCH}")
-    endif()
+    add_compile_definitions("EXCLUDE_SM_${ARCH}")
   endif()
 endfunction()
 
@@ -71,3 +70,5 @@ add_subdirectory(contextFusedMultiHeadAttention)
 add_subdirectory(decoderMaskedMultiheadAttention)
 add_subdirectory(selectiveScan)
 add_subdirectory(userbuffers)
+add_subdirectory(trtllmGenKernels)
+add_subdirectory(fusedLayernormKernels)

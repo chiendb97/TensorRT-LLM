@@ -90,7 +90,6 @@ class CrossAttentionTransformerBlock(Module):
             use_implicit_relative_attention=False,
             rotary_embedding_base=None,
             rotary_embedding_scaling=None,
-            layer_idx_in_cache_pool=None,
             quant_mode=QuantMode(0),
     ):
         super().__init__()
@@ -125,7 +124,6 @@ class CrossAttentionTransformerBlock(Module):
             skip_cross_kv=skip_cross_kv,
             qk_layernorm=True,
             layernorm_type=layernorm_type,
-            layer_idx_in_cache_pool=layer_idx_in_cache_pool,
             quant_mode=quant_mode,
         )
 
@@ -322,7 +320,6 @@ class TransformerBlock(Module):
             use_implicit_relative_attention=False,
             rotary_embedding_base=None,
             rotary_embedding_scaling=None,
-            layer_idx_in_cache_pool=None,
             quant_mode=QuantMode(0),
     ):
         super().__init__()
@@ -356,7 +353,6 @@ class TransformerBlock(Module):
             use_implicit_relative_attention=use_implicit_relative_attention,
             rotary_embedding_base=rotary_embedding_base,
             rotary_embedding_scaling=rotary_embedding_scaling,
-            layer_idx_in_cache_pool=layer_idx_in_cache_pool,
             quant_mode=quant_mode,
         )
 
@@ -557,18 +553,9 @@ class MLLaMAModel(Module):
             }
             if layer_idx in self.cross_attention_layers:
                 assert layers_range[0] == 0, "not support PP now"
-                _layers.append(
-                    CrossAttentionTransformerBlock(
-                        **args,
-                        layer_idx_in_cache_pool=self.config.
-                        num_kv_heads_per_cross_attn_layer[:local_layer_idx].
-                        count(num_kv_heads)))
+                _layers.append(CrossAttentionTransformerBlock(**args))
             else:
-                _layers.append(
-                    TransformerBlock(**args,
-                                     layer_idx_in_cache_pool=self.config.
-                                     num_kv_heads_per_layer[:local_layer_idx].
-                                     count(num_kv_heads)))
+                _layers.append(TransformerBlock(**args))
 
         self.layers = ModuleList(_layers)
 
@@ -719,6 +706,7 @@ class MLLaMAModel(Module):
 
 # TODO try to inherit the DecoderModelForCausalLM
 class MLLaMAForCausalLM(PretrainedModel):
+    config_class = MLLaMAConfig
 
     def __init__(self, config: MLLaMAConfig):
         super().__init__(config)
@@ -1168,9 +1156,10 @@ class MLLaMAForCausalLM(PretrainedModel):
                     lora_weight_pointer = Tensor(
                         name=f'{lora_module}_lora_weights_pointers_{i}',
                         dtype=trt.int64,
-                        shape=[-1, 2],
+                        shape=[-1, 3],
                         dim_range=OrderedDict([('batch_size_beam_width',
-                                                [bb_range]), ('in_out', [2])]))
+                                                [bb_range]),
+                                               ('in_out_scales', [3])]))
                     lora_weight_pointer_dict.update({
                         f'{lora_module}_lora_weights_pointers':
                         lora_weight_pointer
@@ -1319,9 +1308,11 @@ class MLLaMAForCausalLM(PretrainedModel):
                 host_kv_cache_pool_mapping = Tensor(
                     name=f"host_kv_cache_pool_mapping",
                     dtype=trt.int32,
-                    shape=[num_pp_layers],
+                    # 2: (Index of pool, Index of layer within pool)
+                    shape=[num_pp_layers, 2],
                     dim_range=OrderedDict([
                         ('pools_mapping', [num_pp_layers]),
+                        ('layer_cache_pool_locator', [2]),
                     ]))
 
                 # paged blocks for cross kv
@@ -1358,9 +1349,11 @@ class MLLaMAForCausalLM(PretrainedModel):
                 host_cross_kv_cache_pool_mapping = Tensor(
                     name=f"host_cross_kv_cache_pool_mapping",
                     dtype=trt.int32,
-                    shape=[num_pp_layers],
+                    # 2: (Index of pool, Index of layer within pool)
+                    shape=[num_pp_layers, 2],
                     dim_range=OrderedDict([
                         ('pools_mapping', [num_pp_layers]),
+                        ('layer_cache_pool_locator', [2]),
                     ]))
 
                 for i in layers_range:

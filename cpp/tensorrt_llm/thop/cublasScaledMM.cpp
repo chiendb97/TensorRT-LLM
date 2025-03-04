@@ -14,7 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
@@ -31,6 +33,7 @@ namespace
 {
 
 using tensorrt_llm::common::check;
+using tensorrt_llm::common::CublasMMWrapper;
 
 void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
     torch::Tensor const& scale_a, torch::Tensor const& scale_b)
@@ -40,9 +43,13 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     int32_t n = b.sizes()[1];
     int32_t k = a.sizes()[1];
 
-    auto cublasHandle = getCublasHandle();
-    auto cublasLtHandle = getCublasLtHandle();
-    auto cublasWrapper = getCublasMMWrapper(cublasHandle, cublasLtHandle, nullptr, nullptr);
+    thread_local std::shared_ptr<CublasMMWrapper> cublasWrapper;
+    if (cublasWrapper == nullptr)
+    {
+        auto cublasHandle = getCublasHandle();
+        auto cublasLtHandle = getCublasLtHandle();
+        cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+    }
 
     auto const dtype = out.dtype();
     cudaDataType_t aType = CUDA_R_8F_E4M3;
@@ -93,8 +100,8 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
 
     // got from cublasTest matmultFind
     int const algoID = 52;
-    check_cuda_error(
-        cublasLtMatmulAlgoInit(*cublasLtHandle, compType, scalarType, aType, bType, outType, outType, algoID, &algo));
+    check_cuda_error(cublasLtMatmulAlgoInit(
+        cublasWrapper->getCublasLtHandle(), compType, scalarType, aType, bType, outType, outType, algoID, &algo));
     int tileID = CUBLASLT_MATMUL_TILE_256x128;
     int swizzle = 0;
     uint16_t cta = CUBLASLT_CLUSTER_SHAPE_2x1x1;
@@ -182,11 +189,27 @@ Tensor& cublas_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor co
 }
 
 Tensor cublas_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype)
+    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t userbuffers_id)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
-    Tensor out = at::empty({mat_a.sizes()[0], mat_b.sizes()[1]}, mat_a.options().dtype(out_dtype_));
+
+    std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
+    std::vector<int64_t> output_strides = {mat_b.sizes()[1], 1};
+
+    Tensor out;
+    if (userbuffers_id >= 0)
+    {
+        TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
+        auto ub_buffer0 = tensorrt_llm::runtime::ub::ub_get(userbuffers_id);
+        out = torch::from_blob(
+            ub_buffer0.addr, output_size, output_strides, torch::dtype(out_dtype_).device(torch::kCUDA));
+    }
+    else
+    {
+        out = at::empty(output_size, mat_a.options().dtype(out_dtype_));
+    }
+
     return cublas_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, bias, out_dtype, out);
 }
 
@@ -196,7 +219,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "cublas_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
-        " ScalarType? out_dtype) -> (Tensor out)");
+        " ScalarType? out_dtype, int userbuffers_id) -> (Tensor out)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

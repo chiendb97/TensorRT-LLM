@@ -1,5 +1,6 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
+import base64
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -11,6 +12,7 @@ from openai.types.chat import \
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
+from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import SamplingParams
 
 
@@ -47,6 +49,13 @@ class ResponseFormat(OpenAIBaseModel):
     type: Literal["text", "json_object"]
 
 
+class DisaggregatedParams(OpenAIBaseModel):
+    request_type: str
+    first_gen_tokens: Optional[List[int]] = None
+    ctx_request_id: Optional[int] = None
+    encoded_opaque_state: Optional[str] = None
+
+
 class ErrorResponse(OpenAIBaseModel):
     object: str = "error"
     message: str
@@ -74,6 +83,22 @@ class CompletionResponseChoice(OpenAIBaseModel):
             "to stop, None if the completion finished for some other reason "
             "including encountering the EOS token"),
     )
+    disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
+
+    @staticmethod
+    def to_disaggregated_params(
+            tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
+        if tllm_disagg_params is None:
+            return None
+        else:
+            encoded_opaque_state = base64.b64encode(
+                tllm_disagg_params.opaque_state).decode(
+                    "utf-8") if tllm_disagg_params is not None else None
+            return DisaggregatedParams(
+                request_type=tllm_disagg_params.request_type,
+                first_gen_tokens=tllm_disagg_params.first_gen_tokens,
+                ctx_request_id=tllm_disagg_params.ctx_request_id,
+                encoded_opaque_state=encoded_opaque_state)
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -133,6 +158,7 @@ class CompletionRequest(OpenAIBaseModel):
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
     top_k: int = 0
+    top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
     length_penalty: float = 1.0
@@ -161,6 +187,11 @@ class CompletionRequest(OpenAIBaseModel):
             "supported."),
     )
 
+    disaggregated_params: Optional[DisaggregatedParams] = Field(
+        default=None,
+        description=("Parameters for disaggregated serving"),
+    )
+
     # doc: end-completion-extra-params
 
     def to_sampling_params(self) -> SamplingParams:
@@ -181,10 +212,27 @@ class CompletionRequest(OpenAIBaseModel):
             beam_width=self.best_of if self.best_of else self.n,
             min_tokens=self.min_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
+            add_special_tokens=self.add_special_tokens,
+            min_p=self.min_p,
+            ignore_eos=self.ignore_eos,
         )
-        if self.min_p > 0:
-            sampling_params.top_p_min = self.min_p
+        if self.top_p_min > 0:
+            sampling_params.top_p_min = self.top_p_min
         return sampling_params
+
+    def to_llm_disaggregated_params(self) -> LlmDisaggregatedParams:
+        if self.disaggregated_params is None:
+            return None
+        else:
+            opaque_state = base64.b64decode(
+                self.disaggregated_params.encoded_opaque_state
+            ) if self.disaggregated_params.encoded_opaque_state is not None else None
+
+            return LlmDisaggregatedParams(
+                request_type=self.disaggregated_params.request_type,
+                first_gen_tokens=self.disaggregated_params.first_gen_tokens,
+                ctx_request_id=self.disaggregated_params.ctx_request_id,
+                opaque_state=opaque_state)
 
     def model_post_init(self, __context: Any) -> None:
         if self.best_of is None:
@@ -200,7 +248,8 @@ class CompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if "top_logprobs" in data or "logprobs" in data:
+        if ("top_logprobs" in data and data.get("top_logprobs")) or \
+            ("logprobs" in data and data.get("logprobs")):
             raise ValueError("returning log probs is not supported")
         return data
 
@@ -216,7 +265,8 @@ class CompletionRequest(OpenAIBaseModel):
     @classmethod
     def verify_multi_responses(cls, data):
         best_of = data.get("best_of")
-        if best_of and best_of < data.get("n"):
+        n = data.get("n")
+        if best_of and n and best_of < n:
             raise ValueError("best_of should not be smaller than n")
         return data
 
@@ -402,6 +452,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     best_of: Optional[int] = None
     use_beam_search: bool = False
     top_k: int = 0
+    top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
     length_penalty: float = 1.0
@@ -480,9 +531,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
             stop=self.stop,
             include_stop_str_in_output=self.include_stop_str_in_output,
             return_log_probs=self.logprobs,
+            add_special_tokens=self.add_special_tokens,
+            min_p=self.min_p,
+            ignore_eos=self.ignore_eos,
         )
-        if self.min_p > 0:
-            sampling_params.top_p_min = self.min_p
+        if self.top_p_min > 0:
+            sampling_params.top_p_min = self.top_p_min
         return sampling_params
 
     def model_post_init(self, __context: Any) -> None:
