@@ -27,7 +27,7 @@ from tensorrt_llm.llmapi.tokenizer import _xgrammar_tokenizer_info
 def generate_xgrammar_tokenizer_info(args):
 
     tokenizer = AutoTokenizer.from_pretrained(str(args.model_dir))
-    tokenizer_info = _xgrammar_tokenizer_info(tokenizer)
+    tokenizer_info = _xgrammar_tokenizer_info(tokenizer, im_end=args.im_end)
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(str(args.output_dir / "xgrammar_tokenizer_info.json"), 'w') as f:
@@ -41,6 +41,11 @@ if __name__ == "__main__":
                         default=None,
                         required=True,
                         help="HF model directory")
+    parser.add_argument('--im_end',
+                        type=str,
+                        default=None,
+                        required=False,
+                        help="im_end token")
     parser.add_argument(
         '--output_dir',
         type=Path,

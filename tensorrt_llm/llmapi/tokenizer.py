@@ -196,12 +196,16 @@ def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
         raise TypeError(f"Unrecognized tokenizer {obj}")
 
 
-def _xgrammar_tokenizer_info(tokenizer):
+def _xgrammar_tokenizer_info(tokenizer, im_end=None):
     # Reference: https://github.com/mlc-ai/xgrammar/blob/b9a16de54e1e0eff58da14c65750414cceaf1a6f/python/xgrammar/tokenizer_info.py#L133
     if isinstance(tokenizer, TokenizerBase):
         tokenizer = tokenizer.tokenizer
 
-    stop_token_ids = [tokenizer.eos_token_id]
+    # Todo: set eos_token_id = im_end_id in tokenizer config
+    if im_end is not None:
+        stop_token_ids = tokenizer.encode(im_end, add_special_tokens=False)
+    else:
+        stop_token_ids = [tokenizer.eos_token_id]
 
     try:
         encoded_vocab = tokenizer.get_vocab()
