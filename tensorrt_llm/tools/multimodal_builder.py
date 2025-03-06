@@ -148,7 +148,7 @@ def export_onnx(model,
 				onnx_dir,
 				onnx_name='model.onnx',
 				input_names=['input'],
-				output_names=['output'],
+				output_names=['encoder_output'],
 				dynamic_axes={'input': {
 					0: 'batch'
 				}},
