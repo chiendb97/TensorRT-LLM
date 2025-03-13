@@ -199,6 +199,7 @@ def build_trt_engine(model_type,
 	if num_frames is not None:
 		config_args["num_frames"] = num_frames
 
+	print("visual engine config: ", config_args)
 	config_wrapper = Builder().create_builder_config(**config_args)
 	config = config_wrapper.trt_builder_config
 
@@ -1077,7 +1078,10 @@ def build_internvl_engine(args):
 												 torch_dtype=torch.float16,
 												 trust_remote_code=True).to(
 		args.device)
-	max_num_crops = model.config.max_dynamic_patch
+	# binhtranmcs: remove this since we will dynamically read max_num_crops in config
+	# and multiply with max_batch_size before hand
+	# max_num_crops = model.config.max_dynamic_patch
+	max_num_crops = 1
 	wrapper = InternvlVisionWrapper(model, model.config.downsample_ratio,
 									model.config.select_layer)
 
