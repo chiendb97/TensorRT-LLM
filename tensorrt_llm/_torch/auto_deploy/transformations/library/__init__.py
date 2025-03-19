@@ -1,6 +1,8 @@
 """A library of transformation passes."""
 
 from .collectives import *
+from .fused_mha import *
+from .fused_moe import *
 from .fusion import *
 from .kvcache import *
 from .quantization import *

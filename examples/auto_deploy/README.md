@@ -6,7 +6,7 @@
 
 <div align="left">
 
-AutoDeploy is designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models like those from Hugging Face, to optimized inference environments with TRT-LLM. It automates graph transformations to integrate inference optimizations such as tensor parallelism, KV-caching and quantization. AutoDeploy supports optimized in-framework deployment, minimizing the amount of manual modification needed.
+AutoDeploy is designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models like those from Hugging Face, to TensorRT-LLM. It automates graph transformations to integrate inference optimizations such as tensor parallelism, KV-caching and quantization. AutoDeploy supports optimized in-framework deployment, minimizing the amount of manual modification needed.
 
 ______________________________________________________________________
 
@@ -39,7 +39,7 @@ ______________________________________________________________________
 AutoDeploy is accessible through TRT-LLM installation.
 
 ```bash
-sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm --extra-index-url https://pypi.nvidia.com
+sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
 ```
 
 You can refer to [TRT-LLM installation guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/linux.md) for more information.
@@ -183,7 +183,7 @@ Currently `AutoQuantize` supports only `effective_bits` as the performance const
 
 #### 1. Quantize a model with ModelOpt
 
-Refer [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/main/examples/llm_autodeploy/README.md) for generating quantized model checkpoint.
+Refer to [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/main/examples/llm_autodeploy/README.md) for generating quantized model checkpoint.
 
 #### 2. Deploy the quantized model with AutoDeploy
 
@@ -209,7 +209,8 @@ build_config = BuildConfig(
     max_batch_size=<MAX_BS>,
 )
 build_config.plugin_config.tokens_per_block = <PAGE_SIZE>
-# if using "TritonWithFlattenedInputs" as backend <PAGE_SIZE> should equal to <MAX_SEQ_LEN>, see [simple_config.py](./simple_config.py#L109) for details.
+# if using "TritonWithFlattenedInputs" as backend, <PAGE_SIZE> should equal to <MAX_SEQ_LEN>
+# Refer to examples/auto_deploy/simple_config.py (line 109) for details.
 
 # 2. Set up AutoDeploy configuration
 # AutoDeploy will use its own cache implementation

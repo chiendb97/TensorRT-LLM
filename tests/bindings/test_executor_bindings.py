@@ -856,6 +856,23 @@ def test_output_config():
     assert additional_model_output.gather_context == True
 
 
+def test_output_config_pickle():
+    config = trtllm.OutputConfig(
+        True, False, True, False, True, False,
+        list([trtllm.AdditionalModelOutput("topKLogits", True)]))
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config_copy.return_log_probs == True
+    assert config_copy.return_context_logits == False
+    assert config_copy.return_generation_logits == True
+    assert config_copy.exclude_input_from_output == False
+    assert config_copy.return_encoder_output == True
+    assert config_copy.return_perf_metrics == False
+    assert len(config_copy.additional_model_outputs) == 1
+    additional_model_output = config_copy.additional_model_outputs[0]
+    assert additional_model_output.name == "topKLogits"
+    assert additional_model_output.gather_context == True
+
+
 def test_external_draft_tokens_config():
     tokens = [1, 2, 3]
     config = trtllm.ExternalDraftTokensConfig(tokens)
@@ -1069,6 +1086,25 @@ def test_response():
     assert response.result.output_token_ids == [[1, 2, 3]]
 
 
+def test_dynamic_batch_config():
+    config = trtllm.DynamicBatchConfig(enable_batch_size_tuning=True,
+                                       enable_max_num_tokens_tuning=True,
+                                       dynamic_batch_moving_average_window=128)
+    assert config.enable_batch_size_tuning == True
+    assert config.enable_max_num_tokens_tuning == True
+    assert config.dynamic_batch_moving_average_window == 128
+
+
+def test_dynamic_batch_config_pickle():
+    config = trtllm.DynamicBatchConfig(enable_batch_size_tuning=True,
+                                       enable_max_num_tokens_tuning=True,
+                                       dynamic_batch_moving_average_window=128)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config_copy.enable_batch_size_tuning == True
+    assert config_copy.enable_max_num_tokens_tuning == True
+    assert config_copy.dynamic_batch_moving_average_window == 128
+
+
 def test_scheduler_config():
     capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
     config = trtllm.SchedulerConfig()
@@ -1226,6 +1262,25 @@ def test_kv_cache_retention_config():
         ], 50)
 
 
+def test_speculative_decoding_config():
+    config = trtllm.SpeculativeDecodingConfig(True)
+    assert config.fast_logits == True
+
+    kwargs = {
+        "fast_logits": True,
+    }
+
+    config = trtllm.SpeculativeDecodingConfig(**kwargs)
+    for k, v in kwargs.items():
+        assert getattr(config, k) == v
+
+
+def test_speculative_decoding_config_pickle():
+    config = trtllm.SpeculativeDecodingConfig(True)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config_copy.fast_logits == True
+
+
 def test_lookahead_decoding_config():
     config = trtllm.LookaheadDecodingConfig(3, 5, 7)
     assert config.max_window_size == 3
@@ -1246,6 +1301,14 @@ def test_lookahead_decoding_config():
     config = trtllm.LookaheadDecodingConfig(**kwargs)
     for k, v in kwargs.items():
         assert getattr(config, k) == v
+
+
+def test_lookahead_decoding_config_pickle():
+    config = trtllm.LookaheadDecodingConfig(3, 5, 7)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config_copy.max_window_size == 3
+    assert config_copy.max_ngram_size == 5
+    assert config_copy.max_verification_set_size == 7
 
 
 def test_eagle_config():
@@ -1852,6 +1915,7 @@ def test_request_perf_metrics_kv_cache(model_path):
 
     # Enqueue the request
     request_id = executor.enqueue_request(request)
+    # Store two blocks with a total of 35 reusable tokens (4 input + 32 output, but last token is not stored)
 
     # Get the response
     responses = executor.await_responses(request_id)
@@ -1867,6 +1931,8 @@ def test_request_perf_metrics_kv_cache(model_path):
                              output_config=output_config)
 
     # Enqueue the request
+    # New query has 36 tokens that match input and output of first request plus 4 additional tokens.
+    # First block reused completely (32 tokens), from second block we'll partially reuse 3 tokens.
     request_id = executor.enqueue_request(request)
 
     # Get the response
@@ -1875,14 +1941,14 @@ def test_request_perf_metrics_kv_cache(model_path):
     result = responses[0].result
     assert result.is_final
 
-    # Check KV cache metric: one block should be reused from first request
-    # and one newly created -> 50% hit rate
+    # Check KV cache metric: Two blocks will be reused, although second block is partially reused.
+    # Cache hit rate is 100% since granularity is blocks, not tokens.
     kv_cache_metrics = result.request_perf_metrics.kv_cache_metrics
-    assert kv_cache_metrics.num_total_allocated_blocks == 1
-    assert kv_cache_metrics.num_new_allocated_blocks == 1
-    assert kv_cache_metrics.num_reused_blocks == 1
-    assert kv_cache_metrics.num_missed_blocks == 1
-    assert kv_cache_metrics.kv_cache_hit_rate == 0.5
+    assert kv_cache_metrics.num_total_allocated_blocks == 0
+    assert kv_cache_metrics.num_new_allocated_blocks == 0
+    assert kv_cache_metrics.num_reused_blocks == 2
+    assert kv_cache_metrics.num_missed_blocks == 0
+    assert kv_cache_metrics.kv_cache_hit_rate == 1.0
 
 
 @pytest.mark.parametrize("exclude_input_from_output", [False, True])
@@ -2287,14 +2353,6 @@ def test_runtime_defaults():
     default_runtime_defaults = trtllm.RuntimeDefaults()
     for key in all_field_names:
         assert getattr(default_runtime_defaults, key) == None
-
-
-def test_DynamicBatchConfig_pickle():
-    config = trtllm.DynamicBatchConfig(enable_batch_size_tuning=True,
-                                       enable_max_num_tokens_tuning=True,
-                                       dynamic_batch_moving_average_window=128)
-    config_copy = pickle.loads(pickle.dumps(config))
-    assert config.enable_batch_size_tuning == config_copy.enable_batch_size_tuning
 
 
 def test_request_pickle():

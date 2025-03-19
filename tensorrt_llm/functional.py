@@ -452,6 +452,18 @@ class Tensor(object):
         '''
         return sqrt(self)
 
+    def squeeze(self, dim, zero_is_placeholder):
+        '''
+        See functional.squeeze.
+        '''
+        return squeeze(self, dim, zero_is_placeholder)
+
+    def unsqueeze(self, dim):
+        '''
+        See functional.squeeze.
+        '''
+        return unsqueeze(self, dim)
+
     def log(self):
         '''
         See functional.log.
@@ -505,6 +517,12 @@ class Tensor(object):
         See functional.unbind.
         '''
         return unbind(self, dim)
+
+    def repeat(self, sizes):
+        '''
+        See functional.repeat
+        '''
+        return repeat(self, sizes)
 
     def is_dynamic(self, dim=None):
         '''
@@ -572,6 +590,15 @@ class Tensor(object):
 
     def __repr__(self):
         return f"TensorRT-LLM Tensor: {self.name=} {self.dtype=} {self.shape=}"
+
+    def __xor__(self, b):
+        '''
+        Maps to functional.gt or functional.eq.
+        '''
+        print(f"self.shape: {self.shape}, b.shape: {b.shape}")
+        a, b = broadcast_helper(self, b)
+        print(f"a.shape: {a.shape}, b.shape: {b.shape}")
+        return op_xor(a, b)
 
 
 def _create_tensor(trt_tensor: trt.ITensor, producer: trt.ILayer) -> Tensor:
@@ -725,6 +752,15 @@ class MLPType(IntEnum):
     MLP = 0
     GatedMLP = 1
     FusedGatedMLP = 2
+
+
+class SliceInputType(IntEnum):
+    data = 0
+    start = 1
+    size = 2
+    stride = 3
+    fill_value = 4
+    axes = 5
 
 
 def activation(input: Tensor, act_type: trt.ActivationType) -> Tensor:
@@ -1285,6 +1321,80 @@ def slice(input: Tensor,
         layer.set_input(4, fill_value.trt_tensor)
 
     return _create_tensor(layer.get_output(0), layer)
+
+
+def pad(input: Tensor,
+        pad: Union[Sequence[int], Tensor],
+        mode: str = 'constant',
+        value: Optional[float] = None) -> Tensor:
+    '''
+    Add a pad layer.
+
+    The padding layer adds zero-padding at the start and end of the input tensor. And the
+    padding size by which to pad some dimensions of input are described starting from the
+    last dimension and moving forward.
+
+    `[len(pad) / 2]` dimensions of input will be padded. For example, to pad only the last
+    dimension of the input tensor, then pad has the form [padding_left, padding_right]; to
+    pad the last 2 dimensions of the input tensor, then use [padding_left, padding_right,
+    padding_top, padding_bottom]; to pad the last 3 dimensions, use [padding_left,
+    padding_right, padding_top, padding_bottom, padding_front, padding_back].
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the padding_2d is performed.
+        pad : sequence of int
+            An m-elements tuple for padding, where its length m meets the requirement that
+            m <= 2*input dimensions, and m is even.
+        mode : str
+            Only \'constant\' is supported.
+        value : float
+            Fill value for 'constant' padding. Default: 0.
+
+    Returns:
+        The tensor produced by the inserted layer.
+    '''
+    assert mode == "constant", "Only `'constant'` is supported now."
+
+    if isinstance(pad, list) or isinstance(pad, tuple):
+        assert (
+            len(pad) % 2 == 0 and len(pad) <= 2 * input.ndim()
+        ), "The length of `pad` should be even and less than 2*input.ndim"
+        pad = constant(np.array(pad).astype(np.int32)).view([-1, 2])
+    elif isinstance(pad, Tensor):
+        pad = pad.flatten()
+        assert (
+            pad.size(0) % 2 == 0 and pad.size(0) <= 2 * input.ndim()
+        ), "The length of `pad` should be even and less than 2*input.ndim"
+        pad = pad.cast("int32").view([-1, 2])
+    else:
+        raise NotImplementedError(f"pad type {type(pad)} not supported")
+    if value is None:
+        value = 0
+
+    pad = concat([constant(np.zeros((1, 2), dtype=np.int32)),
+                  pad])  # pre-padding the indices
+    padding_index = [0] * input.ndim()
+    padding_index[-(pad.size(0) - 1):] = list(range(pad.size(0) - 1, 0,
+                                                    -1))  # reverse the indices
+    pad = index_select(pad,
+                       dim=0,
+                       index=constant(np.array(padding_index, dtype=np.int32)))
+    pre_padding, post_padding = chunk(pad, chunks=2, dim=1)
+    start = (pre_padding.flatten() * (-1)).cast('int32')
+    extend_size = (pre_padding + post_padding).flatten()
+    size = (extend_size + shape(input)).cast('int32')
+    layer = default_trtnet().add_slice(input.trt_tensor,
+                                       start=[0] * input.ndim(),
+                                       shape=[0] * input.ndim(),
+                                       stride=[1] * input.ndim())
+    layer.mode = trt.SampleMode.FILL
+    layer.set_input(SliceInputType.start, start.trt_tensor)
+    layer.set_input(SliceInputType.size, size.trt_tensor)
+    layer.set_input(SliceInputType.fill_value,
+                    constant_to_tensor_(value, dtype=input.dtype).trt_tensor)
+    output = _create_tensor(layer.get_output(0), layer)
+    return output
 
 
 def rand(shape: Tensor,
@@ -2914,6 +3024,7 @@ eq = partial(elementwise_binary, op=trt.ElementWiseOperation.EQUAL)
 minimum = partial(elementwise_binary, op=trt.ElementWiseOperation.MIN)
 maximum = partial(elementwise_binary, op=trt.ElementWiseOperation.MAX)
 pow = partial(elementwise_binary, op=trt.ElementWiseOperation.POW)
+op_xor = partial(elementwise_binary, op=trt.ElementWiseOperation.XOR)
 
 
 def modulo(x: Tensor, y: Union[Tensor, int]) -> Tensor:
@@ -3530,6 +3641,59 @@ def conv2d(input: Tensor,
     return output
 
 
+def conv3d(input: Tensor,
+           weight: Tensor,
+           bias: Optional[Tensor] = None,
+           stride: Union[int, Tuple[int, int]] = (1, 1, 1),
+           padding: Union[int, Tuple[int, int]] = (0, 0, 0),
+           dilation: Union[int, Tuple[int, int]] = (1, 1, 1),
+           groups: int = 1) -> Tensor:
+    ##
+    ## TODO: Document this function!
+    ##
+
+    ndim = input.ndim()
+    # TRT requires the input of Conv3D layer to be 5-dimentional tensor.
+    if ndim == 4:
+        input = expand_dims(input, 0)
+    assert input.ndim() == 5
+
+    if isinstance(stride, int):
+        stride = tuple([stride] * 3)
+    if isinstance(padding, int):
+        padding = tuple([padding] * 3)
+    if isinstance(dilation, int):
+        dilation = tuple([dilation] * 3)
+
+    noutput = weight.size()[0]
+    kernel_size = (weight.size()[-3], weight.size()[-2], weight.size()[-1])
+
+    is_weight_constant = (weight.producer is not None
+                          and weight.producer.type == trt.LayerType.CONSTANT)
+    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+
+    if bias is not None:
+        is_bias_constant = (bias.producer is not None
+                            and bias.producer.type == trt.LayerType.CONSTANT)
+        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+
+    layer = default_trtnet().add_convolution_nd(input.trt_tensor, noutput,
+                                                kernel_size, weight, bias)
+    layer.stride_nd = stride
+    layer.padding_nd = padding
+    layer.dilation_nd = dilation
+    layer.num_groups = groups
+    layer.dilation_nd = dilation
+
+    if not is_weight_constant:
+        layer.set_input(1, weight.trt_tensor)
+    if bias is not None and not is_bias_constant:
+        layer.set_input(2, bias.trt_tensor)
+
+    output = _create_tensor(layer.get_output(0), layer)
+    return output
+
+
 def conv_transpose2d(input: Tensor,
                      weight: Tensor,
                      bias: Optional[Tensor] = None,
@@ -3753,7 +3917,8 @@ class AllReduceParams():
                  norm_weight: Optional[Tensor] = None,
                  scale: Optional[Tensor] = None,
                  norm_pre_residual_weight: Optional[Tensor] = None,
-                 eps: float = 1e-06):
+                 eps: float = 1e-06,
+                 enable_allreduce: bool = True):
         self.strategy = strategy
         self.config = config
         self.fusion_op = fusion_op
@@ -3763,6 +3928,8 @@ class AllReduceParams():
         self.scale = scale
         self.norm_pre_residual_weight = norm_pre_residual_weight
         self.eps = eps
+        # For torch path only, has no effect on TRT path
+        self.enable_allreduce = enable_allreduce
         assert fusion_op == AllReduceFusionOp.NONE or (residual is not None)
 
     def has_affine(self):
@@ -5861,6 +6028,174 @@ def rms_norm(input: Tensor,
     return y
 
 
+def rearrange(inputs: Union[Tensor, Sequence[Tensor]], expression: str,
+              **kwargs) -> Tensor:
+    '''
+    Add a rearrange operation on a tensor.
+
+    This operation is a reader-friendly smart element reordering for multidimensional tensors,
+    including functionality of transpose (axes permutation), reshape (view), squeeze, unsqueeze,
+    stack, concatenate and other operations. Please see: https://einops.rocks/api/rearrange/
+
+    For example, if the shape of input tensor is [32, 30, 40, 3], and run:
+        `rearrange(x, 'b (h h1) (w w1) c -> b h w 1 (c h1 w1) 1', h1=2, w1=2)`
+    it would produce a tensor with shape as [32, 15, 20, 1, 12, 1].
+
+    Parameters:
+        input: Union[Tensor, Sequence[Tensor]]
+            If it is a tensor, it will directly operate on it.
+            Otherwise, if it is a sequence, it will concat it to a tensor and then
+            operates on it.
+
+        expression : str
+            The expression about how to reorder the tensor in a reader-friendly way.
+
+        kwargs:
+            Keyword arguments to set some identifiers with specific values.
+
+    Returns:
+        The output tensor of this operation.
+    '''
+    import re
+
+    def _init_expression(expr):
+        expr_items = expr.split(" ")
+        tmp_name_index = 0
+        for idx, item in enumerate(expr_items):
+            values = re.findall(r'\b\d+\b', item)
+            if len(values) > 0:
+                prefix = "(" if "(" in item else ""
+                subfix = ")" if ")" in item else ""
+                expr_items[
+                    idx] = f"{prefix}NumericId{tmp_name_index}Val{values[0]}{subfix}"
+                tmp_name_index += 1
+        return " ".join(expr_items)
+
+    def _get_all_identifier(expr):
+        return re.findall(r'\b[a-zA-Z_]+\d*\b', expr)
+
+    def _get_all_symbols(expr):
+        return re.findall(r'\b\w+\b', expr)
+
+    def _get_dim_expr(expr):
+        return [
+            _get_all_symbols(match.group())
+            for match in re.finditer(r'\b\w+\b|\(.*?\)', expr)
+        ]
+
+    src_shape_expr, _, dst_shape_expr = expression.partition("->")
+    unknown_identifiers = re.findall(r'[^a-zA-Z0-9_\(\)]',
+                                     src_shape_expr + dst_shape_expr)
+    assert len(
+        unknown_identifiers) > 0, f"Unknown identifiers: {unknown_identifiers}"
+    src_identifiers = _get_all_identifier(src_shape_expr)
+    dst_identifiers = _get_all_identifier(dst_shape_expr)
+    assert (len(src_identifiers) == len(set(src_identifiers))
+            and len(dst_identifiers) == len(set(dst_identifiers))
+            ), "Indexing expression contains duplicate dimension."
+    assert (set(src_identifiers) == set(dst_identifiers)
+            ), "Identifiers only on one side of expression (should be on both)."
+
+    new_expression = _init_expression(expression)
+    src_shape_expr, _, dst_shape_expr = new_expression.partition("->")
+
+    # concat if inputs are sequence of tensors
+    if isinstance(inputs, Sequence):
+        inputs = concat([unsqueeze(t, 0) for t in inputs], dim=0)
+    assert (
+        inputs.ndim() == len(_get_dim_expr(src_shape_expr))
+    ), f"inputs.ndim() is {inputs.ndim()} while indexing expression has {len(_get_dim_expr(src_shape_expr))}"
+
+    src_symbols = _get_all_symbols(src_shape_expr)
+    dst_symbols = _get_all_symbols(dst_shape_expr)
+
+    # find all the symbols-values mapping and store them in symbol_map
+    symbol_map = {
+        symbol: {
+            "updated": False,
+            "value": None
+        }
+        for symbol in set(src_symbols + dst_symbols)
+    }
+    for symbol in symbol_map:
+        if "NumericId" in symbol:
+            symbol_map[symbol]["value"] = int(symbol.partition("Val")[-1])
+            symbol_map[symbol]["updated"] = True
+    for symbol, value in kwargs.items():
+        symbol_map[symbol]["value"] = value
+        symbol_map[symbol]["updated"] = True
+
+    for idx, dim_expr in enumerate(_get_dim_expr(src_shape_expr)):
+        if len(dim_expr) == 1:
+            symbol = dim_expr[0]
+            if not symbol_map[symbol]["updated"]:
+                symbol_map[symbol]["value"] = shape(inputs, idx)
+                symbol_map[symbol]["updated"] = True
+        else:
+            divisors = []
+            unknown_symbol = None
+            for symbol in dim_expr:
+                if not symbol_map[symbol]["updated"]:
+                    unknown_symbol = symbol
+                else:
+                    divisors.append(symbol_map[symbol]["value"])
+            if unknown_symbol is not None:
+                assert len(divisors) > 0
+                divisor = prod(cast(concat(divisors), "int64"), dim=-1)
+                symbol_map[unknown_symbol]["value"] = shape(inputs,
+                                                            idx) / divisor
+                symbol_map[unknown_symbol]["updated"] = True
+
+    for symbol, item in symbol_map.items():
+        assert (item["updated"]
+                ), f"{symbol} cannot be inferred, please set it manually"
+
+    dst_dims = []
+    for dim_expr in _get_dim_expr(dst_shape_expr):
+        if len(dim_expr) == 1:
+            dst_dims.append(symbol_map[dim_expr[0]]["value"])
+        else:
+            accumulator = prod(cast(
+                concat([symbol_map[symbol]["value"] for symbol in dim_expr]),
+                "int64"),
+                               dim=-1)
+            dst_dims.append(accumulator)
+    dst_dims = cast(concat(dst_dims, dim=-1), "int64")
+
+    src_indices = {symbol: idx for idx, symbol in enumerate(src_identifiers)}
+    permute_dims = [src_indices[symbol] for symbol in dst_identifiers]
+
+    symbol_shape = cast(
+        concat([symbol_map[symbol]["value"] for symbol in src_identifiers],
+               dim=-1), "int64")
+    tensor = inputs.view(symbol_shape)
+    tensor = permute(tensor, permute_dims)
+    tensor = tensor.view(dst_dims)
+    return tensor
+
+
+def repeat(input: Tensor, sizes: Sequence[int]) -> Tensor:
+    '''
+    Repeats the tensor along the specified dimensions.
+
+    Parameters:
+        input : Tensor
+            The tensor to be repeated.
+        sizes : Sequence[int]
+            The number of times to repeat the tensor along each dimension.
+
+    Returns:
+        A tensor except for repeated input tensors along specified dim.
+
+    '''
+    assert input.ndim() <= len(sizes), \
+        "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor"
+    repeated_tensor = input
+    for k in range(-1, -len(sizes) - 1, -1):
+        repeated_tensor = concat([repeated_tensor] * sizes[k], dim=k)
+    return repeated_tensor
+
+
 def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
     '''
     Repeats elements of a tensor along an axis.
@@ -5886,6 +6221,32 @@ def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
     tile_reshape_size[dim] = tile_reshape_size[dim] * repeats
     tensor = tile.view(concat(tile_reshape_size))
     return tensor
+
+
+def meshgrid2d(x: Tensor, y: Tensor) -> Tuple[Tensor]:
+    '''
+    Creates grids (2D) of coordinates specified by the 1D inputs (only supports `indexing=\'xy\'`).
+
+    Parameters:
+        x : Tensor
+            The first input (1D) tensor.
+        y : Tensor
+            The second input (1D) tensor.
+
+    Returns:
+        The tuple of two tensors produced.
+
+    TODO: Add full support for torch.meshgrid.
+          See https://pytorch.org/docs/stable/generated/torch.meshgrid.html#torch-meshgrid
+    '''
+    if x.ndim() == 1:
+        x = expand_dims(x, 0)
+    if y.ndim() == 1:
+        y = expand_dims(y, 0)
+    grid_x = repeat_interleave(x, shape(y, 1),
+                               1).view([x.shape[-1], y.shape[-1]])
+    grid_y = repeat(y, (x.shape[-1], 1))
+    return (grid_x, grid_y)
 
 
 def generate_logn_scaling(seq_length: int = 8192,
@@ -6123,6 +6484,7 @@ ACT2FN = {
     'squared-relu': squared_relu,
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
+    'sigmoid': sigmoid,
 }
 
 GATED_ACT_2_ACT = {

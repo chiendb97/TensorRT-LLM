@@ -22,10 +22,6 @@ methods:
         annotation: bool
         default: false
         name: skip_tokenizer_init
-      speculative_model:
-        annotation: Union[str, pathlib.Path, NoneType]
-        default: null
-        name: speculative_model
       tensor_parallel_size:
         annotation: int
         default: 1
@@ -127,6 +123,22 @@ methods:
         default: false
         name: streaming
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
+  get_kv_cache_events:
+    name: get_kv_cache_events
+    parameters:
+      timeout:
+        annotation: Optional[float]
+        default: 2
+        name: timeout
+    return_annotation: List[dict]
+  get_kv_cache_events_async:
+    name: get_kv_cache_events_async
+    parameters:
+      timeout:
+        annotation: Optional[float]
+        default: 2
+        name: timeout
+    return_annotation: tensorrt_llm.executor.result.IterationResult
   get_stats:
     name: get_stats
     parameters:
@@ -142,7 +154,7 @@ methods:
         annotation: Optional[float]
         default: 2
         name: timeout
-    return_annotation: tensorrt_llm.executor.result.IterationStatsResult
+    return_annotation: tensorrt_llm.executor.result.IterationResult
   save:
     name: save
     parameters:

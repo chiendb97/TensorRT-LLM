@@ -15,19 +15,21 @@ from ..bindings import executor as tllm
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
-                        GenerationResult, IterationStatsResult, LoRARequest,
+                        GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
+from ..executor.postproc_worker import PostprocParams
 from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .llm_utils import (LLMARGS_EXPLICIT_DOCSTRING, CachedModelLoader,
-                        KvCacheRetentionConfig, LlmArgs, LlmBuildStats,
-                        ModelLoader, _ModelRuntimeContext)
+from .llm_args import LLMARGS_EXPLICIT_DOCSTRING
+from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig, LlmArgs,
+                        LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import (MpiCommSession, MpiPoolSession,
                           external_mpi_comm_available)
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
-from .utils import append_docstring, exception_handler, get_device_count
+from .utils import (append_docstring, exception_handler, get_device_count,
+                    nvtx_range)
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -98,7 +100,6 @@ class LLM:
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
-                 speculative_model: Optional[Union[str, Path]] = None,
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
@@ -116,7 +117,6 @@ class LLM:
                 dtype=dtype,
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
-                speculative_model=speculative_model,
                 **kwargs)
 
         except Exception as e:
@@ -256,6 +256,7 @@ class LLM:
 
         return futures
 
+    @nvtx_range("LLM.generate_async")
     def generate_async(
         self,
         inputs: PromptInputs,
@@ -266,6 +267,7 @@ class LLM:
         queries: Optional[PromptInputs] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        _postproc_params: Optional[PostprocParams] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -322,6 +324,9 @@ class LLM:
             len(prompt_token_ids),
             len(query_token_ids) if query_token_ids is not None else 0,
             sampling_params)
+        if _postproc_params:
+            _postproc_params.postproc_args.num_prompt_tokens = len(
+                prompt_token_ids)
         result = self._executor.generate_async(
             prompt_token_ids,
             query_token_ids=query_token_ids,
@@ -331,9 +336,14 @@ class LLM:
             streaming=streaming,
             prompt_tuning_config=prompt_tuning_config,
             kv_cache_retention_config=kv_cache_retention_config,
-            disaggregated_params=disaggregated_params)
-        return RequestOutput._from_generation_result(result, prompt,
-                                                     self.tokenizer)
+            disaggregated_params=disaggregated_params,
+            postproc_params=_postproc_params,
+        )
+        #For dis serving context only requests, skip post-processing
+        tokenizer = None if (disaggregated_params
+                             and disaggregated_params.request_type
+                             == "context_only") else self.tokenizer
+        return RequestOutput._from_generation_result(result, prompt, tokenizer)
 
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
         '''Get iteration statistics from the runtime.
@@ -347,17 +357,60 @@ class LLM:
         '''
         return self._executor.get_stats(timeout=timeout)
 
-    def get_stats_async(self,
-                        timeout: Optional[float] = 2) -> IterationStatsResult:
+    def get_stats_async(self, timeout: Optional[float] = 2) -> IterationResult:
         '''Get iteration statistics from the runtime.
 
         Args:
-            timeout (float, optional): Max wait time in seconds when retrieving stats from queue. . Defaults to 2.
+            timeout (float, optional): Max wait time in seconds when retrieving stats from queue. Defaults to 2.
 
         Returns:
-            tensorrt_llm.executor.result.IterationStatsResult: An async iterable object containing runtime stats.
+            tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime stats.
         '''
         return self._executor.aget_stats(timeout=timeout)
+
+    def get_kv_cache_events(self, timeout: Optional[float] = 2) -> List[dict]:
+        '''Get iteration KV events from the runtime.
+
+        KV events are used to track changes and operations within the KV Cache. Types of events:
+            - KVCacheCreatedData: Indicates the creation of cache blocks.
+            - KVCacheStoredData: Represents a sequence of stored blocks.
+            - KVCacheRemovedData: Contains the hashes of blocks that are being removed from the cache.
+            - KVCacheUpdatedData: Captures updates to existing cache blocks.
+
+        To enable KV events:
+            - set `event_buffer_max_size` to a positive integer in the `KvCacheConfig`.
+            - set `enable_block_reuse` to True in the `KvCacheConfig`.
+
+        Args:
+            timeout (float, optional): Max wait time in seconds when retrieving events from queue. Defaults to 2.
+
+        Returns:
+            List[dict]: A list of runtime events as dict.
+        '''
+        return self._executor.get_kv_events(timeout=timeout)
+
+    def get_kv_cache_events_async(self,
+                                  timeout: Optional[float] = 2
+                                  ) -> IterationResult:
+        '''Get iteration KV events from the runtime.
+
+        KV events are used to track changes and operations within the KV Cache. Types of events:
+            - KVCacheCreatedData: Indicates the creation of cache blocks.
+            - KVCacheStoredData: Represents a sequence of stored blocks.
+            - KVCacheRemovedData: Contains the hashes of blocks that are being removed from the cache.
+            - KVCacheUpdatedData: Captures updates to existing cache blocks.
+
+        To enable KV events:
+            - set `event_buffer_max_size` to a positive integer in the `KvCacheConfig`.
+            - set `enable_block_reuse` to True in the `KvCacheConfig`.
+
+        Args:
+            timeout (float, optional): Max wait time in seconds when retrieving events from queue. . Defaults to 2.
+
+        Returns:
+            tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime events.
+        '''
+        return self._executor.aget_kv_events(timeout=timeout)
 
     def _prepare_sampling_params(
             self,
@@ -482,6 +535,7 @@ class LLM:
             pytorch_backend_config=self.pytorch_backend_config,
             mapping=self.args.parallel_config.to_mapping(),
             build_config=self.args.build_config,
+            speculative_config=self.args.speculative_config,
             hf_model_dir=self._hf_model_dir,
             trt_engine_dir=self._engine_dir)
         executor_config.llm_parallel_config = self.args.parallel_config
@@ -491,7 +545,7 @@ class LLM:
         self._executor = self._executor_cls.create(
             self._engine_dir,
             executor_config=executor_config,
-            logits_post_processor_map=self.args.logits_post_processor_map,
+            batched_logits_processor=self.args.batched_logits_processor,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
@@ -500,7 +554,6 @@ class LLM:
             postproc_worker_config=PostprocWorkerConfig(
                 num_postprocess_workers=self.args._num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args._postprocess_tokenizer_dir,
-                postprocess_result_handler=self.args._postprocess_result_handler
             ),
             is_llm_executor=True)
 

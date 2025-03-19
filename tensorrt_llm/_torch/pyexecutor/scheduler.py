@@ -17,14 +17,19 @@ SchedulerOutput = namedtuple("SchedulerOutput", [
 
 class ScheduledRequests:
     # to be aligned with ScheduledRequests in cpp/tensorrt_llm/batch_manager/common.h
-    context_requests: RequestList
-    generation_requests: RequestList
-    paused_requests: RequestList
+    def __init__(self):
+        self.context_requests: RequestList = []
+        self.generation_requests: RequestList = []
+        self.paused_requests: RequestList = []
 
     @property
     def is_generation_only(self) -> bool:
         return (not self.context_requests and all(
             len(req.draft_tokens) == 0 for req in self.generation_requests))
+
+    @property
+    def can_run_cuda_graph(self) -> bool:
+        return (not self.context_requests)
 
     @property
     def batch_size(self) -> int:
@@ -70,8 +75,9 @@ class BindCapacityScheduler(CapacityScheduler):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
         self.impl = tb_internal.algorithms.CapacityScheduler(
-            max_num_requests, scheduler_policy, True, False,
-            LlmRequestState.CONTEXT_INIT, LlmRequestState.GENERATION_COMPLETE)
+            max_num_requests, scheduler_policy, kv_cache_manager is not None,
+            False, LlmRequestState.CONTEXT_INIT,
+            LlmRequestState.GENERATION_COMPLETE)
 
     def schedule_request(
         self, active_requests: RequestList
@@ -166,6 +172,9 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> tuple[list[LlmRequest], list[LlmRequest]]:
+        for request in active_requests:
+            if request.py_draft_tokens is not None:
+                request.draft_tokens = request.py_draft_tokens
         return self.impl(active_requests, inflight_request_ids,
                          self.max_batch_size, self.max_num_tokens)
 

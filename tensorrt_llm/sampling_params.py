@@ -1,5 +1,6 @@
 import json
 import os
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
 from typing import List, Optional, Tuple, Union
 
@@ -36,6 +37,56 @@ class GuidedDecodingParams:
             )
 
 
+class LogitsProcessor(ABC):
+    """Base class for logits processor.
+
+    The recommended way to create a customized logits processor:
+        * Subclass this class and implement the processing logics in the __call__ method.
+        * Create an instance and pass to SamplingParams.
+    Alternatively, you can create any callable with the same signature with the __call__ method.
+    """
+
+    @abstractmethod
+    def __call__(self, req_id: int, logits: torch.Tensor,
+                 token_ids: List[List[int]], stream_ptr: int,
+                 client_id: Optional[int]) -> None:
+        """Logits processing callback. The callback is expected to inplace modify the logits.
+
+        Args:
+            req_id (int): Request id.
+            logits (torch.Tensor): Logits tensor to be modified.
+            token_ids (List[List[int]]): Token ids produced by the request so far. The shape is beam_width * sequence_length.
+            stream_ptr (int): The operation stream used by the logits tensor.
+            client_id (int, optional): An optional client id.
+        """
+        pass  # noqa
+
+
+class BatchedLogitsProcessor(ABC):
+    """Base class for batched logits processor.
+
+    The recommended way to create a customized batched logits processor:
+        * Subclass this class and implement the processing logics in the __call__ method.
+        * Create an instance and pass to LLM.
+    Alternatively, you can create any callable with the same signature with the __call__ method.
+    """
+
+    @abstractmethod
+    def __call__(self, req_ids: List[int], logits: List[torch.Tensor],
+                 token_ids: List[List[List[int]]], stream_ptr: int,
+                 client_ids: List[Optional[int]]) -> None:
+        """Batched logits processing callback. The callback is expected to inplace modify the logits.
+
+        Args:
+            req_ids (List[int]): A batch of request ids.
+            logits (List[torch.Tensor]): A batch of the logits tensors.
+            token_ids (List[List[List[int]]]): A batch of the token ids produced by the requests so far. The shape is batch * beam_width * sequence_length.
+            stream_ptr (int): The operation stream used by the logits tensors.
+            client_ids (List[Optional[int]]): A batch of optional client ids.
+        """
+        pass  # noqa
+
+
 @dataclass(slots=True, kw_only=True)
 class AdditionalModelOutput:
     """
@@ -65,7 +116,10 @@ class SamplingParams:
         stop_token_ids (List[int], optional): A list of token ids that stop the generation when they are generated. Defaults to None.
         include_stop_str_in_output (bool): Whether to include the stop strings in output text. Defaults to False.
         embedding_bias (torch.Tensor, optional): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]. Defaults to None.
-        logits_post_processor_name (str, optional): The logits postprocessor name. Must correspond to one of the logits postprocessor name provided to the ExecutorConfig. Defaults to None.
+        logits_processor (tensorrt_llm.sampling_params.LogitsProcessor, optional): The logits postprocessor callback. Defaults to None.
+            The LogitsProcessor class is recommended for callback creation.
+        apply_batched_logits_processor (bool): Whether to apply batched logits postprocessor callback. Defaults to False.
+            The BatchedLogitsProcessor class is recommended for callback creation. The callback must be provided when initializing LLM.
 
         n (int): Number of sequences to generate. Defaults to 1.
         best_of (int, optional): Number of sequences to consider for best output. Defaults to None.
@@ -138,7 +192,8 @@ class SamplingParams:
                                                       repr=False)
 
     embedding_bias: Optional[torch.Tensor] = None
-    logits_post_processor_name: Optional[str] = None
+    logits_processor: Optional[LogitsProcessor] = None
+    apply_batched_logits_processor: bool = False
 
     n: int = 1
     best_of: Optional[int] = None
@@ -188,8 +243,6 @@ class SamplingParams:
     truncate_prompt_tokens: Optional[int] = None
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
-
-    BATCHED_POST_PROCESSOR_NAME = tllme.Request.BATCHED_POST_PROCESSOR_NAME
 
     def __post_init__(self):
         if self.pad_id is None:
@@ -299,7 +352,7 @@ class SamplingParams:
 
     def _get_bad_words(self) -> List[List[int]]:
         words = []
-        if self.bad_token_ids is not None:
+        if self.bad_token_ids:
             words = [[i] for i in self.bad_token_ids]
 
         if self.bad is None:
@@ -313,7 +366,7 @@ class SamplingParams:
 
     def _get_stop_words(self) -> List[List[int]]:
         words = []
-        if self.stop_token_ids is not None:
+        if self.stop_token_ids:
             words = [[i] for i in self.stop_token_ids]
 
         if self.stop is None:
@@ -326,7 +379,7 @@ class SamplingParams:
             return words + self._stop_word_ids
 
     def _get_stop_reasons_and_words(
-            self) -> List[Tuple[Union[str, int], List[int]]]:
+            self) -> List[Tuple[Union[str, int], List[List[int]]]]:
         stop_reasons = []
         if self.stop_token_ids is not None:
             stop_reasons.extend(self.stop_token_ids)
@@ -336,11 +389,6 @@ class SamplingParams:
             else:
                 stop_reasons.extend(self.stop)
         stop_words = self._get_stop_words()
-        if len(stop_reasons) != len(stop_words):
-            raise RuntimeError(
-                f"The number of {self.__class__.__name__}.stop_token_ids ({self.stop_token_ids}) "
-                f"and {self.__class__.__name__}.stop ({self.stop}) are inconsistent with the "
-                f"processed stop_words ({stop_words}).")
         return list(zip(stop_reasons, stop_words))
 
     def _get_sampling_config(self) -> tllme.SamplingConfig:

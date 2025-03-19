@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/GptManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/disaggServerUtil.h"
@@ -527,6 +526,7 @@ texec::Request makeExecutorContextRequest(Sample const& sample, SizeType32 const
             lookaheadConfig, // lookaheadConfig
             std::nullopt,    // kvCacheRetentionConfig
             std::nullopt,    // logitsPostProcessorName
+            std::nullopt,    // logitsPostProcessor
             encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt);
     request.setRequestType(tensorrt_llm::executor::RequestType::REQUEST_TYPE_CONTEXT_ONLY);
     return request;
