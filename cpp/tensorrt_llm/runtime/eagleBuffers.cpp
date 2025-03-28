@@ -30,17 +30,15 @@ namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 namespace tensorrt_llm::runtime
 {
 
-void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, TllmRuntime const& runtime,
+void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, BufferManager const& manager,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
-    auto const& manager = runtime.getBufferManager();
-
     auto const& speculativeDecodingModule = modelConfig.getSpeculativeDecodingModule();
     auto const maxNumPaths = speculativeDecodingModule.getMaxNumPaths();
     auto const maxPathLen = speculativeDecodingModule.getMaxPathLen();
     auto const maxDecodingTokens = speculativeDecodingModule.getMaxDecodingTokens();
     auto const maxDecodingDraftTokens = speculativeDecodingModule.getMaxDecodingDraftTokens();
-
+    auto const numEagleLayers = speculativeDecodingModule.getMaxDraftPathLen();
     auto constexpr TRTTokenIdType = runtime::TRTDataType<runtime::TokenIdType>::value;
 
     temperatures = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kFLOAT);
@@ -74,11 +72,26 @@ void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, TllmRuntime const&
         = manager.pinnedPool(ITensor::makeShape({maxNumSequences * maxDecodingTokens}), nvinfer1::DataType::kINT32);
     chunkedContextNextTokens = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     useSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+
+    // Eagle-2
+    useDynamicTreeHost = manager.pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    dynamicTreeMaxTopKHost = manager.pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    prevScores = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), nvinfer1::DataType::kFLOAT);
+    currentExpandIndices = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), TRTTokenIdType);
+    allLayersScores = manager.gpu(
+        ITensor::makeShape({maxNumSequences, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens}),
+        nvinfer1::DataType::kFLOAT);
+    allLayersDraftTokenIds = manager.gpu(
+        ITensor::makeShape({maxNumSequences, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens}),
+        TRTTokenIdType);
+    allLayersDraftTokenIdsPredecessor = manager.gpu(
+        ITensor::makeShape({maxNumSequences, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens}),
+        TRTTokenIdType);
 }
 
 EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::BufferManager const& manager,
     runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
-    executor::DecodingConfig const& decodingConfig, runtime::TllmRuntime const& runtime)
+    executor::DecodingConfig const& decodingConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK_WITH_INFO(maxBeamWidth == 1, "EAGLE does not support beam search");
@@ -91,6 +104,8 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
     auto const numPaths = eagleModule->getMaxNumPaths();
     auto const pathLen = eagleModule->getMaxPathLen();
     auto const maxDecodingDraftTokens = eagleModule->getMaxDecodingDraftTokens();
+    auto const numEagleLayers = eagleModule->getMaxDraftPathLen();
+    auto const maxNonLeafNodesPerLayer = eagleModule->getMaxNonLeafNodesPerLayer();
 
     auto constexpr TRTTokenIdType = runtime::TRTDataType<runtime::TokenIdType>::value;
 
@@ -135,10 +150,23 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
     bufferCast<SizeType32>(*engineInputs.useSpecDecoding)[0] = 1;
     chunkedContextNextTokensHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
 
-    // Eagle-2, not fully supported yet
-    engineInputs.useDynamicTreeHost = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kBOOL);
-    auto useDynamicTreeHostPtr = bufferCast<bool>(*(engineInputs.useDynamicTreeHost));
-    useDynamicTreeHostPtr[0] = 0;
+    // Eagle-2
+    engineInputs.useDynamicTreeHost = manager.pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    engineInputs.dynamicTreeMaxTopKHost = manager.pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+
+    engineInputs.prevScores
+        = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), nvinfer1::DataType::kFLOAT);
+    engineInputs.currentExpandIndices
+        = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), TRTTokenIdType);
+    engineInputs.allLayersScores = manager.gpu(
+        ITensor::makeShape({maxNumSequences, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens}),
+        nvinfer1::DataType::kFLOAT);
+    engineInputs.allLayersDraftTokenIds = manager.gpu(
+        ITensor::makeShape({maxNumSequences, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens}),
+        TRTTokenIdType);
+    engineInputs.allLayersDraftTokenIdsPredecessor = manager.gpu(
+        ITensor::makeShape({maxNumSequences, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens}),
+        TRTTokenIdType);
 
     // output tensors
     engineOutputs.nextDraftTokens
@@ -155,12 +183,10 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
         = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
 
     // helper tensors
-    auto const& stream = manager.getStream();
-    scanTempStorageBytes
-        = tksd::invokeScanGenerationLengths(nullptr, 0, nullptr, nullptr, maxNumSequences, stream.get());
-    reduceTempStorageBytes
-        = tksd::invokeReduceMaxGenerationLengths(nullptr, 0, nullptr, nullptr, maxNumSequences, stream.get());
-    scanReduceTempStorage = manager.gpu(std::max(reduceTempStorageBytes, scanTempStorageBytes));
+    scanReduceTempStorageBytes = tksd::invokeScanReduceGenerationLengths(
+        maxNumSequences, nullptr, nullptr, 0, nullptr, nullptr, manager.getStream().get());
+    scanReduceTempStorage = manager.gpu(scanReduceTempStorageBytes);
+
     cumSumGenerationLengths = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
     maxGenerationLength = manager.gpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
@@ -172,6 +198,29 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
     mDoGreedySampling = defaultConfig.isGreedySampling();
     mDefaultPosteriorThreshold = defaultConfig.getPosteriorThreshold().value_or(mDefaultPosteriorThreshold);
     bufferCast<SizeType32>(*greedySamplingHost)[0] = mDoGreedySampling;
+
+    auto const useDynamicTree = defaultConfig.useDynamicTree();
+    auto const dynamicTreeMaxTopK = defaultConfig.getDynamicTreeMaxTopK().value_or(-1);
+
+    if (useDynamicTree)
+    {
+        TLLM_LOG_WARNING("EAGLE-2 is still under the experimental stage.");
+        TLLM_CHECK_WITH_INFO(dynamicTreeMaxTopK > 0,
+            "When using Eagle-2, dynamicTreeMaxTopK should greater than 0. Now dynamicTreeMaxTopK is %d",
+            dynamicTreeMaxTopK);
+        TLLM_CHECK_WITH_INFO(maxNonLeafNodesPerLayer >= dynamicTreeMaxTopK,
+            "When using Eagle-2, maxNonLeafNodesPerLayer should be greater or equal to dynamicTreeMaxTopK. Now "
+            "maxNonLeafNodesPerLayer is %d, and dynamicTreeMaxTopK is %d",
+            maxNonLeafNodesPerLayer, dynamicTreeMaxTopK);
+        TLLM_CHECK_WITH_INFO(maxDecodingDraftTokens >= dynamicTreeMaxTopK,
+            "When using Eagle-2, maxDecodingDraftTokens should be greater or equal to dynamicTreeMaxTopK. Now "
+            "maxDecodingDraftTokens is %d, and dynamicTreeMaxTopK is %d",
+            maxDecodingDraftTokens, dynamicTreeMaxTopK);
+    }
+
+    // Eagle-2 config
+    bufferCast<SizeType32>(*engineInputs.useDynamicTreeHost)[0] = SizeType32(useDynamicTree);
+    bufferCast<SizeType32>(*engineInputs.dynamicTreeMaxTopKHost)[0] = dynamicTreeMaxTopK;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -221,6 +270,28 @@ void EagleBuffers::reshape(
     engineInputs.eagleNetGenPastKeyValueLengthsHost->reshape(ITensor::makeShape({numSequences}));
     engineInputs.inputGenTokensHost->reshape(ITensor::makeShape({numSequences * maxDecodingTokens}));
     engineInputs.chunkedContextNextTokens->reshape(ITensor::makeShape({numSequences}));
+    // Eagle-2
+    // Reshape prevScores
+    auto prevScoresShape = engineInputs.prevScores->getShape();
+    prevScoresShape.d[0] = numSequences;
+    engineInputs.prevScores->reshape(prevScoresShape);
+    // Reshape currentExpandIndices
+    auto currentExpandIndicesShape = engineInputs.currentExpandIndices->getShape();
+    currentExpandIndicesShape.d[0] = numSequences;
+    engineInputs.currentExpandIndices->reshape(currentExpandIndicesShape);
+    // Reshape allLayersScores
+    auto allLayersScoresShape = engineInputs.allLayersScores->getShape();
+    allLayersScoresShape.d[0] = numSequences;
+    engineInputs.allLayersScores->reshape(allLayersScoresShape);
+    // Reshape allLayersDraftTokenIds
+    auto allLayersDraftTokenIdsShape = engineInputs.allLayersDraftTokenIds->getShape();
+    allLayersDraftTokenIdsShape.d[0] = numSequences;
+    engineInputs.allLayersDraftTokenIds->reshape(allLayersDraftTokenIdsShape);
+    // Reshape allLayersDraftTokenIdsPredecessor
+    auto allLayersDraftTokenIdsPredecessorShape = engineInputs.allLayersDraftTokenIdsPredecessor->getShape();
+    allLayersDraftTokenIdsPredecessorShape.d[0] = numSequences;
+    engineInputs.allLayersDraftTokenIdsPredecessor->reshape(allLayersDraftTokenIdsPredecessorShape);
+
     chunkedContextNextTokensHost->reshape(ITensor::makeShape({numSequences}));
     engineOutputs.chunkedContextNextTokens->reshape(ITensor::makeShape({numSequences}));
 
@@ -289,9 +360,9 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
         // Compute inclusive sum and max
         tksd::invokeScanReduceGenerationLengths(numGenSequences,
             bufferCast<SizeType32>(*engineInputs.specDecodingGenerationLengths),
-            bufferCast<uint8_t>(*scanReduceTempStorage), scanTempStorageBytes,
-            bufferCast<SizeType32>(*cumSumGenerationLengths), bufferCast<uint8_t>(*scanReduceTempStorage),
-            reduceTempStorageBytes, bufferCast<SizeType32>(*maxGenerationLength), manager.getStream().get());
+            bufferCast<uint8_t>(*scanReduceTempStorage), scanReduceTempStorageBytes,
+            bufferCast<SizeType32>(*cumSumGenerationLengths), bufferCast<SizeType32>(*maxGenerationLength),
+            manager.getStream().get());
     }
 
     // Pack tensors from batch slot position to continuous array
@@ -427,12 +498,10 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
 
 void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests,
     ITensor const& requestTypes, ITensor const& seqSlots, EagleBuffers::Inputs const& draftBuffers,
-    runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
+    BufferManager const& manager, runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto const& manager = runtime.getBufferManager();
 
     auto const eagleModule
         = std::dynamic_pointer_cast<runtime::EagleModule const>(modelConfig.getSpeculativeDecodingModulePtr());
@@ -449,6 +518,10 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
         break;
     case nvinfer1::DataType::kHALF:
         setFromInputs<half>(
+            contextRequests, genRequests, vocabSizePadded, seqSlots, draftBuffers, *eagleModule, manager);
+        break;
+    case nvinfer1::DataType::kBF16:
+        setFromInputs<__nv_bfloat16>(
             contextRequests, genRequests, vocabSizePadded, seqSlots, draftBuffers, *eagleModule, manager);
         break;
     default: TLLM_THROW("DataType %d not supported in EagleBuffers", static_cast<SizeType32>(dtype)); break;
@@ -491,6 +564,13 @@ void EagleBuffers::insertInputTensors(
     // For Eagle-2
     inputBuffers.insert_or_assign("use_dynamic_tree", engineInputs.useDynamicTreeHost);
     inputBuffers.insert_or_assign("spec_decoding_use", engineInputs.useSpecDecoding);
+    inputBuffers.insert_or_assign("dynamic_tree_max_topK", engineInputs.dynamicTreeMaxTopKHost);
+    inputBuffers.insert_or_assign("prev_scores", engineInputs.prevScores);
+    inputBuffers.insert_or_assign("current_expand_indices", engineInputs.currentExpandIndices);
+    inputBuffers.insert_or_assign("all_layers_scores", engineInputs.allLayersScores);
+    inputBuffers.insert_or_assign("all_layers_draft_token_ids", engineInputs.allLayersDraftTokenIds);
+    inputBuffers.insert_or_assign(
+        "all_layers_draft_token_ids_predecessor", engineInputs.allLayersDraftTokenIdsPredecessor);
 
     // outputs
     outputBuffers.insert_or_assign("next_draft_tokens", engineOutputs.nextDraftTokens);

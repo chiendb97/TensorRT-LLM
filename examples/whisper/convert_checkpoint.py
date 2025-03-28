@@ -169,31 +169,28 @@ def convert_openai_whisper_encoder(
                           torch.cos(scaled_time)],
                          dim=1)
 
-    weights['position_embedding.weight'] = sinusoids(
+    weights['transformer.position_embedding.weight'] = sinusoids(
         model_metadata['n_audio_ctx'],
         model_metadata['n_audio_state']).contiguous()
 
-    weights['conv1.weight'] = torch.unsqueeze(
+    weights['transformer.conv1.weight'] = torch.unsqueeze(
         model_params['encoder.conv1.weight'], -1).contiguous()
-    weights['conv1.bias'] = model_params['encoder.conv1.bias'].contiguous()
-    weights['conv2.weight'] = torch.unsqueeze(
+    weights['transformer.conv1.bias'] = model_params[
+        'encoder.conv1.bias'].contiguous()
+    weights['transformer.conv2.weight'] = torch.unsqueeze(
         model_params['encoder.conv2.weight'], -1).contiguous()
-    weights['conv2.bias'] = model_params['encoder.conv2.bias'].contiguous()
-
-    # Encoder conv needs to run in fp32 on Volta/Turing
-    major, minor = torch.cuda.get_device_capability()
-    if not major >= 8:
-        weights['conv1.weight'] = weights['conv1.weight'].float()
-        weights['conv1.bias'] = weights['conv1.bias'].float()
-        weights['conv2.weight'] = weights['conv2.weight'].float()
-        weights['conv2.bias'] = weights['conv2.bias'].float()
+    weights['transformer.conv2.bias'] = model_params[
+        'encoder.conv2.bias'].contiguous()
 
     for i in range(model_metadata['n_audio_layer']):
+        trtllm_layer_name_prefix = f'transformer.layers.{i}'
+
         weights[
-            f'encoder_layers.{i}.attention_layernorm.weight'] = model_params[
+            f'{trtllm_layer_name_prefix}.attention_layernorm.weight'] = model_params[
                 'encoder.blocks.' + str(i) + '.attn_ln.weight'].contiguous()
-        weights[f'encoder_layers.{i}.attention_layernorm.bias'] = model_params[
-            'encoder.blocks.' + str(i) + '.attn_ln.bias'].contiguous()
+        weights[
+            f'{trtllm_layer_name_prefix}.attention_layernorm.bias'] = model_params[
+                'encoder.blocks.' + str(i) + '.attn_ln.bias'].contiguous()
 
         t = torch.cat([
             model_params['encoder.blocks.' + str(i) + '.attn.query.weight'],
@@ -202,7 +199,7 @@ def convert_openai_whisper_encoder(
         ],
                       dim=0).contiguous()
 
-        weights[f'encoder_layers.{i}.attention.qkv.weight'] = t
+        weights[f'{trtllm_layer_name_prefix}.attention.qkv.weight'] = t
 
         bias_shape = model_params['encoder.blocks.' + str(i) +
                                   '.attn.query.bias'].shape
@@ -215,37 +212,41 @@ def convert_openai_whisper_encoder(
         ],
                                dim=0).contiguous()
 
-        weights[f'encoder_layers.{i}.attention.qkv.bias'] = fused_bias
+        weights[f'{trtllm_layer_name_prefix}.attention.qkv.bias'] = fused_bias
 
         t = model_params['encoder.blocks.' + str(i) +
                          '.attn.out.weight'].contiguous()
 
-        weights[f'encoder_layers.{i}.attention.dense.weight'] = t
-        weights[f'encoder_layers.{i}.attention.dense.bias'] = model_params[
-            'encoder.blocks.' + str(i) + '.attn.out.bias'].contiguous()
+        weights[f'{trtllm_layer_name_prefix}.attention.dense.weight'] = t
+        weights[
+            f'{trtllm_layer_name_prefix}.attention.dense.bias'] = model_params[
+                'encoder.blocks.' + str(i) + '.attn.out.bias'].contiguous()
 
-        weights[f'encoder_layers.{i}.mlp_layernorm.weight'] = model_params[
-            'encoder.blocks.' + str(i) + '.mlp_ln.weight'].contiguous()
-        weights[f'encoder_layers.{i}.mlp_layernorm.bias'] = model_params[
-            'encoder.blocks.' + str(i) + '.mlp_ln.bias'].contiguous()
+        weights[
+            f'{trtllm_layer_name_prefix}.mlp_layernorm.weight'] = model_params[
+                'encoder.blocks.' + str(i) + '.mlp_ln.weight'].contiguous()
+        weights[
+            f'{trtllm_layer_name_prefix}.mlp_layernorm.bias'] = model_params[
+                'encoder.blocks.' + str(i) + '.mlp_ln.bias'].contiguous()
 
         t = model_params['encoder.blocks.' + str(i) +
                          '.mlp.0.weight'].contiguous()
-        weights[f'encoder_layers.{i}.mlp.fc.weight'] = t
+        weights[f'{trtllm_layer_name_prefix}.mlp.fc.weight'] = t
 
-        weights[f'encoder_layers.{i}.mlp.fc.bias'] = model_params[
+        weights[f'{trtllm_layer_name_prefix}.mlp.fc.bias'] = model_params[
             'encoder.blocks.' + str(i) + '.mlp.0.bias'].contiguous()
 
         t = model_params['encoder.blocks.' + str(i) +
                          '.mlp.2.weight'].contiguous()
-        weights[f'encoder_layers.{i}.mlp.proj.weight'] = t
+        weights[f'{trtllm_layer_name_prefix}.mlp.proj.weight'] = t
 
-        weights[f'encoder_layers.{i}.mlp.proj.bias'] = model_params[
+        weights[f'{trtllm_layer_name_prefix}.mlp.proj.bias'] = model_params[
             'encoder.blocks.' + str(i) + '.mlp.2.bias'].contiguous()
 
-    weights['ln_post.weight'] = model_params[
+    weights['transformer.ln_f.weight'] = model_params[
         'encoder.ln_post.weight'].contiguous()
-    weights['ln_post.bias'] = model_params['encoder.ln_post.bias'].contiguous()
+    weights['transformer.ln_f.bias'] = model_params[
+        'encoder.ln_post.bias'].contiguous()
 
     return weight_only_quantize_dict(weights,
                                      quant_algo=quant_algo,
@@ -258,45 +259,51 @@ def convert_openai_whisper_decoder(model_metadata: dict,
 
     weights = {}
 
-    weights['embedding.vocab_embedding.weight'] = model_params[
+    weights['transformer.vocab_embedding.weight'] = model_params[
         'decoder.token_embedding.weight']
+    weights['transformer.position_embedding.weight'] = model_params[
+        'decoder.positional_embedding']
     weights['lm_head.weight'] = model_params[
         'decoder.token_embedding.weight'].clone()
-    weights['embedding.position_embedding.weight'] = model_params[
-        'decoder.positional_embedding']
 
     for i in range(model_metadata['n_text_layer']):
+        trtllm_layer_name_prefix = f'transformer.layers.{i}'
+
         t = torch.cat([
             model_params['decoder.blocks.' + str(i) + '.attn.query.weight'],
             model_params['decoder.blocks.' + str(i) + '.attn.key.weight'],
             model_params['decoder.blocks.' + str(i) + '.attn.value.weight']
         ],
                       dim=0)
-        dst = weights[f'decoder_layers.{i}.self_attention.qkv.weight'] = t
+        weights[f'{trtllm_layer_name_prefix}.self_attention.qkv.weight'] = t
 
         t = model_params['decoder.blocks.' + str(i) +
                          '.attn.out.weight'].contiguous()
-        dst = weights[f'decoder_layers.{i}.self_attention.dense.weight'] = t
+        weights[f'{trtllm_layer_name_prefix}.self_attention.dense.weight'] = t
 
         bias_shape = model_params['decoder.blocks.' + str(i) +
                                   '.attn.query.bias'].shape
         dtype = model_params['decoder.blocks.' + str(i) +
                              '.attn.query.bias'].dtype
-        weights[f'decoder_layers.{i}.self_attention.qkv.bias'] = torch.cat(
-            [
-                model_params['decoder.blocks.' + str(i) + '.attn.query.bias'],
-                torch.zeros([*bias_shape], dtype=dtype),
-                model_params['decoder.blocks.' + str(i) + '.attn.value.bias']
-            ],
-            dim=0)
-        weights[f'decoder_layers.{i}.self_attention.dense.bias'] = model_params[
-            'decoder.blocks.' + str(i) + '.attn.out.bias']
+        weights[
+            f'{trtllm_layer_name_prefix}.self_attention.qkv.bias'] = torch.cat(
+                [
+                    model_params['decoder.blocks.' + str(i) +
+                                 '.attn.query.bias'],
+                    torch.zeros([*bias_shape], dtype=dtype),
+                    model_params['decoder.blocks.' + str(i) +
+                                 '.attn.value.bias']
+                ],
+                dim=0)
+        weights[
+            f'{trtllm_layer_name_prefix}.self_attention.dense.bias'] = model_params[
+                'decoder.blocks.' + str(i) + '.attn.out.bias']
 
         weights[
-            f'decoder_layers.{i}.self_attention_layernorm.weight'] = model_params[
+            f'{trtllm_layer_name_prefix}.self_attention_layernorm.weight'] = model_params[
                 'decoder.blocks.' + str(i) + '.attn_ln.weight']
         weights[
-            f'decoder_layers.{i}.self_attention_layernorm.bias'] = model_params[
+            f'{trtllm_layer_name_prefix}.self_attention_layernorm.bias'] = model_params[
                 'decoder.blocks.' + str(i) + '.attn_ln.bias']
 
         t = torch.cat([
@@ -307,11 +314,11 @@ def convert_openai_whisper_decoder(model_metadata: dict,
                          '.cross_attn.value.weight']
         ],
                       dim=0)
-        dst = weights[f'decoder_layers.{i}.cross_attention.qkv.weight'] = t
+        weights[f'{trtllm_layer_name_prefix}.cross_attention.qkv.weight'] = t
 
         t = model_params['decoder.blocks.' + str(i) +
                          '.cross_attn.out.weight'].contiguous()
-        dst = weights[f'decoder_layers.{i}.cross_attention.dense.weight'] = t
+        weights[f'{trtllm_layer_name_prefix}.cross_attention.dense.weight'] = t
 
         bias_shape = model_params['decoder.blocks.' + str(i) +
                                   '.cross_attn.query.bias'].shape
@@ -325,39 +332,41 @@ def convert_openai_whisper_decoder(model_metadata: dict,
                                         dim=0)
 
         weights[
-            f'decoder_layers.{i}.cross_attention.qkv.bias'] = cross_attn_qkv_bias
+            f'{trtllm_layer_name_prefix}.cross_attention.qkv.bias'] = cross_attn_qkv_bias
 
         weights[
-            f'decoder_layers.{i}.cross_attention.dense.bias'] = model_params[
+            f'{trtllm_layer_name_prefix}.cross_attention.dense.bias'] = model_params[
                 'decoder.blocks.' + str(i) + '.cross_attn.out.bias']
 
         weights[
-            f'decoder_layers.{i}.cross_attention_layernorm.weight'] = model_params[
+            f'{trtllm_layer_name_prefix}.cross_attention_layernorm.weight'] = model_params[
                 'decoder.blocks.' + str(i) + '.cross_attn_ln.weight']
         weights[
-            f'decoder_layers.{i}.cross_attention_layernorm.bias'] = model_params[
+            f'{trtllm_layer_name_prefix}.cross_attention_layernorm.bias'] = model_params[
                 'decoder.blocks.' + str(i) + '.cross_attn_ln.bias']
 
         t = model_params['decoder.blocks.' + str(i) +
                          '.mlp.0.weight'].contiguous()
-        weights[f'decoder_layers.{i}.mlp.fc.weight'] = t
+        weights[f'{trtllm_layer_name_prefix}.mlp.fc.weight'] = t
 
         t = model_params['decoder.blocks.' + str(i) +
                          '.mlp.2.weight'].contiguous()
-        weights[f'decoder_layers.{i}.mlp.proj.weight'] = t
+        weights[f'{trtllm_layer_name_prefix}.mlp.proj.weight'] = t
 
-        weights[f'decoder_layers.{i}.mlp.fc.bias'] = model_params[
+        weights[f'{trtllm_layer_name_prefix}.mlp.fc.bias'] = model_params[
             'decoder.blocks.' + str(i) + '.mlp.0.bias']
-        weights[f'decoder_layers.{i}.mlp.proj.bias'] = model_params[
+        weights[f'{trtllm_layer_name_prefix}.mlp.proj.bias'] = model_params[
             'decoder.blocks.' + str(i) + '.mlp.2.bias']
 
-        weights[f'decoder_layers.{i}.mlp_layernorm.weight'] = model_params[
-            'decoder.blocks.' + str(i) + '.mlp_ln.weight']
-        weights[f'decoder_layers.{i}.mlp_layernorm.bias'] = model_params[
-            'decoder.blocks.' + str(i) + '.mlp_ln.bias']
+        weights[
+            f'{trtllm_layer_name_prefix}.mlp_layernorm.weight'] = model_params[
+                'decoder.blocks.' + str(i) + '.mlp_ln.weight']
+        weights[
+            f'{trtllm_layer_name_prefix}.mlp_layernorm.bias'] = model_params[
+                'decoder.blocks.' + str(i) + '.mlp_ln.bias']
 
-    weights['final_layernorm.weight'] = model_params['decoder.ln.weight']
-    weights['final_layernorm.bias'] = model_params['decoder.ln.bias']
+    weights['transformer.ln_f.weight'] = model_params['decoder.ln.weight']
+    weights['transformer.ln_f.bias'] = model_params['decoder.ln.bias']
 
     return weight_only_quantize_dict(weights,
                                      quant_algo=quant_algo,

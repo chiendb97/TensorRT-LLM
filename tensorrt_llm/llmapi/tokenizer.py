@@ -52,6 +52,9 @@ class TransformersTokenizer(TokenizerBase):
                                                   **kwargs)
         return cls(tokenizer)
 
+    def save_pretrained(self, pretrained_model_dir: str, **kwargs):
+        self.tokenizer.save_pretrained(pretrained_model_dir, **kwargs)
+
     def clean_up_tokenization(self, out_string: str) -> str:
         return self.tokenizer.clean_up_tokenization(out_string)
 
@@ -196,12 +199,16 @@ def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
         raise TypeError(f"Unrecognized tokenizer {obj}")
 
 
-def _xgrammar_tokenizer_info(tokenizer):
+def _xgrammar_tokenizer_info(tokenizer, im_end=None):
     # Reference: https://github.com/mlc-ai/xgrammar/blob/b9a16de54e1e0eff58da14c65750414cceaf1a6f/python/xgrammar/tokenizer_info.py#L133
     if isinstance(tokenizer, TokenizerBase):
         tokenizer = tokenizer.tokenizer
 
-    stop_token_ids = [tokenizer.eos_token_id]
+    # Todo: set eos_token_id = im_end_id in tokenizer config
+    if im_end is not None:
+        stop_token_ids = tokenizer.encode(im_end, add_special_tokens=False)
+    else:
+        stop_token_ids = [tokenizer.eos_token_id]
 
     try:
         encoded_vocab = tokenizer.get_vocab()
@@ -230,3 +237,30 @@ def _xgrammar_tokenizer_info(tokenizer):
         }
     else:
         raise ValueError(f"Unsupported tokenizer type: {type(tokenizer)}")
+
+
+def load_hf_tokenizer(model_dir: str,
+                      trust_remote_code: bool = True,
+                      use_fast: bool = True) -> Optional[TransformersTokenizer]:
+    ''' Load a tokenizer from a Hugging Face model directory.
+
+    Args:
+        model_dir (str): The model directory.
+        trust_remote_code (bool): Whether to trust the remote code.
+        use_fast (bool): Whether to use the fast tokenizer.
+
+    Returns:
+        A TransformersTokenizer object if the tokenizer is loaded successfully.
+    '''
+
+    try:
+        return TransformersTokenizer.from_pretrained(
+            model_dir,
+            legacy=False,
+            padding_side='left',
+            truncation_side='left',
+            trust_remote_code=trust_remote_code,
+            use_fast=use_fast)
+
+    except Exception:
+        return None

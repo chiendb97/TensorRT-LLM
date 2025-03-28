@@ -4,43 +4,37 @@ set -ex
 
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-11.html#rel-24-11
-# PyTorch v2.5.1 has a fix for https://github.com/pytorch/pytorch/issues/138324.
-TORCH_VERSION="2.5.1"
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-01.html#rel-25-01
+TORCH_VERSION="2.6.0"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {
     if [[ $SYSTEM_ID == *"ubuntu"* ]]; then
       apt-get update && apt-get -y install ninja-build
       apt-get clean && rm -rf /var/lib/apt/lists/*
-    elif [[ $SYSTEM_ID == *"centos"* ]]; then
-      yum -y update && yum install -y ninja-build && yum clean all
-      if [[ "$1" -eq "1" ]]; then
-          # Temporarily disable devtoolset
-          mv /tmp/devtoolset_env /tmp/devtoolset_env.bak
-          touch /tmp/devtoolset_env
-      fi
+    elif [[ $SYSTEM_ID == *"rocky"* ]]; then
+      dnf makecache --refresh && dnf install -y ninja-build && dnf clean all
     else
       echo "This system type cannot be supported..."
       exit 1
     fi
 }
 
-restore_environment() {
-    if [[ $SYSTEM_ID == *"centos"* ]] && [[ "$1" -eq "1" ]]; then
-        # Re-enable devtoolset
-        rm -f /tmp/devtoolset_env
-        mv /tmp/devtoolset_env.bak /tmp/devtoolset_env
-    fi
-}
-
 install_from_source() {
-    if [[ $SYSTEM_ID == *"centos"* ]]; then
+    if [[ $SYSTEM_ID == *"rocky"* ]]; then
       VERSION_ID=$(grep -oP '(?<=^VERSION_ID=).+' /etc/os-release | tr -d '"')
       if [[ $VERSION_ID == "7" ]]; then
         echo "Installation from PyTorch source codes cannot be supported..."
         exit 1
       fi
+    fi
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
+    if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
+
+    if [ "$ARCH" = "sbsa" ] && [ "$TORCH_VERSION" = "2.6.0" ]; then
+      echo "Due to a known issue https://github.com/pytorch/pytorch/issues/141083, PyTorch v2.6.0 installation from source codes cannot be supported..."
+      exit 1
     fi
     prepare_environment $1
 
@@ -70,13 +64,19 @@ install_from_source() {
     cd vision
     python3 setup.py install
     cd /tmp && rm -rf /tmp/vision
-
-    restore_environment $1
 }
 
 install_from_pypi() {
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
+    if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
+
     pip3 uninstall -y torch torchvision
-    pip3 install torch==${TORCH_VERSION} torchvision
+    if [ "$ARCH" = "sbsa" ]; then
+      pip3 install torch==${TORCH_VERSION} torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+    else
+      pip3 install torch==${TORCH_VERSION} torchvision
+    fi
 }
 
 case "$1" in

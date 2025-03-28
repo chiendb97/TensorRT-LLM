@@ -15,19 +15,24 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
+#include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
-#include "tensorrt_llm/thop/thUtils.h"
-#include <nvml.h>
-#include <torch/extension.h>
-#include <unordered_set>
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
+#include <nvml.h>
+#include <torch/extension.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <unordered_set>
 
 // using namespace nvinfer1;
 using tensorrt_llm::kernels::AllReduceFusionOp;
@@ -60,7 +65,7 @@ std::set<int> getLocalGroup(std::set<int> const& group)
 {
     auto const myRank = COMM_SESSION.getRank();
     auto const myLocalRank = LOCAL_COMM_SESSION.getRank();
-    auto const localSize = LOCAL_COMM_SESSION.getSize();
+    auto const localSize = static_cast<uint32_t>(LOCAL_COMM_SESSION.getSize());
 
     std::vector<int32_t> ranks(localSize, 0);
     std::vector<int32_t> localRanks(localSize, 0);
@@ -125,7 +130,7 @@ class AllreduceOp
 {
 public:
     AllreduceOp(std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy,
-        AllReduceStrategyConfig config, AllReduceFusionOp op, float eps, bool affine, bool bias)
+        AllReduceStrategyConfig config, AllReduceFusionOp op, float eps, bool affine, bool bias, bool scale)
         : mGroup(std::move(group))
         , mType(type)
         , mStrategy(strategy)
@@ -134,25 +139,32 @@ public:
         , mEps(eps)
         , mAffine(affine)
         , mBias(bias)
+        , mScale(scale)
     {
     }
 
     ~AllreduceOp() = default;
 
-    std::tuple<torch::Tensor, torch::Tensor> run(
+    std::vector<torch::Tensor> run(
         torch::Tensor input, torch::optional<torch::Tensor> workspace, torch::TensorList reduce_fusion_inputs) noexcept
     {
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-        auto output = torch::empty_like(input);
-        auto finalOutput = torch::empty_like(input);
+        torch::Tensor output;
+        torch::Tensor finalOutput;
+        torch::Tensor scaleOutput;
         size_t size = input.numel();
-        auto const sizePerElem = tensorrt_llm::common::getDTypeSize(mType);
 
         AllReduceStrategyType runtimeStrategy;
 
         static char* forceNcclAllReduceStrategyChar = std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY");
         bool forceNcclAllReduceStrategy = (forceNcclAllReduceStrategyChar != nullptr);
-        if (forceNcclAllReduceStrategy || mStrategy == AllReduceStrategyType::NCCL)
+        // If strategy is set to UB, UB must be used as UB impl output is special and cannot be used
+        // by others.
+        if (mStrategy == AllReduceStrategyType::UB)
+        {
+            runtimeStrategy = AllReduceStrategyType::UB;
+        }
+        else if (forceNcclAllReduceStrategy || mStrategy == AllReduceStrategyType::NCCL)
         {
             runtimeStrategy = AllReduceStrategyType::NCCL;
         }
@@ -180,13 +192,73 @@ public:
             TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: TWOSHOT", rank);
             break;
         }
+        case AllReduceStrategyType::UB:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UB", rank);
+            break;
+        }
         default: break;
         }
 
-        if (runtimeStrategy == AllReduceStrategyType::NCCL)
+        if (runtimeStrategy == AllReduceStrategyType::UB)
         {
+            output = torch::empty_like(input);
+            TLLM_CHECK(mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
+                || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4);
+            TLLM_CHECK_WITH_INFO(
+                tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
+            auto ub_buffer0 = tensorrt_llm::runtime::ub::ub_get(0);
+            TLLM_CHECK(input.data_ptr() == ub_buffer0.addr);
+            auto ub_buffer1 = tensorrt_llm::runtime::ub::ub_get(1);
+            auto ub_comm = tensorrt_llm::runtime::ub::ub_comm();
+            int hidden_size = input.size(-1);
+            int m = size / hidden_size;
+            int scale_size = tensorrt_llm::common::roundUp(m, 128) * tensorrt_llm::common::roundUp(hidden_size / 16, 4);
+            void* residual = reduce_fusion_inputs[0].data_ptr();
+            void* gamma = reduce_fusion_inputs[1].data_ptr();
+            float* scale = static_cast<float*>(reduce_fusion_inputs[2].data_ptr());
+
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
+            {
+                TLLM_CHECK(mScale);
+                TLLM_CHECK(mAffine);
+                TLLM_CHECK(!mBias);
+
+                tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_launcher(ub_buffer0.handle, 0,
+                    ub_buffer1.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale, residual, output.data_ptr(),
+                    mType, ub_comm, stream);
+                finalOutput = torch::from_blob(ub_buffer1.addr, input.sizes(), input.strides(),
+                    torch::dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
+            }
+            else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+            {
+                TLLM_CHECK(mScale);
+                TLLM_CHECK(mAffine);
+                TLLM_CHECK(!mBias);
+                auto ub_buffer2 = tensorrt_llm::runtime::ub::ub_get(2);
+                tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(ub_buffer0.handle, 0,
+                    ub_buffer1.handle, 0, ub_buffer2.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale,
+                    residual, output.data_ptr(), mType, ub_comm, stream);
+                scaleOutput = torch::from_blob(
+                    ub_buffer2.addr, {scale_size}, {1}, torch::dtype(torch::kByte).device(torch::kCUDA));
+                auto output_shape = input.sizes().vec();
+                output_shape.back() /= 2;
+                auto output_strides = input.strides().vec();
+                for (size_t i = 0; i < output_shape.size() - 1; i++)
+                {
+                    output_strides[i] /= 2;
+                }
+                finalOutput = torch::from_blob(
+                    ub_buffer1.addr, output_shape, output_strides, torch::dtype(torch::kByte).device(torch::kCUDA));
+            }
+        }
+        else if (runtimeStrategy == AllReduceStrategyType::NCCL)
+        {
+            output = torch::empty_like(input);
             if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
             {
+                finalOutput = torch::empty_like(input);
+
                 NCCLCHECK(ncclAllReduce(input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
                     ncclSum, *mNcclComm, stream));
                 tensorrt_llm::kernels::AllReduceParams params;
@@ -212,6 +284,7 @@ public:
         {
             auto const tpSize = mGroup.size();
             int tpRank = 0;
+            output = torch::empty_like(input);
             for (auto const& currentRank : mGroup)
             {
                 if (rank == currentRank)
@@ -229,6 +302,7 @@ public:
             params.elts_total = size;
             if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
             {
+                finalOutput = torch::empty_like(input);
                 int fusion_ptr_idx = 0;
                 params.local_output_buffer_ptr = finalOutput.mutable_data_ptr();
                 params.fusion_params.bias_buffer = mBias ? reduce_fusion_inputs[fusion_ptr_idx++].data_ptr() : nullptr;
@@ -238,7 +312,7 @@ public:
                 params.fusion_params.hidden_size = hidden_size;
                 params.fusion_params.eps = mEps;
                 params.fusion_params.intermediate_buffer = output.mutable_data_ptr();
-                for (int i = 0; i < tpSize; ++i)
+                for (size_t i = 0; i < tpSize; ++i)
                 {
                     params.fusion_params.lamport_peer_comm_buffer_ptrs[i]
                         = reinterpret_cast<void**>(workspace_ptr)[tpSize * 4 + i];
@@ -256,13 +330,17 @@ public:
             tensorrt_llm::kernels::customAllReduce(params, mType, runtimeStrategy, mConfig, mOp, stream);
         }
 
-        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
         {
-            return std::make_tuple(finalOutput, output);
+            return {finalOutput, output};
+        }
+        else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+        {
+            return {finalOutput, scaleOutput, output};
         }
         else
         {
-            return std::make_tuple(output, output);
+            return {output};
         }
     }
 
@@ -357,7 +435,7 @@ private:
                         unsigned int remoteDeviceId;
                         NVML_CHECK(nvmlDeviceGetIndex(remoteDevice, &remoteDeviceId));
 
-                        if (remoteDeviceId == secondDeviceId)
+                        if (remoteDeviceId == static_cast<unsigned int>(secondDeviceId))
                         {
                             isNVLINK = true;
                         }
@@ -495,15 +573,16 @@ private:
     std::shared_ptr<ncclComm_t> mNcclComm;
     bool mAffine;
     bool mBias;
+    bool mScale;
 };
 
 } // namespace
 
 #endif // ENABLE_MULTI_DEVICE
 
-std::tuple<torch::Tensor, torch::Tensor> allreduce(torch::Tensor input, torch::optional<torch::Tensor> workspace,
+std::vector<torch::Tensor> allreduce(torch::Tensor input, torch::optional<torch::Tensor> workspace,
     torch::TensorList reduce_fusion_inputs, torch::List<int64_t> group_, int64_t const strategy_, int64_t const config_,
-    int64_t const fusion_op_, double const eps_, bool const affine_, bool const bias_)
+    int64_t const fusion_op_, double const eps_, bool const affine_, bool const bias_, bool const scale_)
 {
 #if ENABLE_MULTI_DEVICE
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
@@ -516,12 +595,11 @@ std::tuple<torch::Tensor, torch::Tensor> allreduce(torch::Tensor input, torch::o
     {
         group.insert(static_cast<int>(rank));
     }
-    AllreduceOp op(group, dtype, strategy, config, fusion_op, eps, affine_, bias_);
+    AllreduceOp op(group, dtype, strategy, config, fusion_op, eps, affine_, bias_, scale_);
     op.initialize();
-    auto output = op.run(input, workspace, reduce_fusion_inputs);
-    return output;
+    return op.run(input, workspace, reduce_fusion_inputs);
 #else
-    return std::make_tuple(input, input);
+    return {input};
 #endif // ENABLE_MULTI_DEVICE
 }
 
@@ -531,7 +609,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "allreduce(Tensor input, Tensor? workspace, Tensor[] reduce_fusion_inputs, int[] group, int "
-        "strategy, int config, int op, float eps, bool affine, bool bias) -> (Tensor, Tensor)");
+        "strategy, int config, int op, float eps, bool affine, bool bias, bool scale) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

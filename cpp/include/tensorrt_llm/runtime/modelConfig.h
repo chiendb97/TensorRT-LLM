@@ -110,6 +110,7 @@ public:
         , mSizePerHead(mHiddenSize / mNbHeads)
         , mDataType(dtype)
         , mUseGptAttentionPlugin(false)
+        , mUseGemmAllReducePlugin(false)
         , mUseMambaConv1dPlugin(false)
         , mInputPacked{false}
         , mTokensPerBlock{kDEFAULT_NUM_TOKENS_PER_BLOCK}
@@ -128,7 +129,6 @@ public:
         , mRotaryEmbeddingDim(0)
         , mContextFMHA(false)
         , mPagedContextFMHA(false)
-        , mUseXQA{false}
         , mPpReduceScatter{false}
         , mUseLoraPlugin(false)
         , mMlpHiddenSize(0)
@@ -140,6 +140,7 @@ public:
         , mUseShapeInference(true)
         , mManageWeightsType(ManageWeightsType::kDisabled)
         , mSkipCrossAttnBlocks(false)
+        , mNumLanguages(0)
     {
         TLLM_CHECK_WITH_INFO(mNbLayers >= mNbAttentionLayers + mNbRnnLayers,
             "Number of layers (%d) expected to be >= number of attention (%d) + number of rnn layers (%d)", mNbLayers,
@@ -271,9 +272,19 @@ public:
         return mUseGptAttentionPlugin;
     }
 
+    [[nodiscard]] bool constexpr useGemmAllReducePlugin() const noexcept
+    {
+        return mUseGemmAllReducePlugin;
+    }
+
     void constexpr useGptAttentionPlugin(bool useGptAttentionPlugin) noexcept
     {
         mUseGptAttentionPlugin = useGptAttentionPlugin;
+    }
+
+    void constexpr useGemmAllReducePlugin(bool useGemmAllReducePlugin) noexcept
+    {
+        mUseGemmAllReducePlugin = useGemmAllReducePlugin;
     }
 
     [[nodiscard]] bool constexpr useMambaConv1dPlugin() const noexcept
@@ -655,7 +666,7 @@ public:
         resetSpeculativeDecodingModule();
     }
 
-    [[nodiscard]] nvinfer1::DataType getKvDataType() const noexcept
+    [[nodiscard]] nvinfer1::DataType getKvDataType() const
     {
         if (getQuantMode().hasFp8KvCache())
         {
@@ -665,8 +676,19 @@ public:
         {
             return nvinfer1::DataType::kINT8;
         }
-
-        return getDataType();
+        else if (getQuantMode().hasFp4KvCache())
+        {
+// Todo: Fix bug ENABLE_FP4=OFF
+// #ifdef ENABLE_FP4
+            return nvinfer1::DataType::kFP4;
+// #else
+//             throw std::runtime_error("Model has FP4 KV cache, but TRT-LLM was not compiled with FP4 enabled.");
+// #endif
+        }
+        else
+        {
+            return getDataType();
+        }
     }
 
     [[nodiscard]] bool constexpr isTransformerBased() const noexcept
@@ -718,6 +740,16 @@ public:
     [[nodiscard]] nvinfer1::DataType constexpr getLogitsDtype() const noexcept
     {
         return mLogitsDtype;
+    }
+
+    void setGemmAllReduceDtype(nvinfer1::DataType inputDtype) noexcept
+    {
+        mGemmAllReduceDtype = inputDtype;
+    }
+
+    [[nodiscard]] nvinfer1::DataType constexpr getGemmAllReduceDtype() const noexcept
+    {
+        return mGemmAllReduceDtype;
     }
 
     void setUseShapeInference(bool useShapeInference) noexcept
@@ -809,6 +841,31 @@ public:
         mSkipCrossAttnBlocks = skipCrossAttnBlocks;
     }
 
+    [[nodiscard]] std::optional<SizeType32> constexpr getNumLanguages() const noexcept
+    {
+        return mNumLanguages;
+    }
+
+    [[nodiscard]] bool constexpr useLanguageAdapter() const noexcept
+    {
+        return getNumLanguages().has_value() && getNumLanguages().value() > 0;
+    }
+
+    void constexpr setNumLanguages(std::optional<SizeType32> numLanguages) noexcept
+    {
+        mNumLanguages = numLanguages;
+    }
+
+    [[nodiscard]] bool isMultiModal() const
+    {
+        return getModelName() == "multiModal";
+    }
+
+    [[nodiscard]] bool isWhisper() const
+    {
+        return getModelName() == "WhisperEncoder";
+    }
+
 private:
     SizeType32 mVocabSize;
     SizeType32 mNbLayers;
@@ -819,6 +876,8 @@ private:
     SizeType32 mSizePerHead;
     nvinfer1::DataType mDataType;
     bool mUseGptAttentionPlugin;
+    bool mUseGemmAllReducePlugin;
+    nvinfer1::DataType mGemmAllReduceDtype;
     bool mUseMambaConv1dPlugin;
     bool mInputPacked;
     bool mPagedState;
@@ -841,7 +900,6 @@ private:
 
     bool mContextFMHA;
     bool mPagedContextFMHA;
-    bool mUseXQA;
     bool mPpReduceScatter;
 
     bool mUseLoraPlugin;
@@ -874,6 +932,9 @@ private:
     std::vector<SizeType32> mNumKvHeadsPerAttentionLayer;
     std::vector<SizeType32> mNumKvHeadsPerCrossAttentionLayer;
     bool mSkipCrossAttnBlocks;
+
+    // Language adapter info
+    std::optional<SizeType32> mNumLanguages;
 };
 
 } // namespace tensorrt_llm::runtime

@@ -23,6 +23,7 @@
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/common.h"
 
 #include <algorithm>
 
@@ -202,6 +203,28 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorCo
             batchSlots, getLimitsPenalty(DecodingPenaltyType::MinLength), "min length");
     }
 
+    // Reset penalty workspace
+    auto const workspaceSizePerBatch
+        = mDecoderDomain.getMaxDecodingTokens() * mConfiguredBeamWidth * mDecoderDomain.getVocabSize();
+    for (SizeType32 bi = 0; bi < batchSize; ++bi)
+    {
+        auto batchSlot = runtime::bufferCast<runtime::SizeType32>(*batchSlots)[bi];
+
+        if (mPenaltyWorkspaceDevice)
+        {
+            auto deviceSlice = runtime::IBuffer::slice(
+                mPenaltyWorkspaceDevice, batchSlot * workspaceSizePerBatch, workspaceSizePerBatch);
+            mBufferManager->setZero(*deviceSlice);
+        }
+
+        if (mPenaltyWorkspacePrevDevice)
+        {
+            auto deviceSlice = runtime::IBuffer::slice(
+                mPenaltyWorkspacePrevDevice, batchSlot * workspaceSizePerBatch, workspaceSizePerBatch);
+            mBufferManager->setZero(*deviceSlice);
+        }
+    }
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -235,7 +258,7 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
     {
         if (params->logitsVec)
         {
-            TLLM_CHECK_WITH_INFO(params->logitsVec->size() == localDecoderDomain.getBatchSize(),
+            TLLM_CHECK_WITH_INFO(params->logitsVec->size() == static_cast<size_t>(localDecoderDomain.getBatchSize()),
                 "Logits vector size (%lu) is not equal to the batchSize (%d)", params->logitsVec->size(),
                 localDecoderDomain.getBatchSize());
             logitsPtrsHostData[bi] = bufferCastOrNull<T>(params->logitsVec.value()[bi]);
@@ -321,7 +344,7 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
     }
 
     invokeBatchApplyPenalty(penaltyParams);
-    sync_check_cuda_error();
+    sync_check_cuda_error(penaltyParams.stream);
 
     mCyclicStep += 1;
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -89,8 +89,13 @@ enum class AttentionInputLayout
 
 struct MHARunnerFixedParams
 {
-    // The FMHA data type.
+    // The FMHA input data type.
     Data_type dataType;
+    // The FMHA kv cache data type.
+    Data_type dataTypeKv;
+    // The FMHA data output type.
+    Data_type dataTypeOut;
+
     // Do we use fp32 accumulation ?
     // TODO(yibinl): remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
     // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
@@ -105,6 +110,8 @@ struct MHARunnerFixedParams
     int numQHeads;
     // The number of Kv Heads.
     int numKvHeads;
+    // The number of tokens per kv cache block.
+    int numTokensPerBlock;
     // The head size.
     int headSize;
     // The head size of V.
@@ -121,6 +128,12 @@ struct MHARunnerFixedParams
     int tpSize = 1;
     // The tensor parallel rank (alibi).
     int tpRank = 0;
+    // q tensor quant block size in sage attention
+    int sageBlockSizeQ = 0;
+    // k tensor quant block size in sage attention
+    int sageBlockSizeK = 0;
+    // v tensor quant block size in sage attention
+    int sageBlockSizeV = 0;
 
     // Convert to string for debug.
     std::string convertToStrOutput()
@@ -151,7 +164,9 @@ struct MHARunnerFixedParams
         output += ", attention_input_layout = ";
         switch (attentionInputLayout)
         {
-        case AttentionInputLayout::PACKED_QKV: output += "packed_qkv"; break;
+        case AttentionInputLayout::PACKED_QKV:
+            output += "packed_qkv, num_tokens_per_block = " + std::to_string(numTokensPerBlock);
+            break;
         case AttentionInputLayout::Q_CONTIGUOUS_KV: output += "q_contiguous_kv"; break;
         case AttentionInputLayout::Q_PAGED_KV: output += "q_paged_kv"; break;
         default: TLLM_CHECK_WITH_INFO(false, "not supported.");
@@ -195,10 +210,14 @@ struct MHARunnerParams
     KVBlockArray pagedKvCache;
     // The output buffer ptr.
     void* outputPtr;
+    // The output scaling factor buffer ptr. (only used for FP4 output)
+    void* outputSfPtr;
     // The packed mask ptr.
     void const* packedMaskPtr;
     // The cumulative Q sequence lengths.
     void const* cuQSeqLenPtr;
+    // The KV sequence lengths.
+    void const* kvSeqLenPtr;
     // The cumulative KV sequence lengths.
     void const* cuKvSeqLenPtr;
     // The cumulative packed mask rows.
@@ -209,9 +228,20 @@ struct MHARunnerParams
     float const* scaleBmm1Ptr;
     // The bmm2 scale device ptr (only used by fp8 kernels).
     float const* scaleBmm2Ptr;
+    // The device scale for O scaling factor.
+    float const* oSfScalePtr;
     // The cuda stream.
     cudaStream_t stream;
+    // Force using fp32 accumulation data type.
     bool forceFp32Acc = false;
+    // pointer to q, k, v scale tensor in sageattention
+    float* qScalePtr;
+    float* kScalePtr;
+    float* vScalePtr;
+    // q, k, v block size in sageattention
+    int qMaxNBlock;
+    int kMaxNBlock;
+    int vMaxNBlock;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -333,6 +363,18 @@ struct Fused_multihead_attention_params_v2
     int dv = 0;
     // The stride of V. If unset, v_stride_in_bytes = kv_stride_in_bytes * dv / d
     int64_t v_stride_in_bytes = 0;
+
+    // SageAttention parameters
+    struct SageAttention
+    {
+        struct Scales
+        {
+            // ceil(max_seqlen / block_size)
+            int max_nblock;
+            // The scale of each block, layout: (B, H, max_nblock)
+            float* scales;
+        } q, k, v;
+    } sage;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -383,6 +425,12 @@ struct Launch_params
     int device_l2_cache_size = 0;
     // total device memory (used by TMA loading of paged kv cache).
     size_t total_device_memory = 0;
+    // q tensor quant block size in sage attention
+    int sage_block_size_q = 0;
+    // k tensor quant block size in sage attention
+    int sage_block_size_k = 0;
+    // v tensor quant block size in sage attention
+    int sage_block_size_v = 0;
 };
 
 } // namespace kernels

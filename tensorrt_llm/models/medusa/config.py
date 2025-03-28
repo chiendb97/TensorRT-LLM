@@ -71,6 +71,7 @@ class MedusaConfig(PretrainedConfig):
 
         trust_remote_code = kwargs.pop('trust_remote_code', True)
         speculative_config_or_dir = kwargs.pop('speculative_model', None)
+        speculative_config = kwargs.pop("speculative_config", None)
 
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
@@ -81,14 +82,18 @@ class MedusaConfig(PretrainedConfig):
                 hf_config_dir, trust_remote_code=trust_remote_code)
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
-        config_file = speculative_config_or_dir / "config.json"
-        with open(config_file) as fp:
-            config = json.load(fp)
-        num_medusa_heads = kwargs.pop(
-            "medusa_num_heads",
-            None) if "medusa_num_heads" in kwargs else config.get(
+        if hasattr(hf_config, "medusa"):
+            # is modelOpt ckpt
+            num_medusa_heads = hf_config.medusa["num_medusa_heads"]
+            num_medusa_layers = hf_config.medusa["num_medusa_layers"]
+        else:
+            config_file = speculative_config_or_dir / "config.json"
+            with open(config_file) as fp:
+                config = json.load(fp)
+
+            num_medusa_heads = speculative_config.num_medusa_heads if speculative_config is not None else config.get(
                 'num_medusa_heads', None)
-        num_medusa_layers = config.get('medusa_num_layers', None)
+            num_medusa_layers = config.get('medusa_num_layers', None)
 
         return cls(architecture="MedusaForCausalLM",
                    dtype=dtype,

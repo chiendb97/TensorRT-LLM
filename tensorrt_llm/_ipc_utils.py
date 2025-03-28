@@ -17,7 +17,7 @@ import struct
 import sys
 from typing import List, Tuple
 
-from cuda import cudart
+from cuda import cuda, cudart
 from cuda.cudart import cudaError_t
 
 from ._utils import mpi_comm
@@ -30,12 +30,26 @@ def _raise_if_error(error: cudaError_t):
         raise RuntimeError(error)
 
 
+def _raise_if_error(error: cuda.CUresult):
+    if error != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(error)
+
+
 def can_access_peer(mapping: Mapping) -> bool:
     src_node = mapping.local_rank
+
     for rank in mapping.tp_group:
         dest_node = mapping.get_local_rank(rank)
-        if mapping.get_node_rank(
-                rank) != mapping.node_rank or dest_node == src_node:
+
+        # Early exit if devices are on different nodes
+        if mapping.get_node_rank(rank) != mapping.node_rank:
+            logger.info(
+                f"Detect inter-node TP between rank {mapping.rank} and rank {rank}"
+            )
+            return False
+
+        # Skip if same device
+        if dest_node == src_node:
             continue
 
         error, result = cudart.cudaDeviceCanAccessPeer(src_node, dest_node)
@@ -43,8 +57,10 @@ def can_access_peer(mapping: Mapping) -> bool:
 
         if result == 0:
             logger.info(
-                f"Cannot access peer device from {src_node} to {dest_node}")
+                f"cudaDeviceCanAccessPeer failed for device: {src_node} peerDevice: {dest_node}"
+            )
             return False
+
     return True
 
 

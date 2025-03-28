@@ -74,7 +74,8 @@ public:
         std::optional<FloatType> const& lengthPenalty = std::nullopt,
         std::optional<SizeType32> const& earlyStopping = std::nullopt,
         std::optional<SizeType32> const& noRepeatNgramSize = std::nullopt,
-        std::optional<SizeType32> const& numReturnSequences = std::nullopt);
+        std::optional<SizeType32> const& numReturnSequences = std::nullopt,
+        std::optional<FloatType> const& minP = std::nullopt);
 
     bool operator==(SamplingConfig const& other) const;
 
@@ -98,6 +99,7 @@ public:
     [[nodiscard]] std::optional<SizeType32> getEarlyStopping() const;
     [[nodiscard]] std::optional<SizeType32> getNoRepeatNgramSize() const;
     [[nodiscard]] std::optional<SizeType32> getNumReturnSequences() const;
+    [[nodiscard]] std::optional<FloatType> getMinP() const;
 
     void setBeamWidth(SizeType32 beamWidth);
     void setTopK(std::optional<SizeType32> const& topK);
@@ -118,6 +120,7 @@ public:
     void setEarlyStopping(std::optional<SizeType32> const& earlyStopping);
     void setNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
     void setNumReturnSequences(std::optional<SizeType32> const& numReturnSequences);
+    void setMinP(std::optional<FloatType> const& minP);
 
 private:
     static SizeType32 checkBeamWidth(SizeType32 beamWidth);
@@ -134,6 +137,7 @@ private:
         std::optional<FloatType> const& beamSearchDiversityRate);
     static std::optional<SizeType32> const& checkNumReturnSequences(
         std::optional<SizeType32> const& numReturnSequences, SizeType32 beamWidth);
+    static std::optional<FloatType> const& checkMinP(std::optional<FloatType> const& minP);
 
     void updateNumReturnBeams();
 
@@ -151,7 +155,7 @@ private:
     std::optional<TokenIdType> mTopPResetIds;
     /// @brief Controls decay in the top-P algorithm. The decay value. Default is 1.f
     std::optional<FloatType> mTopPDecay;
-    /// @brief Controls the random seed used by the random number generator in sampling
+    /// @brief Controls the random seed used by the random number generator in sampling. Default is 0.
     std::optional<RandomSeedType> mSeed;
     /// @brief Controls the modulation of logits when sampling new tokens. It can have values > 0.f. Default is 1.0f
     std::optional<FloatType> mTemperature;
@@ -171,7 +175,7 @@ private:
     /// @brief Controls how to penalize longer sequences in beam search. Default is 0.f
     std::optional<FloatType> mLengthPenalty;
     /// @brief Controls whether the generation process finishes once beamWidth sentences are generated (ends with
-    /// end_token)
+    /// end_token). Default is 1.
     std::optional<SizeType32> mEarlyStopping;
     /// @brief Controls how many repeat ngram size are acceptable. Default is 1 << 30.
     std::optional<SizeType32> mNoRepeatNgramSize;
@@ -181,6 +185,9 @@ private:
     /// @brief The number of beams to return. It is equal to beamWidth unless numReturnSequences is set.
     /// If beamWidth > 1 and numReturnSequences is set, then numReturnBeams is equal to numReturnSequences.
     SizeType32 mNumReturnBeams;
+    /// @brief Controls the min_p scaling for sampling.
+    /// It masks x which P_x < min_p * P_max, where P_x is probability of candidate x. Default is 0.f
+    std::optional<FloatType> mMinP;
 };
 
 /// @brief Configuration that controls the outputs of a Result
@@ -352,12 +359,15 @@ private:
 struct EagleConfig
 {
     explicit EagleConfig(std::optional<EagleChoices> eagleChoices = std::nullopt, bool greedySampling = true,
-        std::optional<float> posteriorThreshold = std::nullopt);
+        std::optional<float> posteriorThreshold = std::nullopt, bool useDynamicTree = false,
+        std::optional<SizeType32> dynamicTreeMaxTopK = std::nullopt);
 
     bool operator==(EagleConfig const& other) const;
     [[nodiscard]] std::optional<EagleChoices> getEagleChoices() const;
     [[nodiscard]] std::optional<float> getPosteriorThreshold() const;
     [[nodiscard]] bool isGreedySampling() const;
+    [[nodiscard]] bool useDynamicTree() const;
+    [[nodiscard]] std::optional<SizeType32> getDynamicTreeMaxTopK() const;
 
 private:
     std::optional<float> const& checkPosteriorValue(std::optional<float> const& value);
@@ -374,6 +384,12 @@ private:
     /// Corresponds to epsilon in https://arxiv.org/pdf/2401.10774.
     /// Default is 0.09f.
     std::optional<float> mPosteriorThreshold;
+
+    /// @brief Flag to use Eagle-2
+    bool mUseDynamicTree;
+
+    /// @brief Number of draft tokens expand for each node in Eagle-2
+    std::optional<SizeType32> mDynamicTreeMaxTopK;
 };
 
 class ContextPhaseParams
@@ -381,8 +397,11 @@ class ContextPhaseParams
 public:
     using RequestIdType = std::uint64_t;
 
-    explicit ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId);
-    ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, void* state);
+    ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, std::optional<VecTokens> draftTokens);
+    ContextPhaseParams(
+        VecTokens firstGenTokens, RequestIdType reqId, void* state, std::optional<VecTokens> draftTokens);
+    ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, std::vector<char> const& serializedState,
+        std::optional<VecTokens> draftTokens);
 
     ContextPhaseParams(ContextPhaseParams const&);
     ContextPhaseParams(ContextPhaseParams&&) noexcept;
@@ -393,12 +412,14 @@ public:
     [[nodiscard]] bool operator==(ContextPhaseParams const&) const noexcept;
 
     [[nodiscard]] VecTokens const& getFirstGenTokens() const& noexcept;
+    [[nodiscard]] std::optional<VecTokens> const& getDraftTokens() const& noexcept;
     [[nodiscard]] VecTokens popFirstGenTokens() && noexcept;
     [[nodiscard]] RequestIdType getReqId() const noexcept;
 
     [[nodiscard]] void const* getState() const noexcept;
     [[nodiscard]] void* getState() noexcept;
     [[nodiscard]] void* releaseState() noexcept;
+    [[nodiscard]] std::vector<char> getSerializedState() const noexcept;
 
 private:
     friend class Serialization;
@@ -413,6 +434,9 @@ private:
 
     /// @brief Context phase state of this request
     StatePtr mState{nullptr, deleter};
+
+    /// @brief The draft tokens generated by context executor
+    std::optional<VecTokens> mDraftTokens;
 };
 
 /// @brief Configuration for speculative decoding (both draft and target models)
@@ -425,6 +449,9 @@ public:
 
     /// @brief Send logits tensor directly from draft to target model.
     bool fastLogits;
+
+private:
+    friend class Serialization;
 };
 
 /// @brief Guided decoding parameters for a request.
@@ -545,6 +572,13 @@ public:
     [[nodiscard]] std::vector<RetentionPriorityAndDuration> getPerBlockRetentionPriorityDuration(
         SizeType32 blockSize, SizeType32 seqLen) const;
 
+    bool operator==(KvCacheRetentionConfig const& other) const
+    {
+        return mTokenRangeRetentionConfigs == other.mTokenRangeRetentionConfigs
+            && mDecodeRetentionPriority == other.mDecodeRetentionPriority
+            && mDecodeDurationMs == other.mDecodeDurationMs;
+    }
+
 private:
     /// @brief The token ranges and priority levels to update. Ranges must be non-overlapping. For example [(0, 64),
     /// (100, 128), (70, 80)] is valid, whereas
@@ -574,12 +608,14 @@ public:
     /// @param positionIds The input position ids
     /// @param badWords A list of bad words tokens. Each "word" can be composed of multiple tokens
     /// @param stopWords A list of stop words tokens. Each "word" can be composed of multiple tokens
-    /// @param embeddingBias The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]
+    /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
     /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
     /// @param loraConfig The LoRA configuration
     /// @param lookaheadConfig The lookahead speculative decoding configuration
     /// @param logitsPostProcessorName The logits postprocessor name. Must correspond to one of the logits postprocessor
+    /// @param logitsPostProcessor The logits postprocessor dynamically specified per request; only supported with
+    /// replicate=false or no tensor parallelism.
     /// @param kvCacheRetentionConfig The configuration used for KV cache block eviction.
     /// name provided to the ExecutorConfig.
     /// @param encoderInputTokenIds The encoder input token ids for encoder-decoder models, or encoder-only models
@@ -599,6 +635,8 @@ public:
     /// @param allottedTimeMs The allotted time in milliseconds after which the request is finished with a timedOut
     /// finish reason. The request always will exceed this time slightly, but at most with 1 forward pass. A request can
     /// be timed-out before ever being scheduled.
+    /// @param languageAdapterUid Task Uid for language adapter.
+
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -612,6 +650,7 @@ public:
         std::optional<LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
         std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         std::optional<std::string> logitsPostProcessorName = std::nullopt,
+        std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         std::optional<VecTokens> encoderInputTokenIds = std::nullopt, std::optional<IdType> clientId = std::nullopt,
         bool returnAllGeneratedTokens = false, PriorityType priority = kDefaultPriority,
         RequestType type = RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
@@ -621,10 +660,13 @@ public:
         std::optional<Tensor> crossAttentionMask = std::nullopt, SizeType32 numReturnSequences = 1,
         std::optional<EagleConfig> eagleConfig = std::nullopt, std::optional<Tensor> skipCrossAttnBlocks = std::nullopt,
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
+        std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
+    /// @brief Dynamic logits postprocessor name will be "dynamic" + requestId
+    static auto constexpr kDynamicPostProcessorNamePrefix = "dynamic";
 
     Request(Request const& other);
     Request(Request&& other) noexcept;
@@ -651,6 +693,7 @@ public:
     [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadConfig() const;
     [[nodiscard]] std::optional<KvCacheRetentionConfig> getKvCacheRetentionConfig() const;
     [[nodiscard]] std::optional<std::string> getLogitsPostProcessorName() const;
+    [[nodiscard]] std::optional<LogitsPostProcessor> getLogitsPostProcessor() const;
     [[nodiscard]] std::optional<VecTokens> getEncoderInputTokenIds() const;
     [[nodiscard]] std::optional<IdType> getClientId() const;
     [[nodiscard]] PriorityType getPriority() const;
@@ -666,6 +709,7 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
+    [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -683,6 +727,7 @@ public:
     void setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig);
     void setKvCacheRetentionConfig(KvCacheRetentionConfig const& kvCacheRetentionConfig);
     void setLogitsPostProcessorName(std::string const& logitsPostProcessorName);
+    void setLogitsPostProcessor(std::optional<LogitsPostProcessor> const& logitsPostProcessor);
     void setEncoderInputTokenIds(VecTokens const& encoderInputTokenIds);
     void setClientId(IdType clientId);
     void setPriority(PriorityType priority);
@@ -697,7 +742,7 @@ public:
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
-    void setAdditionalOutputNames(std::optional<std::vector<std::string>> additionalOutputNames);
+    void setLanguageAdapterUid(SizeType32 languageAdapterUid);
 
 private:
     friend class Serialization;
@@ -725,6 +770,12 @@ struct AdditionalOutput
         , output(std::move(output))
     {
     }
+
+    AdditionalOutput(AdditionalOutput const& other) = default;
+    AdditionalOutput(AdditionalOutput&& other) noexcept = default;
+    AdditionalOutput& operator=(AdditionalOutput const& other) = default;
+    AdditionalOutput& operator=(AdditionalOutput&& other) noexcept = default;
+    ~AdditionalOutput() = default;
 
     std::string name;
     Tensor output;
@@ -864,7 +915,7 @@ private:
 
     /// @brief A vector of (batchSizeLimit, batchSize). When max capacity batch size is less than
     // batchSizeLimit_{i} but greater or equal to batchSizeLimit_{i-1}, the batch size will be batchSize_{i}.
-    // For max capcity batch size beyond the last batchSizeLimit, the batch size may be rounded down to multiple of 512
+    // For max capacity batch size beyond the last batchSizeLimit, the batch size may be rounded down to multiple of 512
     // based on the actual implementation.
     std::vector<std::pair<SizeType32, SizeType32>> mBatchSizeTable;
 };
@@ -903,16 +954,19 @@ private:
 class KvCacheConfig
 {
 public:
-    explicit KvCacheConfig(bool enableBlockReuse = false, std::optional<SizeType32> const& maxTokens = std::nullopt,
+    explicit KvCacheConfig(bool enableBlockReuse = true, std::optional<SizeType32> const& maxTokens = std::nullopt,
         std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> const& sinkTokenLength = std::nullopt,
         std::optional<FloatType> const& freeGpuMemoryFraction = std::nullopt,
         std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true,
         std::optional<FloatType> const& crossKvCacheFraction = std::nullopt,
         std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
-        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt);
+        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt,
+        bool enablePartialReuse = true, bool copyOnPartialReuse = true);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
+    [[nodiscard]] bool getEnablePartialReuse() const;
+    [[nodiscard]] bool getCopyOnPartialReuse() const;
     [[nodiscard]] std::optional<SizeType32> getMaxTokens() const;
     [[nodiscard]] std::optional<std::vector<SizeType32>> getMaxAttentionWindowVec() const;
     [[nodiscard]] std::optional<SizeType32> getSinkTokenLength() const;
@@ -924,6 +978,8 @@ public:
     [[nodiscard]] size_t getEventBufferMaxSize() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
+    void setEnablePartialReuse(bool enablePartialReuse);
+    void setCopyOnPartialReuse(bool copyOnPartialReuse);
     void setMaxTokens(SizeType32 maxTokens);
     void setMaxAttentionWindowVec(std::vector<SizeType32> maxAttentionWindowVec);
     void setSinkTokenLength(SizeType32 sinkTokenLength);
@@ -978,6 +1034,12 @@ private:
 
     /// @brief Max size of the KV cache event buffer
     size_t mEventBufferMaxSize;
+
+    /// @brief Whether blocks that are only partially matched can be reused
+    bool mEnablePartialReuse;
+
+    /// @brief Whether partially matched blocks that are in use can be reused after copying them
+    bool mCopyOnPartialReuse;
 };
 
 /// @brief Configuration class for the runtime perf knobs
@@ -1141,7 +1203,8 @@ public:
         SizeType32 maxPagesPerBlockHost = kDefaultMaxPagesPerBlockHost,
         SizeType32 maxPagesPerBlockDevice = kDefaultMaxPagesPerBlockDevice,
         std::optional<float> const& deviceCachePercent = std::nullopt,
-        std::optional<size_t> const& hostCacheSize = std::nullopt);
+        std::optional<size_t> const& hostCacheSize = std::nullopt,
+        std::optional<std::string> const& loraPrefetchDir = std::nullopt);
 
     bool operator==(PeftCacheConfig const& other) const;
 
@@ -1156,6 +1219,7 @@ public:
     [[nodiscard]] SizeType32 getMaxPagesPerBlockDevice() const;
     [[nodiscard]] std::optional<float> getDeviceCachePercent() const;
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
+    [[nodiscard]] std::optional<std::string> getLoraPrefetchDir() const;
 
 private:
     friend class Serialization;
@@ -1182,6 +1246,8 @@ private:
     std::optional<FloatType> mDeviceCachePercent;
     // size in bytes to use for host cache
     std::optional<size_t> mHostCacheSize;
+    // folder to store the LoRA weights we hope to load during engine initialization
+    std::optional<std::string> mLoraPrefetchDir;
 };
 
 /// @brief Configuration class for the decoding.
@@ -1333,7 +1399,8 @@ public:
         uint64_t maxSeqIdleMicroseconds = kDefaultMaxSeqIdleMicroseconds,
         std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
-        std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt);
+        std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt,
+        bool gatherGenerationLogits = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1363,6 +1430,7 @@ public:
     [[nodiscard]] std::optional<SpeculativeDecodingConfig> getSpecDecConfig() const;
     [[nodiscard]] std::optional<GuidedDecodingConfig> getGuidedDecodingConfig() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
+    [[nodiscard]] bool getGatherGenerationLogits() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1383,10 +1451,11 @@ public:
     void setExtendedRuntimePerfKnobConfig(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
     void setDebugConfig(DebugConfig const& debugConfig);
     void setRecvPollPeriodMs(SizeType32 const& recvPollPeriodMs);
-    void setMaxSeqIdleMicroseconds(uint64_t maxNumTokens);
+    void setMaxSeqIdleMicroseconds(uint64_t maxSeqIdleMicroseconds);
     void setSpecDecConfig(SpeculativeDecodingConfig const& specDecConfig);
     void setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig);
     void setAdditionalOutputNames(std::vector<std::string> const& additionalOutputNames);
+    void setGatherGenerationLogits(bool gatherGenerationLogits);
 
 private:
     friend class Serialization;
@@ -1458,6 +1527,10 @@ private:
 
     /// @brief The additional output tensor names
     std::optional<std::vector<std::string>> mAdditionalOutputNames;
+
+    /// @brief Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
+    /// Default is false.
+    bool mGatherGenerationLogits;
 };
 
 struct KVCacheCreatedData
@@ -1471,7 +1544,7 @@ struct KVCacheStoredBlockData
 {
 
     KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
-        tensorrt_llm::runtime::LoraTaskIdType loraId, SizeType32 cacheLevel, SizeType32 priority)
+        std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority)
         : blockHash{blockHash}
         , tokens{std::move(tokens)}
         , loraId{loraId}
@@ -1485,7 +1558,7 @@ struct KVCacheStoredBlockData
     /// @brief The unique tokens of the block
     tensorrt_llm::runtime::VecUniqueTokens tokens;
     /// @brief The Lora task id of the block
-    tensorrt_llm::runtime::LoraTaskIdType loraId;
+    std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId;
     /// @brief The cache level of the block
     SizeType32 cacheLevel;
     /// @brief The priority of the block
@@ -1577,7 +1650,6 @@ public:
     /// @param modelPath Path to the folder that defines the model to run
     /// @param modelType The type of model
     /// @param executorConfig The configuration for the executor
-    /// @param comm An optional inter-process communicator configuration
     Executor(std::filesystem::path const& modelPath, ModelType modelType, ExecutorConfig const& executorConfig);
 
     Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,

@@ -134,9 +134,9 @@ public:
     std::string getLayerProfileInfo() const;
     void reportToProfiler(SizeType32 contextId);
     void loadManagedWeights(RawEngine const& rawEngine, int localRank);
-    void printEngineInfo();
-    void initializeUserBuffer(SizeType32 tpSize, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
-        SizeType32 maxSequenceLength, SizeType32 hiddenSize, std::optional<SizeType32> maxNumTokens);
+    void initializeUserBuffer(tensorrt_llm::runtime::WorldConfig const& world_config, SizeType32 maxBatchSize,
+        SizeType32 maxBeamWidth, SizeType32 maxSequenceLength, SizeType32 hiddenSize,
+        std::optional<SizeType32> maxNumTokens);
 
     bool isUserBufferEnabled() const
     {
@@ -149,6 +149,10 @@ private:
     void setInputTensorsImpl(SizeType32 contextIndex, TensorMap const& tensorMap, bool throwOnMiss);
 
     void setUserBufferTensors(SizeType32 contextIndex, TensorMap& tensorMap);
+
+    void printEngineInfo();
+
+    void printContextInfo(SizeType32 contextIndex);
 
     // Tool functions for `printEngineInfo()`.
     static std::string shapeToString(nvinfer1::Dims64 const& dim)
@@ -168,10 +172,6 @@ private:
 
     static std::string dataTypeToString(nvinfer1::DataType type)
     {
-#if defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wswitch"
-#endif
         switch (type)
         {
         case nvinfer1::DataType::kINT64: return "INT64";
@@ -184,11 +184,9 @@ private:
         case nvinfer1::DataType::kINT8: return "INT8";
         case nvinfer1::DataType::kFP8: return "FP8";
         case nvinfer1::DataType::kINT4: return "INT4";
+        case nvinfer1::DataType::kFP4: return "FP4";
         default: return "UNKNOWN";
         }
-#if defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
         return "";
     }
 

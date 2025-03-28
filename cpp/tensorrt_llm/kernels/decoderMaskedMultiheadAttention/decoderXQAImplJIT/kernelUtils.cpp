@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
+#include "tensorrt_llm/common/utils.h"
 
 namespace tensorrt_llm
 {
@@ -25,19 +26,11 @@ namespace jit
 namespace
 {
 
-template <typename T>
-bool contains(std::initializer_list<T> const& c, T const& v)
-{
-    return std::find(c.begin(), c.end(), v) != c.end();
-}
+using tensorrt_llm::common::contains;
 
 bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
 {
     if (xqaParams.unidirectional != 1)
-    {
-        return false;
-    }
-    if (xqaParams.q_scaling != 1.0f)
     {
         return false;
     }
@@ -46,10 +39,6 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
         return false;
     }
     if (xqaParams.cross_attention)
-    {
-        return false;
-    }
-    if (xqaParams.cyclic_attention_window_size != xqaParams.max_attention_window_size)
     {
         return false;
     }
@@ -77,23 +66,6 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
             xqaParams.position_embedding_type))
     {
         return false;
-    }
-    if (!forConfigurePlugin)
-    {
-        // Inference time checks.
-        if (xqaParams.host_past_key_value_lengths == nullptr)
-        {
-            return false;
-        }
-        for (int i = 0; i < xqaParams.batch_size; ++i)
-        {
-            // Only checks for non-medusa case, because medusa may not accept all tokens in host_past_key_value_lengths.
-            if (!xqaParams.multi_query_tokens
-                && xqaParams.host_past_key_value_lengths[i] + 1 > xqaParams.max_attention_window_size)
-            {
-                return false;
-            }
-        }
     }
     return true;
 }
@@ -131,7 +103,7 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
     {
         return false;
     }
-    if (xqaParams.paged_kv_cache && !contains({16, 32, 64, 128}, xqaParams.tokens_per_block))
+    if (xqaParams.paged_kv_cache && !contains({8, 16, 32, 64, 128}, xqaParams.tokens_per_block))
     {
         return false;
     }
@@ -159,6 +131,25 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
     if (xqaParams.beam_width != 1 && xqaParams.beam_width != 4)
     {
         return false;
+    }
+    if (!forConfigurePlugin)
+    {
+        // Inference time checks.
+        if (xqaParams.host_past_key_value_lengths == nullptr)
+        {
+            return false;
+        }
+        if (!xqaParams.multi_query_tokens && xqaParams.beam_width != 1
+            && xqaParams.max_past_kv_length + 1 > xqaParams.cyclic_attention_window_size)
+        {
+            return false;
+        }
+        // @fixme: should work but it triggers illegal mem address in invokeQKVPreprocessing.
+        // Hopper XQA is fine because it does not use invokeQKVPreprocessing.
+        if (xqaParams.max_past_kv_length + 1 > xqaParams.cyclic_attention_window_size)
+        {
+            return false;
+        }
     }
     if (xqaParams.head_size % 16 != 0 || xqaParams.head_size < 16 || xqaParams.head_size > 256)
     {

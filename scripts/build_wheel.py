@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
-from shutil import copy, rmtree
+from shutil import copy, copytree, rmtree
 from subprocess import CalledProcessError, check_output, run
 from textwrap import dedent
 from typing import List
@@ -73,7 +73,7 @@ def main(*,
          job_count: int = None,
          extra_cmake_vars: List[str] = list(),
          extra_make_targets: str = "",
-         trt_root: str = None,
+         trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
@@ -86,7 +86,8 @@ def main(*,
          python_bindings: bool = True,
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
-         nvtx: bool = False):
+         nvtx: bool = False,
+         skip_stubs: bool = False):
 
     if clean:
         clean_wheel = True
@@ -222,9 +223,38 @@ def main(*,
     pkg_dir = project_dir / "tensorrt_llm"
     assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
     lib_dir = pkg_dir / "libs"
+    include_dir = pkg_dir / "include"
     if lib_dir.exists():
         clear_folder(lib_dir)
+    if include_dir.exists():
+        clear_folder(include_dir)
+
+    cache_dir = os.getenv("TRTLLM_DG_CACHE_DIR")
+    if cache_dir is not None:
+        cache_dir = Path(cache_dir)
+    elif on_windows:
+        if os.getenv("APPDATA") is not None:
+            cache_dir = Path(os.getenv("APPDATA")) / "tensorrt_llm"
+        else:
+            cache_dir = Path(os.getenv("TEMP")) / "tensorrt_llm"
+    else:
+        if os.getenv("HOME") is not None:
+            cache_dir = Path(os.getenv("HOME")) / ".tensorrt_llm"
+        else:
+            cache_dir = Path(os.getenv("TEMP"), "/tmp") / "tensorrt_llm"
+    if cache_dir.exists():
+        clear_folder(cache_dir)
     lib_dir.mkdir(parents=True, exist_ok=True)
+    include_dir.mkdir(parents=True, exist_ok=True)
+    copytree(get_project_dir() / "3rdparty" / "cutlass" / "include" / "cute",
+             include_dir / "cute",
+             dirs_exist_ok=True)
+    copytree(get_project_dir() / "3rdparty" / "cutlass" / "include" / "cutlass",
+             include_dir / "cutlass",
+             dirs_exist_ok=True)
+    copytree(get_source_dir() / "include" / "tensorrt_llm" / "deep_gemm",
+             include_dir / "deep_gemm",
+             dirs_exist_ok=True)
     if on_windows:
         copy(build_dir / "tensorrt_llm/tensorrt_llm.dll",
              lib_dir / "tensorrt_llm.dll")
@@ -250,14 +280,22 @@ def main(*,
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so",
             lib_dir / "libtensorrt_llm_nvrtc_wrapper.so")
+        if os.path.exists(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
+        ):
+            copy(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so",
+                lib_dir / "libtensorrt_llm_ucx_wrapper.so")
         copy(
             build_dir /
-            "tensorrt_llm/batch_manager/libtensorrt_llm_ucx_wrapper.so",
-            lib_dir / "libtensorrt_llm_ucx_wrapper.so")
+            "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
+            lib_dir / "libdecoder_attention_0.so")
         copy(
             build_dir /
-            "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention.so",
-            lib_dir / "libdecoder_attention.so")
+            "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_1.so",
+            lib_dir / "libdecoder_attention_1.so")
 
     bin_dir = pkg_dir / "bin"
     if bin_dir.exists():
@@ -283,47 +321,48 @@ def main(*,
             return pybind_lib[0]
 
         copy(get_pybind_lib(), pkg_dir)
+        if not skip_stubs:
+            with working_directory(project_dir):
+                build_run(
+                    f"\"{sys.executable}\" -m pip install pybind11-stubgen")
+            with working_directory(pkg_dir):
+                if on_windows:
+                    stubgen = "stubgen.py"
+                    stubgen_contents = """
+                    # Loading torch, trt before bindings is required to avoid import errors on windows.
+                    # isort: off
+                    import torch
+                    import tensorrt as trt
+                    # isort: on
+                    import os
+                    import platform
 
-        with working_directory(project_dir):
-            build_run(f"\"{sys.executable}\" -m pip install pybind11-stubgen")
-        with working_directory(pkg_dir):
-            if on_windows:
-                stubgen = "stubgen.py"
-                stubgen_contents = """
-                # Loading torch, trt before bindings is required to avoid import errors on windows.
-                # isort: off
-                import torch
-                import tensorrt as trt
-                # isort: on
-                import os
-                import platform
+                    from pybind11_stubgen import main
 
-                from pybind11_stubgen import main
+                    if __name__ == "__main__":
+                        # Load dlls from `libs` directory before launching bindings.
+                        if platform.system() == "Windows":
+                            os.add_dll_directory(r\"{lib_dir}\")
+                        main()
+                    """.format(lib_dir=lib_dir)
+                    (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
+                    build_run(f"\"{sys.executable}\" {stubgen} -o . bindings")
+                    (pkg_dir / stubgen).unlink()
+                else:
+                    env_ld = os.environ.copy()
 
-                if __name__ == "__main__":
-                    # Load dlls from `libs` directory before launching bindings.
-                    if platform.system() == "Windows":
-                        os.add_dll_directory(r\"{lib_dir}\")
-                    main()
-                """.format(lib_dir=lib_dir)
-                (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
-                build_run(f"\"{sys.executable}\" {stubgen} -o . bindings")
-                (pkg_dir / stubgen).unlink()
-            else:
-                env_ld = os.environ.copy()
-
-                new_library_path = "/usr/local/cuda/compat/lib.real"
-                if 'LD_LIBRARY_PATH' in env_ld:
-                    new_library_path += f":{env_ld['LD_LIBRARY_PATH']}"
-                env_ld["LD_LIBRARY_PATH"] = new_library_path
-                try:
-                    build_run(
-                        f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings --exit-code",
-                        env=env_ld)
-                except CalledProcessError as ex:
-                    print(f"Failed to build pybind11 stubgen: {ex}",
-                          file=sys.stderr)
-                    exit(1)
+                    new_library_path = "/usr/local/cuda/compat/lib.real"
+                    if 'LD_LIBRARY_PATH' in env_ld:
+                        new_library_path += f":{env_ld['LD_LIBRARY_PATH']}"
+                    env_ld["LD_LIBRARY_PATH"] = new_library_path
+                    try:
+                        build_run(
+                            f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings --exit-code",
+                            env=env_ld)
+                    except CalledProcessError as ex:
+                        print(f"Failed to build pybind11 stubgen: {ex}",
+                              file=sys.stderr)
+                        exit(1)
 
     if not skip_building_wheel:
         if dist_dir is None:
@@ -400,6 +439,7 @@ def add_arguments(parser: ArgumentParser):
         nargs="+",
         default=[])
     parser.add_argument("--trt_root",
+                        default="/usr/local/tensorrt",
                         help="Directory to find TensorRT headers/libs")
     parser.add_argument("--nccl_root",
                         help="Directory to find NCCL headers/libs")
@@ -429,6 +469,9 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--nvtx",
                         action="store_true",
                         help="Enable NVTX features.")
+    parser.add_argument("--skip-stubs",
+                        action="store_true",
+                        help="Skip building python stubs")
 
 
 if __name__ == "__main__":

@@ -6,11 +6,13 @@ import logging
 import os
 import types
 from ast import literal_eval
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 import safetensors
-from helper import convert_weight_to_dtype, fuse_qkv_one_layer, reshape, split
+from helper import (convert_weight_to_dtype, fairseq_sin_pos_embedding,
+                    fuse_qkv_one_layer, reshape, split)
 from transformers import (AutoModelForSeq2SeqLM, Blip2ForConditionalGeneration,
                           MBartForConditionalGeneration,
                           Pix2StructForConditionalGeneration,
@@ -18,6 +20,7 @@ from transformers import (AutoModelForSeq2SeqLM, Blip2ForConditionalGeneration,
 
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType)
+from tensorrt_llm.layers import LanguageAdapterConfig
 from tensorrt_llm.models import PretrainedConfig
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
@@ -170,7 +173,7 @@ def convert_t5_weights_to_tllm_safetensors(config, component, params):
     attention_hidden_size = n_head * head_size  # head size * num_heads not necessarily equals hidden_dim, such as Flan-T5
 
     hf_param_prefix = f'{component}'
-    trtllm_layer_name = f'{component}_layers'
+    trtllm_layer_name = f'transformer.layers'
     trtllm_attn_layer_name = 'attention' if component == 'encoder' else 'self_attention'
     trtllm_attn_layernorm_name = 'self_attention_layernorm' if component == 'decoder' else 'attention_layernorm'
     hf_component_idx = 1 if component == 'encoder' else 2
@@ -178,8 +181,11 @@ def convert_t5_weights_to_tllm_safetensors(config, component, params):
     def get_attn_module_name(component, block, layer, attn_type):
         return f'{component}.block.{int(block)}.layer.{int(layer)}.{attn_type}'
 
-    weights['embedding.vocab_embedding.weight'] = reshape(
-        params['shared.weight'].clone(), None)
+    weights['transformer.vocab_embedding.weight'] = reshape(
+        params['shared.weight'].clone(),
+        None) if not config.use_parallel_embedding else reshape(
+            split(params['shared.weight'].clone(), mapping.tp_size,
+                  mapping.tp_rank, 0), None)
 
     layers_range = mapping.pp_layers(num_layers)
     for layer_idx in layers_range:
@@ -301,7 +307,7 @@ def convert_t5_weights_to_tllm_safetensors(config, component, params):
                 weights[weight_info["name"]] = reshape(
                     params[hf_weight_name].clone(), shape=weight_info["shape"])
 
-    weights['final_layernorm.weight'] = reshape(
+    weights['transformer.ln_f.weight'] = reshape(
         params[f'{component}.final_layer_norm.weight'].clone(), None)
 
     if component == 'decoder':
@@ -322,6 +328,94 @@ def convert_t5_weights_to_tllm_safetensors(config, component, params):
 
 
 convert_blip2_weights_to_tllm_safetensors = convert_t5_weights_to_tllm_safetensors  # func alias
+
+
+def parse_nmt_config_by_component(config, component, args):
+    assert component in ('encoder', 'decoder'), 'Unsupported component!'
+    component_config = types.SimpleNamespace()
+    component_config = copy_args_to_component_config(component_config, args)
+    component_config.n_layer = config.getint(component, f'{component}_layers')
+    component_config.n_head = config.getint(component,
+                                            f'{component}_attention_heads')
+    component_config.hidden_size = config.getint(
+        component, f'{component}_embed_dim')  # fairseq naming
+    component_config.head_size = config.getint(
+        component,
+        'd_kv',
+        fallback=component_config.hidden_size // component_config.n_head)
+    component_config.ffn_hidden_size = config.getint(
+        component, f'{component}_ffn_embed_dim')  # fairseq naming
+    component_config.vocab_size = config.getint(component, 'vocab_size')
+    component_config.n_positions = config.getint(
+        component, 'max_source_positions')  # fairseq naming
+    component_config.has_position_embedding = not config.getboolean(
+        component, 'no_token_positional_embeddings',
+        fallback=False)  # fairseq naming
+    component_config.has_token_type_embedding = config.getboolean(
+        component, 'has_token_type_embedding', fallback=False)
+    component_config.has_embedding_layernorm = config.getboolean(
+        component, 'layernorm_embedding', fallback=True)  # fairseq naming
+    component_config.has_embedding_scale = not config.getboolean(
+        component, 'no_scale_embedding')  # fairseq naming
+    component_config.q_scaling = config.getfloat(component,
+                                                 'q_scaling',
+                                                 fallback=1.0)
+    component_config.has_attention_qkvo_bias = config.getboolean('structure',
+                                                                 't5_with_bias',
+                                                                 fallback=True)
+    component_config.has_mlp_bias = config.getboolean('structure',
+                                                      't5_with_bias',
+                                                      fallback=True)
+    component_config.has_model_final_layernorm = config.getboolean(
+        component, 'has_model_final_layernorm')
+    component_config.layernorm_eps = config.getfloat(
+        component, 'layer_norm_epsilon', fallback=1e-5)  # fairseq naming
+
+    normalize_before = config.getboolean(
+        component, f'{component}_normalize_before')  # fairseq naming
+    component_config.layernorm_position = layernorm_position_map[
+        'pre_layernorm' if normalize_before else 'post_layernorm']
+
+    component_config.layernorm_type = layernorm_type_map[config.get(
+        component, 'layernorm_type', fallback='LayerNorm')]
+    component_config.hidden_act = config.get(component,
+                                             'activation_fn')  # fairseq naming
+    component_config.gated_act = config.getboolean(component,
+                                                   'is_gated_act',
+                                                   fallback=False)
+    component_config.mlp_type = mlp_type_map['GatedMLP' if component_config.
+                                             gated_act else 'MLP']
+    component_config.relative_attention = config.get(
+        'structure', 'position_embedding_type') == 'relative'
+
+    component_config.num_buckets = config.getint(
+        component, 'relative_attention_num_buckets', fallback=0)
+    component_config.max_distance = config.getint(
+        component, 'relative_attention_max_distance', fallback=0)
+    component_config.position_embedding_type = config.get(
+        'structure', 'position_embedding_type')
+    component_config.logits_dtype = config.get(component,
+                                               'logits_dtype',
+                                               fallback='float32')
+    if component == 'decoder':
+        component_config.rescale_before_lm_head = config.getboolean(
+            component, 'rescale_before_lm_head')
+
+        component_config.encoder_hidden_size = config.getint(
+            'encoder', 'encoder_embed_dim')  # fairseq naming
+        component_config.encoder_num_heads = config.getint(
+            'encoder', 'encoder_attention_heads')
+        component_config.encoder_head_size = config.getint(
+            'encoder',
+            'd_kv',
+            fallback=component_config.encoder_hidden_size //
+            component_config.encoder_num_heads)
+        component_config.decoder_start_token_id = None
+        component_config.eos_token_id = None
+        component_config.bos_token_id = None
+        component_config.pad_token_id = None
+
+    return component_config
 
 
 def parse_nmt_config(args, model):
@@ -354,93 +448,6 @@ def parse_nmt_config(args, model):
         "position_embedding_type"] = "learned_absolute"  # "sinusoid"
     config["structure"]["model_type"] = args.model_type
 
-    def parse_nmt_config_by_component(config, component, args):
-        assert component in ('encoder', 'decoder'), 'Unsupported component!'
-        component_config = types.SimpleNamespace()
-        component_config = copy_args_to_component_config(component_config, args)
-        component_config.n_layer = config.getint(component,
-                                                 f'{component}_layers')
-        component_config.n_head = config.getint(component,
-                                                f'{component}_attention_heads')
-        component_config.hidden_size = config.getint(
-            component, f'{component}_embed_dim')  # fairseq naming
-        component_config.head_size = config.getint(
-            component,
-            'd_kv',
-            fallback=component_config.hidden_size // component_config.n_head)
-        component_config.ffn_hidden_size = config.getint(
-            component, f'{component}_ffn_embed_dim')  # fairseq naming
-        component_config.vocab_size = config.getint(component, 'vocab_size')
-        component_config.n_positions = config.getint(
-            component, 'max_source_positions')  # fairseq naming
-        component_config.has_position_embedding = not config.getboolean(
-            component, 'no_token_positional_embeddings',
-            fallback=False)  # fairseq naming
-        component_config.has_token_type_embedding = config.getboolean(
-            component, 'has_token_type_embedding', fallback=False)
-        component_config.has_embedding_layernorm = config.getboolean(
-            component, 'layernorm_embedding', fallback=True)  # fairseq naming
-        component_config.has_embedding_scale = not config.getboolean(
-            component, 'no_scale_embedding')  # fairseq naming
-        component_config.q_scaling = config.getfloat(component,
-                                                     'q_scaling',
-                                                     fallback=1.0)
-        component_config.has_attention_qkvo_bias = config.getboolean(
-            'structure', 't5_with_bias', fallback=True)
-        component_config.has_mlp_bias = config.getboolean('structure',
-                                                          't5_with_bias',
-                                                          fallback=True)
-        component_config.has_model_final_layernorm = config.getboolean(
-            component, 'has_model_final_layernorm')
-        component_config.layernorm_eps = config.getfloat(
-            component, 'layer_norm_epsilon', fallback=1e-5)  # fairseq naming
-
-        normalize_before = config.getboolean(
-            component, f'{component}_normalize_before')  # fairseq naming
-        component_config.layernorm_position = layernorm_position_map[
-            'pre_layernorm' if normalize_before else 'post_layernorm']
-
-        component_config.layernorm_type = layernorm_type_map[config.get(
-            component, 'layernorm_type', fallback='LayerNorm')]
-        component_config.hidden_act = config.get(
-            component, 'activation_fn')  # fairseq naming
-        component_config.gated_act = config.getboolean(component,
-                                                       'is_gated_act',
-                                                       fallback=False)
-        component_config.mlp_type = mlp_type_map['GatedMLP' if component_config.
-                                                 gated_act else 'MLP']
-        component_config.relative_attention = config.get(
-            'structure', 'position_embedding_type') == 'relative'
-
-        component_config.num_buckets = config.getint(
-            component, 'relative_attention_num_buckets', fallback=0)
-        component_config.max_distance = config.getint(
-            component, 'relative_attention_max_distance', fallback=0)
-        component_config.position_embedding_type = config.get(
-            'structure', 'position_embedding_type')
-        component_config.logits_dtype = config.get(component,
-                                                   'logits_dtype',
-                                                   fallback='float32')
-        if component == 'decoder':
-            component_config.rescale_before_lm_head = config.getboolean(
-                component, 'rescale_before_lm_head')
-
-            component_config.encoder_hidden_size = config.getint(
-                'encoder', 'encoder_embed_dim')  # fairseq naming
-            component_config.encoder_num_heads = config.getint(
-                'encoder', 'encoder_attention_heads')
-            component_config.encoder_head_size = config.getint(
-                'encoder',
-                'd_kv',
-                fallback=component_config.encoder_hidden_size //
-                component_config.encoder_num_heads)
-            component_config.decoder_start_token_id = None
-            component_config.eos_token_id = None
-            component_config.bos_token_id = None
-            component_config.pad_token_id = None
-
-        return component_config
-
     encoder_config = parse_nmt_config_by_component(config, "encoder", args)
     decoder_config = parse_nmt_config_by_component(config, "decoder", args)
 
@@ -460,7 +467,7 @@ def convert_nmt_weights_to_tllm_safetensors(config, component, params,
     vocab_size = config.vocab_size
 
     hf_param_prefix = f'models.0.{component}'
-    trtllm_layer_name = f'{component}_layers'
+    trtllm_layer_name = f'transformer.layers'
     trtllm_attn_layer_name = 'attention' if component == 'encoder' else 'self_attention'
     trtllm_attn_layernorm_name = 'self_attention_layernorm' if component == 'decoder' else 'attention_layernorm'
 
@@ -540,10 +547,13 @@ def convert_nmt_weights_to_tllm_safetensors(config, component, params,
     def get_attn_module_name(component, layer, attn_type):
         return f'models.0.{component}.layers.{int(layer)}.{attn_type}'
 
-    weights["embedding.vocab_embedding.weight"] = reshape(
+    weights["transformer.vocab_embedding.weight"] = reshape(
         params[f'{hf_param_prefix}.embed_tokens.weight'].clone(),
-        (vocab_size, -1))
-    weights["embedding.position_embedding.weight"] = reshape(
+        (vocab_size, -1)) if not config.use_parallel_embedding else reshape(
+            split(params[f'{hf_param_prefix}.embed_tokens.weight'].clone(),
+                  mapping.tp_size, mapping.tp_rank, 0),
+            (vocab_size // mapping.tp_size, -1))
+    weights["transformer.position_embedding.weight"] = reshape(
         sin_pos_embedding, (config.max_position_embeddings, hidden_size))
 
     num_layers = config.num_hidden_layers
@@ -596,9 +606,9 @@ def convert_nmt_weights_to_tllm_safetensors(config, component, params,
                   dim=0), (config.vocab_size // mapping.tp_size, hidden_size))
 
     if config.has_model_final_layernorm:
-        weights['final_layernorm.weight'] = params[
+        weights['transformer.ln_f.weight'] = params[
             f'{hf_param_prefix}.layer_norm.weight'].clone()
-        weights['final_layernorm.bias'] = params[
+        weights['transformer.ln_f.bias'] = params[
             f'{hf_param_prefix}.layer_norm.bias'].clone()
 
     return weights
@@ -772,24 +782,24 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
     vocab_size = config.vocab_size
 
     hf_param_prefix = f'model.{component}'
-    trtllm_layer_name = f'{component}_layers'
+    trtllm_layer_name = f'transformer.layers'
     trtllm_attn_layer_name = 'attention' if component == 'encoder' else 'self_attention'
     trtllm_attn_layernorm_name = 'self_attention_layernorm' if component == 'decoder' else 'attention_layernorm'
     embedding_layer_names = {
         'embed_tokens.weight': {
-            "name": 'embedding.vocab_embedding.weight',
+            "name": 'transformer.vocab_embedding.weight',
             "shape": (vocab_size, -1)
         },
         'embed_positions.weight': {
-            "name": 'embedding.position_embedding.weight',
+            "name": 'transformer.position_embedding.weight',
             "shape": (config.max_position_embeddings, hidden_size)
         },
         'layernorm_embedding.weight': {
-            "name": 'embedding.embedding_layernorm.weight',
+            "name": 'transformer.ln_embed.weight',
             "shape": None
         },
         'layernorm_embedding.bias': {
-            "name": 'embedding.embedding_layernorm.bias',
+            "name": 'transformer.ln_embed.bias',
             "shape": None
         },
     }
@@ -846,12 +856,12 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
 
     if config.model_type == 'mbart':
         hidden_layer_name_split['layer_norm.weight'] = {
-            "name": 'final_layernorm.weight',
+            "name": 'transformer.ln_f.weight',
             "shape": None,
             "split_dim": 0
         }
         hidden_layer_name_no_split['layer_norm.bias'] = {
-            "name": 'final_layernorm.bias',
+            "name": 'transformer.ln_f.bias',
             "shape": None,
             "split_dim": 0
         }
@@ -891,6 +901,13 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
                 f'{hf_param_prefix}.{hf_weight_name}'].clone()
         weights[weight_info["name"]] = reshape(weights[weight_info["name"]],
                                                weight_info["shape"])
+
+    weights["embedding.vocab_embedding.weight"] = reshape(
+        params[f'{hf_param_prefix}.embed_tokens.weight'].clone(),
+        (vocab_size, -1)) if not config.use_parallel_embedding else reshape(
+            split(params[f'{hf_param_prefix}.embed_tokens.weight'].clone(),
+                  mapping.tp_size, mapping.tp_rank, 0),
+            (vocab_size // mapping.tp_size, -1))
 
     num_layers = config.num_hidden_layers
 
@@ -942,9 +959,9 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
                   dim=0), (config.vocab_size // mapping.tp_size, hidden_size))
 
     if config.has_model_final_layernorm:
-        weights['final_layernorm.weight'] = params[
+        weights['transformer.ln_f.weight'] = params[
             f'{hf_param_prefix}.layer_norm.weight'].clone()
-        weights['final_layernorm.bias'] = params[
+        weights['transformer.ln_f.bias'] = params[
             f'{hf_param_prefix}.layer_norm.bias'].clone()
 
     return weights
@@ -1070,15 +1087,18 @@ def convert_pix2struct_weights_to_tllm_safetensors(config, component, params):
     attention_hidden_size = n_head * head_size  # head size * num_heads not necessarily equals hidden_dim, such as Flan-T5
 
     hf_param_prefix = f'{component}'
-    trtllm_layer_name = f'{component}_layers'
+    trtllm_layer_name = f'transformer.layers'
     trtllm_attn_layer_name = 'self_attention'
     trtllm_attn_layernorm_name = 'self_attention_layernorm'
 
     def get_attn_module_name(component, layer, attn_type):
         return f'{component}.layer.{int(layer)}.{attn_type}.attention'
 
-    weights['embedding.vocab_embedding.weight'] = reshape(
-        params[f'{hf_param_prefix}.embed_tokens.weight'].clone(), None)
+    weights['transformer.vocab_embedding.weight'] = reshape(
+        params[f'{hf_param_prefix}.embed_tokens.weight'].clone(),
+        None) if not config.use_parallel_embedding else reshape(
+            split(params[f'{hf_param_prefix}.embed_tokens.weight'].clone(),
+                  mapping.tp_size, mapping.tp_rank, 0), None)
 
     layers_range = mapping.pp_layers(num_layers)
     for layer_idx in layers_range:
@@ -1185,7 +1205,7 @@ def convert_pix2struct_weights_to_tllm_safetensors(config, component, params):
                 weights[weight_info["name"]] = reshape(
                     params[hf_weight_name].clone(), shape=weight_info["shape"])
 
-    weights[f'final_layernorm.weight'] = reshape(
+    weights[f'transformer.ln_f.weight'] = reshape(
         params[f'{component}.final_layer_norm.weight'].clone(), None)
 
     weights['lm_head.weight'] = reshape(
@@ -1200,6 +1220,251 @@ def convert_pix2struct_weights_to_tllm_safetensors(config, component, params):
                     f'{component}.layer.0.self_attention.attention.relative_attention_bias.weight']
                 .T, mapping.tp_size, mapping.tp_rank, 0),
             (n_head // mapping.tp_size, config.num_buckets))
+
+    return weights
+
+
+def parse_language_adapter_config(args, model):
+    config = configparser.ConfigParser()
+    config.read(args.model_dir + "/config.ini")
+    # rename from "sinusoid" to "learned_absolute"
+    config["structure"]["position_embedding_type"] = "learned_absolute"
+
+    locale_list = ['de_DE', 'en_US', 'es_ES', 'fr_FR']  # to be changed by user
+
+    encoder_config = parse_nmt_config_by_component(config, "encoder", args)
+    encoder_config.residual_scaling = config.getfloat("encoder",
+                                                      'residual_scaling',
+                                                      fallback=1.0)
+    encoder_config.language_adapter_config = LanguageAdapterConfig(
+        num_languages=config.getint("encoder", 'adapter_langs', fallback=None),
+        ffn_hidden_size=config.getint("encoder",
+                                      'encoder_adapter_embed_dim',
+                                      fallback=None),
+        language_list=locale_list).to_dict()
+
+    decoder_config = parse_nmt_config_by_component(config, "decoder", args)
+    decoder_config.residual_scaling = config.getfloat("decoder",
+                                                      'residual_scaling',
+                                                      fallback=1.0)
+    decoder_config.language_adapter_config = LanguageAdapterConfig(
+        num_languages=config.getint("decoder", 'adapter_langs', fallback=None),
+        ffn_hidden_size=config.getint("decoder",
+                                      'decoder_adapter_embed_dim',
+                                      fallback=None),
+        language_list=locale_list).to_dict()
+
+    decoder_config.decoder_start_token_id = 2
+    decoder_config.eos_token_id = 2
+    decoder_config.bos_token_id = 2
+    decoder_config.pad_token_id = 0
+
+    return encoder_config, decoder_config
+
+
+def convert_language_adapter_weights_to_tllm_safetensors(
+        config, component, params):
+    weights = {}
+
+    mapping = config.mapping
+
+    convert_weight_to_dtype(params, config.dtype)
+
+    param_prefix = f'{component}'
+    trtllm_layer_name = f'transformer.layers'
+    trtllm_attn_layer_name = 'attention' if component == 'encoder' else 'self_attention'
+    trtllm_attn_layernorm_name = 'self_attention_layernorm' if component == 'decoder' else 'attention_layernorm'
+    mlp_param_prefix = '' if f'{param_prefix}.0.fc1.weight' in params else 'mlp.'
+
+    hidden_size = params[
+        f'{param_prefix}.layers.0.self_attn.out_proj.weight'].shape[0]
+    ffn_hidden_size = params[
+        f'{param_prefix}.layers.0.{mlp_param_prefix}fc1.weight'].shape[0]
+
+    hidden_layer_name_split = {
+        'self_attn.out_proj.weight': {
+            "name": f'{trtllm_attn_layer_name}.dense.weight',
+            "shape": (hidden_size, hidden_size // mapping.tp_size),
+            "split_dim": -1
+        },
+        f'{mlp_param_prefix}fc1.weight': {
+            "name": 'mlp.fc.weight',
+            "shape": (ffn_hidden_size // mapping.tp_size, hidden_size),
+            "split_dim": 0
+        },
+        f'{mlp_param_prefix}fc1.bias': {
+            "name": 'mlp.fc.bias',
+            "shape": (ffn_hidden_size // mapping.tp_size),
+            "split_dim": 0
+        },
+        f'{mlp_param_prefix}fc2.weight': {
+            "name": 'mlp.proj.weight',
+            "shape": (hidden_size, ffn_hidden_size // mapping.tp_size),
+            "split_dim": -1
+        },
+    }
+
+    hidden_layer_name_no_split = {
+        'self_attn.out_proj.bias': {
+            "name": f'{trtllm_attn_layer_name}.dense.bias',
+            "shape": (hidden_size)
+        },
+        'self_attn_layer_norm.weight': {
+            "name": f'{trtllm_attn_layernorm_name}.weight',
+            "shape": None
+        },
+        'self_attn_layer_norm.bias': {
+            "name": f'{trtllm_attn_layernorm_name}.bias',
+            "shape": None
+        },
+        f'{mlp_param_prefix}fc2.bias': {
+            "name": 'mlp.proj.bias',
+            "shape": (hidden_size)
+        },
+        'final_layer_norm.weight': {
+            "name": 'mlp_layernorm.weight',
+            "shape": None
+        },
+        'final_layer_norm.bias': {
+            "name": 'mlp_layernorm.bias',
+            "shape": None
+        },
+    }
+
+    if component == "decoder":
+        hidden_layer_name_split.update({
+            'encoder_attn.out_proj.weight': {
+                "name": 'cross_attention.dense.weight',
+                "shape": (hidden_size, hidden_size // mapping.tp_size),
+                "split_dim": -1
+            },
+        })
+        hidden_layer_name_no_split.update({
+            'encoder_attn.out_proj.bias': {
+                "name": 'cross_attention.dense.bias',
+                "shape": (hidden_size)
+            },
+            'encoder_attn_layer_norm.weight': {
+                "name": 'cross_attention_layernorm.weight',
+                "shape": None,
+            },
+            'encoder_attn_layer_norm.bias': {
+                "name": 'cross_attention_layernorm.bias',
+                "shape": None
+            },
+        })
+
+    def get_attn_module_name(layer, attn_type):
+        return f'{param_prefix}.layers.{int(layer)}.{attn_type}'
+
+    # support MostlyFreezedEmbedding in 5.5B model
+    embed_tokens_weight_name = f'{param_prefix}.embed_tokens.weight'
+    if embed_tokens_weight_name not in params:
+        embed_tokens_weight_name = f'{param_prefix}.embed_tokens.weight_'
+
+    weights['transformer.vocab_embedding.weight'] = reshape(
+        params[embed_tokens_weight_name].clone(),
+        None) if not config.use_parallel_embedding else reshape(
+            split(params[embed_tokens_weight_name].clone(), mapping.tp_size,
+                  mapping.tp_rank, 0), None)
+
+    weights[
+        'transformer.position_embedding.weight'] = fairseq_sin_pos_embedding(
+            config.max_position_embeddings,
+            params[embed_tokens_weight_name].shape[1])
+
+    num_layers = config.num_hidden_layers
+    layers_range = mapping.pp_layers(num_layers)
+
+    for layer_idx in layers_range:
+        local_layer_idx = layer_idx - layers_range[0]
+        hf_layer_name_prefix = f'{param_prefix}.layers.{layer_idx}'
+        trtllm_layer_name_prefix = f'{trtllm_layer_name}.{local_layer_idx}'
+
+        for hf_weight_name, weight_info in hidden_layer_name_split.items():
+            weights[
+                f'{trtllm_layer_name_prefix}.{weight_info["name"]}'] = reshape(
+                    split(params[f'{hf_layer_name_prefix}.{hf_weight_name}'],
+                          mapping.tp_size,
+                          mapping.tp_rank,
+                          dim=weight_info["split_dim"]), weight_info["shape"])
+
+        for hf_weight_name, weight_info in hidden_layer_name_no_split.items():
+            trtllm_layer_fullname = f'{trtllm_layer_name_prefix}.{weight_info["name"]}'
+            hf_layer_fullname = f'{hf_layer_name_prefix}.{hf_weight_name}'
+            weights[trtllm_layer_fullname] = reshape(
+                params[hf_layer_fullname].clone(), shape=weight_info["shape"])
+
+        self_attn_module_name = get_attn_module_name(layer_idx, 'self_attn')
+        weights.update(
+            fuse_qkv_one_layer(
+                params, self_attn_module_name,
+                f'{trtllm_layer_name_prefix}.{trtllm_attn_layer_name}',
+                mapping.tp_size, mapping.tp_rank, config.model_type,
+                (hidden_size * 3 // mapping.tp_size, hidden_size),
+                (hidden_size * 3 // mapping.tp_size)))
+
+        if component == 'decoder':
+            cross_attn_module_name = get_attn_module_name(
+                layer_idx, 'encoder_attn')
+            weights.update(
+                fuse_qkv_one_layer(
+                    params, cross_attn_module_name,
+                    f'{trtllm_layer_name_prefix}.cross_attention',
+                    mapping.tp_size, mapping.tp_rank, config.model_type,
+                    (hidden_size * 3 // mapping.tp_size, hidden_size),
+                    (hidden_size * 3 // mapping.tp_size)))
+        assert len(config.language_adapter_config['language_list']) > 0
+
+        language_adapter_weights = defaultdict(list)
+        language_adapter_weight_info = {
+            'fc1.weight': {
+                "name": f'{trtllm_layer_name_prefix}.adapter.layers.fc.weight',
+                "shape": None
+            },
+            'fc1.bias': {
+                "name": f'{trtllm_layer_name_prefix}.adapter.layers.fc.bias',
+                "shape": None
+            },
+            'fc2.weight': {
+                "name":
+                f'{trtllm_layer_name_prefix}.adapter.layers.proj.weight',
+                "shape": None
+            },
+            'fc2.bias': {
+                "name": f'{trtllm_layer_name_prefix}.adapter.layers.proj.bias',
+                "shape": None
+            },
+        }
+
+        for language in config.language_adapter_config['language_list']:
+            for key in language_adapter_weight_info.keys():
+                language_adapter_weights[key].append(params[
+                    f'{param_prefix}.layers.{layer_idx}.adapter.{language}.{key}']
+                                                     .unsqueeze(0))
+
+        import torch
+        for key, weight_info in language_adapter_weight_info.items():
+            weights[weight_info["name"]] = torch.cat(
+                language_adapter_weights[key], dim=0)
+
+        weights[
+            f'{trtllm_layer_name_prefix}.adapter_layer_norm.weight'] = params[
+                f'{param_prefix}.layers.{layer_idx}.adapter_layer_norm.weight']
+        weights[f'{trtllm_layer_name_prefix}.adapter_layer_norm.bias'] = params[
+            f'{param_prefix}.layers.{layer_idx}.adapter_layer_norm.bias']
+
+    if component == 'decoder':
+
+        # share_decoder_input_output_embed=True, output_proj = embed_tokens.transpose()
+        lm_head_weight_name = f'{param_prefix}.output_projection.weight'
+        if lm_head_weight_name not in params:
+            lm_head_weight_name = embed_tokens_weight_name
+        weights['lm_head.weight'] = reshape(
+            split(params[lm_head_weight_name],
+                  mapping.tp_size,
+                  mapping.tp_rank,
+                  dim=0), (config.vocab_size // mapping.tp_size, hidden_size))
 
     return weights
 
@@ -1222,6 +1487,20 @@ def get_model(args):
     elif args.model_type == "blip2":
         model = Blip2ForConditionalGeneration.from_pretrained(
             args.model_dir).language_model
+    elif args.model_type == "language_adapter":
+        import torch
+
+        class DummyTorchModel:
+
+            def __init__(self, model) -> None:
+                self.model = model
+
+            def state_dict(self):
+                return self.model['model']
+
+        model = torch.load(args.model_dir + "/model.pt", weights_only=False)
+        return DummyTorchModel(model)
+
     return model
 
 
@@ -1247,6 +1526,8 @@ def convert_checkpoint(args):
         args, model)
 
     additional_settings = ["gated_act"]
+    if model_type == 'language_adapter':
+        additional_settings += ["residual_scaling", "language_adapter_config"]
 
     if not args.nougat and args.model_type != "pix2struct":
         tllm_encoder_config = {
@@ -1423,7 +1704,9 @@ if __name__ == "__main__":
         '--model_type',
         type=str,
         default='t5',
-        choices=['t5', 'nmt', 'bart', 'pix2struct', 'blip2'],
+        choices=[
+            't5', 'nmt', 'bart', 'pix2struct', 'blip2', 'language_adapter'
+        ],
         help=
         'Multimodal type when this script is used for multimodal conversion.')
 

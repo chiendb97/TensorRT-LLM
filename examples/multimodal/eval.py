@@ -89,16 +89,26 @@ def parse_arguments(args=None):
 
 def load_dataset(args) -> datasets.Dataset:
     split_name = 'validation' if 'VQAv2' in args.eval_task else 'test'
-    dataset = datasets.load_dataset(
-        args.dataset_dir or args.eval_task,
-        cache_dir=args.dataset_cache_dir,
-        split=split_name,
-        storage_options={
-            'client_kwargs': {
-                'timeout': aiohttp.ClientTimeout(total=3600)
-            }
-        },
-    )
+
+    if args.dataset_dir is not None and os.path.exists(
+            os.path.join(args.dataset_dir, "dataset_info.json")):
+        logger.info(f"load dataset by load_from_disk from {args.dataset_dir}")
+        dataset = datasets.load_from_disk(args.dataset_dir)
+
+    else:
+        logger.info(
+            f"load dataset by load_dataset from {args.dataset_dir or args.eval_task}"
+        )
+        dataset = datasets.load_dataset(
+            args.dataset_dir or args.eval_task,
+            cache_dir=args.dataset_cache_dir,
+            split=split_name,
+            storage_options={
+                'client_kwargs': {
+                    'timeout': aiohttp.ClientTimeout(total=3600)
+                }
+            },
+        )
     return dataset
 
 
@@ -191,8 +201,8 @@ def prepare_prompts(task, data, model_type, processor) -> str:
         prompts = processor.apply_chat_template(conversation,
                                                 add_generation_prompt=True)
     elif model_type == 'mllama':
-        # TODO: use apply_chat_template when llama 3.2 model is updated
-        prompts = f"<|image|><|begin_of_text|> {question}; answer: "
+        prompts = processor.apply_chat_template(images=data['image'],
+                                                text=question + "; answer: ")
     else:
         raise ValueError(f"Unsupported model_type: {model_type}")
 
@@ -203,8 +213,6 @@ def eval(output, task, data) -> bool:
     output = output.strip().lower()
     if task == 'lmms-lab/VQAv2':
         return any(answer['answer'] in output for answer in data['answers'])
-    elif task == 'lmms-lab/ai2d':
-        return data['answer'] == output[0]
     else:
         return data['answer'].lower() in output
 
@@ -227,10 +235,18 @@ else:
                                                  trust_remote_code=True)
 hf_correct = trtllm_correct = 0
 
+if args.model_type == 'mllama':
+    from tensorrt_llm.runtime.processor_wrapper import MllamaProcessorWrapper
+    hf_processor = MllamaProcessorWrapper(hf_processor, logger)
+
+torch.random.manual_seed(0)
+profiler.start('evaluation')
 if args.test_trtllm or args.test_hf:
     for i in range(args.max_ite):
         logger.debug(f"Ite: {i:3d}")
         data = dataset[i]
+        if i > len(dataset):
+            break
         prompts = prepare_prompts(args.eval_task, data, args.model_type,
                                   hf_processor)
         image = data['image']
@@ -288,6 +304,10 @@ if args.test_trtllm or args.test_hf:
     # check if the accuracy is above the threshold
     if args.accuracy_threshold is not None and args.test_trtllm:
         assert trtllm_correct / args.max_ite >= args.accuracy_threshold / 100, \
-            f"TRT-LLM's accuracy is below the threshold: {args.accuracy_threshold}%"
+            f"TRT-LLM's accuracy is below the threshold: {args.accuracy_threshold}%."
 else:
     logger.info("Neither enable test_trtllm nor enable test_hf")
+
+profiler.stop('evaluation')
+logger.info(
+    f'Evaluation takes: {profiler.elapsed_time_in_sec("evaluation")} sec')

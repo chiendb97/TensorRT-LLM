@@ -19,10 +19,10 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <memory>
 #include <vector>
@@ -30,7 +30,7 @@
 namespace tensorrt_llm::batch_manager
 {
 class LlmRequest;
-}
+} // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::runtime
 {
@@ -51,43 +51,27 @@ public:
         kSYNC
     };
 
-    GptDecoderBatched(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream,
-        SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype);
+    GptDecoderBatched(
+        CudaStreamPtr stream, SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype);
 
-    //! Setup the decoder before calling `forward()`
     void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig) override;
+        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+        WorldConfig const& worldConfig) override;
 
     void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) override;
-
     void setupEagle(EagleBuffers::Inputs eagleBuffers) override;
-
     void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) override;
-
-    void disableLookahead(SizeType32 maxBatchSize, RequestVector const& genRequests) override;
-
-    void newBatch(GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig,
-        ModelConfig const& modelConfig) override;
-
-    void newRequests(std::vector<SizeType32> const& seqSlots, std::vector<decoder_batch::Request> const& requests,
-        std::vector<SamplingConfig> const& samplingConfigs, ModelConfig const& modelConfig) override;
+    void disableLookahead(
+        SizeType32 maxBatchSize, RequestVector const& genRequests, TensorPtr const& batchSlots) override;
 
     DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
+    void forward(decoder_batch::Output& output, decoder_batch::Input const& input) override;
 
-    void forwardSync(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent) override;
-
-    void forwardSync(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent, decoder_batch::Output& output,
-        decoder_batch::Input const& input) override;
-
-    void forwardAsync(decoder::Output& output, decoder::Input const& input) override;
-
-    void forwardSync() override;
-
-    //! @return [batchSize], indicators of finished requests
-    [[nodiscard]] std::vector<bool> getFinished() const override
+    //! @returns [batchSize], number of finished sequences per request, on gpu
+    [[nodiscard]] TensorPtr getFinishedSum() const override
     {
-        return {mFinished.begin(), mFinished.begin() + mActualBatchSize};
+        return ITensor::slice(mJointDecodingOutput->finishedSum, 0, mActualBatchSize);
     }
 
     //! @returns [batchSize, beamWidth], FinishedState value, on gpu
@@ -108,16 +92,6 @@ public:
         return tensor;
     }
 
-    //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
-    //! ids without padding, on gpu. In case of beam search, contains the ungathered data.
-    [[nodiscard]] TensorPtr getIds() const override
-    {
-        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-        auto tensor = ITensor::slice(mJointDecodingOutput->ids, 0, mActualBatchSize);
-        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-        return tensor;
-    }
-
     //! @param batchIdx index of the batch
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], only used for beam search. It contains
     //! gathered token ids without padding for request `batchIdx`, on gpu.
@@ -130,23 +104,10 @@ public:
         return tensor;
     }
 
-    //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], only used for beam search. It contains
-    //! gathered token ids without padding, on gpu
-    [[nodiscard]] TensorPtr getGatheredIds() const override
-    {
-        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-        auto tensor = ITensor::slice(mJointDecodingOutput->gatheredIds, 0, mActualBatchSize);
-        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-        return tensor;
-    }
-
     //! @brief Gather final beam search results for request `batchSlot`.
     //! Result will only be available after event returned.
     [[nodiscard]] CudaEvent finalize(
         SizeType32 batchSlot, SamplingConfig const& samplingConfig, bool streaming) const override;
-
-    //! @brief Gather final beam search results for all requests.
-    void finalize(SamplingConfig const& samplingConfig) const override;
 
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains parent ids collected during beam
     //! search without padding, on gpu
@@ -190,28 +151,6 @@ public:
         return mJointDecodingOutput->newTokensSteps;
     }
 
-    //! @brief Get tokens generated in one step of last forward pass
-    //! @param iter The iteration within [0; maxTokensPerStep) for which to get the tokens
-    //! @returns [batchSize, beamWidth], tokens generated in `iter` (per beam), on gpu
-    [[nodiscard]] TensorPtr getNewTokens(SizeType32 iter = 0) const override
-    {
-        TensorPtr newTokensView = ITensor::slice(mJointDecodingOutput->newTokensSteps, iter, 1);
-        newTokensView->squeeze(0);
-        return ITensor::slice(newTokensView, 0, mActualBatchSize);
-    }
-
-    //! @returns [batchSize], the number of generation steps executed on each request
-    [[nodiscard]] std::vector<SizeType32> getNbSteps() const override
-    {
-        return {mNbSteps.begin(), mNbSteps.begin() + mActualBatchSize};
-    }
-
-    //! @returns [1], number of finished sequences, in pinned host memory
-    [[nodiscard]] TensorPtr getNbFinished() const override
-    {
-        return mFinishedSum;
-    }
-
     //! @returns [batchSize, maxDraftTokens], predicted draft tokens for next step, on gpu
     [[nodiscard]] TensorPtr getNextDraftTokens() const override
     {
@@ -247,15 +186,62 @@ public:
         return mDecodingMode;
     }
 
+    DecodingInput& getJointDecodingInput() const
+    {
+        return *mJointDecodingInput.get();
+    }
+
+    DecodingOutput& getJointDecodingOutput() const
+    {
+        return *mJointDecodingOutput.get();
+    }
+
+    CudaStreamPtr getDecoderStream() const
+    {
+        return mDecoderStream;
+    }
+
+    SpeculativeDecodingMode getSpeculativeDecodingMode() const
+    {
+        return mSpeculativeDecodingMode;
+    }
+
+    SizeType32 getMaxDecodingEngineTokens() const
+    {
+        return mMaxDecodingEngineTokens;
+    }
+
+    TensorPtr getFinishedSteps() const
+    {
+        return mFinishedSteps;
+    }
+
+    IGptDecoder& getUnderlyingDecoder() const
+    {
+        return *mDecoder.get();
+    }
+
+    [[nodiscard]] BufferManager const& getBufferManager() const
+    {
+        return mBufferManager;
+    }
+
+    [[nodiscard]] SizeType32 getActualBatchSize() const
+    {
+        return mActualBatchSize;
+    }
+
+    void setActualBatchSize(SizeType32 actualBatchSize)
+    {
+        mActualBatchSize = actualBatchSize;
+    }
+
+    [[nodiscard]] SizeType32 getMaxSequenceLength() const
+    {
+        return mMaxSequenceLength;
+    }
+
 private:
-    //! @brief Gather final beam search results for request `batchIdx`.
-    [[nodiscard]] CudaEvent postProcessRequest(
-        SizeType32 batchIdx, SamplingConfig const& samplingConfig, bool streaming) const;
-
-    //! @brief Initialize the decoder at `batchSlot` with a new `request`.
-    void newRequest(SizeType32 batchSlot, decoder_batch::Request const& request, SamplingConfig const& samplingConfig,
-        ModelConfig const& modelConfig);
-
     //! @brief Allocate buffers for speculative decoding.
     void allocateSpeculativeDecodingBuffers(nvinfer1::DataType dtype);
 
@@ -264,29 +250,6 @@ private:
 
     //! @brief Setup buffers for lookahead decoding.
     void setupLookahead(ModelConfig const& modelConfig);
-
-    //! @brief Setups decoder internal tensors for new speculative decoding request
-    void newRequestSpeculativeDecoding(SizeType32 batchIdx, decoder_batch::Request const& request,
-        SamplingConfig const& samplingConfig, ModelConfig const& modelConfig);
-
-    //! @brief Setups decoder internal tensors for new request in Draft model Sps mode
-    void newRequestDraftTokensExternal(
-        SizeType32 batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
-
-    //! @brief Setups decoder internal tensors for new Medusa request
-    void newRequestMedusa(SizeType32 batchIdx, decoder_batch::Request const& request);
-
-    //! @brief Setups decoder internal tensors for new Lookahead request
-    void newRequestLookahead(SizeType32 batchIdx, decoder_batch::Request const& request);
-
-    //! @brief Setups decoder internal tensors for new Explicit draft tokens request
-    void newRequestExplicitDraftTokens(SizeType32 batchIdx, decoder_batch::Request const& request);
-
-    //! @brief Setups decoder internal tensors for new Eagle request
-    void newRequestEagle(SizeType32 batchIdx, decoder_batch::Request const& request, ModelConfig const& modelConfig);
-
-    //! @brief Updates finished state on host for all active requests
-    void updateFinished(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent);
 
     //! @brief Sets inputs for explicit draft tokens.
     void setExplicitDraftTokensInputs(decoder_batch::Input const& input);
@@ -297,18 +260,16 @@ private:
     //! @brief Calls decoders for tokens per engine step
     void forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType);
 
+    //! @brief Prepare Input and Output for decoder step
+    void prepareForward(SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input);
+
     //! @brief Calls decoder for whole batch
-    void forwardDecoder(
-        SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType);
+    void forwardDecoder(DecodingOutput& output, DecodingInput const& input, ForwardType forwardType);
 
 private:
-    std::size_t const mVocabSize;
-    std::size_t const mVocabSizePadded;
     CudaStreamPtr mRuntimeStream;
     CudaStreamPtr mDecoderStream;
     BufferManager mBufferManager;
-    DecoderFinishedEventPtr mDecoderFinishEvent;
-    CudaEvent mForwardEvent;
 
     using GptDecoderPtr = std::unique_ptr<IGptDecoder>;
     GptDecoderPtr mDecoder;
@@ -318,21 +279,10 @@ private:
     DecodingInputPtr mJointDecodingInput;
     DecodingOutputPtr mJointDecodingOutput;
 
-    std::vector<SizeType32> mNbSteps;
-    std::vector<bool> mFinished;
-    TensorPtr mFinishedSum;
-    std::vector<SizeType32> mMaxNewTokens;
-    std::vector<SizeType32> mBeamWidths;
-    std::vector<SizeType32> mNumDecodingEngineTokens;
+    TensorPtr mFinishedSteps; // [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState
+                              // for each generated token of maxTokensPerStep, on gpu
 
-    TensorPtr mFinishedSteps;     // [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState
-                                  // for each generated token of maxTokensPerStep, on gpu
-
-    TensorPtr mBatchSlotsSetup;   // [maxBatchSize], int32_t, address map, pinned
-    TensorPtr mBatchSlotsDecoder; // [maxTokensPerEngineStep, maxBatchSize], int32_t, address map, pinned
     SizeType32 mMaxSequenceLength{};
-    SizeType32 mMaxAttentionWindow{};
-    SizeType32 mSinkTokenLength{};
     SizeType32 mActualBatchSize{};
     // How many tokens for one request can be processed per mDecoders call.
     // It is maxDecodingTokens for non speculative decoding and Draft model approach.

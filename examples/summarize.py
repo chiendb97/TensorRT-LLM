@@ -111,6 +111,7 @@ def main(args):
                            dataset_revision,
                            cache_dir=args.dataset_cache_dir,
                            split=dataset_split)
+    dataset = dataset.shuffle(args.random_seed)
 
     max_batch_size = args.batch_size
 
@@ -168,7 +169,6 @@ def main(args):
                 f.write(f'Model path: {args.hf_model_dir}\n')
                 f.write(f'Tokenizer path: {args.tokenizer_dir}\n')
 
-    # TODO: Add random_seed flag in gptj
     rouge_dir = args.rouge_dir if args.rouge_dir and os.path.exists(
         args.rouge_dir) else "rouge"
     metric_tensorrt_llm = [
@@ -286,6 +286,7 @@ def main(args):
                     lora_uids=args.lora_task_uids,
                     lookahead_config=args.lookahead_config,
                     output_sequence_lengths=True,
+                    output_generation_logits=eval_ppl,
                     return_dict=True,
                     random_seed=random_seed,
                     medusa_choices=args.medusa_choices,
@@ -480,12 +481,20 @@ def main(args):
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
             assert args.num_beams == 1, "Medusa should use num_beams == 1"
             runner_kwargs.update(medusa_choices=args.medusa_choices)
-        if args.eagle_choices is not None or args.eagle_posterior_threshold is not None:
-            args.eagle_choices = ast.literal_eval(args.eagle_choices)
+        if args.eagle_choices is not None or args.eagle_posterior_threshold is not None or args.eagle_use_dynamic_tree:
             assert args.num_beams == 1, "Eagle should use num_beams == 1"
-            runner_kwargs.update(eagle_choices=args.eagle_choices)
-            runner_kwargs.update(
-                eagle_posterior_threshold=args.eagle_posterior_threshold)
+            if args.eagle_choices is not None and not args.eagle_use_dynamic_tree:
+                args.eagle_choices = ast.literal_eval(args.eagle_choices)
+                runner_kwargs.update(eagle_choices=args.eagle_choices)
+            if args.eagle_posterior_threshold is not None:
+                runner_kwargs.update(
+                    eagle_posterior_threshold=args.eagle_posterior_threshold)
+            if args.eagle_use_dynamic_tree:
+                runner_kwargs.update(
+                    eagle_use_dynamic_tree=args.eagle_use_dynamic_tree)
+                assert args.eagle_dynamic_tree_max_top_k is not None and args.eagle_dynamic_tree_max_top_k > 0
+                runner_kwargs.update(eagle_dynamic_tree_max_top_k=args.
+                                     eagle_dynamic_tree_max_top_k)
         if args.lookahead_config is not None:
             args.lookahead_config = ast.literal_eval(args.lookahead_config)
             assert len(
@@ -518,7 +527,8 @@ def main(args):
                 kv_cache_free_gpu_memory_fraction,
                 enable_chunked_context=args.enable_chunked_context,
                 multi_block_mode=args.multi_block_mode,
-                cuda_graph_mode=args.cuda_graph_mode)
+                cuda_graph_mode=args.cuda_graph_mode,
+                gather_generation_logits=args.eval_ppl)
         runner_kwargs.update(
             enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
         if args.prompt_lookup_config is not None:
@@ -526,8 +536,8 @@ def main(args):
             runner_kwargs.update(max_input_len=test_token_num +
                                  prompt_lookup_num_tokens + output_len)
         runner = runner_cls.from_dir(**runner_kwargs)
-        assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
-            "PPL evaluation requires engine built with gather_all_token_logits enabled"
+        assert not (args.eval_ppl and not runner.gather_context_logits), \
+            "PPL evaluation requires engine built with gather_context_logits enabled"
 
         datapoint = dataset[0:1]
         output, *_ = eval_trt_llm(datapoint,
@@ -736,22 +746,40 @@ def main(args):
             for beam_idx in range(num_sequences):
                 logger.info(f"TensorRT-LLM beam {beam_idx} result")
                 if args.eval_task != "eval_context_ppl":
-                    computed_metrics_tensorrt_llm = metric_tensorrt_llm[
-                        beam_idx].compute()
-                    for key in computed_metrics_tensorrt_llm.keys():
-                        logger.info(
-                            f'  {key} : {computed_metrics_tensorrt_llm[key]*100}'
-                        )
+                    if args.estimate_accuracy_std_dev:
+                        computed_metrics_tensorrt_llm = metric_tensorrt_llm[
+                            beam_idx].compute(use_aggregator=False)
+                        computed_std_dev_tensorrt_llm = {
+                            key: np.std(scores)
+                            for key, scores in
+                            computed_metrics_tensorrt_llm.items()
+                        }
+                        computed_metrics_tensorrt_llm = {
+                            key: np.mean(scores)
+                            for key, scores in
+                            computed_metrics_tensorrt_llm.items()
+                        }
+                        for key in computed_metrics_tensorrt_llm.keys():
+                            logger.info(
+                                f"  {key} : {computed_metrics_tensorrt_llm[key]*100} ({computed_std_dev_tensorrt_llm[key]*100})"
+                            )
+                    else:
+                        computed_metrics_tensorrt_llm = metric_tensorrt_llm[
+                            beam_idx].compute()
+                        for key in computed_metrics_tensorrt_llm.keys():
+                            logger.info(
+                                f"  {key} : {computed_metrics_tensorrt_llm[key]*100}"
+                            )
                     if args.check_accuracy and beam_idx == 0:
-                        assert computed_metrics_tensorrt_llm[
-                            'rouge1'] * 100 > args.tensorrt_llm_rouge1_threshold
+                        rouge1 = computed_metrics_tensorrt_llm['rouge1'] * 100
+                        assert rouge1 > args.tensorrt_llm_rouge1_threshold, f"[FAILED] rouge1 ({rouge1}) is smaller than threshold ({args.tensorrt_llm_rouge1_threshold})."
                 if args.eval_ppl:
                     logger.info(
                         f"  Per-token perplexity: {np.mean(ppls_trt_llm[beam_idx])}"
                     )
                     if args.check_accuracy and beam_idx == 0:
                         avg_ppl = np.mean(ppls_trt_llm[beam_idx])
-                        assert avg_ppl < args.tensorrt_llm_ppl_threshold, f"[FAILED] average PPL ({avg_ppl}) is larger than threshold ({args.tensorrt_llm_ppl_threshold})"
+                        assert avg_ppl < args.tensorrt_llm_ppl_threshold, f"[FAILED] average PPL ({avg_ppl}) is larger than threshold ({args.tensorrt_llm_ppl_threshold})."
         if test_hf:
             np.random.seed(0)  # rouge score use sampling to compute the score
             logger.info(
@@ -788,6 +816,7 @@ if __name__ == '__main__':
                             'eval_context_ppl'
                         ])
     parser.add_argument('--check_accuracy', action='store_true')
+    parser.add_argument('--estimate_accuracy_std_dev', action='store_true')
     parser.add_argument('--tensorrt_llm_rouge1_threshold',
                         type=float,
                         default=15.0)

@@ -15,6 +15,7 @@
 include(FetchContent)
 
 set(SRCS
+    utils/mpiUtils.cpp
     utils/numpyUtils.cpp
     utils/sessionUtils.cpp
     utils/debugUtils.cu
@@ -39,6 +40,8 @@ set(SRCS
     iBuffer.cpp
     iTensor.cpp
     ipcUtils.cpp
+    ipcSocket.cpp
+    ipcNvlsMemory.cpp
     memoryCounters.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp
@@ -46,6 +49,7 @@ set(SRCS
     runtimeKernels.cu
     rnnStateBuffers.cpp
     statefulGptDecoder.cpp
+    statefulGptDecoderBatched.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp
     tllmLogger.cpp
@@ -60,7 +64,7 @@ if(NOT WIN32)
   #
   # Ignore overloaded-virtual warning. We intentionally change parameters of
   # some methods in derived class.
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-overloaded-virtual")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
   if(WARNING_IS_ERROR)
     message(STATUS "Treating warnings as errors in GCC compilation")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")

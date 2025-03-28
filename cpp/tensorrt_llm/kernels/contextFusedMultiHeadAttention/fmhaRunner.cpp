@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 
 #include "fmhaRunner.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/mathUtils.h"
 #include <cassert>
 #include <cstring>
@@ -82,11 +83,12 @@ FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
 {
     TLLM_CHECK_WITH_INFO(
-        (mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90), "Unsupported architecture");
+        (mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90 || mSM == kSM_100 || mSM == kSM_120),
+        "Unsupported architecture");
     TLLM_CHECK_WITH_INFO((mFixedParams.dataType == DATA_TYPE_FP16 || mFixedParams.dataType == DATA_TYPE_BF16
                              || mFixedParams.dataType == DATA_TYPE_E4M3),
         "Unsupported data type");
-    xmmaKernel = getXMMAKernelsV2(mFixedParams.dataType, mSM);
+    xmmaKernel = getXMMAKernelsV2(mFixedParams.dataType, mFixedParams.dataTypeOut, mSM);
 
     if (mFixedParams.headSizeV == 0)
     {
@@ -106,8 +108,8 @@ FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
 // Shared setup function.
 void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
 {
-    // Memset kernel params.
-    memset(&mKernelParams, 0, sizeof(mKernelParams));
+    // Reinit kernel params.
+    mKernelParams = {};
 
     // Set the batch size, and sequence length.
     mKernelParams.b = runnerParams.b;
@@ -143,11 +145,12 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     else if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_CONTIGUOUS_KV)
     {
         // Contiguous kv input layout.
-        mKernelParams.kv_stride_in_bytes = get_size_in_bytes(mFixedParams.headSize, mFixedParams.dataType);
+        mKernelParams.kv_stride_in_bytes
+            = get_size_in_bytes(2 * mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
     }
     // Set the output buffer stride in bytes.
     mKernelParams.o_stride_in_bytes
-        = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSizeV, mFixedParams.dataType);
+        = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSizeV, mFixedParams.dataTypeOut);
     // Set the packed_mask_stride_in_bytes.
     if (mFixedParams.attentionMaskType == ContextAttentionMaskType::CUSTOM_MASK)
     {
@@ -212,7 +215,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     // TRT doesn't support host scales. Use device scales instead.
     // The scaleBmm1Ptr offset.
     // 2 scales prepared for scaleBmm1 in the device memory: float scale, float (scale with log2e).
-    int64_t scaleBmm1PtrOffset = (mLaunchParams.useBase2ExpTrick ? 1 : 0);
+    int64_t scaleBmm1PtrOffset = (mLaunchParams.useBase2ExpTrick ? kIdxScaleSoftmaxLog2Ptr : kIdxScaleSoftmaxPtr);
     // Only fp8 kernels need to load scales from the device memory.
     if (mFixedParams.dataType == DATA_TYPE_E4M3)
     {
@@ -231,6 +234,14 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     {
         mKernelParams.paged_kv_cache = runnerParams.pagedKvCache.copyKVBlockArrayForContextFMHA();
     }
+
+    // for sage attention
+    mKernelParams.sage.q.scales = runnerParams.qScalePtr;
+    mKernelParams.sage.k.scales = runnerParams.kScalePtr;
+    mKernelParams.sage.v.scales = runnerParams.vScalePtr;
+    mKernelParams.sage.q.max_nblock = runnerParams.qMaxNBlock;
+    mKernelParams.sage.k.max_nblock = runnerParams.kMaxNBlock;
+    mKernelParams.sage.v.max_nblock = runnerParams.vMaxNBlock;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -279,6 +290,8 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     bool const isSm8x = (mSM == kSM_86 || mSM == kSM_89);
     bool const isSm80 = (mSM == kSM_80);
     bool const isSm89 = (mSM == kSM_89);
+    bool const isSm100 = (mSM == kSM_100);
+    bool const isSm120 = (mSM == kSM_120);
 
     // Sliding_window_causal mask.
     if (runnerParams.kvSeqLen > runnerParams.slidingWindowSize
@@ -308,7 +321,8 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     // Hopper: fallback to original fmha_v2 when head_size <= 64 and seq_len <= 256
     // Only supports packed_qkv input + padding/causal mask.
     else if (isSm90 && !separateQKvInput && paddingOrCausalMask
-        && (mFixedParams.headSize == 32 || mFixedParams.headSize == 64) && runnerParams.qSeqLen <= 256)
+        && (mFixedParams.headSize == 32 || mFixedParams.headSize == 64) && runnerParams.qSeqLen <= 256
+        && !common::getEnvForceDeterministicAttention())
     {
         mLaunchParams.flash_attention = false;
         // get max sequence length for non-flash-attention.
@@ -339,9 +353,9 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
             // flash attention tiled kernel is faster on Ada and Ampere derivatives when head_size>=256
             mLaunchParams.granular_tiling = false;
         }
-        else if (isSm80 || isSm8x)
+        else if (isSm80 || isSm8x || isSm100 || isSm120)
         {
-            // otherwise, choose tiled kernel for Ampere/Ada
+            // otherwise, choose tiled kernel for Ampere/Ada/Gb20x
             mLaunchParams.granular_tiling = true;
         }
     }
@@ -383,6 +397,10 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.use_tma = false;
         mLaunchParams.dynamic_scheduler = false;
     }
+
+    mLaunchParams.sage_block_size_q = mFixedParams.sageBlockSizeQ;
+    mLaunchParams.sage_block_size_k = mFixedParams.sageBlockSizeK;
+    mLaunchParams.sage_block_size_v = mFixedParams.sageBlockSizeV;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -433,9 +451,9 @@ void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
     tensor_stride_qkv[2] = tensor_size_qkv[2] * tensor_stride_qkv[1];                    // d*h*3
 
     uint64_t tensor_stride_o[3];
-    tensor_stride_o[0] = get_size_in_bytes(tensor_size_o[0], mFixedParams.dataType); // d
-    tensor_stride_o[1] = tensor_size_o[1] * tensor_stride_o[0];                      // d*h
-    tensor_stride_o[2] = tensor_size_o[2] * tensor_stride_o[1];                      // d*h*1
+    tensor_stride_o[0] = get_size_in_bytes(tensor_size_o[0], mFixedParams.dataTypeOut); // d
+    tensor_stride_o[1] = tensor_size_o[1] * tensor_stride_o[0];                         // d*h
+    tensor_stride_o[2] = tensor_size_o[2] * tensor_stride_o[1];                         // d*h*1
 
     // traversal stride
     uint32_t traversal_stride_qkv[4] = {1, 1, 1, 1};
@@ -482,7 +500,7 @@ void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
     // O: 16
     // Note: sliding window causal kernel currently has reg spill when TMA store is enabled
     box_size[3] = 16;
-    if ((get_size_in_bytes(mFixedParams.dataType) == 1)
+    if ((get_size_in_bytes(mFixedParams.dataTypeOut) == 1)
         && mLaunchParams.attention_mask_type != ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL)
     {
         qkv_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
@@ -563,7 +581,7 @@ void FusedMHARunnerV2::setSeparateQKvTmaDescriptors(MHARunnerParams runnerParams
 
     // O: 16. Reuse
     box_size_qo[3] = 16;
-    if ((get_size_in_bytes(mFixedParams.dataType) == 1)
+    if ((get_size_in_bytes(mFixedParams.dataTypeOut) == 1)
         && mLaunchParams.attention_mask_type != ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL)
     {
         qo_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
@@ -722,14 +740,7 @@ int FusedMHARunnerV2::getSFromMaxSeqLen(int const max_seq_len) const
 // If any kernel in the map meets the requirements, then return true.
 bool FusedMHARunnerV2::isFmhaSupported()
 {
-    bool foundKernels = xmmaKernel->checkIfKernelExist(mFixedParams);
-
-    if (!foundKernels)
-    {
-        TLLM_LOG_WARNING("Fall back to unfused MHA for %s in sm_%d.", mFixedParams.convertToStrOutput().c_str(), mSM);
-    }
-
-    return foundKernels;
+    return xmmaKernel->checkIfKernelExist(mFixedParams);
 }
 
 } // namespace kernels

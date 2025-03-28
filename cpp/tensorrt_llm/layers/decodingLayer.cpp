@@ -175,7 +175,6 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
     auto params = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
 
     auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
-    auto const maxSeqLen = baseOutputs->outputIds->getDimension<-1>();
     auto const& endIds = params->endIds;
 
     std::shared_ptr<BaseDecodingOutputs> preparedOutputs;
@@ -261,6 +260,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         decodeInputs->draftProbs = externalDraftTokenParams->draftProbs;
         decodeInputs->targetProbs = externalDraftTokenParams->targetProbs;
         decodeInputs->numDraftTokens = externalDraftTokenParams->numDraftTokens;
+        decodeInputs->numDraftTokensHost = externalDraftTokenParams->numDraftTokensHost;
         decodeInputs->draftTokenIds = externalDraftTokenParams->draftTokenIds;
         decodeInputs->constantThreshold = externalDraftTokenParams->constantThreshold;
         decodeInputs->useRandomAcceptanceThreshold = externalDraftTokenParams->useRandomAcceptanceThreshold;

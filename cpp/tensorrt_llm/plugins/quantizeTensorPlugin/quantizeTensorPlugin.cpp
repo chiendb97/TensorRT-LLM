@@ -134,7 +134,7 @@ int QuantizeTensorPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             stream, mProp.maxGridSize[0]);
     }
 #endif
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 
@@ -182,7 +182,7 @@ size_t QuantizeTensorPlugin::getSerializationSize() const noexcept
 void QuantizeTensorPlugin::serialize(void* buffer) const noexcept
 {
     char *d = static_cast<char*>(buffer), *a = d;
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void QuantizeTensorPlugin::destroy() noexcept
