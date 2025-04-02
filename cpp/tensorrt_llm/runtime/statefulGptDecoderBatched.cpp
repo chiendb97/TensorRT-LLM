@@ -70,10 +70,9 @@ SamplingConfig extractSamplingConfig(SamplingConfig const& batchSamplingConfig, 
 
 } // namespace
 
-StatefulGptDecoderBatched::StatefulGptDecoderBatched(
-    CudaStreamPtr stream, SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype)
+StatefulGptDecoderBatched::StatefulGptDecoderBatched(CudaStreamPtr stream, nvinfer1::DataType dtype)
 {
-    mDecoder = std::make_unique<GptDecoderBatched>(stream, speculativeDecodingMode, dtype);
+    mDecoder = std::make_unique<GptDecoderBatched>(stream, SpeculativeDecodingMode::None(), dtype);
 
     auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
 
@@ -86,11 +85,11 @@ StatefulGptDecoderBatched::StatefulGptDecoderBatched(
 
 StatefulGptDecoderBatched::~StatefulGptDecoderBatched() = default;
 
-void StatefulGptDecoderBatched::setup(tensorrt_llm::executor::DecodingMode const& mode, SizeType32 maxBatchSize,
+void StatefulGptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize,
     SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-    SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
-    WorldConfig const& worldConfig)
+    nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
+    constexpr SizeType32 maxTokensPerStep = 1;
     mDecoder->setup(mode, maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength,
         maxTokensPerStep, dtype, modelConfig, worldConfig);
 
@@ -104,20 +103,21 @@ void StatefulGptDecoderBatched::newBatch(GenerationInput const& inputs, Generati
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     // split batch into single requests
     auto const& inputLengths = inputs.lengths;
-    mDecoder->setActualBatchSize(inputLengths->getShape().d[0]);
-    mDecoder->getJointDecodingInput().numDecodingEngineTokens.clear();
-    mDecoder->getJointDecodingInput().numDecodingEngineTokens.resize(mDecoder->getActualBatchSize(), 1);
+    mDecoder->getDecoderState().setActualBatchSize(inputLengths->getShape().d[0]);
+    mDecoder->getDecoderState().getJointDecodingInput().numDecodingEngineTokens.clear();
+    mDecoder->getDecoderState().getJointDecodingInput().numDecodingEngineTokens.resize(
+        mDecoder->getDecoderState().getActualBatchSize(), 1);
 
-    auto const& jointOutputIdsShape = mDecoder->getJointDecodingOutput().ids->getShape();
+    auto const& jointOutputIdsShape = mDecoder->getDecoderState().getJointDecodingOutput().ids->getShape();
     auto const maxBatchSize = jointOutputIdsShape.d[0];
-    TLLM_CHECK(mDecoder->getActualBatchSize() <= maxBatchSize);
+    TLLM_CHECK(mDecoder->getDecoderState().getActualBatchSize() <= maxBatchSize);
     auto const maxBeamWidth = jointOutputIdsShape.d[1];
     TLLM_CHECK(samplingConfig.beamWidth <= maxBeamWidth);
 
     auto const inputIdsShape = inputs.ids->getShape();
     TensorPtr inputIdsFlatView = ITensor::view(inputs.ids);
 
-    TensorPtr batchSlotsView = ITensor::slice(mBatchSlotsSetup, 0, mDecoder->getActualBatchSize());
+    TensorPtr batchSlotsView = ITensor::slice(mBatchSlotsSetup, 0, mDecoder->getDecoderState().getActualBatchSize());
     auto batchSlots = BufferRange<SizeType32>(*batchSlotsView);
     std::iota(batchSlots.begin(), batchSlots.end(), 0);
 
@@ -131,7 +131,7 @@ void StatefulGptDecoderBatched::newBatch(GenerationInput const& inputs, Generati
     auto inputLengthsHost = bufferManager.copyFrom(*inputLengths, MemoryType::kCPU);
     auto inputLengthsPtr = bufferCast<SizeType32>(*inputLengthsHost);
     auto inputOffset = 0;
-    for (auto batchIdx = 0; batchIdx < mDecoder->getActualBatchSize(); ++batchIdx)
+    for (auto batchIdx = 0; batchIdx < mDecoder->getDecoderState().getActualBatchSize(); ++batchIdx)
     {
         auto const inputLength = inputLengthsPtr[batchIdx];
         auto const inputShape = ITensor::makeShape({inputLength});
@@ -179,15 +179,17 @@ void StatefulGptDecoderBatched::newBatch(GenerationInput const& inputs, Generati
         requestSamplingConfig.outputLogProbs = {{outputs.logProbs != nullptr}};
         // Temporary usage of CreateNewDecoderRequests - only used for static batching.
         batch_manager::CreateNewDecoderRequests().newRequest(batchIdx, request, requestSamplingConfig, modelConfig,
-            *mDecoder, runtimeStream, mDecoder->getMaxSequenceLength());
+            *mDecoder, runtimeStream, mDecoder->getDecoderState().getMaxSequenceLength());
     }
 
     auto fusedSamplingConfig = samplingConfig;
-    fusedSamplingConfig.cumLogProbs = std::vector<bool>(mDecoder->getActualBatchSize(), outputs.cumLogProbs != nullptr);
-    fusedSamplingConfig.outputLogProbs = std::vector<bool>(mDecoder->getActualBatchSize(), outputs.logProbs != nullptr);
+    fusedSamplingConfig.cumLogProbs
+        = std::vector<bool>(mDecoder->getDecoderState().getActualBatchSize(), outputs.cumLogProbs != nullptr);
+    fusedSamplingConfig.outputLogProbs
+        = std::vector<bool>(mDecoder->getDecoderState().getActualBatchSize(), outputs.logProbs != nullptr);
 
-    mDecoder->getUnderlyingDecoder().setup(
-        fusedSamplingConfig, mDecoder->getActualBatchSize(), batchSlotsView, {mDecoder->getJointDecodingOutput()});
+    mDecoder->getUnderlyingDecoder().setup(fusedSamplingConfig, mDecoder->getDecoderState().getActualBatchSize(),
+        batchSlotsView, {mDecoder->getDecoderState().getJointDecodingOutput()});
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -205,8 +207,8 @@ void StatefulGptDecoderBatched::forwardAsync(decoder::Output& output, decoder::I
     {
         auto logitsSlice = std::shared_ptr(ITensor::slice(input.logits, batchIdx, singleRequest));
         logits.emplace_back(ITensor::view(logitsSlice,
-            ITensor::makeShape(
-                {singleRequest, mDecoder->getJointDecodingInput().beamWidths.at(batchIdx), logitsShape.d[2]})));
+            ITensor::makeShape({singleRequest,
+                mDecoder->getDecoderState().getJointDecodingInput().beamWidths.at(batchIdx), logitsShape.d[2]})));
     }
 
     decoder_batch::Input batchInput{logits};
@@ -224,8 +226,8 @@ void StatefulGptDecoderBatched::forwardAsync(decoder::Output& output, decoder::I
     bufferManager.setZero(*mFinishedSum);
     auto const& runtimeStream = bufferManager.getStream();
 
-    kernels::reduce(
-        *mFinishedSum, *ITensor::slice(mDecoder->getJointDecodingOutput().finishedSum, 0, batchSize), runtimeStream);
+    kernels::reduce(*mFinishedSum,
+        *ITensor::slice(mDecoder->getDecoderState().getJointDecodingOutput().finishedSum, 0, batchSize), runtimeStream);
     runtimeStream.record(mForwardEvent);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -244,48 +246,43 @@ void StatefulGptDecoderBatched::forwardSync()
 
 StatefulGptDecoderBatched::TensorPtr StatefulGptDecoderBatched::getIds() const
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto tensor = ITensor::slice(mDecoder->getJointDecodingOutput().ids, 0, mDecoder->getActualBatchSize());
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return tensor;
+    return mDecoder->getDecoderState().getIds();
 }
 
 StatefulGptDecoderBatched::TensorPtr StatefulGptDecoderBatched::getGatheredIds() const
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto tensor = ITensor::slice(mDecoder->getJointDecodingOutput().gatheredIds, 0, mDecoder->getActualBatchSize());
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return tensor;
+    return mDecoder->getDecoderState().getGatheredIds();
 }
 
 void StatefulGptDecoderBatched::finalize(SamplingConfig const& samplingConfig) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto batchSlots = bufferCast<SizeType32>(*mBatchSlotsSetup);
-    for (SizeType32 batchIdx = 0; batchIdx < mDecoder->getActualBatchSize(); ++batchIdx)
+    for (SizeType32 batchIdx = 0; batchIdx < mDecoder->getDecoderState().getActualBatchSize(); ++batchIdx)
     {
         auto slot = batchSlots[batchIdx];
         auto requestSamplingConfig = extractSamplingConfig(samplingConfig, slot);
-        auto event = mDecoder->finalize(slot, requestSamplingConfig, /*streaming*/ false);
+        auto event = mDecoder->finalize(mDecoder->getDecoderState(), slot, requestSamplingConfig, /*streaming*/ false);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 StatefulGptDecoderBatched::TensorPtr StatefulGptDecoderBatched::getCumLogProbs() const
 {
-    return mDecoder->getCumLogProbs();
+    return mDecoder->getDecoderState().getCumLogProbs();
 }
 
 StatefulGptDecoderBatched::TensorPtr StatefulGptDecoderBatched::getLogProbs() const
 {
-    return mDecoder->getLogProbs();
+    return mDecoder->getDecoderState().getLogProbs();
 }
 
 StatefulGptDecoderBatched::TensorPtr StatefulGptDecoderBatched::getNewTokens(SizeType32 iter) const
 {
-    TensorPtr newTokensView = ITensor::slice(mDecoder->getJointDecodingOutput().newTokensSteps, iter, 1);
+    TensorPtr newTokensView
+        = ITensor::slice(mDecoder->getDecoderState().getJointDecodingOutput().newTokensSteps, iter, 1);
     newTokensView->squeeze(0);
-    return ITensor::slice(newTokensView, 0, mDecoder->getActualBatchSize());
+    return ITensor::slice(newTokensView, 0, mDecoder->getDecoderState().getActualBatchSize());
 }
 
 StatefulGptDecoderBatched::TensorPtr StatefulGptDecoderBatched::getNbFinished() const

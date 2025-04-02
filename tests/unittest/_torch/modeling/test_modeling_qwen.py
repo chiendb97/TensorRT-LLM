@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -26,7 +24,6 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from utils.llm_data import llm_models_root
 from utils.util import getSMVersion
 # isort: on
@@ -173,7 +170,6 @@ class TestQwen(unittest.TestCase):
         tokens_per_block = 128
         head_dim = qwen.config.hidden_size // qwen.config.num_attention_heads
         num_layers = qwen.config.num_hidden_layers
-        num_heads = qwen.config.num_attention_heads
         num_kv_heads = qwen.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = 1
@@ -192,7 +188,6 @@ class TestQwen(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -419,7 +414,6 @@ class TestQwen(unittest.TestCase):
             tokens_per_block = 128
             head_dim = model.config.hidden_size // model.config.num_attention_heads
             num_layers = model.config.num_hidden_layers
-            num_heads = model.config.num_attention_heads
             num_kv_heads = model.config.num_key_value_heads
             max_seq_len = num_blocks * tokens_per_block
             batch_size = len(context_sequence_lengths) + 2
@@ -438,7 +432,6 @@ class TestQwen(unittest.TestCase):
                 kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_layers,
-                num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
                 tokens_per_block=tokens_per_block,

@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -9,6 +7,7 @@ import torch
 from parameterized import parameterized
 from transformers import LlamaConfig
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
+from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -21,9 +20,6 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from utils.util import getSMVersion
 
 LLAMA_3_1_8B_CONFIG = {
     "architectures": ["LlamaForCausalLM"],
@@ -121,7 +117,6 @@ class TestLlama(unittest.TestCase):
         tokens_per_block = 128
         head_dim = llama.config.hidden_size // llama.config.num_attention_heads
         num_layers = llama.config.num_hidden_layers
-        num_heads = llama.config.num_attention_heads
         num_kv_heads = llama.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = len(context_sequence_lengths) + 2
@@ -140,7 +135,6 @@ class TestLlama(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -234,7 +228,6 @@ class TestLlama(unittest.TestCase):
         tokens_per_block = 128
         head_dim = llama.config.hidden_size // llama.config.num_attention_heads
         num_layers = llama.config.num_hidden_layers
-        num_heads = llama.config.num_attention_heads
         num_kv_heads = llama.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = 1
@@ -253,7 +246,6 @@ class TestLlama(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,

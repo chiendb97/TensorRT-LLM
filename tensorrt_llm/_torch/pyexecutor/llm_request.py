@@ -47,6 +47,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_batch_idx = None
         self.py_rewind_len = 0
         self.py_draft_tokens = self.draft_tokens
+        self.py_last_draft_tokens = None
 
 
 def convert_wordlist(word_list) -> List[List[int]]:
@@ -118,6 +119,10 @@ def executor_request_to_llm_request(req_id: int,
         is None else executor_request.prompt_tuning_config.embedding_table,
         prompt_vocab_size=None if executor_request.prompt_tuning_config is None
         else executor_request.prompt_tuning_config.embedding_table.shape[0],
+        mrope_rotary_cos_sin=None if executor_request.mrope_config is None else
+        executor_request.mrope_config.mrope_rotary_cos_sin,
+        mrope_position_deltas=None if executor_request.mrope_config is None else
+        executor_request.mrope_config.mrope_position_deltas,
         lora_task_id=None,
         lora_weights=None,
         lora_config=None,
@@ -132,6 +137,7 @@ def executor_request_to_llm_request(req_id: int,
         exclude_input_from_output,
         logits_post_processor=None,
         apply_logits_post_processor_batched=False,
+        guided_decoding_params=executor_request.guided_decoding_params,
         encoder_input_tokens=None,
         return_encoder_output=False,
         client_id=executor_request.client_id,

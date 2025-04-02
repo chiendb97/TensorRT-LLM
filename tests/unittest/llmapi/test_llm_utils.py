@@ -8,7 +8,7 @@ from tensorrt_llm.builder import PluginConfig
 from tensorrt_llm.llmapi.llm_utils import *
 
 # isort: off
-from test_llm import llama_model_path
+from .test_llm import llama_model_path
 # isort: on
 
 
@@ -215,8 +215,3 @@ def test_LlmArgs_default_gpus_per_node():
     # set explicitly
     llm_args = LlmArgs(llama_model_path, gpus_per_node=6)
     assert llm_args.gpus_per_node == 6
-
-
-if __name__ == '__main__':
-    #test_ModelLoader()
-    test_CachedModelLoader()

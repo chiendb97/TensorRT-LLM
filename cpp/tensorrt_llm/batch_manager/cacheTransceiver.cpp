@@ -15,6 +15,10 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/executor/types.h"
+#include <cstdint>
+#include <limits>
+#include <sstream>
 #define UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper"
 
 #if defined(_WIN32)
@@ -260,6 +264,56 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     return retData;
 }
 
+void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
+{
+    namespace su = executor::serialize_utils;
+    int worldSize = mpiComm.getSize();
+
+    std::ostringstream oStream;
+    su::serialize(request->getKvCacheTransferStart(), oStream);
+    su::serialize(request->getKvCacheTransferEnd(), oStream);
+
+    auto str = oStream.str();
+    std::vector<char> sendBuffer(str.begin(), str.end());
+    auto sendBufferSize = sendBuffer.size();
+    auto recvBufferSize = sendBufferSize * worldSize;
+    std::vector<char> recvBuffer(recvBufferSize);
+
+    mpiComm.allgather(sendBuffer.data(), recvBuffer.data(), sendBufferSize, mpi::MpiType::kCHAR);
+
+    su::VectorWrapBuf<char> strbuf(recvBuffer);
+    std::istream is(&strbuf);
+
+    auto minStartTime = executor::RequestPerfMetrics::TimePoint::max();
+    auto maxEndTime = executor::RequestPerfMetrics::TimePoint::min();
+
+    for (int rank = 0; rank < worldSize; rank++)
+    {
+        minStartTime = std::min(su::deserialize<executor::RequestPerfMetrics::TimePoint>(is), minStartTime);
+        maxEndTime = std::max(su::deserialize<executor::RequestPerfMetrics::TimePoint>(is), maxEndTime);
+    }
+
+    // Handle KV cache size separately - gather all sizes to the leader rank
+    std::size_t localKVCacheSize = request->getKvCacheSize();
+    std::vector<std::size_t> allKVCacheSizes(worldSize, 0);
+
+    mpiComm.allgather(&localKVCacheSize, allKVCacheSizes.data(), 1, mpi::MpiType::kUINT64);
+
+    std::size_t totalKVCacheSize = 0;
+    for (int rank = 0; rank < worldSize; rank++)
+    {
+        totalKVCacheSize += allKVCacheSizes[rank];
+    }
+
+    // Update the latest KV cache transfer time for leader rank
+    if (mpiComm.getRank() == 0)
+    {
+        request->setKvCacheTransferStart(minStartTime);
+        request->setKvCacheTransferEnd(maxEndTime);
+        request->setKvCacheSize(totalKVCacheSize);
+    }
+}
+
 void CacheTransceiver::checkContextTransferStatus(bool blocking)
 {
     auto syncComm = mCacheState->getParallelConfig().mEnableAttenionDP ? mMpiGroupTPInDPComm : mMpiGroupTensorParaComm;
@@ -403,6 +457,11 @@ void CacheTransceiver::checkGenTransferStatus(int atLeastRequestNum)
         {
             it->second.get();
 
+            // Gather the kv cache transfer time from all workers and update to leader rank
+            if (!common::getEnvKVCacheTransferOutputPath().empty())
+            {
+                updateKVCacheTransferBW(*mMpiGroupComm, it->first);
+            }
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                 "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
                 it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());

@@ -1,20 +1,16 @@
-import os
-import sys
 from difflib import SequenceMatcher
 
 import pytest
 import torch
+from utils.llm_data import llm_models_root
+from utils.util import getSMVersion
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.llmapi.llm_utils import BuildConfig, CalibConfig
+from tensorrt_llm.llmapi.llm_utils import CalibConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from utils.llm_data import llm_models_root
-from utils.util import getSMVersion
 
 MAX_SEQ_LEN = 2048
 
@@ -29,7 +25,7 @@ def similar(a, b, threshold=0.9):
 @pytest.mark.parametrize("backend", ["TRTLLM", "FLASHINFER"],
                          ids=["trtllm", "flashinfer"])
 @pytest.mark.parametrize("quant", ["bf16", "fp8", "fp8_kv_cache"])
-@pytest.mark.parametrize("tp_size", [1, 4], ids=["tp1", "tp4"])
+@pytest.mark.parametrize("tp_size", [1, 2, 4], ids=["tp1", "tp2", "tp4"])
 @pytest.mark.parametrize("pp_size", [1, 2], ids=["pp1", "pp2"])
 @pytest.mark.parametrize("torch_compile", [True, False],
                          ids=["torch_compile", "eager"])
@@ -59,10 +55,6 @@ def test_llama(model_name, backend, quant, tp_size, pp_size, torch_compile):
     # 16GB weight + 8GB KV cache + 8GB cache_indirection (TRT engine only) = 32GB
     if not is_fp8 and get_total_gpu_memory(0) < 32 * 1024**3:
         pytest.skip("Not enough GPU memory to run BF16 model")
-    if pp_size > 1 and tp_size > 1:
-        pytest.skip(
-            "https://nvbugs/5164088 - Fails creating IPC memory when creating allreduce workspace"
-        )
     if torch_compile and pp_size > 1:
         pytest.skip(
             "Pipeline parallel with torch.compile is not supported yet.\n"
@@ -102,9 +94,8 @@ def test_llama(model_name, backend, quant, tp_size, pp_size, torch_compile):
         pytorch_backend_config=pytorch_config,
         calib_config=CalibConfig(calib_dataset=str(llm_models_root() /
                                                    "datasets/cnn_dailymail")),
-        build_config=BuildConfig(
-            max_seq_len=2048,
-        ),  # This verifies a bug in compile warmUp that does not generate valid warmup requests
+        max_seq_len=
+        2048,  # This verifies a bug in compile warmUp that does not generate valid warmup requests
     )
     with llm:
         outputs = llm.generate(

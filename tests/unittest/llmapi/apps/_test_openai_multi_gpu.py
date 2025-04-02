@@ -1,17 +1,13 @@
 import os
-import sys
 import tempfile
 
 import openai
 import pytest
 import yaml
-from openai_server import RemoteOpenAIServer
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import get_model_path, prompts
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from utils.util import skip_single_gpu
+
+from ..test_llm import get_model_path, prompts
+from .openai_server import RemoteOpenAIServer
 
 
 @pytest.fixture(scope="module")
@@ -81,6 +77,7 @@ def async_client(server: RemoteOpenAIServer):
 
 
 @skip_single_gpu
+@pytest.mark.part0
 def test_chat_tp2(client: openai.OpenAI, model_name: str):
     messages = [{
         "role": "system",
@@ -102,6 +99,7 @@ def test_chat_tp2(client: openai.OpenAI, model_name: str):
 
 
 @skip_single_gpu
+@pytest.mark.part0
 def test_completion_tp2(client: openai.OpenAI, model_name: str):
     completion = client.completions.create(
         model=model_name,
@@ -114,6 +112,7 @@ def test_completion_tp2(client: openai.OpenAI, model_name: str):
 
 @skip_single_gpu
 @pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.part0
 async def test_chat_streaming_tp2(async_client: openai.AsyncOpenAI,
                                   model_name: str):
     messages = [{
@@ -139,6 +138,7 @@ async def test_chat_streaming_tp2(async_client: openai.AsyncOpenAI,
 
 @skip_single_gpu
 @pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.part0
 async def test_completion_streaming_tp2(async_client: openai.AsyncOpenAI,
                                         model_name: str):
     completion = await async_client.completions.create(
@@ -151,4 +151,5 @@ async def test_completion_streaming_tp2(async_client: openai.AsyncOpenAI,
     str_chunk = []
     async for chunk in completion:
         str_chunk.append(chunk.choices[0].text)
+    pytest.skip("https://nvbugspro.nvidia.com/bug/5163855")
     assert "".join(str_chunk) == " D E F G H"

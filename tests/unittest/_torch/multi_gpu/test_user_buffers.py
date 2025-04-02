@@ -1,4 +1,3 @@
-import os
 import pickle
 import sys
 import traceback
@@ -9,6 +8,7 @@ import torch
 import torch.nn as nn
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
+from utils.util import skip_pre_blackwell_unittest
 
 import tensorrt_llm
 import tensorrt_llm.bindings.internal.userbuffers as ub
@@ -22,9 +22,6 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
-from utils.util import skip_pre_blackwell_unittest
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -107,7 +104,102 @@ def run_single_rank(tensor_parallel_size, a, b, c):
     return True
 
 
-def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma, scale):
+def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        support = ub.ub_supported()
+        if not support:
+            return True
+        eps = 1e-6
+
+        a_partial = torch.chunk(a, tensor_parallel_size, 1)
+        b_partial = torch.chunk(b, tensor_parallel_size, 0)
+
+        a_local = a_partial[rank].cuda()
+        b_local = b_partial[rank].cuda()
+        c = c.cuda()
+        gamma = gamma.cuda()
+
+        ub_size = c.nelement() * c.element_size()
+        ub0_addr, ub1_addr = init_runtime(tensor_parallel_size, ub_size)
+        assert ub.ub_is_initialized()
+
+        ub0 = ub.ub_get(0)
+        assert not ub0.invalid()
+        assert ub0_addr == ub0.addr
+        ub0_tensor = convert_to_torch_tensor(
+            TensorWrapper(ub0.addr, a.dtype, c.size()))
+        hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
+        parallel_config = ParallelConfig(
+            tensor_parallel_rank=rank,
+            tensor_parallel_size=tensor_parallel_size,
+            tensor_parallel_mode=TensorParallelMode.COLUMN)
+        ar = AllReduce(parallel_config, strategy=AllReduceStrategy.UB)
+        ar_params = AllReduceParams(
+            strategy=AllReduceStrategy.UB,
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            residual=c,
+            norm_weight=gamma,
+            eps=eps)
+        res_ub, residual = ar.forward(hidden, all_reduce_params=ar_params)
+        res = res_ub.clone()
+        residual = userbuffers_allreduce_finalize(residual, False)
+
+        torch.cuda.synchronize()
+        if rank == 0:
+            # Fully simulate matmul + allreduce behavior
+            ax = [a_partial[i].cuda() for i in range(0, tensor_parallel_size)]
+            bx = [b_partial[i].cuda() for i in range(0, tensor_parallel_size)]
+            h1 = [
+                torch.matmul(ax[i], bx[i])
+                for i in range(0, tensor_parallel_size)
+            ]
+            sum = h1[0]
+            for i in range(1, tensor_parallel_size):
+                sum = sum + h1[i]
+            ref_residual = sum + c
+            ref = rms_norm(ref_residual.to(torch.float32), gamma,
+                           eps).to(res.dtype)
+            torch.testing.assert_close(ref, res, atol=5e-1, rtol=1e-2)
+            torch.testing.assert_close(ref_residual,
+                                       residual,
+                                       atol=5e-1,
+                                       rtol=1e-2)
+
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason='needs 2 GPUs to run this test')
+@pytest.mark.parametrize("mnk", [(256, 512, 256), (32, 16, 64)],
+                         ids=lambda x: f"m{x[0]}_n{x[1]}_k{x[2]}")
+def test_user_buffers_ar_rms_norm(mnk):
+    torch.manual_seed(42)
+    tensor_parallel_size = 2
+    dtype = torch.float16
+    m = mnk[0]
+    n = mnk[1]
+    k = mnk[2]
+    a = torch.randn((m, k), dtype=dtype)
+    b = torch.randn((k, n), dtype=dtype)
+    c = torch.randn((m, n), dtype=dtype)
+    gamma = torch.randn((n), dtype=dtype)
+
+    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
+        results = executor.map(
+            run_single_rank_ar_rms_norm,
+            *zip(*[(tensor_parallel_size, a, b, c, gamma)] *
+                 tensor_parallel_size))
+        for r in results:
+            assert r is True
+
+
+def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
+                                    scale):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     try:
@@ -149,7 +241,7 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma, scale):
             eps=eps)
         q_res, residual = ar.forward(hidden, all_reduce_params=ar_params)
         res = dequant(q_res, scale, torch.float16)
-        residual = userbuffers_allreduce_finalize(residual)
+        residual = userbuffers_allreduce_finalize(residual, False)
 
         torch.cuda.synchronize()
         if rank == 0:
@@ -203,7 +295,7 @@ def test_user_buffers():
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("mnk", [(256, 512, 256), (32, 16, 64)],
                          ids=lambda x: f"m{x[0]}_n{x[1]}_k{x[2]}")
-def test_user_buffers_ar_rms_norm(mnk):
+def test_user_buffers_ar_rms_norm_fp8(mnk):
     torch.manual_seed(42)
     tensor_parallel_size = 2
     dtype = torch.float16
@@ -218,7 +310,7 @@ def test_user_buffers_ar_rms_norm(mnk):
 
     with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
         results = executor.map(
-            run_single_rank_ar_rms_norm,
+            run_single_rank_ar_rms_norm_fp8,
             *zip(*[(tensor_parallel_size, a, b, c, gamma, scale)] *
                  tensor_parallel_size))
         for r in results:
@@ -573,7 +665,7 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
         # instruction generates slight difference.
         torch.testing.assert_close(t1, t2, atol=1.5, rtol=1e-2)
 
-        residual = userbuffers_allreduce_finalize(residual)
+        residual = userbuffers_allreduce_finalize(residual, False)
         torch.testing.assert_close(ref_residual,
                                    residual.cpu(),
                                    atol=5e-1,

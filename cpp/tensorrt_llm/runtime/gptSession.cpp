@@ -193,16 +193,14 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
     {
         if (decoderPerRequest)
         {
-            mDecoders.emplace_back(std::make_shared<StatefulGptDecoderBatched>(
-                stream, mModelConfig.getSpeculativeDecodingMode(), logitsType));
+            mDecoders.emplace_back(std::make_shared<StatefulGptDecoderBatched>(stream, logitsType));
         }
         else
         {
             mDecoders.emplace_back(std::make_shared<StatefulGptDecoder>(vocabSize, vocabSizePadded, stream));
         }
-        constexpr SizeType32 maxTokensPerStep = 1;
         mDecoders.back()->setup(decodingMode, batchSize, beamWidth, maxAttentionWindow, sinkTokenLength,
-            maxSequenceLength, maxTokensPerStep, logitsType, mModelConfig, mWorldConfig);
+            maxSequenceLength, logitsType, mModelConfig, mWorldConfig);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -242,7 +240,7 @@ void GptSession::createKvCacheManager(SizeType32 maxBatchSize, SizeType32 maxBea
         kvCacheConfig, kvDtype, mModelConfig, mWorldConfig, getBufferManager());
     mKvCacheManager = std::make_shared<bmkv::KVCacheManager>(
         std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd), sizePerHead, tokensPerBlock,
-        blocksInPrimaryPool, blocksInSecondaryPool, maxBatchSize, maxBeamWidth, maxAttentionWindow,
+        blocksInPrimaryPool, blocksInSecondaryPool, maxBatchSize, maxBeamWidth, mDecoderMaxAttentionWindowVec,
         /*temporaryAttentionWindow*/ 0, sinkTokenLength, mRuntime->getStreamPtr(), maxSequenceLength, enableBlockReuse,
         kvCacheConfig.onboardBlocks);
 

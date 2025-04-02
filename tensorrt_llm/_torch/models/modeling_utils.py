@@ -22,6 +22,7 @@ from ..modules.linear import Linear, WeightMode
 from ..modules.logits_procesor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..pipeline_interface import PipelineInterface
+from ..speculative import SpecMetadata
 
 
 @contextlib.contextmanager
@@ -64,7 +65,8 @@ class MetaInitMode(TorchDispatchMode):
     aten = torch.ops.aten
     init_ops = {aten.empty.memory_format, aten.empty_like.default}
     random_init_ops = {
-        aten.normal_.default, aten.uniform_.default
+        aten.normal_.default,
+        aten.uniform_.default,
         # TODO: this is not a exhaustive list for random init ops, add as needed
     }
 
@@ -212,6 +214,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         input_ids: torch.LongTensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -252,9 +255,9 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         self.pp_layer_list = self.model_config.mapping.pp_layers_torch(
             num_hidden_layers)
         decoder_layer_cls = self.layers[0].__class__
-        if hasattr(self, 'moe_stream'):  # DeepseekV3
+        if hasattr(self, 'aux_stream'):  # DeepseekV3
             layer_fn = lambda layer_idx: decoder_layer_cls(
-                self.model_config, layer_idx, self.moe_stream)
+                self.model_config, layer_idx, self.aux_stream)
         else:
             layer_fn = lambda layer_idx: decoder_layer_cls(
                 self.model_config, layer_idx)
@@ -276,6 +279,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
+        **kwargs,
     ) -> torch.Tensor:
         # unpack pp_interface or embedding lookup for the input
         if self.pp_rank != 0:
@@ -325,7 +329,6 @@ class PostInitCaller(type):
 TModel = TypeVar("TModel", bound=DecoderModel)
 
 
-# TODO: Maybe extract PP logic from DecoderModelForCausalLM similar to DecoderModel
 class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
@@ -457,6 +460,10 @@ class DecoderModelForCausalLM(nn.Module,
         # create each interface buffer at runtime
         return self.model.create_pipeline_interface(num_input_ids)
 
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.lm_head.vocab_size_padded
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -465,9 +472,9 @@ class DecoderModelForCausalLM(nn.Module,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
         return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-
         if self._supports_pp and self.pp_size > 1:
             output = self.model(
                 input_ids=input_ids,
@@ -475,6 +482,7 @@ class DecoderModelForCausalLM(nn.Module,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
                 pipeline_interface=pipeline_interface,
+                spec_metadata=spec_metadata,
             )
 
             # No need to compute logits for non-last PP ranks
@@ -486,6 +494,7 @@ class DecoderModelForCausalLM(nn.Module,
                 attn_metadata=attn_metadata,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
+                spec_metadata=spec_metadata,
             )
 
         return self.logits_processor.forward(

@@ -54,7 +54,7 @@ def sanity_check():
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
             'If you are attempting to use the pip development mode (editable installation), '
-            'please execute `build_wheels.py` first, and then run `pip install -e .`.'
+            'please execute `scripts/build_wheel.py` first, and then run `pip install -e .`.'
         )
 
 
@@ -241,10 +241,6 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
-        "benchmarking": [
-            "click",
-            "pydantic",
-        ]
     },
     zip_safe=True,
     install_requires=required_deps,

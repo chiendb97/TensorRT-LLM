@@ -4,39 +4,39 @@ import glob
 import math
 import traceback
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from typing import Any, Dict, Optional, Tuple
 
 import safetensors
 import torch
 
-import tensorrt_llm._torch
-import tensorrt_llm.bindings
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._torch.attention_backend import *
-from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionMetadata, AttentionRuntimeFeatures)
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
-from tensorrt_llm._torch.compilation.backend import Backend
-from tensorrt_llm._torch.metadata import *
-from tensorrt_llm._torch.models import AutoModelForCausalLM
-from tensorrt_llm._torch.models.modeling_utils import MetaInitMode, timing
-from tensorrt_llm._torch.pyexecutor.distributed import MPIDist
-from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, KVCacheManager)
-from tensorrt_llm._torch.speculative import (SpecConfig, SpecMetadata,
-                                             get_spec_metadata)
-from tensorrt_llm._torch.utils import set_torch_compiling
+from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
-from ..._utils import nvtx_range
-from ...models.modeling_utils import QuantAlgo
+from ..attention_backend.interface import (AttentionMetadata,
+                                           AttentionRuntimeFeatures)
+from ..attention_backend.utils import get_attention_backend
+from ..autotuner import AutoTuner, autotune
+from ..compilation.backend import Backend
+from ..metadata import KVCacheParams
+from ..model_config import ModelConfig
+from ..models import AutoModelForCausalLM
+from ..models.modeling_utils import MetaInitMode, timing
 from ..pipeline_interface import PipelineInterface
+from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
+from ..utils import set_torch_compiling
 from .config import LoadFormat, PyTorchConfig
 from .cuda_graph_runner import DecodingCUDAGraphRunner
+from .distributed import MPIDist
+from .guided_decoder import GuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .resource_manager import ResourceManager
+from .resource_manager import (BaseResourceManager, KVCacheManager,
+                               ResourceManager)
 from .scheduler import ScheduledRequests
 
 MAX_UINT64 = (1 << 64) - 1
@@ -50,8 +50,9 @@ class ModelEngine(ABC):
 
     @abstractmethod
     def forward(self, scheduled_requests: ScheduledRequests,
+                resource_manager: ResourceManager,
                 new_tensors_device: Optional[Dict[str, torch.Tensor]],
-                resource_manager: ResourceManager):
+                extra_model_inputs: Optional[Dict[str, Any]]):
         raise NotImplementedError
 
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -71,9 +72,8 @@ _KV_CACHE_MAP = {
 _VALID_KV_CACHE_DTYPES = ("fp8", "auto")
 
 
-def validate_and_set_kv_cache_quant(
-        model_config: tensorrt_llm._torch.model_config.ModelConfig,
-        pyt_kv_cache_dtype: str) -> QuantAlgo:
+def validate_and_set_kv_cache_quant(model_config: ModelConfig,
+                                    pyt_kv_cache_dtype: str) -> QuantAlgo:
     logger.info(
         f'Validating KV Cache config against kv_cache_dtype="{pyt_kv_cache_dtype}"'
     )
@@ -208,6 +208,10 @@ def initialize_dummy_weights(
             param.uniform_(low, high, generator=generator)
 
 
+KV_CACHE_MANAGER_KEY = 'kv_cache_manager'
+DRAFT_KV_CACHE_MANAGER_KEY = 'draft_kv_cache_manager'
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -221,6 +225,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
         spec_config: Optional[SpecConfig] = None,
+        guided_decoding_config: Optional[GuidedDecodingConfig] = None,
     ):
         self.ub_buffers = None
         self.batch_size = batch_size
@@ -233,6 +238,10 @@ class PyTorchModelEngine(ModelEngine):
         self.dist = dist
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
+        # We keep a reference to the last used spec metadata to
+        # accommodate certain target/draft model use cases. See
+        # py_executor.py for how this is used.
+        self.last_spec_metadata = None
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
@@ -261,6 +270,13 @@ class PyTorchModelEngine(ModelEngine):
         self._enable_overlap_scheduler = self.pytorch_backend_config.enable_overlap_scheduler
         self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
+
+        self.guided_decoder: Optional[GuidedDecoder] = None
+        if self.mapping.is_last_pp_rank(
+        ) and guided_decoding_config is not None:
+            self.guided_decoder = GuidedDecoder(guided_decoding_config,
+                                                self.batch_size,
+                                                self.model.vocab_size_padded)
 
         try:
             if pytorch_backend_config.torch_compile_enabled:
@@ -340,9 +356,14 @@ class PyTorchModelEngine(ModelEngine):
             self.max_draft_len = 0
         self.iter_counter = 0
 
+        # We look up this key in resource_manager during forward to find the
+        # kv cache manager. Can be changed to support multiple model engines
+        # with different KV cache managers.
+        self.kv_cache_manager_key = KV_CACHE_MANAGER_KEY
+
     def warmup(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(
-            'kv_cache_manager')
+            self.kv_cache_manager_key)
         spec_resource_manager = resource_manager.get_resource_manager(
             'spec_resource_manager')
         if kv_cache_manager is None:
@@ -406,9 +427,17 @@ class PyTorchModelEngine(ModelEngine):
                     num_tokens / kv_cache_manager.tokens_per_block):
                 # Should only need (at most) one more page per request.
                 is_gen = num_tokens == 1
-                requests = kv_cache_manager.add_dummy_requests(list(
-                    range(batch_size)), [num_tokens] * batch_size,
-                                                               is_gen=is_gen)
+                max_num_draft_tokens = self.spec_config.max_draft_tokens if self.spec_config is not None and is_gen else 0
+
+                requests = kv_cache_manager.add_dummy_requests(
+                    list(range(batch_size)), [num_tokens] * batch_size,
+                    is_gen=is_gen,
+                    max_num_draft_tokens=max_num_draft_tokens)
+
+                if spec_resource_manager is not None:
+                    spec_resource_manager.add_dummy_requests(
+                        request_ids=list(range(batch_size)))
+
                 result = ScheduledRequests()
                 result.context_requests = []
                 result.generation_requests = []
@@ -444,6 +473,16 @@ class PyTorchModelEngine(ModelEngine):
             finally:
                 self._run_cuda_graphs = _run_cuda_graphs
 
+        # TODO: current warmup_request is not suitable for star attention
+        cp_type = self.mapping.cp_config.get('cp_type', None)
+        if cp_type == 'star_attention':
+            return
+
+        # TODO: CUDA graph support with eagle.
+        if self.spec_config is not None and self.spec_config.spec_dec_mode.is_eagle3(
+        ):
+            return
+
         if self._torch_compile_enabled:
             # Disable cuda graph capture here so that we can properly capture it later
             with no_cuda_graph():
@@ -470,13 +509,36 @@ class PyTorchModelEngine(ModelEngine):
                                          resource_manager=resource_manager)
                             torch.cuda.synchronize()
 
+        if self.pytorch_backend_config.autotuner_enabled:
+            with no_cuda_graph(), autotune():
+                num_tokens = min(self.max_num_tokens,
+                                 kv_cache_manager.max_seq_len - 1)
+                with release_batch(
+                        get_torch_compile_warmup_request(1,
+                                                         num_tokens)) as batch:
+                    if batch is None:
+                        # No KV cache space!
+                        pass
+                    else:
+                        logger.info(f"Run autotuning warmup for batch size={1}")
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                        torch.cuda.synchronize()
+
+                logger.info(f"Autotuner Cache size after warmup " +
+                            str(len(AutoTuner.get().profiling_cache)))
+
         if not self._run_cuda_graphs:
             return
 
         logger.info(
             f"Creating CUDA graph instances for {len(self._cuda_graph_batch_sizes)} batch sizes."
         )
-        for bs in self._cuda_graph_batch_sizes:
+        # Reverse the order of the cuda graph batch sizes to make smaller batch size graph could reuse larger batch size graph memory
+        cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
+                                        reverse=True)
+        for bs in cuda_graph_batch_sizes:
             if bs > self.batch_size:
                 # skip batch size larger than self.batch_size
                 continue
@@ -541,9 +603,8 @@ class PyTorchModelEngine(ModelEngine):
         batch_size = scheduled_requests.batch_size
         new_batch_size = batch_size
         if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
-            graph_batch_size = self.dist.allgather(
+            graph_batch_size = self.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
-            graph_batch_size = self._post_allgather_pp(graph_batch_size)
             all_can_graph = all(graph_batch[0]
                                 for graph_batch in graph_batch_size)
             if all_can_graph:
@@ -574,9 +635,11 @@ class PyTorchModelEngine(ModelEngine):
         # Set the dummy request ids starting at (uint64 max value - padding_size - 1) to avoid conflict with
         # active request IDs
         max_req_id = MAX_UINT64 - padding_size - 1
+        max_num_draft_tokens = self.spec_config.max_draft_tokens if self.spec_config is not None else 0
         generation_requests = kv_cache_manager.add_dummy_requests(
-            [max_req_id + i + 1 for i in range(padding_size)], is_gen=True)
-
+            [max_req_id + i + 1 for i in range(padding_size)],
+            is_gen=True,
+            max_num_draft_tokens=max_num_draft_tokens)
         scheduled_requests.generation_requests.extend(generation_requests)
         return generation_requests
 
@@ -624,9 +687,8 @@ class PyTorchModelEngine(ModelEngine):
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = len(batch.generation_requests)
         if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
-            all_can_graph_batch = self.dist.allgather(
+            all_can_graph_batch = self.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
-            all_can_graph_batch = self._post_allgather_pp(all_can_graph_batch)
             is_all_gen_only = all(all_can_graph[0]
                                   for all_can_graph in all_can_graph_batch)
             all_batch_size_equal = all(
@@ -673,8 +735,9 @@ class PyTorchModelEngine(ModelEngine):
 
     def _load_model(self, checkpoint_dir: str, load_format: LoadFormat,
                     **kwargs):
-        config = tensorrt_llm._torch.model_config.ModelConfig.from_pretrained(
-            checkpoint_dir, trust_remote_code=True, **kwargs)
+        config = ModelConfig.from_pretrained(checkpoint_dir,
+                                             trust_remote_code=True,
+                                             **kwargs)
         config.spec_config = self.spec_config
 
         validate_and_set_kv_cache_quant(
@@ -776,6 +839,7 @@ class PyTorchModelEngine(ModelEngine):
                 inputs['attn_metadata'].kv_lens_cuda[
                     num_ctx_requests:num_seqs] += (
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
+
         return inputs
 
     def _prepare_tp_inputs(
@@ -800,6 +864,7 @@ class PyTorchModelEngine(ModelEngine):
         multi_modal_data = []
         draft_tokens = []
         draft_lens = []
+        mrope_config = defaultdict(list)
 
         batch_idx = 0
 
@@ -824,6 +889,10 @@ class PyTorchModelEngine(ModelEngine):
             if prompt_embedding_table is not None:
                 multi_modal_data.append(prompt_embedding_table)
 
+            mrope_rotary_cos_sin = request.get_mrope_rotary_cos_sin()
+            if mrope_rotary_cos_sin is not None:
+                mrope_config['mrope_rotary_cos_sin'].append(
+                    mrope_rotary_cos_sin)
             request.py_batch_idx = batch_idx
             batch_idx += 1
 
@@ -847,6 +916,13 @@ class PyTorchModelEngine(ModelEngine):
                 extend_requests.append(request)
             else:
                 generation_requests.append(request)
+
+            mrope_position_deltas = request.mrope_position_deltas
+            if mrope_position_deltas is not None:
+                mrope_config['mrope_position_deltas'].append(
+                    torch.tensor([mrope_position_deltas],
+                                 dtype=torch.int32).to('cuda',
+                                                       non_blocking=True))
         is_spec_decode = len(extend_requests) > 0
         if self._enable_overlap_scheduler and is_spec_decode:
             spec_dec_mode = self.spec_config.spec_dec_mode
@@ -865,6 +941,7 @@ class PyTorchModelEngine(ModelEngine):
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 position_ids.append(past_seen_token_num)
                 draft_lens.append(num_draft_tokens)
+                prompt_lengths.append(num_draft_tokens + 1)
                 # draft tokens
                 input_ids.extend(request.py_draft_tokens)
                 gather_ids.extend(
@@ -902,9 +979,9 @@ class PyTorchModelEngine(ModelEngine):
                                             (1 + self.max_draft_len))
                 num_cached_tokens_per_seq.append(past_seen_token_num +
                                                  self.max_draft_len + 1)
+                prompt_lengths.append(request.py_prompt_len)
 
             request_ids.append(request.py_request_id)
-            prompt_lengths.append(request.py_prompt_len)
 
         sequence_lengths.extend([1] * len(generation_requests))
         gather_ids.extend(
@@ -1022,6 +1099,9 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
+        if self.spec_config is not None and self.spec_config.spec_dec_mode.extend_ctx(
+        ):
+            attn_metadata.num_contexts += len(extend_requests)
 
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
@@ -1038,16 +1118,9 @@ class PyTorchModelEngine(ModelEngine):
             'position_ids':
             self.position_ids_cuda[:total_num_tokens].unsqueeze(0),
             'inputs_embeds': None,
-            'multi_modal_data': multi_modal_data
+            'multi_modal_data': multi_modal_data,
+            'mrope_config': mrope_config
         }
-
-        if self.mapping.has_pp():
-            pipeline_interface = None
-            if self.mapping.pp_rank > 0:
-                pipeline_interface = self.model.create_pipeline_interface(
-                    inputs['input_ids'].shape[0])
-                pipeline_interface.recv()
-            inputs['pipeline_interface'] = pipeline_interface
 
         if spec_metadata is not None:
             total_draft_lens = sum(draft_lens)
@@ -1062,18 +1135,17 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.num_generations = len(
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = total_num_tokens
+            spec_metadata.seq_lens = sequence_lengths
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_rank_num_tokens = self.dist.allgather([
+                all_rank_num_tokens = self.dist.tp_allgather([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths)
                 ])
-                all_rank_num_tokens = self._post_allgather_pp(
-                    all_rank_num_tokens)
                 attn_all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
                 ]
@@ -1085,11 +1157,17 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
             else:
-                all_rank_num_tokens = self.dist.allgather(
+                all_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
-                all_rank_num_tokens = self._post_allgather_pp(
-                    all_rank_num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+
+        if self.mapping.has_pp():
+            pipeline_interface = None
+            if self.mapping.pp_rank > 0:
+                pipeline_interface = self.model.create_pipeline_interface(
+                    inputs['input_ids'].shape[0])
+                pipeline_interface.recv()
+            inputs['pipeline_interface'] = pipeline_interface
 
         num_generation_tokens = len(generation_requests) + len(
             extend_requests) + sum(draft_lens)
@@ -1164,14 +1242,6 @@ class PyTorchModelEngine(ModelEngine):
             'multi_modal_data': multi_modal_data
         }
 
-        if self.mapping.has_pp():
-            pipeline_interface = None
-            if self.mapping.pp_rank > 0:
-                pipeline_interface = self.model.create_pipeline_interface(
-                    inputs['input_ids'].shape[0])
-                pipeline_interface.recv()
-            inputs['pipeline_interface'] = pipeline_interface
-
         if spec_metadata is not None:
             total_draft_lens = sum(draft_lens)
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
@@ -1181,18 +1251,17 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.num_generations = len(
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = num_tokens
+            spec_metadata.seq_lens = sequence_lengths
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_rank_num_tokens = self.dist.allgather([
+                all_rank_num_tokens = self.dist.tp_allgather([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths)
                 ])
-                all_rank_num_tokens = self._post_allgather_pp(
-                    all_rank_num_tokens)
                 attn_all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
                 ]
@@ -1204,11 +1273,18 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
             else:
-                all_rank_num_tokens = self.dist.allgather(
+                all_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
-                all_rank_num_tokens = self._post_allgather_pp(
-                    all_rank_num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+
+        if self.mapping.has_pp():
+            pipeline_interface = None
+            if self.mapping.pp_rank > 0:
+                pipeline_interface = self.model.create_pipeline_interface(
+                    inputs['input_ids'].shape[0])
+                pipeline_interface.recv()
+            inputs['pipeline_interface'] = pipeline_interface
+
         return inputs, None
 
     def _prepare_star_attention_inputs(self,
@@ -1421,8 +1497,8 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.prepare()
         if self.enable_attention_dp:
-            all_rank_num_tokens = self.dist.allgather(attn_metadata.num_tokens)
-            all_rank_num_tokens = self._post_allgather_pp(all_rank_num_tokens)
+            all_rank_num_tokens = self.dist.tp_allgather(
+                attn_metadata.num_tokens)
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         return {
@@ -1458,10 +1534,11 @@ class PyTorchModelEngine(ModelEngine):
     def forward(self,
                 scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
-                new_tensors_device: Optional[Dict[str, torch.Tensor]] = None):
+                new_tensors_device: Optional[Dict[str, torch.Tensor]] = None,
+                extra_model_inputs: Optional[Dict[str, Any]] = None):
 
         kv_cache_manager = resource_manager.get_resource_manager(
-            'kv_cache_manager')
+            self.kv_cache_manager_key)
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
         if self.spec_config is not None:
@@ -1476,6 +1553,10 @@ class PyTorchModelEngine(ModelEngine):
         if kv_cache_manager is None:
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
                 scheduled_requests, attn_metadata, spec_metadata)
+            if extra_model_inputs is not None:
+                inputs.update(extra_model_inputs)
+            self.last_spec_metadata = spec_metadata
+
             if self.mapping.has_pp() and not self.mapping.is_last_pp_rank():
                 pp_interface = self._forward_step_intermediate(inputs)
                 pp_interface.send()
@@ -1502,16 +1583,20 @@ class PyTorchModelEngine(ModelEngine):
                                                       attn_metadata,
                                                       spec_metadata,
                                                       new_tensors_device)
+            if extra_model_inputs is not None:
+                inputs.update(extra_model_inputs)
+            self.last_spec_metadata = spec_metadata
+
             self.iter_counter += 1
 
             if maybe_graph is None:
                 if self.mapping.has_pp() and not self.mapping.is_last_pp_rank():
                     pp_interface = self._forward_step_intermediate(inputs)
                     pp_interface.send()
-                    return self._post_forward_intermediate(
+                    outputs = self._post_forward_intermediate(
                         inputs, pp_interface, gather_ids)
                 else:
-                    return self._forward_step(inputs, gather_ids)
+                    outputs = self._forward_step(inputs, gather_ids)
             else:
                 if maybe_graph.needs_capture():
                     if not self.mapping.is_last_pp_rank():
@@ -1533,7 +1618,21 @@ class PyTorchModelEngine(ModelEngine):
                                                               pp_interface,
                                                               gather_ids=None)
 
-                return outputs
+            # Note: To overlap the CPU and GPU computation as much as possible,
+            # guided_decoder.build should be called immediately after the launch of the single step;
+            # while guided_decoder.execute should be called right before the samplings.
+            # We can insert other CPU computation between them in the future.
+            if self.mapping.is_last_pp_rank(
+            ) and self.guided_decoder is not None:
+                guided_decoder_resource_manager = resource_manager.get_resource_manager(
+                    "guided_decoder_resource_manager")
+                self.guided_decoder.build(scheduled_requests,
+                                          guided_decoder_resource_manager)
+                self.guided_decoder.execute(scheduled_requests,
+                                            outputs['logits'],
+                                            guided_decoder_resource_manager)
+
+            return outputs
 
     @nvtx_range("_forward_step")
     def _forward_step(self, inputs: Dict[str, Any],
@@ -1572,7 +1671,7 @@ class PyTorchModelEngine(ModelEngine):
             hidden_states = hidden_states.unsqueeze(0)
 
         if gather_ids is None:
-            if attn_metadata is not None and attn_metadata.kv_cache_manager is not None:
+            if attn_metadata is not None:
                 last_tokens = torch.cumsum(
                     attn_metadata.seq_lens_cuda,
                     dim=0,
@@ -1586,12 +1685,6 @@ class PyTorchModelEngine(ModelEngine):
             return {'hidden_states': hidden_states[gather_ids]}
         else:
             return {'hidden_states': hidden_states}
-
-    def _post_allgather_pp(self, allgather_result):
-        if self.mapping.has_pp():
-            return [allgather_result[rank] for rank in self.mapping.tp_group]
-        else:
-            return allgather_result
 
     def _init_userbuffers(self, hidden_size, quant_config, dtype):
         # No quant, do not allow UB

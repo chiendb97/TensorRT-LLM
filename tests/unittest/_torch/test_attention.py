@@ -1,12 +1,11 @@
 import math
-import os
-import sys
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
 import flashinfer
 import pytest
 import torch
+from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import (AttentionBackend,
@@ -20,9 +19,6 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -144,7 +140,6 @@ def kv_cache_manager_from(Attention: type[AttentionBackend], s: Scenario,
     num_layers = s.num_layers
     num_kv_heads = s.num_kv_heads
     head_dim = s.head_dim
-    num_heads = s.num_kv_heads
     max_seq_len = num_blocks * tokens_per_block
     batch_size = s.batch_size
 
@@ -167,7 +162,6 @@ def kv_cache_manager_from(Attention: type[AttentionBackend], s: Scenario,
         kv_cache_config,
         cache_type,
         num_layers=num_layers,
-        num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         tokens_per_block=tokens_per_block,

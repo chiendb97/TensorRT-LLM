@@ -11,6 +11,7 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from .. import bindings as tllm
+from .._utils import global_mpi_rank
 from ..bindings import executor as tllm
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
@@ -18,18 +19,19 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
+from ..executor.utils import (create_mpi_comm_session,
+                              get_spawn_proxy_process_env)
 from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .llm_args import LLMARGS_EXPLICIT_DOCSTRING
+from .llm_args import LLMARGS_EXPLICIT_DOCSTRING, PybindMirror
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig, LlmArgs,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
-from .mpi_session import (MpiCommSession, MpiPoolSession,
-                          external_mpi_comm_available)
+from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
-                    nvtx_range)
+                    nvtx_range, print_colored_debug)
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -97,7 +99,6 @@ class LLM:
                  skip_tokenizer_init: bool = False,
                  trust_remote_code: bool = False,
                  tensor_parallel_size: int = 1,
-                 pipeline_parallel_size: int = 1,
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
@@ -115,7 +116,6 @@ class LLM:
                 skip_tokenizer_init=skip_tokenizer_init,
                 trust_remote_code=trust_remote_code,
                 tensor_parallel_size=tensor_parallel_size,
-                pipeline_parallel_size=pipeline_parallel_size,
                 dtype=dtype,
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
@@ -126,6 +126,8 @@ class LLM:
                 f"Failed to parse the arguments for the LLM constructor: {e}")
             raise e
 
+        print_colored_debug(
+            f"LLM.args._mpi_session: {self.args._mpi_session}\n", "yellow")
         self.mpi_session = self.args._mpi_session
 
         if self.args.parallel_config.is_multi_gpu:
@@ -139,13 +141,17 @@ class LLM:
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
             )
             if not self.mpi_session:
-                if not external_mpi_comm_available(
-                        self.args.parallel_config.world_size):
+                mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
+                if not mpi_process_pre_spawned:
+                    print_colored_debug(f"LLM create MpiPoolSession\n",
+                                        "yellow")
                     self.mpi_session = MpiPoolSession(
                         n_workers=self.args.parallel_config.world_size)
                 else:
-                    self.mpi_session = MpiCommSession(
-                        n_workers=self.args.parallel_config.world_size)
+                    print_colored_debug(f"LLM create MpiCommSession\n",
+                                        "yellow")
+                    self.mpi_session = create_mpi_comm_session(
+                        self.args.parallel_config.world_size)
 
         try:
             # Due to the Executor can only accept a engine path, we need to save the engine to a directory
@@ -258,7 +264,7 @@ class LLM:
 
         return futures
 
-    @nvtx_range("LLM.generate_async")
+    @nvtx_range("LLM.generate_async", color="green", category="LLM")
     def generate_async(
         self,
         inputs: PromptInputs,
@@ -289,6 +295,9 @@ class LLM:
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
+        print_colored_debug(
+            f"rank {global_mpi_rank()} generate_async: {inputs}\n", "green")
+
         sampling_params = self._prepare_sampling_params(sampling_params)
 
         if sampling_params.n > self.args.build_config.max_batch_size:
@@ -302,6 +311,7 @@ class LLM:
 
         query_token_ids = None
         prompt_tuning_config = None
+        mrope_config = None
         if "prompt_token_ids" in inputs:
             prompt_token_ids = inputs['prompt_token_ids']
             prompt = None
@@ -314,9 +324,13 @@ class LLM:
             if queries is not None:
                 query_token_ids, _ = self.input_processor(
                     queries, sampling_params)
-            if extra_processed_inputs is not None:
+            if (extra_processed_inputs is not None
+                    and 'prompt_tuning_config' in extra_processed_inputs):
                 prompt_tuning_config = extra_processed_inputs.get(
                     'prompt_tuning_config')
+            if (extra_processed_inputs is not None
+                    and 'mrope_config' in extra_processed_inputs):
+                mrope_config = extra_processed_inputs.get('mrope_config')
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
@@ -337,18 +351,18 @@ class LLM:
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
             prompt_tuning_config=prompt_tuning_config,
+            mrope_config=mrope_config,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
             postproc_params=_postproc_params,
         )
-        #For dis serving context only requests, skip post-processing
-        tokenizer = None if (disaggregated_params
-                             and disaggregated_params.request_type
-                             == "context_only") else self.tokenizer
-        return RequestOutput._from_generation_result(result, prompt, tokenizer)
+
+        return RequestOutput._from_generation_result(result, prompt,
+                                                     self.tokenizer)
 
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
         '''Get iteration statistics from the runtime.
+        To collect statistics, call this function after prompts have been submitted with LLM().generate().
 
         Args:
             timeout (float, optional): Max wait time in seconds when retrieving stats from queue. Defaults to 2.
@@ -361,6 +375,8 @@ class LLM:
 
     def get_stats_async(self, timeout: Optional[float] = 2) -> IterationResult:
         '''Get iteration statistics from the runtime.
+        To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you're using trtllm-serve)
+        after prompts have been submitted.
 
         Args:
             timeout (float, optional): Max wait time in seconds when retrieving stats from queue. Defaults to 2.
@@ -490,15 +506,18 @@ class LLM:
         max_num_tokens = self.args.max_num_tokens or self.args.build_config.max_num_tokens
         executor_config = tllm.ExecutorConfig(
             max_beam_width=self.args.build_config.max_beam_width,
-            scheduler_config=self.args.scheduler_config,
+            scheduler_config=PybindMirror.maybe_to_pybind(
+                self.args.scheduler_config),
             batching_type=self.args.batching_type or tllm.BatchingType.INFLIGHT,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             gather_generation_logits=self.args.gather_generation_logits)
         if self.args.kv_cache_config is not None:
-            executor_config.kv_cache_config = self.args.kv_cache_config
+            executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
+                self.args.kv_cache_config)
         if self.args.peft_cache_config is not None:
-            executor_config.peft_cache_config = self.args.peft_cache_config
+            executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
+                self.args.peft_cache_config)
         elif self.args.build_config.plugin_config.lora_plugin:
             engine_config = EngineConfig.from_json_file(self._engine_dir /
                                                         "config.json")
@@ -526,7 +545,7 @@ class LLM:
 
         executor_config.normalize_log_probs = self.args.normalize_log_probs
         executor_config.enable_chunked_context = self.args.enable_chunked_prefill
-        executor_config.max_beam_width = self.args.build_config.max_beam_width
+        executor_config.max_beam_width = self.args.max_beam_width or self.args.build_config.max_beam_width
         if self.args.extended_runtime_perf_knob_config is not None:
             executor_config.extended_runtime_perf_knob_config = self.args.extended_runtime_perf_knob_config
 
@@ -539,7 +558,9 @@ class LLM:
             build_config=self.args.build_config,
             speculative_config=self.args.speculative_config,
             hf_model_dir=self._hf_model_dir,
-            trt_engine_dir=self._engine_dir)
+            trt_engine_dir=self._engine_dir,
+            max_input_len=self.args.max_input_len,
+            max_seq_len=self.args.max_seq_len)
         executor_config.llm_parallel_config = self.args.parallel_config
         return_logits = self.args.gather_generation_logits or (
             self.args.build_config

@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 
@@ -14,8 +12,6 @@ from tensorrt_llm._torch.models.modeling_mamba_hybrid import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 MAMBA_HYBRID_CONFIG = {
     "architectures": ["MambaHybridForCausalLM"],
@@ -97,7 +93,6 @@ class TestMambaHybrid(unittest.TestCase):
         tokens_per_block = 128
         head_dim = mamba_hybrid.config.hidden_size // mamba_hybrid.config.num_attention_heads
         num_layers = mamba_hybrid.config.hybrid_override_pattern.count("*")
-        num_heads = mamba_hybrid.config.num_attention_heads
         num_kv_heads = mamba_hybrid.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = len(context_sequence_lengths) + 2
@@ -116,7 +111,6 @@ class TestMambaHybrid(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
