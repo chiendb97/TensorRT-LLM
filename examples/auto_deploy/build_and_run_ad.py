@@ -48,7 +48,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
     )
     ad_logger.info(f"AutoDeploy Config: {ad_config}")
 
-    # TODO (lliebenwein): let's see if prefetching can't be done through the LLM api?
+    # TODO: let's see if prefetching can't be done through the LLM api?
     # I believe the "classic workflow" invoked via the LLM api can do that.
     # put everything into the HF model Factory and try pre-fetching the checkpoint
     factory = ModelFactoryRegistry.get("hf")(model=config.model, model_kwargs=config.model_kwargs)
@@ -105,6 +105,7 @@ def main(config: Optional[SimpleConfig] = None):
             "Benchmark with " + ", ".join(f"{k}={getattr(config, k)}" for k in keys),
             results_path=config.benchmark_results_path,
         )
+    llm.shutdown()
 
 
 if __name__ == "__main__":
