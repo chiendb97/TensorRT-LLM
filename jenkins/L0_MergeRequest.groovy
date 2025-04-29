@@ -21,10 +21,10 @@ UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifac
 // Container configuration
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.01-py3-x86_64-ubuntu24.04-trt10.8.0.43-skip-devel-202503131720-8877"
-LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.01-py3-aarch64-ubuntu24.04-trt10.8.0.43-skip-devel-202503131720-8877"
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.0-devel-rocky8-x86_64-rocky8-py310-trt10.8.0.43-skip-devel-202503131720-8877"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.0-devel-rocky8-x86_64-rocky8-py312-trt10.8.0.43-skip-devel-202503131720-8877"
+LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-x86_64-ubuntu24.04-trt10.9.0.34-skip-devel-202504101610-3421"
+LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-aarch64-ubuntu24.04-trt10.9.0.34-skip-devel-202504101610-3421"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py310-trt10.9.0.34-skip-devel-202504101610-3421"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py312-trt10.9.0.34-skip-devel-202504101610-3421"
 
 LLM_ROCKYLINUX8_DOCKER_IMAGE = LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE
 
@@ -510,7 +510,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/functional.py",
         "tensorrt_llm/mapping.py",
         "tensorrt_llm/llmapi/",
-        "tensorrt_llm/executor.py",
+        "tensorrt_llm/executor/",
         "tensorrt_llm/_ipc_utils.py",
         "tensorrt_llm/parameter.py",
         "tensorrt_llm/models/llama/",
@@ -524,6 +524,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
+        "tests/unittest/llmapi/test_llm_pytorch.py",
+        "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
         "jenkins/L0_Test.groovy",
     ]
 
@@ -606,6 +608,7 @@ def collectTestResults(pipeline, testFilter)
             testResultLink = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}/test-results"
 
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget ${testResultLink}/", allowStepFailed: true)
             sh "cat index.html | grep \"tar.gz\" | cut -d \"\\\"\" -f 2 > result_file_names.txt"
             sh "cat result_file_names.txt"
@@ -616,6 +619,16 @@ def collectTestResults(pipeline, testFilter)
             echo "Result File Number: ${resultFileNumber}, Downloaded: ${resultFileDownloadedNumber}"
 
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+            if (testFilter[(IS_POST_MERGE)]) {
+                try {
+                    sh "python3 llm/scripts/generate_duration.py --duration-file=new_test_duration.json"
+                    trtllm_utils.uploadArtifacts("new_test_duration.json", "${UPLOAD_PATH}/test-results/")
+                } catch (Exception e) {
+                    // No need to fail the stage if the duration file generation fails
+                    echo "An error occurred while generating or uploading the duration file: ${e.toString()}"
+                }
+            }
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
@@ -632,13 +645,11 @@ def collectTestResults(pipeline, testFilter)
                     echo "Test coverage is skipped because there is no test data file."
                     return
                 }
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install coverage")
                 sh "coverage --version"
 
-                trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                 sh "cp llm/examples/openai_triton/manual_plugin/fmha_triton.py llm/examples/openai_triton/plugin_autogen/"
                 def coverageConfigFile = "cov/.coveragerc"
                 sh """
