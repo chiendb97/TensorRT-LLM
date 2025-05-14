@@ -56,9 +56,11 @@ add_library(
   fp8Quantize.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
+  groupRmsNormOp.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
+  moeCommOp.cpp
   fp8BlockScaleMoe.cpp
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
