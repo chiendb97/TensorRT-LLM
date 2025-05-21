@@ -15,7 +15,7 @@
 import math
 import weakref
 from collections import OrderedDict
-from enum import IntEnum, IntFlag, auto
+from enum import IntEnum
 from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -3873,44 +3873,30 @@ def unbind(input: Tensor, dim: int = 0):
 
 
 class AllReduceStrategy(IntEnum):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
     NCCL = 0
-    ONESHOT = 1
-    TWOSHOT = 2
-    UB = 3
-    AUTO = 4
+    MIN_LATENCY = 1
+    UB = 2
+    AUTO = 3
+    ONESHOT = 4
+    TWOSHOT = 5
 
 
-class AllReduceConfig(IntFlag):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
-    USE_MEMCPY = auto()
-    PUSH_MODE = auto()
-
-
-class AllReduceFusionOp(IntFlag):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
+class AllReduceFusionOp(IntEnum):
     NONE = 0
     RESIDUAL_RMS_NORM = 1
     LAST_PROCESS_FOR_UB = 2
     RESIDUAL_RMS_PREPOST_NORM = 3
     RESIDUAL_RMS_NORM_QUANT_FP8 = 4
     RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
+    RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
+    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
 
 
 class AllReduceParams():
 
     def __init__(self,
                  strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
-                 config: AllReduceConfig = AllReduceConfig(0),
                  fusion_op: AllReduceFusionOp = AllReduceFusionOp.NONE,
                  bias: Optional[Tensor] = None,
                  residual: Optional[Tensor] = None,
@@ -3920,7 +3906,6 @@ class AllReduceParams():
                  eps: float = 1e-06,
                  enable_allreduce: bool = True):
         self.strategy = strategy
-        self.config = config
         self.fusion_op = fusion_op
         self.bias = bias
         self.residual = residual
@@ -3930,7 +3915,8 @@ class AllReduceParams():
         self.eps = eps
         # For torch path only, has no effect on TRT path
         self.enable_allreduce = enable_allreduce
-        assert fusion_op == AllReduceFusionOp.NONE or (residual is not None)
+        assert fusion_op == AllReduceFusionOp.NONE.value or (residual
+                                                             is not None)
 
     def has_affine(self):
         return 1 if self.norm_weight is not None else 0
@@ -3967,10 +3953,6 @@ def create_allreduce_plugin(
         "strategy", np.array([int(all_reduce_params.strategy)], np.int8),
         trt.PluginFieldType.INT8)
     pfc.append(p_strategy)
-    p_config = trt.PluginField(
-        "config", np.array([int(all_reduce_params.config)], np.int8),
-        trt.PluginFieldType.INT8)
-    pfc.append(p_config)
     p_fusion_op = trt.PluginField(
         "fusion_op", np.array([int(all_reduce_params.fusion_op)], np.int8),
         trt.PluginFieldType.INT8)
@@ -3979,7 +3961,6 @@ def create_allreduce_plugin(
         "eps", np.array([float(all_reduce_params.eps)], np.float32),
         trt.PluginFieldType.FLOAT32)
     pfc.append(p_eps)
-
     p_affine = trt.PluginField(
         "affine", np.array([int(all_reduce_params.has_affine())], np.int8),
         trt.PluginFieldType.INT8)
@@ -4781,7 +4762,7 @@ class RopeEmbeddingUtils:
         return np.random.rand(dim).astype(dtype)
 
     @staticmethod
-    def create_sinusoidal_positions_for_deepseek_attention_plugin(
+    def create_sinusoidal_positions_yarn(
             num_pos: int,
             dim: int,
             base: int = 10000,
@@ -5213,6 +5194,7 @@ def gpt_attention(
     cp_group: List[int] = [0],
     cp_size: int = 1,
     cp_rank: int = 0,
+    num_kv_heads_origin: int = -1,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -5474,6 +5456,9 @@ def gpt_attention(
         skip_attn: Tensor = None,
             A bool tensor on CPU. If it is true, don't run attention plugin, returning directly.
 
+        num_kv_heads_origin: int
+            The origin number of KV heads, without the process of TP
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -5505,6 +5490,9 @@ def gpt_attention(
     else:
         use_logn_scaling = 0
 
+    if num_kv_heads_origin < 1:
+        num_kv_heads_origin = num_kv_heads
+
     unfuse_qkv_gemm = trt.PluginField(
         "unfuse_qkv_gemm", np.array(np.int8(is_unfuse_qkv_gemm), dtype=np.int8),
         trt.PluginFieldType.INT8)
@@ -5523,6 +5511,9 @@ def gpt_attention(
     num_kv_heads = trt.PluginField("num_kv_heads",
                                    np.array(num_kv_heads, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
+    num_kv_heads_origin = trt.PluginField(
+        "num_kv_heads_origin", np.array(num_kv_heads_origin, dtype=np.int32),
+        trt.PluginFieldType.INT32)
     head_size = trt.PluginField("head_size",
                                 np.array(hidden_size_per_head, dtype=np.int32),
                                 trt.PluginFieldType.INT32)
@@ -5714,9 +5705,10 @@ def gpt_attention(
         trt.PluginFieldType.INT8)
 
     pfc = trt.PluginFieldCollection([
-        layer_idx, nheads, vision_start, vision_length, num_kv_heads, head_size,
-        unidirectional, q_scaling, attn_logit_softcapping_scale,
-        position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
+        layer_idx, nheads, vision_start, vision_length, num_kv_heads,
+        num_kv_heads_origin, head_size, unidirectional, q_scaling,
+        attn_logit_softcapping_scale, position_embedding_type,
+        rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
         rotary_embedding_max_positions, rotary_embedding_original_max_positions,
@@ -6485,6 +6477,7 @@ ACT2FN = {
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
     'sigmoid': sigmoid,
+    'quick_gelu': quick_gelu,
 }
 
 GATED_ACT_2_ACT = {

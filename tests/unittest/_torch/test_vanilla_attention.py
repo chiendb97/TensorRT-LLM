@@ -99,7 +99,6 @@ class TestVanillaAttention(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -114,6 +113,7 @@ class TestVanillaAttention(unittest.TestCase):
             buf = kv_cache_manager.get_buffers(i)
             if buf is not None:
                 torch.nn.init.normal_(buf)
+                del buf
 
         vanilla_attn = VanillaAttention(layer_idx=0,
                                         num_heads=num_heads,

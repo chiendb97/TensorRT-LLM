@@ -26,7 +26,7 @@ from utils.llm_data import llm_models_root
                 "model_kwargs": {"num_hidden_layers": 2},
             },
         ),
-        # small llama3.1-8B model with world_size 2 + trtllm runtime
+        # small llama3.1-8B model with world_size 2 + trtllm runtime + torch-opt
         (
             2,
             {
@@ -35,6 +35,20 @@ from utils.llm_data import llm_models_root
                     "meta-llama/Meta-Llama-3.1-8B-Instruct",
                 ),
                 "runtime": "trtllm",
+                "attn_backend": "TritonWithFlattenedInputs",
+                "compile_backend": "torch-opt",
+                "model_kwargs": {"num_hidden_layers": 2},
+            },
+        ),
+        # small Mixtral-8x7B model with world_size 2
+        (
+            2,
+            {
+                "model": _hf_model_dir_or_hub_id(
+                    f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1",
+                    "mistralai/Mixtral-8x7B-Instruct-v0.1",
+                ),
+                "runtime": "demollm",
                 "attn_backend": "TritonWithFlattenedInputs",
                 "compile_backend": "torch-simple",
                 "model_kwargs": {"num_hidden_layers": 2},

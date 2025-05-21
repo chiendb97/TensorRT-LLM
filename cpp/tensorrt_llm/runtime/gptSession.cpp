@@ -83,7 +83,8 @@ GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConf
     , mWorldConfig{worldConfig}
     , mDevice{utils::initDevice(worldConfig)}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
-    , mRuntime{std::make_shared<TllmRuntime>(rawEngine, mLogger.get(), sessionConfig.gpuWeightsPercent)}
+    , mRuntime{std::make_shared<TllmRuntime>(
+          rawEngine, mLogger.get(), sessionConfig.useGpuDirectStorage, sessionConfig.gpuWeightsPercent)}
     , mGatherGenerationLogits{sessionConfig.gatherGenerationLogits}
 {
     TLLM_LOG_WARNING(
@@ -193,16 +194,14 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
     {
         if (decoderPerRequest)
         {
-            mDecoders.emplace_back(std::make_shared<StatefulGptDecoderBatched>(
-                stream, mModelConfig.getSpeculativeDecodingMode(), logitsType));
+            mDecoders.emplace_back(std::make_shared<StatefulGptDecoderBatched>(stream, logitsType));
         }
         else
         {
             mDecoders.emplace_back(std::make_shared<StatefulGptDecoder>(vocabSize, vocabSizePadded, stream));
         }
-        constexpr SizeType32 maxTokensPerStep = 1;
         mDecoders.back()->setup(decodingMode, batchSize, beamWidth, maxAttentionWindow, sinkTokenLength,
-            maxSequenceLength, maxTokensPerStep, logitsType, mModelConfig, mWorldConfig);
+            maxSequenceLength, logitsType, mModelConfig, mWorldConfig);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -242,11 +241,11 @@ void GptSession::createKvCacheManager(SizeType32 maxBatchSize, SizeType32 maxBea
         kvCacheConfig, kvDtype, mModelConfig, mWorldConfig, getBufferManager());
     mKvCacheManager = std::make_shared<bmkv::KVCacheManager>(
         std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd), sizePerHead, tokensPerBlock,
-        blocksInPrimaryPool, blocksInSecondaryPool, maxBatchSize, maxBeamWidth, maxAttentionWindow,
-        /*temporaryAttentionWindow*/ 0, sinkTokenLength, mRuntime->getStreamPtr(), maxSequenceLength, enableBlockReuse,
-        kvCacheConfig.onboardBlocks);
+        blocksInPrimaryPool, blocksInSecondaryPool, maxBatchSize, maxBeamWidth, mDecoderMaxAttentionWindowVec,
+        /*tempAttentionWindowInputs*/ std::nullopt, kvDtype, sinkTokenLength, mRuntime->getStreamPtr(),
+        maxSequenceLength, enableBlockReuse, kvCacheConfig.onboardBlocks);
 
-    auto const maxBlocksPerSeq = mKvCacheManager->getMaxBlocksPerSeq();
+    auto const maxBlocksPerSeq = mKvCacheManager->getOffsetTableDimensions().maxBlocksPerSeq;
 
     TLLM_CHECK(mBuffers.size() == static_cast<size_t>(mMicroBatchConfig.numGenBatches));
     for (auto& buffers : mBuffers)
@@ -255,7 +254,7 @@ void GptSession::createKvCacheManager(SizeType32 maxBatchSize, SizeType32 maxBea
         buffers->transformerBuffers->reshapeKvTensors(maxBatchSize, maxBeamWidth, maxBlocksPerSeq, *mRuntime);
     }
 
-    mKvCacheManager->allocatePools(kvDtype, kvCacheConfig.useUvm);
+    mKvCacheManager->allocatePools(kvCacheConfig.useUvm);
 
     for (auto& buffers : mBuffers)
     {

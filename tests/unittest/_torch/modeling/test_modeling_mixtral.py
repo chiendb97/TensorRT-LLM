@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -8,6 +6,7 @@ import torch
 from parameterized import parameterized
 from transformers import MixtralConfig
 from transformers import MixtralForCausalLM as HFMixtralForCausalLM
+from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -20,9 +19,6 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from utils.util import getSMVersion
 
 MIXTRAL_8X7B_CONFIG = {
     "architectures": ["MixtralForCausalLM"],
@@ -77,9 +73,11 @@ class TestMixtral(unittest.TestCase):
         if quant_algo == "FP8" and getSMVersion() < 90:
             self.skipTest(
                 "This test is not supported in pre-Hopper architecture")
-        if quant_algo == "NVFP4" and getSMVersion() < 100:
+        if quant_algo == "NVFP4" and (getSMVersion() < 100
+                                      or getSMVersion() >= 120):
             self.skipTest(
-                "This test is not supported in pre-Blackwell architecture")
+                "This test is not supported in pre-Blackwell architecture, nor GeForce Blackwell"
+            )
 
         dtype = mixtral_config.torch_dtype
         device = torch.device("cuda")
@@ -104,7 +102,6 @@ class TestMixtral(unittest.TestCase):
         tokens_per_block = 128
         head_dim = mixtral.config.hidden_size // mixtral.config.num_attention_heads
         num_layers = mixtral.config.num_hidden_layers
-        num_heads = mixtral.config.num_attention_heads
         num_kv_heads = mixtral.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = len(sequence_length)
@@ -123,7 +120,6 @@ class TestMixtral(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -215,7 +211,6 @@ class TestMixtral(unittest.TestCase):
         tokens_per_block = 128
         head_dim = mixtral.config.hidden_size // mixtral.config.num_attention_heads
         num_layers = mixtral.config.num_hidden_layers
-        num_heads = mixtral.config.num_attention_heads
         num_kv_heads = mixtral.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = 1
@@ -234,7 +229,6 @@ class TestMixtral(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,

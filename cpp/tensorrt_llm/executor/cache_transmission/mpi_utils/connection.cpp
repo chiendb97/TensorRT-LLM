@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -28,18 +29,22 @@ MpiConnection::MpiConnection(mpi::MpiComm const* comm, int rank)
 
 void MpiConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
-    mComm->send(data, size, mpi::MpiType::kCHAR, mRank, ctx.getTag());
+    mComm->sendRawTag(data, size, mpi::MpiType::kCHAR, mRank, ctx.getTag());
 }
 
 void MpiConnection::recv(DataContext const& ctx, void* data, size_t size) const
 {
-    mComm->recv(data, size, mpi::MpiType::kCHAR, mRank, ctx.getTag());
+    mComm->recvRawTag(data, size, mpi::MpiType::kCHAR, mRank, ctx.getTag());
 }
 
 MpiConnectionManager::MpiConnectionManager(mpi::MpiComm const* comm)
     : mComm{comm}
 {
     TLLM_CHECK(mComm);
+    mCommState = CommState{
+        tensorrt_llm::mpi::getWorldRanks(tensorrt_llm::mpi::MpiComm::session()), mpi::MpiComm::session().getRank()};
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "MpiConnectionManager::MpiConnectionManager, commState:%s",
+        mCommState.toString().c_str());
 }
 
 MpiConnection const* MpiConnectionManager::recvConnect(DataContext const& ctx, void* data, size_t size)
@@ -65,6 +70,11 @@ std::vector<Connection const*> MpiConnectionManager::getConnections(CommState co
     }
     TLLM_CHECK(!ret.empty());
     return ret;
+}
+
+CommState const& MpiConnectionManager::getCommState() const
+{
+    return mCommState;
 }
 
 } // namespace tensorrt_llm::executor::kv_cache

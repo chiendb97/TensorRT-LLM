@@ -1,5 +1,9 @@
+import contextlib
 import os
+import threading
 from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List
 
 import torch
 
@@ -8,6 +12,17 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from .pipeline_interface import PipelineInterface
 
 is_torch_compiling_flag = False
+
+aux_stream_name_list = ['Attention', 'MoeShared', 'MoeChunkingOverlap']
+AuxStreamType = Enum(
+    'AuxStreamType',
+    aux_stream_name_list,
+)
+EventType = Enum(
+    'EventType',
+    ['Main', *aux_stream_name_list],
+    start=0,
+)
 
 
 def set_torch_compiling(enable: bool):
@@ -18,6 +33,43 @@ def set_torch_compiling(enable: bool):
 def is_torch_compiling() -> bool:
     global is_torch_compiling_flag
     return is_torch_compiling_flag
+
+
+_global_attrs = threading.local()
+
+
+def get_global_attrs():
+    return _global_attrs
+
+
+_model_extra_attrs = threading.local()
+
+
+def get_model_extra_attrs():
+    return getattr(_model_extra_attrs, 'attrs', None)
+
+
+@contextlib.contextmanager
+def model_extra_attrs(attrs: Dict):
+    old_attrs = getattr(_model_extra_attrs, 'attrs', None)
+    _model_extra_attrs.attrs = attrs
+    try:
+        yield
+    finally:
+        _model_extra_attrs.attrs = old_attrs
+
+
+def with_model_extra_attrs(get_attrs):
+
+    def decorator(func):
+
+        def wrapper(self, *args, **kwargs):
+            with model_extra_attrs(get_attrs(self)):
+                return func(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def make_weak_ref(x):
@@ -43,6 +95,10 @@ def make_weak_ref(x):
 class Fp4QuantizedTensor:
     fp4_tensor: torch.Tensor
     scaling_factor: torch.Tensor
+
+    @property
+    def shape(self):
+        return self.fp4_tensor.shape
 
 
 _disable_fp4_allgather = os.getenv("TLLM_DISABLE_FP4_ALLGATHER", "0") == "1"
@@ -116,3 +172,43 @@ def reswizzle_sf(sf: torch.Tensor,
     sf_out_reshaped[:total_rows] = sf_unswizzle[:, :row].reshape(total_rows, -1)
     sf_out_swizzle = sf_out.transpose(1, 3).reshape(-1)
     return sf_out_swizzle
+
+
+def next_positive_power_of_2(x: int) -> int:
+    if x < 1:
+        return 1
+
+    return 1 << (x - 1).bit_length()
+
+
+def last_positive_power_of_2(x: int) -> int:
+    next = next_positive_power_of_2(x)
+    if next == x:
+        return next
+
+    return next // 2
+
+
+def nearest_in_buckets(x: int, buckets: List[int]) -> int:
+    return min(max(next_positive_power_of_2(x), buckets[0]), buckets[-1])
+
+
+def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
+    max_num_tokens = next_positive_power_of_2(max_num_tokens)
+    num_token_buckets = []
+    m = max_num_tokens
+    while m >= 1:
+        num_token_buckets.append(m)
+        m //= 2
+
+    return tuple(num_token_buckets)
+
+
+def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
+    max_num_tokens = last_positive_power_of_2(max_num_tokens)
+    num_token_buckets = []
+    m = max_num_tokens
+    while m >= 1:
+        num_token_buckets.append(m)
+        m //= 2
+    return num_token_buckets

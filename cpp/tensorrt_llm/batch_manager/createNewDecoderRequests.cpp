@@ -54,8 +54,15 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     CudaStream const& runtimeStream, SizeType32 maxSequenceLength) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     TLLM_CHECK(batchSlot >= 0);
-    auto const& jointOutputIdsShape = decoder.getJointDecodingOutput().ids->getShape();
+
+    auto const& decoderStream = decoder.getDecoderStream();
+    BufferManager const manager{decoderStream};
+
+    auto& decoderState = decoder.getDecoderState();
+
+    auto const& jointOutputIdsShape = decoderState.getJointDecodingOutput().ids->getShape();
     auto const batchSize = jointOutputIdsShape.d[0];
     TLLM_CHECK(0 <= batchSize && batchSlot < batchSize);
     auto const maxBeamWidth = jointOutputIdsShape.d[1];
@@ -77,19 +84,16 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     TLLM_CHECK(requestIds->getDataType() == TRTDataType<TokenIdType>::value);
     auto const endId = request.endId.value_or(-1);
 
-    auto const& decoderStream = decoder.getDecoderStream();
-    BufferManager manager{decoderStream};
-
     // input
-    auto& dJointInput = decoder.getJointDecodingInput();
+    auto& dJointInput = decoderState.getJointDecodingInput();
 
     dJointInput.beamWidths.at(batchSlot) = beamWidth;
-    dJointInput.numDecodingEngineTokens.at(batchSlot) = numDecodingEngineTokens;
+    decoderState.setNumDecodingEngineTokens(batchSlot, numDecodingEngineTokens);
 
-    TensorPtr endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
+    TensorPtr const endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
     runtime::kernels::invokeFill(*endIdTensorPtr, endId, *decoderStream);
 
-    TensorPtr embeddingBiasSlice = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchSlot, 1);
+    TensorPtr const embeddingBiasSlice = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchSlot, 1);
     if (request.embeddingBias)
     {
         TLLM_CHECK(request.embeddingBias->getShape().nbDims == 2);
@@ -114,10 +118,10 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
             BufferRange<int32_t*>(*constPointerCast(jointWordsPtrs))[batchSlot]
                 = runtime::bufferCast<TokenIdType>(*requestWordsList);
             runtime::bufferCast<SizeType32>(*constPointerCast(jointWordsLens))[batchSlot] = wordsLen;
-            // FIXME(nkorobov): this is monotonically growing size
+            // FIXME: this is monotonically growing size
             jointMaxWordsLen = std::max(static_cast<SizeType32>(wordsLen), jointMaxWordsLen);
 
-            // NOTE(nkorobov): jointWordsList is not used in gptDecoder, but required to keep <name>WordsList's
+            // NOTE: jointWordsList is not used in gptDecoder, but required to keep <name>WordsList's
             // memory allocated
             jointWordsLists[batchSlot] = requestWordsList;
         }
@@ -133,33 +137,34 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     setupWords(dJointInput.badWordsLists, request.badWordsList, dJointInput.badWordsPtrs, dJointInput.badWordsLens,
         dJointInput.maxBadWordsLen, batchSlot);
 
-    TensorPtr sequenceLimitLength{ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
+    TensorPtr const sequenceLimitLength{
+        ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
     runtime::kernels::invokeFill(*sequenceLimitLength, inputLength + maxNewTokens, *decoderStream);
 
-    TensorPtr inputLengths{ITensor::slice(constPointerCast(dJointInput.lengths), batchSlot, 1)};
+    TensorPtr const inputLengths{ITensor::slice(constPointerCast(dJointInput.lengths), batchSlot, 1)};
     runtime::kernels::invokeFill(*inputLengths, inputLength, *decoderStream);
 
     // output
-    auto& dJointOutput = decoder.getJointDecodingOutput();
+    auto& dJointOutput = decoderState.getJointDecodingOutput();
     auto const outputIdsShape = ITensor::makeShape({1, beamWidth, maxSequenceLength});
 
     auto finishedSum = ITensor::slice(dJointOutput.finishedSum, batchSlot, 1);
     manager.setZero(*finishedSum);
 
-    for (SizeType32 ti = 0; ti < decoder.getMaxDecodingEngineTokens(); ++ti)
+    for (SizeType32 ti = 0; ti < decoderState.getMaxDecodingEngineTokens(); ++ti)
     {
-        TensorPtr newTokensStepView = ITensor::slice(dJointOutput.newTokensSteps, ti, 1);
+        TensorPtr const newTokensStepView = ITensor::slice(dJointOutput.newTokensSteps, ti, 1);
         newTokensStepView->squeeze(0);
         auto newTokensVec = ITensor::slice(newTokensStepView, batchSlot, 1);
         manager.setZero(*newTokensVec);
     }
 
-    // FIXME(nkorobov): we call setZero mMaxDecodingEngineTokens times for only 1 element
-    for (SizeType32 ti = 0; ti < decoder.getMaxDecodingEngineTokens(); ++ti)
+    // FIXME: we call setZero mMaxDecodingEngineTokens times for only 1 element
+    for (SizeType32 ti = 0; ti < decoderState.getMaxDecodingEngineTokens(); ++ti)
     {
-        TensorPtr finishedStepsView = ITensor::slice(decoder.getFinishedSteps(), ti, 1);
+        TensorPtr const finishedStepsView = ITensor::slice(decoderState.getFinishedSteps(), ti, 1);
         finishedStepsView->squeeze(0);
-        TensorPtr finishedSteps = ITensor::slice(finishedStepsView, batchSlot, 1);
+        TensorPtr const finishedSteps = ITensor::slice(finishedStepsView, batchSlot, 1);
         if (ti < numDecodingEngineTokens)
         {
             manager.setZero(*finishedSteps);
@@ -186,7 +191,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     if (beamWidth > 1)
     {
-        TensorPtr cumLogProbs = ITensor::slice(dJointOutput.cumLogProbs, batchSlot, 1);
+        TensorPtr const cumLogProbs = ITensor::slice(dJointOutput.cumLogProbs, batchSlot, 1);
         runtime::kernels::invokeFill(
             *IBuffer::slice(cumLogProbs, 1, beamWidth - 1), DecodingOutput::kNegativeInfinity, *decoderStream);
 
@@ -199,16 +204,16 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     }
 
     // Speculative execution
-    if (numDecodingEngineTokens > 1 || decoder.getSpeculativeDecodingMode().isDraftTokensExternal())
+    if (numDecodingEngineTokens > 1 || decoderState.getSpeculativeDecodingMode().isDraftTokensExternal())
     {
         TLLM_CHECK(beamWidth == 1);
-        newRequestSpeculativeDecoding(batchSlot, request, samplingConfig, modelConfig, decoder.getJointDecodingInput(),
-            decoder.getJointDecodingOutput(), runtimeStream, *decoderStream, decoder.getSpeculativeDecodingMode(),
-            decoder.getMaxDecodingEngineTokens());
+        newRequestSpeculativeDecoding(batchSlot, request, samplingConfig, modelConfig,
+            decoderState.getJointDecodingInput(), decoderState.getJointDecodingOutput(), runtimeStream, *decoderStream,
+            decoderState.getSpeculativeDecodingMode(), decoderState.getMaxDecodingEngineTokens());
     }
 
     // fill outputIds with endIds
-    TensorPtr outputIds = ITensor::slice(dJointOutput.ids, batchSlot, 1);
+    TensorPtr const outputIds = ITensor::slice(dJointOutput.ids, batchSlot, 1);
     auto outputIdsTileView = ITensor::view(outputIds, ITensor::makeShape({beamWidth, maxSequenceLength}));
     runtime::kernels::invokeFill(*outputIdsTileView, endId, *decoderStream);
 
@@ -216,10 +221,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     auto const requestIdsShape = requestIds->getShape();
     auto outputIdsView = ITensor::view(outputIds, requestIdsShape);
     manager.copy(*requestIds, *outputIdsView);
-    if (beamWidth > 1)
-    {
-        runtime::kernels::tileTensorInplace(*outputIdsTileView, beamWidth, *decoderStream);
-    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -241,7 +242,7 @@ void CreateNewDecoderRequests::newRequestSpeculativeDecoding(SizeType32 batchIdx
 
         TensorPtr nextDraftTokens
             = ITensor::slice(dJointOutput.speculativeDecodingOutputs->nextDraftTokens, batchIdx, 1);
-        // FIXME(nkorobov): can we skip this?
+        // FIXME: can we skip this?
         manager.setZero(*nextDraftTokens);
         if (speculativeDecodingMode.variableDraftLength())
         {

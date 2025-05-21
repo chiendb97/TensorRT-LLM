@@ -7,12 +7,14 @@ import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
 from queue import Queue
-from typing import TYPE_CHECKING, Generator, List, Optional, Union
+from typing import (TYPE_CHECKING, AsyncIterable, Generator, List, Optional,
+                    Union)
 
 import numpy as np
 import torch
 
 from tensorrt_llm.logger import logger, set_level
+from tensorrt_llm.lora_manager import LoraConfig
 
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
@@ -24,7 +26,8 @@ from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             enable_worker_single_process_for_tp1, print_colored,
                             print_colored_debug)
-from ..sampling_params import BatchedLogitsProcessor, SamplingParams
+from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
+                               SamplingParams)
 from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
@@ -43,6 +46,11 @@ __all__ = [
 if enable_llm_debug():
     # Mainly enable more detailed logging from cpp runtime.
     set_level("info")
+
+
+async def empty_async_iterable() -> AsyncIterable:
+    if False:  # ensures the function remains an async generator
+        yield
 
 
 class CppExecutorError(RuntimeError):
@@ -108,7 +116,8 @@ class GenerationExecutor(ABC):
             lora_request: Optional[LoRARequest] = None,
             prompt_adapter_request: Optional[PromptAdapterRequest] = None,
             streaming: bool = False,
-            prompt_tuning_config: Optional[list] = None,
+            multimodal_embedding: Optional[list] = None,
+            mrope_config: Optional[dict] = None,
             kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
             disaggregated_params: Optional[DisaggregatedParams] = None,
             postproc_params: Optional[PostprocParams] = None
@@ -133,7 +142,8 @@ class GenerationExecutor(ABC):
                 lora_request=lora_request,
                 prompt_adapter_request=prompt_adapter_request,
                 streaming=streaming,
-                prompt_tuning_config=prompt_tuning_config,
+                multimodal_embedding=multimodal_embedding,
+                mrope_config=mrope_config,
                 kv_cache_retention_config=kv_cache_retention_config,
                 disaggregated_params=disaggregated_params))
         return result
@@ -194,6 +204,24 @@ class GenerationExecutor(ABC):
         # (self._last_client_id + 1) % UINT64_MAX
         self._last_client_id = (self._last_client_id + 1) & ((1 << 64) - 1)
         return self._last_client_id
+
+    def _get_logprob_params(
+            self, request: GenerationRequest) -> Optional[LogprobParams]:
+        """Store logprobs-related fields from request for the later logprob calculation."""
+        logprob_params = None
+        if request.sampling_params.logprobs or request.sampling_params.prompt_logprobs:
+            logprob_params = LogprobParams(
+                logprobs=request.sampling_params.logprobs,
+                prompt_logprobs=request.sampling_params.prompt_logprobs,
+                # drop logits if users didn't explicitly ask for it, or if it's using PostProcess flow
+                drop_context_logits=(
+                    not request.sampling_params._need_return_context_logits)
+                or self.postproc_config.num_postprocess_workers > 0,
+                drop_generation_logits=(
+                    not request.sampling_params._need_return_generation_logits)
+                or self.postproc_config.num_postprocess_workers > 0)
+
+        return logprob_params
 
     def _maybe_initialize_iteration_results(self):
         if self._is_llm_executor:
@@ -256,7 +284,11 @@ class GenerationExecutor(ABC):
         Returns:
             List[dict]: A list of runtime stats as dict.
         """
-        assert self._iter_stats_result is not None, "Stats IterationResult is not properly instantiated."
+        if self._iter_stats_result is None:
+            print_colored(
+                "Iteration statistics are not available yet. To collect runtime statistics, please call get_stats() AFTER prompts have been submitted.\n",
+                "yellow")
+            return []
 
         self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result.get_results()
@@ -267,7 +299,11 @@ class GenerationExecutor(ABC):
         Returns:
             IterationResult: An async iterable object containing runtime stats.
         """
-        assert self._iter_stats_result is not None, "Stats IterationResult is not properly instantiated."
+        if self._iter_stats_result is None:
+            print_colored(
+                "Iteration statistics are not available yet. To collect runtime statistics, please call get_stats_async() in async coroutine or the /metrics endpoint (if you're using trtllm-serve) AFTER prompts have been submitted.\n",
+                "yellow")
+            return empty_async_iterable()
 
         self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result
@@ -310,6 +346,7 @@ class GenerationExecutor(ABC):
         return_logits: bool = False,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
+        lora_config: Optional[LoraConfig] = None,
     ) -> Union["ExecutorBindingsProxy", "ExecutorBindingsWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import ExecutorBindingsProxy
@@ -337,6 +374,9 @@ class GenerationExecutor(ABC):
             "executor_config": executor_config,
             "batched_logits_processor": batched_logits_processor,
         }
+
+        if lora_config:
+            worker_kwargs["lora_config"] = lora_config
 
         # The case where the Python main process is launched by mpirun
         mpirun_launch = external_mpi_comm_available(model_world_size)
