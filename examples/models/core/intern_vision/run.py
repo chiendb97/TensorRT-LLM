@@ -29,7 +29,6 @@ import torch
 
 from transformers import AutoModel
 
-
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._utils import trt_dtype_to_torch
@@ -65,7 +64,6 @@ def load_image(image_path):
     # If you need to add a batch dimension (e.g., for model input)
     tensor_image = tensor_image.unsqueeze(0)  # Shape: [1, C, H, W]
 
-    print(tensor_image.shape)
     return tensor_image
 
 
@@ -137,15 +135,14 @@ if __name__ == '__main__':
         logger.info(f"Rank{runtime_rank} is generating HF reference...")
         if args.run_hf_test:
             hf_model = AutoModel.from_pretrained(
-                args.hf_model_dir, trust_remote_code=True).vision_model.cuda().to(torch.float32).eval()
+                args.hf_model_dir, trust_remote_code=True).cuda().to(torch.float32).eval()
             pixel_values = pixel_values.to(device=hf_model.device, dtype=torch.float32)
             with torch.no_grad():
-                hf_last_hidden_state = hf_model.forward(output_hidden_states=args.debug,
-                                              pixel_values=pixel_values)['last_hidden_state']
+                vit_embeds = hf_model.extract_feature(pixel_values=pixel_values)
             torch.cuda.synchronize()
 
     if tensorrt_llm.mpi_rank() == 0:
         logger.info(f"Rank{runtime_rank} is comparing with HF reference...")
-        logger.info(f"Huggingface output: {hf_last_hidden_state}")
+        logger.info(f"Huggingface output: {vit_embeds}")
         logger.info(f"TensorRT-LLM output: {res}")
         pass

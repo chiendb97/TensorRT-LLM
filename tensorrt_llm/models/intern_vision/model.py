@@ -88,6 +88,7 @@ class InternVisionEncoderLayer(Module):
                  max_position_embeddings,
                  norm_epsilon,
                  hidden_act,
+                 qkv_bias,
                  mapping: Mapping,
                  dtype=None):
         super().__init__()
@@ -102,6 +103,7 @@ class InternVisionEncoderLayer(Module):
             max_position_embeddings=max_position_embeddings,
             attention_head_size=self.hidden_size // num_attention_heads,
             num_kv_heads=num_attention_heads,
+            bias=qkv_bias,
             tp_group=self.mapping.tp_group,
             tp_size=self.mapping.tp_size,
             cp_group=self.mapping.cp_group,
@@ -128,9 +130,9 @@ class InternVisionEncoderLayer(Module):
         self.ls2 = Parameter(shape=[self.hidden_size])
 
     def forward(self, hidden_states):
-        hidden_states = hidden_states + identity(self.attn(self.norm1(hidden_states) * self.ls1.value))
+        hidden_states = hidden_states + self.attn(self.norm1(hidden_states)) * self.ls1.value
 
-        hidden_states = hidden_states + identity(self.mlp(self.norm2(hidden_states) * self.ls2.value))
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states)) * self.ls2.value
 
         return hidden_states
 
@@ -151,8 +153,6 @@ class InternVisionBase(PretrainedModel):
         Use as the abstractmethod, load corresponding HF model.
         Subclass must implement this method!
         """
-
-        assert cls.__name__ != "InternVisionBase", f"Never call from InternVisionBase class!"
 
         if cls.__name__ == "InternVisionModel":
             return load_hf_intern_vision_base(model_dir, load_model_on_cpu, dtype)
@@ -209,7 +209,6 @@ class InternVisionBase(PretrainedModel):
         # opt_shape is set to half of max batch_size and seq_len by default
         # tune this according to real data distribution
         bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
-        # bs_range = [4, 4, 4]
         pixel_values = Tensor(
             name='pixel_values',
             dtype=trt.float32,
@@ -258,13 +257,15 @@ class InternVisionModel(InternVisionBase):
                 max_position_embeddings=config.max_position_embeddings,
                 norm_epsilon=config.norm_epsilon,
                 hidden_act=config.hidden_act,
+                qkv_bias=config.qkv_bias,
                 mapping=config.mapping,
                 dtype=config.dtype) for _ in range(config.num_hidden_layers)
         ])
 
         self.mlp1 = MLP1(config.hidden_size, config.downsample_ratio, config.llm_hidden_size)
 
-    def pixel_shuffle(self, x: Tensor, scale_factor=0.5):
+    @staticmethod
+    def pixel_shuffle(x: Tensor, scale_factor=0.5):
         n, w, h, c = x.size()
         # N, W, H, C --> N, W, H * scale, C // scale
         x = x.view([n, w, int(h * scale_factor), int(c / scale_factor)])

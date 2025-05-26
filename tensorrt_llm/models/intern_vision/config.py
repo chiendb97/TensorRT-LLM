@@ -26,12 +26,14 @@ class InternVisionConfig(PretrainedConfig):
 
     def __init__(self,
                  *,
+                 qkv_bias,
                  num_channels,
                  patch_size,
                  image_size,
                  downsample_ratio,
                  llm_hidden_size,
                  **kwargs):
+        self.qkv_bias = qkv_bias
         self.num_channels = num_channels
         self.patch_size = patch_size
         self.image_size = image_size
@@ -42,6 +44,7 @@ class InternVisionConfig(PretrainedConfig):
 
     def to_dict(self):
         output = super().to_dict()
+        output['qkv_bias'] = self.qkv_bias
         output['num_channels'] = self.num_channels
         output['patch_size'] = self.patch_size
         output['image_size'] = self.image_size
@@ -97,6 +100,7 @@ class InternVisionConfig(PretrainedConfig):
             quantization=quant_config,
             mapping=mapping,
             #InternVision model args
+            qkv_bias = hf_config.vision_config.qkv_bias,
             num_channels=hf_config.vision_config.num_channels,
             patch_size=hf_config.vision_config.patch_size,
             image_size=hf_config.vision_config.image_size,

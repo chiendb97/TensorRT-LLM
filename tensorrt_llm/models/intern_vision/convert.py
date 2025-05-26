@@ -104,7 +104,7 @@ def _load_weights_from_hf_intern_vision_model(hf_model,
                 v = split(v=v_clone,
                           tp_size=mapping.tp_size,
                           idx=mapping.tp_rank,
-                          dim=0)
+                          dim=1)
             elif 'mlp.fc2.bias' in k:
                 key = f'{trtllm_prefix}layers.{idx}.mlp.proj.bias'
                 v_clone = v.clone()
@@ -118,7 +118,7 @@ def _load_weights_from_hf_intern_vision_model(hf_model,
                 v = split(v=v_clone,
                           tp_size=mapping.tp_size,
                           idx=mapping.tp_rank,
-                          dim=0)
+                          dim=1)
             elif 'attn.proj.bias' in k:
                 key = f'{trtllm_prefix}layers.{idx}.attn.dense.bias'
                 v_clone = v.clone()
@@ -143,6 +143,10 @@ def _load_weights_from_hf_intern_vision_model(hf_model,
             else:
                 no_match[k] = v
                 continue
+        else:
+            no_match[k] = v
+            continue
+
         weights[key] = v
 
     return (weights, no_match)
