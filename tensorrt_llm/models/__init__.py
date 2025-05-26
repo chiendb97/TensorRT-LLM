@@ -62,6 +62,7 @@ from .qwen.model import QWenForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
 from .redrafter.model import ReDrafterForCausalLM
 from .stdit.model import STDiT3Model
+from .intern_vision.model import InternVisionModel
 
 __all__ = [
     'BertModel',
@@ -133,6 +134,7 @@ __all__ = [
     'SpeculativeDecodingMode',
     'CohereForCausalLM',
     'MLLaMAForCausalLM',
+    'InternVisionModel'
 ]
 
 MODEL_MAP = {
@@ -216,4 +218,5 @@ MODEL_MAP = {
     'RobertaModel': RobertaModel,
     'RobertaForQuestionAnswering': RobertaForQuestionAnswering,
     'RobertaForSequenceClassification': RobertaForSequenceClassification,
+    'InternVisionModel': InternVisionModel,
 }

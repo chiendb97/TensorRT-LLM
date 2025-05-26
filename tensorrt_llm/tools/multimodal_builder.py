@@ -1267,8 +1267,7 @@ def build_internvl_engine(args):
 
 	model = AutoModelForCausalLM.from_pretrained(args.model_path,
 												 torch_dtype=torch.float16,
-												 trust_remote_code=True).to(
-		args.device)
+												 trust_remote_code=True).to(args.device)
 	# binhtranmcs: remove this since we will dynamically read max_num_crops in config
 	# and multiply with max_batch_size before hand
 	# max_num_crops = model.config.max_dynamic_patch
