@@ -45,7 +45,20 @@ def _load_weights_from_hf_intern_vision_model(hf_model,
     for k, v in hf_model.state_dict().items():
         key = None
         v = v.to(torch_dtype).cpu()
-        if 'vision_model.embeddings.class_embedding' in k:
+
+        if 'mlp1.0.weight' in k:
+            key = f'{trtllm_prefix}mlp1.norm.weight'
+        elif 'mlp1.0.bias' in k:
+            key = f'{trtllm_prefix}mlp1.norm.bias'
+        elif 'mlp1.1.weight' in k:
+            key = f'{trtllm_prefix}mlp1.fc1.weight'
+        elif 'mlp1.1.bias' in k:
+            key = f'{trtllm_prefix}mlp1.fc1.bias'
+        elif 'mlp1.3.weight' in k:
+            key = f'{trtllm_prefix}mlp1.fc2.weight'
+        elif 'mlp1.3.bias' in k:
+            key = f'{trtllm_prefix}mlp1.fc2.bias'
+        elif 'vision_model.embeddings.class_embedding' in k:
             key = f'{trtllm_prefix}embedding.class_embedding'
         elif 'vision_model.embeddings.position_embedding' in k:
             key = f'{trtllm_prefix}embedding.position_embedding'
@@ -100,28 +113,28 @@ def _load_weights_from_hf_intern_vision_model(hf_model,
                           idx=mapping.tp_rank,
                           dim=0)
             elif 'attn.proj.weight' in k:
-                key = f'{trtllm_prefix}layers.{idx}.attention.dense.weight'
+                key = f'{trtllm_prefix}layers.{idx}.attn.dense.weight'
                 v_clone = v.clone()
                 v = split(v=v_clone,
                           tp_size=mapping.tp_size,
                           idx=mapping.tp_rank,
                           dim=0)
             elif 'attn.proj.bias' in k:
-                key = f'{trtllm_prefix}layers.{idx}.attention.dense.bias'
+                key = f'{trtllm_prefix}layers.{idx}.attn.dense.bias'
                 v_clone = v.clone()
                 v = split(v=v_clone,
                           tp_size=mapping.tp_size,
                           idx=mapping.tp_rank,
                           dim=0)
             elif 'attn.qkv.weight' in k:
-                key = f'{trtllm_prefix}layers.{idx}.attention.qkv.weight'
+                key = f'{trtllm_prefix}layers.{idx}.attn.qkv.weight'
                 v_clone = v.clone()
                 v = split_qkv_tp(v_clone,
                                  model_config.num_attention_heads,
                                  model_config.hidden_size,
                                  mapping.tp_size, mapping.tp_rank)
             elif 'attn.qkv.bias' in k:
-                key = f'{trtllm_prefix}layers.{idx}.attention.qkv.bias'
+                key = f'{trtllm_prefix}layers.{idx}.attn.qkv.bias'
                 v_clone = v.clone()
                 v = split_qkv_bias_tp(v_clone,
                                       model_config.num_attention_heads,
@@ -191,7 +204,7 @@ def load_weights_from_hf_model(
 
     torch_dtype = getattr(torch, config.dtype)
 
-    no_match = None
+    no_match = {}
     if config.architecture in [
         "InternVLChatModel", "InternVisionModel"
     ]:
@@ -200,7 +213,7 @@ def load_weights_from_hf_model(
     else:
         assert False, f"Unknown Intern Vision model {config.architecture}"
 
-    if no_match is not None:
+    if no_match:
         logger.warning(
             f"These weights from huggingface model are not used:\n {[key for key in no_match.keys()]}"
         )
