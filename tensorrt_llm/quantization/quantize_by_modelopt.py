@@ -279,7 +279,6 @@ def get_hf_config(ckpt_path):
     else:
         return AutoConfig.from_pretrained(ckpt_path, trust_remote_code=True)
 
-
 def _get_llava_qwen_model(model_dir, dtype, device):
     if "hf" in model_dir:
         from transformers import LlavaOnevisionForConditionalGeneration
@@ -876,6 +875,10 @@ def quantize_and_export(*,
                     tensorrt_llm_config = json.load(f)
                 qwen_config = AutoConfig.from_pretrained(model_dir,
                                                          trust_remote_code=True)
+
+                if qwen_config.model_type == "internvl_chat":
+                    qwen_config = qwen_config.llm_config
+
                 try:
                     from transformers import LlavaOnevisionConfig
                     if isinstance(qwen_config, LlavaOnevisionConfig):
@@ -916,33 +919,6 @@ def quantize_and_export(*,
                 tensorrt_llm_config['rotary_pct'] = 0.5
                 with open(f"{export_path}/config.json", "w") as f:
                     json.dump(tensorrt_llm_config, f, indent=4)
-
-        # Workaround for qwen version
-        if model_type == 'qwen':
-            with open(f"{export_path}/config.json", "r") as f:
-                tensorrt_llm_config = json.load(f)
-            qwen_config = AutoConfig.from_pretrained(model_dir,
-                                                     trust_remote_code=True)
-            # this means the llm is qwen but the multimodal is internvl_chat
-            # need to get qwen config inside internvl config
-            if qwen_config.model_type == "internvl_chat":
-                qwen_config = qwen_config.llm_config
-
-            try:
-                from transformers import LlavaOnevisionConfig
-                if isinstance(qwen_config, LlavaOnevisionConfig):
-                    qwen_config = qwen_config.text_config
-            except:
-                pass
-
-            tensorrt_llm_config["qwen_type"] = qwen_config.model_type
-            if qwen_config.model_type == "qwen2":
-                tensorrt_llm_config["norm_epsilon"] = qwen_config.rms_norm_eps
-                tensorrt_llm_config["rotary_base"] = qwen_config.rope_theta
-            tensorrt_llm_config[
-                "intermediate_size"] = qwen_config.intermediate_size
-            with open(f"{export_path}/config.json", "w") as f:
-                json.dump(tensorrt_llm_config, f, indent=4)
 
             # context parallel
             if cp_size > 1:
