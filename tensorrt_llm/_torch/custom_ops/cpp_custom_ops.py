@@ -1,8 +1,10 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+
+from ..._utils import get_sm_version
 
 
 def _register_fake():
@@ -52,6 +54,18 @@ def _register_fake():
         else:
             return [torch.empty_like(input)]
 
+    #MNNVL Allreduce
+    @torch.library.register_fake("trtllm::mnnvl_twoshot_allreduce")
+    def _(input, buffer, buffer_flags, wait_for_results):
+        output = input.new_empty(input.shape)
+        return output
+
+    @torch.library.register_fake("trtllm::mnnvl_twoshot_rmsnorm")
+    def _(comm_buf, gamma, eps, residual, buffer_flags):
+        output = residual.new_empty(residual.shape)
+        residual_out = residual.new_empty(residual.shape)
+        return [output, residual_out]
+
     @torch.library.register_fake("trtllm::moe_allreduce")
     def _(residual, norm_weight, device_num_experts, scale_input,
           active_experts_token_input, token_input, workspace, rank, nranks,
@@ -61,8 +75,11 @@ def _register_fake():
         return [norm_out, residual_out]
 
     @torch.library.register_fake("trtllm::allgather")
-    def _(input, group):
-        output_shape = (len(group), *input.shape)
+    def _(input, sizes, group):
+        if sizes is None:
+            output_shape = (len(group) * input.shape[0], *input.shape[1:])
+        else:
+            output_shape = (sum(sizes), *input.shape[1:])
         return input.new_empty(output_shape)
 
     @torch.library.register_fake("trtllm::cublas_scaled_mm")
@@ -103,71 +120,6 @@ def _register_fake():
         ret = mat1.new_empty(shape, dtype=out_dtype)
         return ret
 
-    @torch.library.register_fake("trtllm::attention")
-    def _(
-        q,
-        k,
-        v,
-        out_dtype,
-        workspace,
-        sequence_length,
-        host_past_key_value_lengths,
-        context_lengths,
-        host_context_lengths,
-        host_request_types,
-        kv_cache_block_offsets,
-        host_kv_cache_block_offsets,
-        host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping,
-        cache_indirection,
-        kv_scale_orig_quant,
-        kv_scale_quant_orig,
-        out_scale,
-        rotary_inv_freq,
-        rotary_cos_sin,
-        latent_cache,
-        q_pe,
-        block_ids_per_seq,
-        is_fused_qkv,
-        update_kv_cache,
-        predicted_tokens_per_seq,
-        layer_idx,
-        num_heads,
-        num_kv_heads,
-        head_size,
-        tokens_per_block,
-        max_num_requests,
-        max_context_length,
-        attention_window_size,
-        sink_token_length,
-        beam_width,
-        mask_type,
-        quant_mode,
-        q_scaling,
-        position_embedding_type,
-        rotary_embedding_dim,
-        rotary_embedding_base,
-        rotary_embedding_scale_type,
-        rotary_embedding_scale,
-        rotary_embedding_short_m_scale,
-        rotary_embedding_long_m_scale,
-        rotary_embedding_max_positions,
-        rotary_embedding_original_max_positions,
-        use_paged_context_fmha,
-        attention_input_type,
-        is_mla_enable,
-        q_lora_rank,
-        kv_lora_rank,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        v_head_dim,
-        mrope_rotary_cos_sin,
-        mrope_position_deltas,
-    ):
-        output_shape = (q.shape[0], num_heads *
-                        v_head_dim if is_mla_enable else num_heads * head_size)
-        return q.new_empty(output_shape, dtype=out_dtype or q.dtype)
-
     @torch.library.register_fake("trtllm::noaux_tc_op")
     def _(scores, scores_with_bias, n_group, topk_group, topk,
           routed_scaling_factor):
@@ -185,49 +137,12 @@ def _register_fake():
     def _(a, b, a_scale, b_scale):
         m = a.shape[0]
         n = b.shape[0]
-        return a.new_empty((m, n))
+        return a.new_empty((m, n), dtype=torch.bfloat16)
 
     @torch.library.register_fake(
         "tensorrt_llm::static_quantize_e4m3_per_tensor")
     def _(input: torch.Tensor, scale: torch.Tensor):
         return torch.empty_like(input).to(torch.float8_e4m3fn), scale
-
-    @torch.library.register_fake("trtllm::deepseek_allreduce_fusion")
-    def _(
-        input,
-        workspace,
-        reduce_fusion_inputs,
-        rank,
-        nranks,
-        eps,
-        fusion_op,
-    ):
-        from tensorrt_llm.functional import AllReduceFusionOp
-        residual = reduce_fusion_inputs[0]
-        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4 or fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
-            sf_vec_size = 16
-            quant_shape, scale_shape = fp4_utils.get_fp4_shape(
-                input.shape, sf_vec_size)
-            if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
-                return [
-                    input.new_empty(quant_shape, dtype=torch.uint8),
-                    input.new_empty(scale_shape, dtype=torch.uint8),
-                    torch.empty_like(residual)
-                ]
-            else:
-                return [
-                    torch.empty_like(input),
-                    input.new_empty(quant_shape, dtype=torch.uint8),
-                    input.new_empty(scale_shape, dtype=torch.uint8),
-                    torch.empty_like(residual)
-                ]
-
-        elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-            return [torch.empty_like(input), torch.empty_like(residual)]
-        elif fusion_op == AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM:
-            return [torch.empty_like(residual), torch.empty_like(residual)]
-        else:
-            raise ValueError(f"Unsupported fusion op: {fusion_op}")
 
     @torch.library.register_fake("trtllm::logits_bitmask")
     def _(logits: List[torch.Tensor], bitmask: List[torch.Tensor]):
@@ -320,9 +235,30 @@ def _register_fake():
     def _(max_sm_count: int):
         pass
 
-    @torch.library.custom_op("trtllm::group_rms_norm",
+    @torch.library.register_fake("trtllm::moe_load_balance_wait_gpu_stage")
+    def _(single_layer_load_balancer_ptr: int):
+        return torch.empty((1, ),
+                           dtype=torch.int32,
+                           device=torch.device("cuda"))
+
+    @torch.library.register_fake("trtllm::moe_load_balance_set_cpu_stage")
+    def _(single_layer_load_balancer_ptr: int):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_load_balance_statistic")
+    def _(single_layer_load_balancer_ptr: int,
+          gathered_raw_expert_ids: torch.Tensor, enabled: torch.Tensor,
+          is_first_stage: bool, is_last_stage: bool):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_load_balance_routing")
+    def _(single_layer_load_balancer_ptr: int,
+          token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
+        return torch.empty_like(token_selected_experts)
+
+    @torch.library.custom_op("trtllm::group_rms_norm_base",
                              mutates_args=("outputs", ))
-    def group_rms_norm(
+    def group_rms_norm_base(
         inputs: List[torch.Tensor],
         outputs: List[torch.Tensor],
         weights: List[torch.Tensor],
@@ -331,7 +267,7 @@ def _register_fake():
     ) -> None:
         pass
 
-    @group_rms_norm.register_fake
+    @group_rms_norm_base.register_fake
     def _(
         inputs: List[torch.Tensor],
         outputs: List[torch.Tensor],
@@ -361,3 +297,73 @@ def _register_fake():
         weight_bias: float,
     ) -> List[torch.Tensor]:
         return outputs
+
+    # Use groupRMSNormHeuristic which automatically selects between regular and large batch kernels
+    @torch.library.custom_op("trtllm::group_rms_norm_heuristic",
+                             mutates_args=("outputs", ))
+    def group_rms_norm_heuristic(
+        inputs: List[torch.Tensor],
+        outputs: List[torch.Tensor],
+        weights: List[torch.Tensor],
+        eps: float,
+        weight_bias: float,
+    ) -> None:
+        pass
+
+    @group_rms_norm_heuristic.register_fake
+    def _(
+        inputs: List[torch.Tensor],
+        outputs: List[torch.Tensor],
+        weights: List[torch.Tensor],
+        eps: float,
+        weight_bias: float,
+    ) -> List[torch.Tensor]:
+        return outputs
+
+    @torch.library.register_fake(
+        "trtllm::mtp_sampling_and_accepted_draft_tokens_op")
+    def _(logits: torch.Tensor, draft_tokens: torch.Tensor,
+          target_tokens: torch.Tensor, num_mtp_modules: int, batch_size: int,
+          num_context_request: int, vocab_size: int):
+        return logits.new_empty((batch_size, num_mtp_modules + 1),
+                                dtype=torch.int32), logits.new_empty(
+                                    (batch_size, ), dtype=torch.int32)
+
+    @torch.library.register_fake("trtllm::fp8_quantize_1x128")
+    def _(input: torch.Tensor):
+        pad_m = fp4_utils.pad_up(input.shape[0], 4)
+        blocked_n = (input.shape[1] + 127) // 128
+        if get_sm_version() >= 100:
+            sz = (blocked_n, input.shape[0])
+        else:
+            sz = (fp4_utils.pad_up(pad_m * blocked_n * 4, 128) // 4, )
+        return torch.empty_like(input,
+                                dtype=torch.float8_e4m3fn), input.new_empty(
+                                    sz, dtype=torch.float)
+
+    @torch.library.register_fake("trtllm::causal_conv1d_fwd")
+    def _(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias_: Optional[torch.Tensor],
+        conv_states: Optional[torch.Tensor],
+        query_start_loc: Optional[torch.Tensor],
+        cache_indices: Optional[torch.Tensor],
+        has_initial_state: Optional[torch.Tensor],
+        silu_activation: bool,
+        pad_slot_id: int,
+    ) -> None:
+        pass
+
+    @torch.library.register_fake("trtllm::causal_conv1d_update")
+    def _(
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias_: Optional[torch.Tensor],
+        silu_activation: bool,
+        cache_seqlens_: Optional[torch.Tensor],
+        conv_state_indices_: Optional[torch.Tensor],
+        pad_slot_id: int,
+    ) -> None:
+        pass

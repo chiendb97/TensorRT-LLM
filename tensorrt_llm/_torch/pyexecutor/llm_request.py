@@ -4,6 +4,7 @@ import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings import executor as tllm_executor
+from tensorrt_llm.executor.result import TokenLogprobs
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
 '''
@@ -91,27 +92,25 @@ class LogitsStorage:
                              position] if self._storage is not None else None
 
 
-LogProbs = list[list[float]]
-
-
 class LogProbStorage:
     beam_width: int = -1
-    log_probs: list[list[float]]
+    log_probs: list[TokenLogprobs]
     cum_log_probs: list[float]
 
-    def _init(self, first_input: LogProbs):
+    def _init(self, first_input: list[TokenLogprobs]):
         self.beam_width = len(first_input)
         self.log_probs = [[] for _ in range(self.beam_width)]
         self.cum_log_probs = [0 for _ in range(self.beam_width)]
 
-    def append(self, new_probs: LogProbs):
+    def append(self, new_probs: list[TokenLogprobs]):
         if self.beam_width == -1:
             self._init(new_probs)
 
         assert len(new_probs) == self.beam_width, "Beam width mismatch"
         for idx, probs in enumerate(new_probs):
             self.log_probs[idx].extend(probs)
-            self.cum_log_probs[idx] += sum(probs)
+            self.cum_log_probs[idx] += sum(
+                next(iter(prob.values())).logprob for prob in probs)
 
 
 class PyResult:
@@ -141,7 +140,7 @@ class PyResult:
         if self._generation_logits:
             self._generation_logits.append(generation_logits)
 
-    def append_log_probs(self, log_probs: LogProbs):
+    def append_log_probs(self, log_probs: list[TokenLogprobs]):
         if self._log_probs:
             self._log_probs.append(log_probs)
 
@@ -158,7 +157,7 @@ class PyResult:
             not self._streaming).transpose(0, 1)
 
     @property
-    def log_probs(self) -> list[list[float]] | None:
+    def log_probs(self) -> list[TokenLogprobs] | None:
         return self._log_probs and self._log_probs.log_probs
 
     @property
@@ -240,9 +239,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_max_new_tokens = self.max_new_tokens
         self.py_batch_idx = None
         self.py_rewind_len = 0
-        self.py_draft_tokens = self.draft_tokens
+        self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
         self.py_last_draft_tokens = None
         self.py_decoding_iter = 0
+        self.is_attention_dp_dummy = False
+        self.is_cuda_graph_dummy = False
         self.py_lora_task_layer_module_configs = None
 
         self.py_return_log_probs = return_log_probs
@@ -266,6 +267,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         response = super().create_response(use_fast_logits, mpi_world_rank)
         return LlmResponse(response,
                            self.py_result) if response is not None else None
+
+    @property
+    def is_dummy(self):
+        return self.is_attention_dp_dummy or self.is_cuda_graph_dummy
 
 
 def convert_wordlist(word_list) -> List[List[int]]:
