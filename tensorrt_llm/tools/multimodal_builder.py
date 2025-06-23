@@ -1574,14 +1574,14 @@ def build_qwen2_audio_engine(args):
 				output_names=["output"],
 				dynamic_axes=dynamic_axes)
 
-    build_trt_engine(args.model_type, [],
-                     f'{args.output_dir}/onnx',
-                     args.output_dir,
-                     args.max_batch_size,
-                     model_params={
-                         'num_mul_bins': args.num_mul_bins,
-                         'max_mel_seq_len': args.max_mel_seq_len
-                     })
+	build_trt_engine(args.model_type, [],
+					 f'{args.output_dir}/onnx',
+					 args.output_dir,
+					 args.max_batch_size,
+					 model_params={
+						 'num_mul_bins': args.num_mul_bins,
+						 'max_mel_seq_len': args.max_mel_seq_len
+					 })
 
 
 def build_pixtral_engine(args):
