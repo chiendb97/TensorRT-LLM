@@ -51,11 +51,13 @@ set(SRCS
     trtEncoderModel.cpp
     trtGptModelInflightBatching.cpp
     trtGptModelV1.cpp
+    updateDecoderBuffers.cpp
     utils/debugUtils.cpp
     utils/inflightBatchingUtils.cpp
     utils/logitsThread.cpp
     utils/staticThreadPool.cpp
-    evictionPolicy.cpp)
+    evictionPolicy.cpp
+    cacheTransBuffer.cpp)
 
 file(GLOB_RECURSE XGRAMMAR_SRCS "${3RDPARTY_DIR}/xgrammar/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
@@ -94,3 +96,12 @@ set_property(TARGET ${BATCH_MANAGER_STATIC_TARGET}
 set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
+
+if(ENABLE_UCX)
+  find_package(ucx REQUIRED)
+  find_package(ucxx REQUIRED)
+  target_include_directories(
+    ${BATCH_MANAGER_STATIC_TARGET}
+    PRIVATE $<TARGET_PROPERTY:ucxx::ucxx,INTERFACE_INCLUDE_DIRECTORIES>)
+  target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC)
+endif()

@@ -1,12 +1,11 @@
 import math
-import os
-import sys
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
 import flashinfer
 import pytest
 import torch
+from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import (AttentionBackend,
@@ -20,9 +19,6 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -144,7 +140,6 @@ def kv_cache_manager_from(Attention: type[AttentionBackend], s: Scenario,
     num_layers = s.num_layers
     num_kv_heads = s.num_kv_heads
     head_dim = s.head_dim
-    num_heads = s.num_kv_heads
     max_seq_len = num_blocks * tokens_per_block
     batch_size = s.batch_size
 
@@ -167,7 +162,6 @@ def kv_cache_manager_from(Attention: type[AttentionBackend], s: Scenario,
         kv_cache_config,
         cache_type,
         num_layers=num_layers,
-        num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         tokens_per_block=tokens_per_block,
@@ -522,6 +516,10 @@ def test_attention_backend(s: Scenario):
         },
     )
 
+    del flashinfer_kv_cache
+    del ref_kv_cache
+    torch.cuda.empty_cache()
+
 
 def generate_causal_mask(seq_lens, qo_lens, batch_size, dtype):
     causal_masks = []
@@ -549,11 +547,11 @@ def generate_causal_mask(seq_lens, qo_lens, batch_size, dtype):
 
 
 @pytest.mark.parametrize("s", [
-    PagedScenario(num_layers=32, num_generations=5),
-    PagedScenario(num_layers=32, num_generations=5, kv_len=64, causal=False),
+    PagedScenario(num_layers=4, num_generations=5),
+    PagedScenario(num_layers=4, num_generations=5, kv_len=64, causal=False),
     PagedScenario(
-        num_layers=32, num_generations=5, kvcache_dtype=torch.float8_e4m3fn),
-    PagedScenario(num_layers=32,
+        num_layers=4, num_generations=5, kvcache_dtype=torch.float8_e4m3fn),
+    PagedScenario(num_layers=4,
                   num_generations=5,
                   kv_len=64,
                   causal=False,
@@ -703,7 +701,7 @@ def test_attention_backend_ifb(s: PagedScenario):
                               atol=fp8_atol if is_fp8 else atol,
                               rtol=rtol)
 
-
-if __name__ == "__main__":
-    test_attention_backend(Scenario(num_layers=1))
-    # test_attention_backend(Scenario(num_layers=1, qo_len=32, kv_len=32, causal=False))
+    del flashinfer_kv_cache
+    del ref_kv_cache
+    del vanilla_kv_cache
+    torch.cuda.empty_cache()

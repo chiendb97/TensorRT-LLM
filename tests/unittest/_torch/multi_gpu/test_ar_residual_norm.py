@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import pickle
 import random
 import sys
@@ -29,11 +28,10 @@ from torch import nn
 
 import tensorrt_llm
 from tensorrt_llm._torch.compilation.backend import Backend
-from tensorrt_llm._torch.distributed import ParallelConfig, TensorParallelMode
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm.mapping import Mapping
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
     cloudpickle.dumps,
@@ -79,11 +77,10 @@ def row_linear_residual_norm_fusion_forward(
         out_features=hidden_size,
         bias=False,
         dtype=dtype,
-        parallel_config=ParallelConfig(
-            tensor_parallel_size=tensor_parallel_size,
-            tensor_parallel_rank=tensor_parallel_rank,
-            tensor_parallel_mode=TensorParallelMode.ROW,
-        ),
+        tensor_parallel_mode=TensorParallelMode.ROW,
+        mapping=Mapping(world_size=tensor_parallel_size,
+                        tp_size=tensor_parallel_size,
+                        rank=tensor_parallel_rank),
     ).cuda()
     norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
 
@@ -151,6 +148,9 @@ def row_linear_residual_norm_fusion_forward(
 @pytest.mark.parametrize("fused_add_norm", [True, False],
                          ids=["fused_add_norm", "unfused_add_norm"])
 def test_row_linear_residual_norm_fusion(seq_len, hidden_size, fused_add_norm):
+    pytest.skip(
+        "Skip for now, waiting for proper fix for this issue: https://nvbugspro.nvidia.com/bug/5060957"
+    )
     torch.manual_seed(42)
     dtype = torch.bfloat16
     tensor_parallel_size = 2

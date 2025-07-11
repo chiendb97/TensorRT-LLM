@@ -17,11 +17,11 @@
 
 #include "trtGptModelV1.h"
 
-#include "promptTuningBuffers.h"
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
+#include "tensorrt_llm/batch_manager/promptTuningBuffers.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/stlUtils.h"
@@ -103,13 +103,12 @@ SamplingConfig initBatchSamplingConfig(SamplingConfig const& baseSamplingConfig)
     initOptional(batchSamplingConfig.topPDecay, baseSamplingConfig.topPDecay);
     initOptional(batchSamplingConfig.topPMin, baseSamplingConfig.topPMin);
     initOptional(batchSamplingConfig.topPResetIds, baseSamplingConfig.topPResetIds);
-
     // beam search layer
     batchSamplingConfig.beamSearchDiversityRate = baseSamplingConfig.beamSearchDiversityRate;
     batchSamplingConfig.lengthPenalty = baseSamplingConfig.lengthPenalty;
     batchSamplingConfig.earlyStopping = baseSamplingConfig.earlyStopping;
-
     batchSamplingConfig.normalizeLogProbs = baseSamplingConfig.normalizeLogProbs;
+    batchSamplingConfig.beamWidthArray = baseSamplingConfig.beamWidthArray;
 
     return batchSamplingConfig;
 }
@@ -120,6 +119,7 @@ void addToSamplingConfig(SamplingConfig& batchSamplingConfig, SamplingConfig con
     TLLM_CHECK(batchSamplingConfig.beamSearchDiversityRate == addSamplingConfig.beamSearchDiversityRate);
     TLLM_CHECK(batchSamplingConfig.lengthPenalty == addSamplingConfig.lengthPenalty);
     TLLM_CHECK(batchSamplingConfig.earlyStopping == addSamplingConfig.earlyStopping);
+    TLLM_CHECK(batchSamplingConfig.beamWidthArray == addSamplingConfig.beamWidthArray);
 
     auto addOptional = [](auto& batch, auto const& add, char const* name)
     {

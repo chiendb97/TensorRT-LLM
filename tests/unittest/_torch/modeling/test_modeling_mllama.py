@@ -1,10 +1,9 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 
 import torch
 from parameterized import parameterized
+from test_modeling_llama import Scenario, reduce_llama_config
 from transformers import MllamaConfig
 from transformers import \
     MllamaForConditionalGeneration as HFMllamaForConditionalGeneration
@@ -20,11 +19,6 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-
-sys.path.append(os.path.dirname(__file__))
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-
-from test_modeling_llama import Scenario, reduce_llama_config
 
 LLAMA_3_2_11B_VISION_CONFIG = {
     'architectures': ['MllamaForConditionalGeneration'],
@@ -314,7 +308,6 @@ class TestMLlama(unittest.TestCase):
         tokens_per_block = 128
         head_dim = mllama.config.hidden_size // mllama.config.num_attention_heads
         num_layers = mllama.config.num_hidden_layers
-        num_heads = mllama.config.num_attention_heads
         num_kv_heads = mllama.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = 1
@@ -333,7 +326,6 @@ class TestMLlama(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,

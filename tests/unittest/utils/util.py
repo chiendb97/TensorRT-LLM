@@ -78,6 +78,8 @@ skip_pre_blackwell = pytest.mark.skipif(
 skip_blackwell = pytest.mark.skipif(
     getSMVersion() == 100,
     reason="This test is not supported in Blackwell architecture")
+skip_blackwell_geforce = pytest.mark.skipif(
+    getSMVersion() == 120, reason="This test is not supported on SM 120")
 
 # If used together with @parameterized, we have to use unittest.skipIf instead of pytest.mark.skipif
 skip_pre_ada_unittest = unittest.skipIf(
@@ -145,6 +147,21 @@ def skip_num_gpus_less_than(num_gpus: int):
 
 
 skip_single_gpu = skip_num_gpus_less_than(2)
+
+
+def compose_decorator(*decorators):
+
+    def composed_decorator(f):
+        for dec in reversed(decorators):
+            f = dec(f)
+        return f
+
+    return composed_decorator
+
+
+pytest.mark.gpu2 = compose_decorator(skip_single_gpu, pytest.mark.gpu2)
+pytest.mark.gpu4 = compose_decorator(skip_num_gpus_less_than(4),
+                                     pytest.mark.gpu4)
 
 
 def skip_gpu_memory_less_than(required_memory: int):
