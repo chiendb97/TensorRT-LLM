@@ -170,7 +170,6 @@ def export_onnx(model,
 
 
 def build_trt_engine(model_type,
-
                      input_sizes,
                      onnx_dir,
                      engine_dir,
@@ -426,7 +425,7 @@ def build_interlm_xcomposer2_engine(args):
         [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
         f'{args.output_dir}/onnx',
         args.output_dir,
-        args.max_batch_size)
+		args.max_batch_size)
 
 
 def build_pix2struct_engine(args):
@@ -1228,7 +1227,7 @@ def build_mllama_engine(args):
 
 
 def build_internvl_engine(args):
-	image = torch.rand([1, 3, 448, 448]).to(args.device, torch.float16)
+	image = torch.rand([1, 3, 448, 448]).to(args.device, torch.bfloat16)
 
 	class InternvlVisionWrapper(torch.nn.Module):
 
@@ -1266,7 +1265,7 @@ def build_internvl_engine(args):
 			return vit_embeds_mlp
 
 	model = AutoModelForCausalLM.from_pretrained(args.model_path,
-												 torch_dtype=torch.float16,
+												 torch_dtype=torch.bfloat16,
 												 trust_remote_code=True).to(args.device)
 	# binhtranmcs: remove this since we will dynamically read max_num_crops in config
 	# and multiply with max_batch_size before hand
@@ -1279,7 +1278,8 @@ def build_internvl_engine(args):
 	build_trt_engine(args.model_type,
 					 [image.shape[1], image.shape[2], image.shape[3]],
 					 f'{args.output_dir}/onnx', args.output_dir,
-					 args.max_batch_size * max_num_crops)
+					 args.max_batch_size * max_num_crops,
+					 dtype=torch.bfloat16)
 
 
 def compute_rotary_pos_emb(grid_thw, hf_config, VisionRotaryEmbedding):
