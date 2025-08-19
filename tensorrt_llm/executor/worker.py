@@ -119,7 +119,6 @@ class GenerationExecutorWorker(GenerationExecutor):
             args = {
                 "executor_config": executor_config,
                 "checkpoint_dir": executor_config.hf_model_dir,
-                "engine_dir": executor_config.trt_engine_dir,
             }
             if executor_config.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
@@ -135,7 +134,6 @@ class GenerationExecutorWorker(GenerationExecutor):
             else:
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
-
             return create_executor(**args)
 
         self.engine = _create_engine()
@@ -152,13 +150,23 @@ class GenerationExecutorWorker(GenerationExecutor):
             self._runtime_model_config = _engine_config_to_model_config(
                 engine_config)
             if engine_config.build_config.plugin_config.lora_plugin:
-                self._lora_manager = LoraManager()
+                # TODO(azuker): Passing peft cache manager to LoraManager is used for LoRA optimization
+                # (see LoraManager constructor docstring). Getting the peft cache manager from this
+                # point in the TRT flow is currently not supported (it's at the CPP
+                # Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager) therefore for now this LoRA
+                # optimization is not available in TRT-python flow.
+                self._lora_manager = LoraManager(cpp_peft_cache_manager=None)
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
 
         if getattr(executor_config, "backend",
                    "") == "pytorch" and lora_config is not None:
-            self._lora_manager = LoraManager()
+            from tensorrt_llm._torch.pyexecutor.resource_manager import \
+                ResourceManagerType
+            peft_cache_manager = self.engine.resource_manager.resource_managers.get(
+                ResourceManagerType.PEFT_CACHE_MANAGER)
+            self._lora_manager = LoraManager(
+                cpp_peft_cache_manager=peft_cache_manager.impl)
             lora_model_config = self.engine.model_engine.lora_model_config
             assert lora_model_config is not None
             self._lora_model_config = lora_model_config
@@ -252,7 +260,7 @@ class GenerationExecutorWorker(GenerationExecutor):
     def _iteration_result_task(self, it_result_queue: IterationResultQueue,
                                engine_get_result_api: Callable,
                                result_singleton: IterationResult,
-                               result_serializer: Callable):
+                               result_serializer: Callable) -> bool:
         time.sleep(0.2)
         async_queues = []
         queue = result_singleton.queue if self._is_llm_executor and result_singleton else it_result_queue.queue
@@ -343,13 +351,17 @@ class GenerationExecutorWorker(GenerationExecutor):
         if mpi_rank() == 0:
             self.start_thread(self.dispatch_stats_thread)
 
-    def _load_lora_adapter(self, lora_request: LoRARequest):
-        self._lora_manager.load_from_ckpt(
+    def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
+        """Returns True if the adapter was loaded by this call, False if it was already loaded"""
+        adapter_id = str(lora_request.adapter_id)
+        newly_loaded_uids = self._lora_manager.load_from_ckpt(
             [lora_request.path],
             model_config=self._runtime_model_config if
             self._runtime_model_config is not None else self._lora_model_config,
             runtime_mapping=None,
-            uids=[str(lora_request.adapter_id)])
+            uids=[adapter_id],
+            ckpt_source=lora_request.ckpt_source)
+        return adapter_id in newly_loaded_uids
 
     def _load_prompt_adapter(self,
                              prompt_adapter_request: PromptAdapterRequest):
@@ -360,23 +372,23 @@ class GenerationExecutorWorker(GenerationExecutor):
 
     def _enqueue_request(self, request: GenerationRequest) -> int:
         assert request.id is not None
+        py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
+            adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
+                request.lora_request.adapter_id)
             self._load_lora_adapter(request.lora_request)
             uid = str(request.lora_request.adapter_id)
             lora_config = tllm.LoraConfig(
                 task_id=request.lora_request.adapter_id,
-                weights=self._lora_manager.cpp_lora_weights[uid],
+                weights=self._lora_manager.cpp_lora_weights[uid]
+                if not adapter_in_cache else None,
                 config=self._lora_manager.cpp_lora_config[uid])
+            py_lora_path = request.lora_request.lora_path
         else:
             lora_config = None
 
         prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
         prompt_tuning_config = None
-        multimodal_embedding = None
-        mrope_config = None
-        multimodal_input = None
-        if request.multimodal_embedding is not None:
-            multimodal_embedding = request.multimodal_embedding
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
             uid = str(request.prompt_adapter_request.adapter_id)
@@ -387,19 +399,30 @@ class GenerationExecutorWorker(GenerationExecutor):
             prompt_token_ids = list(range(
                 vocab_size, vocab_size + pa_length)) + prompt_token_ids
 
-        if request.mrope_config is not None:
-            mrope_config = tllm.MropeConfig(**request.mrope_config)
-
-        if request.multimodal_input is not None:
-            multimodal_input = tllm.MultimodalInput(
-                multimodal_hashes=request.multimodal_input.multimodal_hashes,
-                multimodal_positions=request.multimodal_input.
-                multimodal_positions,
-                multimodal_lengths=request.multimodal_input.multimodal_lengths)
+        # MULTIMODAL
+        # NOTE: Since, we only support PyTorch backend for multimodal, we will send multimodal_data through the 'py_multimodal_data' field
+        # except `multimodal_input` as it needs to go through the C++ runtime.
+        multimodal_input = None
+        if request.multimodal_params is not None and request.multimodal_params.has_content(
+        ):
+            if request.multimodal_params.multimodal_input is not None:
+                multimodal_input = tllm.MultimodalInput(
+                    multimodal_hashes=request.multimodal_params.
+                    multimodal_input.multimodal_hashes,
+                    multimodal_positions=request.multimodal_params.
+                    multimodal_input.multimodal_positions,
+                    multimodal_lengths=request.multimodal_params.
+                    multimodal_input.multimodal_lengths)
+            # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
+            request.multimodal_params.multimodal_input = None
 
         context_phase_params = None
         request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
         if request.disaggregated_params is not None:
+            assert (
+                not self._is_pytorch_backend
+                or self.engine.kv_cache_transceiver is not None
+            ), "kv_cache_transceiver is disabled, please set 'cache_transceiver_config: backend:<backend_type>` in config file for disaggregated serving"
             request_type = request.disaggregated_params.get_request_type()
             if request_type == tllm.RequestType.REQUEST_TYPE_GENERATION_ONLY:
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
@@ -463,8 +486,9 @@ class GenerationExecutorWorker(GenerationExecutor):
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
-                multimodal_embedding=multimodal_embedding,
-                mrope_config=mrope_config,
+                #NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
+                multimodal_embedding=None,
+                mrope_config=None,
                 logits_post_processor_name=(
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME
                     if request.sampling_params.apply_batched_logits_processor
@@ -474,6 +498,22 @@ class GenerationExecutorWorker(GenerationExecutor):
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
+            executor_request.py_lora_path = py_lora_path
+
+            if self._is_pytorch_backend and request.multimodal_params is not None:
+                if request.multimodal_params.multimodal_data is not None:
+                    # Convert back to tensor, as opposite to `to_handle` in `llm.generate_async`
+                    # for values with non-selected keys, it's no-op
+                    request.multimodal_params.to_tensor(
+                        "multimodal_data", key="multimodal_embedding")
+                    embedding = request.multimodal_params.multimodal_data.get(
+                        "multimodal_embedding")
+                    if embedding is not None and embedding.is_cuda:
+                        # make sure the embedding resides on the local device
+                        request.multimodal_params.multimodal_data[
+                            "multimodal_embedding"] = embedding.to("cuda")
+
+                    executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
                 # For PyTorch backend, we attach logits processors as a dynamic Python attribute
@@ -481,6 +521,10 @@ class GenerationExecutorWorker(GenerationExecutor):
                 lp = request.sampling_params.logits_processor
                 executor_request.py_logits_post_processors = lp if isinstance(
                     lp, list) else [lp]
+
+            executor_request.py_scheduling_params = None
+            if self._is_pytorch_backend and request.scheduling_params is not None:
+                executor_request.py_scheduling_params = request.scheduling_params
 
             if request.query_token_ids is not None:
                 # pytorch star attention workflow
@@ -555,6 +599,12 @@ class GenerationExecutorWorker(GenerationExecutor):
 
             self.engine.shutdown()
             self.engine = None
+
+            if hasattr(
+                    self._executor_config, "checkpoint_loader"
+            ) and self._executor_config.checkpoint_loader is not None:
+                self._executor_config.checkpoint_loader.cleanup()
+                self._executor_config.checkpoint_loader = None
 
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()

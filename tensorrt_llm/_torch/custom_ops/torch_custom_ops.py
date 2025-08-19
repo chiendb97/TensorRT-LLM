@@ -4,11 +4,11 @@ from typing import List, Optional, Tuple
 import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._utils import get_sm_version
 
-from ..attention_backend.interface import AttentionInputType
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
-from ..utils import (compute_swizzled_sf_shape, fp4_scale_infer_shape,
+from ..utils import (fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
 
@@ -22,12 +22,9 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
-    # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
     tuning_config = TuningConfig(dynamic_tensor_specs=(
         DynamicTensorSpec(0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-                          lambda x: min(last_positive_power_of_2(x), 8192)),
-        DynamicTensorSpec(3, 0, (0, ), lambda x: x),
-    ))
+                          lambda x: min(last_positive_power_of_2(x), 8192)), ))
 
     def __init__(
         self,
@@ -41,9 +38,10 @@ class MoERunner(TunableRunner):
         ep_rank: int,
         cluster_size: int,
         cluster_rank: int,
-        enable_alltoall: bool,
         use_deepseek_fp8_block_scale: bool,
-        use_w4a8_group_scaling: bool,
+        use_w4_group_scaling: bool,
+        use_mxfp8_act_scaling: bool,
+        min_latency_mode: bool,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -55,18 +53,22 @@ class MoERunner(TunableRunner):
         self.ep_rank = ep_rank
         self.cluster_size = cluster_size
         self.cluster_rank = cluster_rank
-        self.enable_alltoall = enable_alltoall
+        # The best tactic is estimated as if alltoall is disabled
+        self.enable_alltoall = False
         self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
-        self.use_w4a8_group_scaling = use_w4a8_group_scaling
-
+        self.use_w4_group_scaling = use_w4_group_scaling
+        self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
+        self.min_latency_mode = min_latency_mode
         instance_key = (x_dtype, weight_dtype, output_dtype,
-                        use_deepseek_fp8_block_scale, use_w4a8_group_scaling)
+                        use_deepseek_fp8_block_scale, use_w4_group_scaling,
+                        use_mxfp8_act_scaling)
 
         if instance_key not in MoERunner.runner_dict:
             MoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FusedMoeRunner(
                     x_dtype, weight_dtype, output_dtype,
-                    use_deepseek_fp8_block_scale, use_w4a8_group_scaling)
+                    use_deepseek_fp8_block_scale, use_w4_group_scaling,
+                    use_mxfp8_act_scaling)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
     def get_valid_tactics(
@@ -74,22 +76,7 @@ class MoERunner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        x, _, _, min_latency_mode_tensor = inputs
-        min_latency_mode = min_latency_mode_tensor.size(0) == 1
-        m = x.shape[0]
-
-        # Only profile m <= 128 for min latency mode = True
-        # Profile all valid buckets for min latency mode = False
-        # TODO: min_latency_mode = True will cause the following error:
-        # Cannot profile configuration 4: Cutlass GEMM Tactic
-        # [TensorRT-LLM][ERROR] Assertion failed: Failed to initialize cutlass TMA WS grouped gemm.
-        # Should be fixed in the moe_kernels in the future.
-        invalid = (m > 128 and
-                   min_latency_mode) or (m <= 128 and min_latency_mode and
-                                         (not self.weight_dtype == torch.int64))
-
-        return [] if invalid else list(
-            range(self.fused_moe_runner.get_tactic_num()))
+        return range(self.fused_moe_runner.get_tactic_num())
 
     def forward(
         self,
@@ -98,13 +85,13 @@ class MoERunner(TunableRunner):
         tactic: int = -1,
         do_preparation: bool = False,
     ):
-        x, fc1_expert_weights, fc2_expert_weights, min_latency_mode_tensor = inputs
-        min_latency_mode = min_latency_mode_tensor.size(0) == 1
-        # determine if we should use min latency mode according to the profiled seq len
+        x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
         self.fused_moe_runner.run_gemm_profile(
             x,
             fc1_expert_weights,
+            fc1_expert_biases,
             fc2_expert_weights,
+            fc2_expert_biases,
             self.top_k,
             self.tp_size,
             self.tp_rank,
@@ -113,7 +100,7 @@ class MoERunner(TunableRunner):
             self.cluster_size,
             self.cluster_rank,
             self.enable_alltoall,
-            min_latency_mode,
+            self.min_latency_mode,
             gemm_idx,
             tactic,
             do_preparation,
@@ -122,13 +109,11 @@ class MoERunner(TunableRunner):
     @classmethod
     @lru_cache(maxsize=None)
     def refine_tuning_config(cls, tune_max_num_tokens: int):
-        cls.tuning_config = TuningConfig(dynamic_tensor_specs=(
-            DynamicTensorSpec(
+        cls.tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
                 0, 0, get_last_power_of_2_num_tokens_buckets(
                     tune_max_num_tokens), lambda x: min(
-                        last_positive_power_of_2(x), tune_max_num_tokens)),
-            DynamicTensorSpec(3, 0, (0, ), lambda x: x),
-        ))
+                        last_positive_power_of_2(x), tune_max_num_tokens)), ))
 
 
 @torch.library.custom_op("trtllm::fused_moe", mutates_args=())
@@ -137,10 +122,16 @@ def fused_moe(
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
+    fc1_expert_biases: Optional[torch.Tensor],
     fc2_expert_weights: torch.Tensor,
+    fc2_expert_biases: Optional[torch.Tensor],
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,
+    swizzled_input_sf: bool = True,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
     tp_size: int = 1,
     tp_rank: int = 0,
     ep_size: int = 1,
@@ -149,39 +140,55 @@ def fused_moe(
     cluster_rank: int = 0,
     enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
-    use_w4a8_group_scaling: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
+    tuner_num_tokens: Optional[int] = None,
+    tuner_top_k: Optional[int] = None,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     MoERunner.refine_tuning_config(tune_max_num_tokens)
 
-    # TODO: set min_latency_mode always to False due to the error in the moe_kernels
-    min_latency_tensor = torch.empty(0)
+    # Only the non-alltoall case is considered for profiling in the warmup phase.
+    # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
+    if enable_alltoall:
+        assert tuner_num_tokens is not None
+        assert tuner_top_k is not None
+        tuner_input = input[:tuner_num_tokens]
+    else:
+        assert tuner_num_tokens is None
+        assert tuner_top_k is None
+        tuner_input = input
+        tuner_top_k = token_selected_experts.size(1)
 
     # allocate workspace for profiling
     moe_runner = MoERunner(
         x_dtype=input.dtype,
         weight_dtype=fc1_expert_weights.dtype,
         output_dtype=output_dtype,
-        top_k=token_selected_experts.size(1),
+        top_k=tuner_top_k,
         tp_size=tp_size,
         tp_rank=tp_rank,
         ep_size=ep_size,
         ep_rank=ep_rank,
         cluster_size=cluster_size,
         cluster_rank=cluster_rank,
-        enable_alltoall=enable_alltoall,
         use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-        use_w4a8_group_scaling=use_w4a8_group_scaling,
+        use_w4_group_scaling=use_w4_group_scaling,
+        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+        min_latency_mode=min_latency_mode,
     )
 
     _, gemm_tactic_1 = tuner.choose_one(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
         MoERunner.tuning_config,
-        [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
+        [
+            tuner_input, fc1_expert_weights, fc1_expert_biases,
+            fc2_expert_weights, fc2_expert_biases
+        ],
         gemm_idx=1,
     )
 
@@ -189,7 +196,10 @@ def fused_moe(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
         MoERunner.tuning_config,
-        [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
+        [
+            tuner_input, fc1_expert_weights, fc1_expert_biases,
+            fc2_expert_weights, fc2_expert_biases
+        ],
         gemm_idx=2,
     )
 
@@ -199,9 +209,15 @@ def fused_moe(
         token_selected_experts,
         token_final_scales,
         fc1_expert_weights,
+        fc1_expert_biases,
         fc2_expert_weights,
+        fc2_expert_biases,
         quant_scales,
         input_sf,
+        swizzled_input_sf,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
         tp_size,
         tp_rank,
         ep_size,
@@ -222,18 +238,26 @@ def _(
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
+    fc1_expert_biases: Optional[torch.Tensor],
     fc2_expert_weights: torch.Tensor,
+    fc2_expert_biases: Optional[torch.Tensor],
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,
+    swizzled_input_sf: bool = True,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
     tp_size: int = 1,
     tp_rank: int = 0,
     ep_size: int = 1,
     ep_rank: int = 0,
     cluster_size: int = 1,
     cluster_rank: int = 0,
+    enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
-    use_w4a8_group_scaling: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
 ):
@@ -253,6 +277,93 @@ def _(
         ]
     else:
         return [input.new_empty([seq_len, hidden_size], dtype=output_dtype)]
+
+
+class FP8RowwiseGemmRunner(TunableRunner):
+    runner_dict = dict()
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+        constraint_specs=(
+            ConstraintSpec(2, 0, lambda shapes: shapes[0][0]),
+            ConstraintSpec(3, 0, lambda shapes: shapes[1][0]),
+        ))
+
+    def __init__(
+        self,
+        to_userbuffers: bool,
+        output_dtype: torch.dtype,
+    ):
+        self.to_userbuffers = to_userbuffers
+        self.output_dtype = output_dtype
+        instance_key = (output_dtype, )
+        if instance_key not in FP8RowwiseGemmRunner.runner_dict:
+            FP8RowwiseGemmRunner.runner_dict[
+                instance_key] = torch.classes.trtllm.FP8RowwiseGemmRunner(
+                    output_dtype)
+        self.fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner.runner_dict[
+            instance_key]
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return list(range(self.fp8_rowwise_gemm_runner.get_num_configs()))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        mat1, mat2, mat1_scale, mat2_scale = inputs
+        return self.fp8_rowwise_gemm_runner.run_gemm(
+            mat1,
+            mat2,
+            mat1_scale,
+            mat2_scale,
+            self.to_userbuffers,
+            tactic,
+        )
+
+
+@torch.library.custom_op("trtllm::fp8_rowwise_gemm", mutates_args=())
+def fp8_rowwise_gemm(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+
+    tuner = AutoTuner.get()
+
+    # allocate workspace for profiling
+    fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner(to_userbuffers, output_dtype)
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::fp8_rowwise_gemm::gemm",
+        [fp8_rowwise_gemm_runner],
+        FP8RowwiseGemmRunner.tuning_config,
+        [act, weight, act_scale, weight_scale],
+    )
+
+    return fp8_rowwise_gemm_runner(
+        inputs=[act, weight, act_scale, weight_scale], tactic=best_tactic)
+
+
+@fp8_rowwise_gemm.register_fake
+def _(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+    return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
 
 
 class FP4GemmRunner(TunableRunner):
@@ -588,206 +699,239 @@ def _(
                              dtype=output_dtype)
 
 
-@torch.library.custom_op("trtllm::attention", mutates_args=())
-def attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out_dtype: Optional[torch.dtype],
-    workspace: Optional[torch.Tensor],
-    sequence_length: torch.Tensor,
-    host_past_key_value_lengths: torch.Tensor,
-    context_lengths: torch.Tensor,
-    host_context_lengths: torch.Tensor,
-    host_request_types: torch.Tensor,
-    kv_cache_block_offsets: Optional[torch.Tensor],
-    host_kv_cache_block_offsets: Optional[torch.Tensor],
-    host_kv_cache_pool_pointers: Optional[torch.Tensor],
-    host_kv_cache_pool_mapping: Optional[torch.Tensor],
-    cache_indirection: Optional[torch.Tensor],
-    kv_scale_orig_quant: Optional[torch.Tensor],
-    kv_scale_quant_orig: Optional[torch.Tensor],
-    out_scale: Optional[torch.Tensor],
-    rotary_inv_freq: Optional[torch.Tensor],
-    rotary_cos_sin: Optional[torch.Tensor],
-    latent_cache: Optional[torch.Tensor],
-    q_pe: Optional[torch.Tensor],
-    block_ids_per_seq: Optional[torch.Tensor],
-    is_fused_qkv: bool,
-    update_kv_cache: bool,
-    predicted_tokens_per_seq: int,
-    layer_idx: int,
-    num_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    tokens_per_block: Optional[int],
-    max_num_requests: int,
-    max_context_length: int,
-    attention_window_size: int,
-    sink_token_length: int,
-    beam_width: int,
-    mask_type: int,
-    quant_mode: int,
-    q_scaling: float,
-    position_embedding_type: int,
-    rotary_embedding_dim: int,
-    rotary_embedding_base: float,
-    rotary_embedding_scale_type: int,
-    rotary_embedding_scale: float,
-    rotary_embedding_short_m_scale: float,
-    rotary_embedding_long_m_scale: float,
-    rotary_embedding_max_positions: int,
-    rotary_embedding_original_max_positions: int,
-    use_paged_context_fmha: bool,
-    attention_input_type: Optional[int],
-    is_mla_enable: bool,
-    q_lora_rank: Optional[int],
-    kv_lora_rank: Optional[int],
-    qk_nope_head_dim: Optional[int],
-    qk_rope_head_dim: Optional[int],
-    v_head_dim: Optional[int],
-    mrope_rotary_cos_sin: Optional[torch.Tensor],
-    mrope_position_deltas: Optional[torch.Tensor],
-    mla_context_paged_kv: Optional[torch.Tensor],
-    mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
-    attention_chunk_size: Optional[int],
-) -> List[torch.Tensor]:
-    num_tokens = q.size(0)
-    attention_input_type = (AttentionInputType(attention_input_type)
-                            if attention_input_type is not None else
-                            AttentionInputType.mixed)
-    is_gen_only = attention_input_type == AttentionInputType.generation_only
-    v_head_size = head_size if not is_mla_enable else kv_lora_rank if is_gen_only else v_head_dim
-    if out_dtype is None:
-        out_dtype = q.dtype
+class WeightOnlyQuantGemmRunner(TunableRunner):
+    runner_dict = dict()
+    tuning_config = TuningConfig(dynamic_tensor_specs=(
+        DynamicTensorSpec(0, 0, get_last_power_of_2_num_tokens_buckets,
+                          last_positive_power_of_2), ))
 
-    if out_dtype == torch.uint8:
-        num_nvfp4_elements_per_container = 2
-        scaling_vector_size = 16
-        size_per_token = num_heads * v_head_size
-        output_act = q.new_empty(
-            (num_tokens, size_per_token // num_nvfp4_elements_per_container),
-            dtype=torch.uint8)
-        # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
-        output_sf = q.new_empty(compute_swizzled_sf_shape(
-            num_tokens, size_per_token // scaling_vector_size),
-                                dtype=torch.uint8)
-    else:
-        output_act = q.new_empty((num_tokens, num_heads * v_head_size),
-                                 dtype=out_dtype)
-        # NOTE(tizheng): Does this introduce overhead?
-        output_sf = torch.empty(())  # Create a placeholder, which is not used.
+    def __init__(
+        self,
+        activation_dtype: torch.dtype,
+        weight_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+        to_userbuffers: bool,
+    ):
+        self.output_dtype = output_dtype
+        self.to_userbuffers = to_userbuffers
+        instance_key = (activation_dtype, weight_dtype)
+        if instance_key not in WeightOnlyQuantGemmRunner.runner_dict:
+            WeightOnlyQuantGemmRunner.runner_dict[
+                instance_key] = torch.classes.trtllm.WeightOnlyQuantGemmRunner(
+                    activation_dtype, weight_dtype)
+        self.weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner.runner_dict[
+            instance_key]
 
-    torch.ops.trtllm.attention_inplace(
-        q, k, v, output_act, output_sf, out_dtype, workspace, sequence_length,
-        host_past_key_value_lengths, context_lengths, host_context_lengths,
-        host_request_types, kv_cache_block_offsets, host_kv_cache_block_offsets,
-        host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
-        cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
-        rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq,
-        is_fused_qkv, update_kv_cache, predicted_tokens_per_seq, layer_idx,
-        num_heads, num_kv_heads, head_size, tokens_per_block, max_num_requests,
-        max_context_length, attention_window_size, sink_token_length,
-        beam_width, mask_type, quant_mode, q_scaling, position_embedding_type,
-        rotary_embedding_dim, rotary_embedding_base,
-        rotary_embedding_scale_type, rotary_embedding_scale,
-        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
-        rotary_embedding_max_positions, rotary_embedding_original_max_positions,
-        use_paged_context_fmha, attention_input_type, is_mla_enable,
-        q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
-        v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
-        mla_context_paged_kv, mla_context_kv_cache_block_offsets,
-        attention_chunk_size)
-    return output_act, output_sf
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return list(range(self.weight_only_quant_gemm_runner.get_num_configs()))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        activation, weight, weight_scale = inputs
+        return self.weight_only_quant_gemm_runner.run_gemm(
+            activation,
+            weight,
+            weight_scale,
+            tactic,
+            self.to_userbuffers,
+            self.output_dtype,
+        )
 
 
-@attention.register_fake
+@torch.library.custom_op("trtllm::weight_only_quant_gemm", mutates_args=())
+def weight_only_quant_gemm(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    weight_dtype: torch.dtype,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+
+    tuner = AutoTuner.get()
+
+    # allocate workspace for profiling
+    weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner(
+        activation.dtype, weight_dtype, output_dtype, to_userbuffers)
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::weight_only_quant_gemm::gemm",
+        [weight_only_quant_gemm_runner],
+        WeightOnlyQuantGemmRunner.tuning_config,
+        [activation, weight, weight_scale],
+    )
+
+    return weight_only_quant_gemm_runner(
+        inputs=[activation, weight, weight_scale], tactic=best_tactic)
+
+
+@weight_only_quant_gemm.register_fake
 def _(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out_dtype: Optional[torch.dtype],
-    workspace: Optional[torch.Tensor],
-    sequence_length: torch.Tensor,
-    host_past_key_value_lengths: torch.Tensor,
-    context_lengths: torch.Tensor,
-    host_context_lengths: torch.Tensor,
-    host_request_types: torch.Tensor,
-    kv_cache_block_offsets: Optional[torch.Tensor],
-    host_kv_cache_block_offsets: Optional[torch.Tensor],
-    host_kv_cache_pool_pointers: Optional[torch.Tensor],
-    host_kv_cache_pool_mapping: Optional[torch.Tensor],
-    cache_indirection: Optional[torch.Tensor],
-    kv_scale_orig_quant: Optional[torch.Tensor],
-    kv_scale_quant_orig: Optional[torch.Tensor],
-    out_scale: Optional[torch.Tensor],
-    rotary_inv_freq: Optional[torch.Tensor],
-    rotary_cos_sin: Optional[torch.Tensor],
-    latent_cache: Optional[torch.Tensor],
-    q_pe: Optional[torch.Tensor],
-    block_ids_per_seq: Optional[torch.Tensor],
-    is_fused_qkv: bool,
-    update_kv_cache: bool,
-    predicted_tokens_per_seq: int,
-    layer_idx: int,
-    num_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    tokens_per_block: Optional[int],
-    max_num_requests: int,
-    max_context_length: int,
-    attention_window_size: int,
-    sink_token_length: int,
-    beam_width: int,
-    mask_type: int,
-    quant_mode: int,
-    q_scaling: float,
-    position_embedding_type: int,
-    rotary_embedding_dim: int,
-    rotary_embedding_base: float,
-    rotary_embedding_scale_type: int,
-    rotary_embedding_scale: float,
-    rotary_embedding_short_m_scale: float,
-    rotary_embedding_long_m_scale: float,
-    rotary_embedding_max_positions: int,
-    rotary_embedding_original_max_positions: int,
-    use_paged_context_fmha: bool,
-    attention_input_type: Optional[int],
-    is_mla_enable: bool,
-    q_lora_rank: Optional[int],
-    kv_lora_rank: Optional[int],
-    qk_nope_head_dim: Optional[int],
-    qk_rope_head_dim: Optional[int],
-    v_head_dim: Optional[int],
-    mrope_rotary_cos_sin: Optional[torch.Tensor],
-    mrope_position_deltas: Optional[torch.Tensor],
-    mla_context_paged_kv: Optional[torch.Tensor],
-    mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
-    attention_chunk_size: Optional[int],
-) -> List[torch.Tensor]:
-    num_tokens = q.size(0)
-    attention_input_type = (AttentionInputType(attention_input_type)
-                            if attention_input_type is not None else
-                            AttentionInputType.mixed)
-    if out_dtype is None:
-        out_dtype = q.dtype
-    is_gen_only = attention_input_type == AttentionInputType.generation_only
-    v_head_size = head_size if not is_mla_enable else kv_lora_rank if is_gen_only else v_head_dim
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    weight_type: torch.dtype,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype = None,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+    dtype = output_dtype if output_dtype is not None else activation.dtype
+    return activation.new_empty((activation.size(0), weight.size(1)),
+                                dtype=dtype)
 
-    if out_dtype == torch.uint8:
-        num_nvfp4_elements_per_container = 2
-        scaling_vector_size = 16
-        size_per_token = num_heads * v_head_size
-        output_act = q.new_empty(
-            (num_tokens, size_per_token // num_nvfp4_elements_per_container),
-            dtype=torch.uint8)
-        # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
-        output_sf = q.new_empty(compute_swizzled_sf_shape(
-            num_tokens, size_per_token // scaling_vector_size),
-                                dtype=torch.uint8)
-    else:
-        output_act = q.new_empty((num_tokens, num_heads * v_head_size),
-                                 dtype=out_dtype)
-        output_sf = torch.empty(())  # Create a placeholder, which is not used.
 
-    return output_act, output_sf
+class FinegrainedMixedDtypeGemm(TunableRunner):
+    _runner_dict = dict()
+    MAX_SUPPORTED_SM_VERSION = 90
+
+    def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
+                 quant_mode: int):
+        instance_key = (activation_dtype, output_dtype, quant_mode)
+        if instance_key not in FinegrainedMixedDtypeGemm._runner_dict:
+            FinegrainedMixedDtypeGemm._runner_dict[
+                instance_key] = torch.classes.trtllm.finegrainedMixedDtypeGemmRunner(
+                    activation_dtype, output_dtype, quant_mode)
+        self._finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm._runner_dict[
+            instance_key]
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return list(
+            range(self._finegrained_mixed_dtype_gemm_runner.get_num_configs()))
+
+    def forward(self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs) -> torch.Tensor:
+
+        if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
+            raise ValueError(
+                f"SM version {get_sm_version()} is not supported for W4A16 GEMM"
+            )
+
+        activation, weights_packed, scales = inputs
+
+        alpha = 1.0 if kwargs.get("alpha") is None else kwargs["alpha"]
+
+        return self._finegrained_mixed_dtype_gemm_runner.run_gemm(
+            activation, weights_packed, scales, kwargs["group_size"], tactic,
+            kwargs["bias"], kwargs["zeros"], alpha)
+
+
+@torch.library.custom_op("trtllm::finegrained_mixed_dtype_gemm",
+                         mutates_args=())
+def finegrained_mixed_dtype_gemm(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        has_zero_point: bool,
+        output_dtype: torch.dtype,
+        alpha: Optional[float] = None,
+        bias: Optional[torch.Tensor] = None,
+        zeros: Optional[torch.Tensor] = None) -> torch.Tensor:
+
+    assert not has_zero_point or zeros is not None, "Expected 'zeros' tensor when has_zero_point is True"
+
+    tuner = AutoTuner.get()
+
+    tuning_config = TuningConfig(dynamic_tensor_specs=(
+        # For tensor index 0 (input A), tune dimension 0 (M dimension)
+        DynamicTensorSpec(0, 0, (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32,
+                                 16, 8, 4, 2, 1), last_positive_power_of_2), ))
+
+    # NOTE: qunant_mode equals 0 it means we use scale only (FINEGRAINED_SCALE_ONLY), zeros is not used, else we use scale and zero point
+    quant_mode = 1 if has_zero_point else 0
+    if quant_mode == 0:
+        assert zeros is None, "When quant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros must be None"
+
+    finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm(
+        input.dtype, output_dtype, quant_mode)
+
+    kwargs = {
+        "group_size": group_size,
+        "zeros": zeros,
+        "bias": bias,
+        "alpha": alpha
+    }
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::finegrained_mixed_dtype_gemm::gemm",
+        [finegrained_mixed_dtype_gemm_runner], tuning_config,
+        [input, weight, scales], **kwargs)
+
+    return finegrained_mixed_dtype_gemm_runner(inputs=[input, weight, scales],
+                                               tactic=best_tactic,
+                                               **kwargs)
+
+
+@finegrained_mixed_dtype_gemm.register_fake
+def _(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    has_zero_point: bool,
+    output_dtype: torch.dtype,
+    alpha: Optional[float] = None,
+    bias: Optional[torch.Tensor] = None,
+    zeros: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    # For a typical GEMM: input [M, K] @ weight [K, N] -> output [M, N]
+    # Weight is typically packed, so we need to infer the output dimension
+    M = input.size(0)
+    # Assuming weight is packed and the output dimension can be inferred from weight.size(1)
+    N = weight.size(1) if weight.dim() > 1 else weight.size(0)
+    return input.new_empty((M, N), dtype=output_dtype)
+
+
+def get_event(event_idx: int):
+    from ..utils import get_model_extra_attrs
+    extra_attrs = get_model_extra_attrs()
+    assert "events" in extra_attrs, "Missing Event Book"
+    return extra_attrs["events"]()[event_idx]
+
+
+def get_stream(stream_id: int):
+    from ..utils import get_model_extra_attrs
+    extra_attrs = get_model_extra_attrs()
+    if stream_id == 0:
+        return extra_attrs["global_stream"]
+    assert "aux_streams" in extra_attrs, "Missing Aux Streams"
+    return extra_attrs["aux_streams"]()[stream_id - 1]
+
+
+@torch.library.custom_op("trtllm::set_stream", mutates_args=())
+def set_stream(stream_id: int) -> None:
+    stream = get_stream(stream_id)
+    assert stream is not None
+    torch.cuda.set_stream(stream)
+
+
+@torch.library.custom_op("trtllm::record_event", mutates_args=())
+def record_event(event_idx: int) -> None:
+    event = get_event(event_idx)
+    event.record()
+
+
+@torch.library.custom_op("trtllm::wait_event", mutates_args=())
+def wait_event(event_idx: int) -> None:
+    event = get_event(event_idx)
+    event.wait()
+
+
+@torch.library.custom_op("trtllm::record_stream", mutates_args=())
+def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
+    stream = get_stream(stream_id)
+    assert stream is not None
+    tensor.record_stream(stream)

@@ -761,7 +761,7 @@ __global__ void setPagedKVCacheForMLAKernel(T* output, T const* k_ptr, T const* 
 // q {total_uncached_tokens, h, d_nope + d_rope}
 // latent_cache {total_uncached_tokens, d_k + d_rope}
 template <typename T, typename TCache, int BLOCK_SIZE, int K_DIM, int ROPE_DIM>
-__global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, T* q_ptr, T const* latent_cache_ptr,
+__global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, T* q_ptr, T* latent_cache_ptr,
     int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
     float2 const* cos_sin_cache, size_t head_num, int nope_size, float const* kv_scale_orig_quant_ptr)
 {
@@ -857,6 +857,10 @@ __global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, T*
                         quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
                             reinterpret_cast<T const*>(&data), quant_scale_kv_val);
                     }
+                    // copy to latent_cache (for chunked prefill, it will not load kv cache for uncached k_pe)
+                    // we only need to copy original value.
+                    auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (K_DIM + ROPE_DIM) + K_DIM;
+                    *reinterpret_cast<VecT*>(&latent_cache_ptr[src_k_global_offset + head_dim_idx]) = data;
                 }
                 else
                 {
@@ -919,6 +923,49 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
         <<<grid, 256, 0, stream>>>(params.attention_input_buf, params.latent_cache, kv_cache_buffer,
             params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
             params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv);
+    if (params.attention_input_buf != nullptr && params.quant_attention_input_buf != nullptr
+        && params.cache_type == KvCacheDataType::FP8)
+    {
+        TLLM_LOG_DEBUG("MLA RoPE Context: Quantizing attention_input_buf to FP8");
+
+        int const dim_q_per_head = (params.meta.qk_nope_head_dim + params.meta.qk_rope_head_dim);
+        int const dim_k_per_head = (params.meta.qk_nope_head_dim + params.meta.qk_rope_head_dim);
+        int const dim_v_per_head = (params.meta.v_head_dim);
+
+        // Total dimension per token across all heads for Q, K, and V components respectively
+        int const total_q_dim_all_heads = params.head_num * dim_q_per_head;
+        int const total_k_dim_all_heads
+            = params.head_num * dim_k_per_head; // Assuming effective num_kv_heads = head_num for layout
+        int const total_v_dim_all_heads
+            = params.head_num * dim_v_per_head; // Assuming effective num_kv_heads = head_num for layout
+
+        int const num_total_qkv_elements
+            = params.acc_q_len * (total_q_dim_all_heads + total_k_dim_all_heads + total_v_dim_all_heads);
+        size_t headDim = params.meta.kv_lora_rank + params.meta.qk_rope_head_dim;
+        float const* device_qkv_scale_ptr = params.quant_scale_qkv;
+
+        if (num_total_qkv_elements > 0)
+        {
+            int const threads_per_block = 256;
+            int const num_blocks = (num_total_qkv_elements + threads_per_block - 1) / threads_per_block;
+
+            TLLM_LOG_DEBUG(
+                "Launching QuantizeCopyInputToFp8Kernel with num_blocks: %d, threads_per_block: %d, elements: %d",
+                num_blocks, threads_per_block, num_total_qkv_elements);
+
+            tensorrt_llm::kernels::QuantizeCopyInputToFp8Kernel<T><<<num_blocks, threads_per_block, 0, stream>>>(
+                static_cast<T const*>(params.attention_input_buf),             // Source
+                static_cast<__nv_fp8_e4m3*>(params.quant_attention_input_buf), // Destination
+                num_total_qkv_elements, device_qkv_scale_ptr);
+            sync_check_cuda_error(stream);
+
+            cudaStreamSynchronize(stream);
+        }
+        else
+        {
+            TLLM_LOG_WARNING("MLA RoPE Context: num_total_qkv_elements is 0, skipping quantization.");
+        }
+    }
 }
 
 template <typename T, typename KVCacheBuffer>
@@ -980,10 +1027,10 @@ void invokeMLASetPagedKV(T* output, T const* k_ptr, T const* v_ptr, T const* k_p
 }
 
 template <typename T, typename TCache>
-void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T const* latent_cache_ptr,
-    int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,
-    int const max_input_uncached_seq_len, float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size,
-    int lora_size, float const* kv_scale_orig_quant_ptr, cudaStream_t stream)
+void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* latent_cache_ptr, int const num_requests,
+    int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
+    float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size, int lora_size,
+    float const* kv_scale_orig_quant_ptr, cudaStream_t stream)
 {
     dim3 grid(int(tensorrt_llm::common::divUp(max_input_uncached_seq_len, 32)), num_requests, head_num + 1 + 8);
     TLLM_CHECK_WITH_INFO(lora_size == 512, "lora_size should be equal to %d", 512);
@@ -1012,7 +1059,7 @@ INSTANTIATE_MLA_ROPE(__nv_bfloat16, KVLinearBuffer);
         int const num_contexts, int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len,                     \
         int const lora_size, int const rope_size, float const* kv_scale_quant_orig_ptr, cudaStream_t stream);          \
     template void invokeMLARopeAppendPagedKVAssignQ<T, TCache>(KVBlockArray & kv_cache, T * q_ptr,                     \
-        T const* latent_cache_ptr, int const num_requests, int64_t const* cu_ctx_cached_kv_lens,                       \
+        T * latent_cache_ptr, int const num_requests, int64_t const* cu_ctx_cached_kv_lens,                            \
         int64_t const* cu_seq_lens, int const max_input_uncached_seq_len, float2 const* cos_sin_cache,                 \
         size_t head_num, int nope_size, int rope_size, int lora_size, float const* kv_scale_orig_quant_ptr,            \
         cudaStream_t stream);
@@ -1033,6 +1080,17 @@ INSTANTIATE_SET_KVCACHE_MLA(float);
 INSTANTIATE_SET_KVCACHE_MLA(half);
 INSTANTIATE_SET_KVCACHE_MLA(__nv_bfloat16);
 
+template <typename T_IN>
+__global__ void QuantizeCopyInputToFp8Kernel(
+    T_IN const* input_buffer, __nv_fp8_e4m3* output_fp8_buffer, int num_total_elements, float const* device_scale_ptr)
+{
+    uint element_idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if (element_idx < num_total_elements)
+    {
+        float scale_factor = (device_scale_ptr != nullptr) ? *device_scale_ptr : 1.0f;
+        output_fp8_buffer[element_idx] = __nv_fp8_e4m3(static_cast<float>(input_buffer[element_idx]) * scale_factor);
+    }
+}
 } // namespace kernels
 
 } // namespace tensorrt_llm

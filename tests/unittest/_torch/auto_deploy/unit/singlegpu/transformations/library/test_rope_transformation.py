@@ -18,8 +18,9 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_output_tupl
 torch.manual_seed(0)
 
 
-def _precompute_freqs_cis_explicit(seq_len: int, head_dim: int, rope_theta: float):
-    dtype = torch.float32
+def _precompute_freqs_cis_explicit(
+    seq_len: int, head_dim: int, rope_theta: float, dtype: torch.dtype = torch.float32
+):
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
     positions = torch.arange(seq_len, dtype=torch.float32)
     freqs = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
@@ -84,14 +85,16 @@ class RoPEModel(torch.nn.Module):
             else:
                 unsq_dim = 2
 
-            cos, sin = _precompute_freqs_cis_explicit(s, self.head_dim, rope_theta=10000)
+            cos, sin = _precompute_freqs_cis_explicit(
+                s, self.head_dim, rope_theta=10000, dtype=x.dtype
+            )
             cos = cos.to(x.device).unsqueeze(0).expand(b, -1, -1)
             sin = sin.to(x.device).unsqueeze(0).expand(b, -1, -1)
 
             if self.mode == "match":
                 q_out, k_out = apply_rotary_pos_emb_explicit(q, k, cos, sin, unsq_dim)
             else:  # optimize
-                q_out, k_out = torch.ops.rope.torch_apply_rope_with_explicit_cos_sin(
+                q_out, k_out = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
                     q, k, cos, sin, unsq_dim
                 )
 
@@ -119,7 +122,7 @@ class RoPEModel(torch.nn.Module):
             if self.mode == "match":
                 q_out, k_out = apply_rotary_pos_emb_complex(q, k, freqs, unsq_dim)
             else:
-                q_out, k_out = torch.ops.rope.torch_apply_rope_with_complex_freqs(
+                q_out, k_out = torch.ops.auto_deploy.torch_rope_with_complex_freqs(
                     q, k, freqs, unsq_dim
                 )
 
@@ -212,9 +215,9 @@ def test_rope_variants(
     if transformation == "match":
         fn = match_rope_pattern
         check_op = (
-            torch.ops.rope.torch_apply_rope_with_explicit_cos_sin
+            torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin
             if variant == "explicit" or variant == "explicit_pm"
-            else torch.ops.rope.torch_apply_rope_with_complex_freqs
+            else torch.ops.auto_deploy.torch_rope_with_complex_freqs
         )
 
         def checker(gm):
@@ -228,8 +231,8 @@ def test_rope_variants(
                 if is_op(
                     n,
                     {
-                        torch.ops.rope.torch_apply_rope_with_explicit_cos_sin,
-                        torch.ops.rope.torch_apply_rope_with_complex_freqs,
+                        torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin,
+                        torch.ops.auto_deploy.torch_rope_with_complex_freqs,
                     },
                 ):
                     q_arg, k_arg, *rest = n.args
@@ -254,7 +257,7 @@ def test_rope_variants(
         fn = optimize_rope
 
         def checker(gm):
-            return any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes)
+            return any(is_op(n, torch.ops.auto_deploy.flashinfer_rope) for n in gm.graph.nodes)
 
     if transformation == "match_layout":
         _ = run_test(
@@ -269,6 +272,7 @@ def test_rope_variants(
             True,  # strict_loading
             dyn,  # dynamic_shapes
             None,  # check_num_matches
+            False,  # skip_output_assert
             target_layout,
         )
     elif transformation == "match":
@@ -284,6 +288,7 @@ def test_rope_variants(
             True,  # strict_loading
             dyn,  # dynamic_shapes
             1,  # check_num_matches
+            False,  # skip_output_assert
         )
     else:
         _ = run_test(
@@ -298,6 +303,7 @@ def test_rope_variants(
             True,  # strict_loading
             dyn,  # dynamic_shapes
             None,  # check_num_matches
+            False,  # skip_output_assert
         )
 
 
@@ -346,7 +352,7 @@ class DSModel(torch.nn.Module):
         else:
             cos = cos[pos_ids]
             sin = sin[pos_ids]
-            q_out, k_out = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+            q_out, k_out = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
                 q, k, cos, sin, unsq_dim
             )
         if self.layout == "BNSD":
@@ -387,7 +393,7 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
 
         def checker(gm):
             return any(
-                is_op(n, torch.ops.rope.torch_apply_rope_with_qk_interleaving)
+                is_op(n, torch.ops.auto_deploy.torch_rope_with_qk_interleaving)
                 for n in gm.graph.nodes
             )
 
@@ -396,7 +402,7 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
 
         def checker(gm):
             for n in gm.graph.nodes:
-                if is_op(n, torch.ops.rope.torch_apply_rope_with_qk_interleaving):
+                if is_op(n, torch.ops.auto_deploy.torch_rope_with_qk_interleaving):
                     q_arg, k_arg, *rest = n.args
                     if not (
                         is_op(q_arg, torch.ops.aten.contiguous)
@@ -428,6 +434,7 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
             True,  # strict_loading
             dynamic_shapes,  # dynamic_shapes
             None,  # check_num_matches
+            False,  # skip_output_assert
             target_layout,
         )
     else:
@@ -443,4 +450,5 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
             True,  # strict_loading
             dynamic_shapes,  # dynamic_shapes
             1,  # check_num_matches
+            False,  # skip_output_assert
         )

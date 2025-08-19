@@ -17,6 +17,7 @@
 #pragma once
 
 #include <numeric>
+#include <optional>
 
 #include "BatchedGemmOptions.h"
 #include "KernelParams.h"
@@ -243,9 +244,23 @@ struct BatchedGemmData
         // Shape is [B].
         float const* mPtrScaleGate{nullptr};
 
+        // The clamp limit for the accumulator before applying the activation.
+        // Shape is [B].
+        // Clamp is INF if nullptr.
+        // If applied on SwiGlu, it will be:
+        //
+        //   x_glu    = x_glu.clamp(min=None, max=limit)
+        //   x_linear = x_linear.clamp(min=-limit, max=limit)
+        float const* mPtrClampLimit{nullptr};
+
         // The alpha and beta for SwiGlu.
-        // gatedActivation <- (x0 + beta) * sigmoid(alpha * x1)
-        // Shape is [B]
+        // gatedActivation <- (x0 + beta) * activation(x1, alpha)
+        // Shape is [B].
+        // Alpha is 1.f if nullptr.
+        // Beta is 0.f if nullptr.
+        // The formula:
+        //
+        //   out_glu  = x_glu * torch.sigmoid(alpha * x_glu) + (x_linear + beta)
         float const* mPtrSwiGluAlpha{nullptr};
         float const* mPtrSwiGluBeta{nullptr};
 
@@ -392,12 +407,15 @@ struct BatchedGemmData
 class BatchedGemmInterface
 {
 public:
+    using ModuleCache = std::unordered_map<std::string, std::tuple<CUmodule, CUfunction>>;
+
     BatchedGemmInterface() {}
 
     // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
     // Provided config must be validated with isValidConfig before the call.
     int32_t run(BatchedGemmConfig const& config, void* workspace, BatchedGemmData const& options, void* cudaStream,
-        int32_t multiProcessorCount);
+        int32_t multiProcessorCount, bool usePdl = true,
+        std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt);
 
     // Initializes the buffers before the world sync. Must be called before run.
     int32_t runInitBeforeWorldSync(
@@ -579,10 +597,13 @@ std::vector<size_t> BatchedGemmInterface::getWorkspaceSizesInBytes(
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
 int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspace,
-    BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t /* multiProcessorCount */)
+    BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t /* multiProcessorCount */, bool usePdl,
+    std::optional<std::reference_wrapper<ModuleCache>> moduleCache)
 {
+    // Might be used.
+    (void) usePdl;
+    (void) moduleCache;
     // Get options from config and data.
     auto options = getOptionsFromConfigAndData(config, batchedGemmData);
 
@@ -634,17 +655,17 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     auto const numCtaZ = options.mNumSlicesForSplitK;
     mNumCtas = numCtaX * numCtaY * numCtaZ;
 
-    auto kernelParams = KernelParams::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
+    auto kernelParams = KernelParamsSetup::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
         batchedGemmData.mInputBuffers.mPtrB, batchedGemmData.mOutputBuffers.mPtrC,
         batchedGemmData.mInputBuffers.mPtrSfA, batchedGemmData.mInputBuffers.mPtrSfB,
         batchedGemmData.mInputBuffers.mPtrPerTokenSfA, batchedGemmData.mInputBuffers.mPtrPerTokenSfB,
         batchedGemmData.mInputBuffers.mPtrBias, batchedGemmData.mOutputBuffers.mPtrSfC,
         batchedGemmData.mInputBuffers.mPtrScaleC, batchedGemmData.mInputBuffers.mPtrScaleGate,
-        batchedGemmData.mInputBuffers.mPtrSwiGluAlpha, batchedGemmData.mInputBuffers.mPtrSwiGluBeta,
-        batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax, dPtrRowMaxBars,
-        batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas, batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
-        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit,
-        maxNumCtasInBatchDim);
+        batchedGemmData.mInputBuffers.mPtrClampLimit, batchedGemmData.mInputBuffers.mPtrSwiGluAlpha,
+        batchedGemmData.mInputBuffers.mPtrSwiGluBeta, batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax,
+        dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
+        batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx,
+        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit, maxNumCtasInBatchDim);
 
     // The size of the grid.
     std::vector<int32_t> grid{numCtaX, numCtaY, numCtaZ};
@@ -652,8 +673,42 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
 #ifdef TLLM_GEN_EXPORT_INTERFACE
     CUmodule cuModule;
     CUfunction cuFunction;
-    cuModuleLoadData(&cuModule, config.mData);
-    cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
+
+    if (moduleCache.has_value())
+    {
+        ModuleCache& moduleCacheRef = moduleCache.value().get();
+
+        // Modules are associated with a specific context, so the context is included in the key
+        CUcontext ctx;
+        unsigned long long ctxId;
+        cuCtxGetCurrent(&ctx);
+        cuCtxGetId(ctx, &ctxId);
+
+        // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
+        // string in decimal representation.
+        std::string const ctxName
+            = std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
+        std::string const funcName = std::string(config.mFunctionName);
+        auto const moduleKey = ctxName + funcName;
+        auto module = moduleCacheRef.find(moduleKey);
+
+        // Use cache if module is found, otherwise load and insert into cache
+        if (module != moduleCacheRef.end())
+        {
+            cuFunction = std::get<1>(module->second);
+        }
+        else
+        {
+            cuModuleLoadData(&cuModule, config.mData);
+            cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
+            moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
+        }
+    }
+    else
+    {
+        cuModuleLoadData(&cuModule, config.mData);
+        cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
+    }
 
     // Prepare the grid/block.
     dim3 block3{static_cast<uint32_t>(config.mNumThreadsPerCTA), static_cast<uint32_t>(1), static_cast<uint32_t>(1)};
@@ -667,11 +722,17 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     // Run the kernel.
     auto result = trtllm::gen::launchKernel((void*) &kernelParams, cudaStream, config.mSharedMemSize, cuFunction,
         block3, grid3, cluster3,
-        config.mOptions.mGridWaitForPrimaryEarlyExit | config.mOptions.mGridWaitForPrimaryA
-            | config.mOptions.mGridWaitForPrimaryB);
+        usePdl
+            && (config.mOptions.mGridWaitForPrimaryEarlyExit | config.mOptions.mGridWaitForPrimaryA
+                | config.mOptions.mGridWaitForPrimaryB));
     if (result != CUDA_SUCCESS)
     {
         return -1;
+    }
+    // If a module cache has not been given, unload the module to avoid leaking
+    if (!moduleCache.has_value())
+    {
+        cuModuleUnload(cuModule);
     }
 #else
     config.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid);

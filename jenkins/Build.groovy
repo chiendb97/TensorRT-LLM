@@ -16,7 +16,8 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 
 LLM_DOCKER_IMAGE = env.dockerImage
 
-AGENT_IMAGE = env.dockerImage
+// Always use x86_64 image for agent
+AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64")
 
 POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
 POD_TIMEOUT_SECONDS_TMP = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
@@ -47,12 +48,23 @@ CONFIG_LINUX_AARCH64 = "linux_aarch64"
 def CONFIG_LINUX_AARCH64_LLVM = "linux_aarch64_LLVM"
 
 @Field
+def CONFIG_LINUX_X86_64_NANOBIND = "linux_x86_64_Nanobind"
+
+@Field
+def CONFIG_LINUX_AARCH64_NANOBIND = "linux_aarch64_Nanobind"
+
+@Field
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   // cmake-vars cannot be empty, so passing (default) multi-device configuration.
   (CONFIG_LINUX_X86_64_VANILLA) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
     (TARNAME) : "TensorRT-LLM.tar.gz",
+    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
+  ],
+  (CONFIG_LINUX_X86_64_NANOBIND) : [
+    (WHEEL_EXTRA_ARGS) : "--binding_type nanobind --extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
+    (TARNAME) : "nanobind-TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_X86_64_SINGLE_DEVICE) : [
@@ -68,6 +80,11 @@ def BUILD_CONFIGS = [
   (CONFIG_LINUX_AARCH64): [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
+    (WHEEL_ARCHS): "90-real;100-real;120-real",
+  ],
+  (CONFIG_LINUX_AARCH64_NANOBIND): [
+    (WHEEL_EXTRA_ARGS) : "--binding_type nanobind --extra-cmake-vars WARNING_IS_ERROR=ON",
+    (TARNAME) : "nanobind-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_AARCH64_LLVM) : [
@@ -94,7 +111,7 @@ BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
 BUILD_MEMORY_REQUEST = "48Gi"
 BUILD_MEMORY_LIMIT = "64Gi"
-BUILD_JOBS = "4"
+BUILD_JOBS = "8"
 
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
@@ -305,18 +322,19 @@ def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 
     for (it in artifacts) {
         def uploadpath = it.key
         def filepath = it.value
-        echo "uploading ${filepath} as ${uploadpath}"
-        trtllm_utils.llmRetry(retryTimes, "uploadArtifacts", {
-            rtUpload (
-                serverId: serverId,
-                spec: """{
+        def spec = """{
                     "files": [
                         {
                         "pattern": "${filepath}",
                         "target": "${prefix}/${uploadpath}"
                         }
                     ]
-                }""",
+                }"""
+        echo "Uploading ${filepath} as ${uploadpath}. Spec: ${spec}"
+        trtllm_utils.llmRetry(retryTimes, "uploadArtifacts", {
+            rtUpload (
+                serverId: serverId,
+                spec: spec,
             )
         })
     }
@@ -419,7 +437,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks"
+        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks"
     }
     if (is_linux_x86_64) {
         sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
@@ -427,7 +445,10 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
 
     // Build tritonserver artifacts
     def llmPath = sh (script: "realpath ${LLM_ROOT}",returnStdout: true).trim()
-    sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DUSE_CXX11_ABI=ON && make -j${BUILD_JOBS} install"
+    // TODO: Remove after the cmake version is upgraded to 3.31.8
+    // Get triton tag from docker/dockerfile.multi
+    def tritonShortTag = sh(script: "${LLM_ROOT}/jenkins/scripts/get_triton_tag.sh ${LLM_ROOT}", returnStdout: true).trim()
+    sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DTRITON_COMMON_REPO_TAG=${tritonShortTag} -DTRITON_CORE_REPO_TAG=${tritonShortTag} -DTRITON_THIRD_PARTY_REPO_TAG=${tritonShortTag} -DTRITON_BACKEND_REPO_TAG=${tritonShortTag} -DUSE_CXX11_ABI=ON && make -j${BUILD_JOBS} install"
 
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
@@ -441,6 +462,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "mkdir -p TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/benchmarks/bertBenchmark TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/benchmarks/gptManagerBenchmark TensorRT-LLM/benchmarks/cpp"
+    sh "cp ${LLM_ROOT}/cpp/build/benchmarks/disaggServerBenchmark TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
 
@@ -491,7 +513,7 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     sh "bash -c 'git config --global --add safe.directory \"*\"'"
     // Because different architectures involve different macros, a comprehensive test is conducted here.
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
     }
 }
 
@@ -520,6 +542,8 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA),
         "Build TRT-LLM LLVM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM),
+        "Build TRT-LLM Nanobind": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
+            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_NANOBIND : CONFIG_LINUX_X86_64_NANOBIND),
     ]
 
     if (cpu_arch == X86_64_TRIPLE) {
@@ -591,6 +615,7 @@ pipeline {
         //Workspace normally is: /home/jenkins/agent/workspace/LLM/L0_MergeRequest@tmp/
         HF_HOME="${env.WORKSPACE_TMP}/.cache/huggingface"
         CCACHE_DIR="${CCACHE_DIR}"
+        GITHUB_MIRROR="https://urm.nvidia.com/artifactory/github-go-remote"
         PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1

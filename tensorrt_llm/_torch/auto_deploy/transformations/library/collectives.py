@@ -15,21 +15,21 @@ from .._graph import canonicalize_graph
 # * version above with fused GEMMs (i.e. with a split node)
 # * all_reduce(pointwise_op(linear(x)))
 # * ...
-def fuse_collectives(gm: GraphModule) -> GraphModule:
+def fuse_collectives(gm: GraphModule) -> None:
     num_gemm_collective_fusions = 0
     ad_logger.debug("Before GEMM+Collective fusion: " + str(gm))
 
     # lookup for fused ops
     # TODO: avoid this hardcoded lookup, e.g., by generating fused ops on the fly.
     lookup = {
-        torch.ops.linear.simple: torch.ops.linear.fused_linear_all_reduce,
-        torch.ops.aten.linear: torch.ops.linear.fused_linear_all_reduce,
-        torch.ops.quant.fp8_linear: torch.ops.quant.fused_fp8_linear_all_reduce,
+        torch.ops.auto_deploy.torch_linear_simple: torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce,
+        torch.ops.aten.linear: torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce,
+        torch.ops.auto_deploy.torch_quant_fp8_linear: torch.ops.auto_deploy.torch_quant_fused_fp8_linear_all_reduce,
     }
 
     # go through all nodes and find all_reduce nodes
     for node in gm.graph.nodes:
-        if not is_op(node, torch.ops.dist.all_reduce):
+        if not is_op(node, torch.ops.auto_deploy.torch_dist_all_reduce):
             continue
 
         # check if args are as expected
@@ -54,13 +54,12 @@ def fuse_collectives(gm: GraphModule) -> GraphModule:
         gm.graph.erase_node(parent_node)
         num_gemm_collective_fusions += 1
 
-    gm = canonicalize_graph(gm)
+    canonicalize_graph(gm)
     ad_logger.info(f"Found {num_gemm_collective_fusions} GEMM+Collective fusions")
     ad_logger.debug("After GEMM+Collective fusion: " + str(gm))
-    return gm
 
 
-def fuse_allreduce_residual_rmsnorm(gm: GraphModule) -> GraphModule:
+def fuse_allreduce_residual_rmsnorm(gm: GraphModule) -> None:
     """Essentially, this function fuses the following operators into one allreduce trtllm implementation.
 
     * target pattern:
@@ -72,7 +71,7 @@ def fuse_allreduce_residual_rmsnorm(gm: GraphModule) -> GraphModule:
 
     """
     if not is_trtllm_op_available():
-        return gm
+        return
 
     num_ar_r_rms_fusions = 0
     ad_logger.debug("Before allreduce+residual+rmsnorm fusion: " + str(gm))
@@ -158,14 +157,11 @@ def fuse_allreduce_residual_rmsnorm(gm: GraphModule) -> GraphModule:
             nonlocal num_ar_r_rms_fusions
             num_ar_r_rms_fusions += 1
 
-        return
-
     # Traverse all nodes
     for node in gm.graph.nodes:
-        if is_op(node, torch.ops.dist.all_reduce):
+        if is_op(node, torch.ops.auto_deploy.torch_dist_all_reduce):
             trace_and_fuse(allreduce_node=node, graph=gm.graph)
 
-    gm = canonicalize_graph(gm)
+    canonicalize_graph(gm)
     ad_logger.info(f"Found {num_ar_r_rms_fusions} allreduce+residual+rmsnorm fusions")
     ad_logger.debug("After allreduce+residual+rmsnorm fusion: " + str(gm))
-    return gm

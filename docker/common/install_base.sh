@@ -44,6 +44,8 @@ cleanup() {
 
 init_ubuntu() {
   apt-get update
+  # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
+  apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
     ccache \
     gdb \
@@ -59,7 +61,8 @@ init_ubuntu() {
     python3-pip \
     python-is-python3 \
     wget \
-    pigz
+    pigz \
+    libzmq3-dev
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi
@@ -115,17 +118,20 @@ install_gcctoolset_rockylinux() {
   # https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cuda
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   dnf install \
-	  vim \
-	  wget \
-	  git-lfs \
-	  gcc-toolset-11 \
-	  libffi-devel \
-	  -y
+    patch \
+    vim \
+    wget \
+    git-lfs \
+    gcc-toolset-11 \
+    libffi-devel \
+    -y
   dnf install \
-	  openmpi \
-	  openmpi-devel \
-	  pigz \
-	  -y
+    openmpi \
+    openmpi-devel \
+    pigz \
+    rdma-core-devel \
+    zeromq-devel \
+    -y
   echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
 }

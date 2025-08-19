@@ -16,7 +16,8 @@ from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            print_colored, print_colored_debug)
+                            enable_llm_debug, print_colored,
+                            print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorkerConfig
@@ -24,7 +25,7 @@ from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
                     create_mpi_comm_session, get_spawn_proxy_process_env,
-                    is_llm_response)
+                    is_llm_response, print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 
 __all__ = [
@@ -57,7 +58,6 @@ class GenerationExecutorProxy(GenerationExecutor):
         )
 
         self.workers_started = False
-        self.doing_pre_shutdown = False
         self.worker_cls = worker_cls
 
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
@@ -246,6 +246,12 @@ class GenerationExecutorProxy(GenerationExecutor):
         return True  # success
 
     def dispatch_stats_task(self) -> bool:
+        if not self._iter_stats_result:
+            # This can happen temporarily because the WAR in tensorrt_llm/bench/benchmark/throughput.py
+            # is not synchronized with self.dispatch_stats_thread.
+            logger.debug(
+                f"Skipping stats dispatch while self._iter_stats_result=None")
+            return True  # Intended behavior, not an error
         return self._iteration_result_task(self.mp_stats_queue,
                                            self._iter_stats_result)
 
@@ -333,10 +339,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             return
         print_colored_debug('Proxy.pre_shutdown...\n', "yellow")
 
-        if self.doing_pre_shutdown:
+        if self.doing_shutdown:
             return
         else:
-            self.doing_pre_shutdown = True
+            self.doing_shutdown = True
 
         self._abort_all_requests()
 
@@ -348,7 +354,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         if not self.workers_started:
             return
 
-        if not self.doing_pre_shutdown:
+        if not self.doing_shutdown:
             self.pre_shutdown()
 
         print_colored_debug('Proxy.shutdown...\n', "yellow")
@@ -389,6 +395,9 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()
+
+        if enable_llm_debug():
+            print_alive_threads()
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """

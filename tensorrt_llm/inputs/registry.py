@@ -3,6 +3,7 @@ from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
 
 from torch import nn
 
+from .._utils import nvtx_range_debug
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .data import TextPrompt
@@ -60,17 +61,48 @@ class DefaultInputProcessor(InputProcessor):
         if sampling_params.truncate_prompt_tokens is not None:
             kwargs = dict(truncation=True,
                           max_length=sampling_params.truncate_prompt_tokens)
-
-        token_ids = self.tokenizer.encode(
-            inputs["prompt"],
-            add_special_tokens=sampling_params.add_special_tokens,
-            **kwargs)
+        toktoken_special_tokens = {
+            "<|startoftext|>",
+            "<|endoftext|>",
+            "<|reserved_200000|>",
+            "<|reserved_200001|>",
+            "<|return|>",
+            "<|constrain|>",
+            "<|reserved_200004|>",
+            "<|channel|>",
+            "<|start|>",
+            "<|end|>",
+            "<|message|>",
+            "<|reserved_200009|>",
+            "<|reserved_200010|>",
+            "<|reserved_200011|>",
+            "<|call|>",
+            "<|reserved_200013|>",
+        }
+        with nvtx_range_debug("tokenize prompt"):
+            try:
+                token_ids = self.tokenizer.encode(
+                    inputs["prompt"],
+                    add_special_tokens=sampling_params.add_special_tokens,
+                    **kwargs)
+            except:
+                # Tiktoken path
+                token_ids = self.tokenizer.encode(
+                    inputs["prompt"], allowed_special=toktoken_special_tokens)
 
         if "query" in inputs:
-            query_token_ids = self.tokenizer.encode(
-                inputs["query"],
-                add_special_tokens=sampling_params.add_special_tokens,
-                **kwargs)
+            with nvtx_range_debug("tokenize query"):
+                try:
+                    query_token_ids = self.tokenizer.encode(
+                        inputs["query"],
+                        add_special_tokens=sampling_params.add_special_tokens,
+                        **kwargs)
+                except:
+                    # Tiktoken path
+                    query_token_ids = self.tokenizer.encode(
+                        inputs["query"],
+                        allowed_special=toktoken_special_tokens)
+
             return token_ids, {"query_token_ids": query_token_ids}
 
         return token_ids, None

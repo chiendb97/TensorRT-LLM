@@ -5,8 +5,7 @@ import torch
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi.llm_utils import BuildConfig, KvCacheConfig
 
 prompts = ["A B C"]
@@ -17,10 +16,10 @@ global_kvcache_config = KvCacheConfig(max_tokens=10000)
 @pytest.mark.parametrize("return_log_probs", [False, True])
 @pytest.mark.parametrize("gather_generation_logits", [False, True])
 @pytest.mark.parametrize("gather_context_logits", [False, True])
-@pytest.mark.parametrize("enable_trtllm_sampler", [False, True])
+@pytest.mark.parametrize("use_torch_sampler", [False, True])
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
 def test_generate_with_return_logits(disable_overlap_scheduler: bool,
-                                     enable_trtllm_sampler: bool,
+                                     use_torch_sampler: bool,
                                      gather_context_logits: bool,
                                      gather_generation_logits: bool,
                                      return_log_probs: bool):
@@ -28,7 +27,7 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if not enable_trtllm_sampler and gather_context_logits:
+    if use_torch_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
     build_config = BuildConfig()
@@ -42,7 +41,7 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
-        enable_trtllm_sampler=enable_trtllm_sampler,
+        use_torch_sampler=use_torch_sampler,
         disable_overlap_scheduler=disable_overlap_scheduler,
     )
 
@@ -84,10 +83,10 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
 @pytest.mark.parametrize("return_log_probs", [False, True])
 @pytest.mark.parametrize("gather_generation_logits", [False, True])
 @pytest.mark.parametrize("gather_context_logits", [False, True])
-@pytest.mark.parametrize("enable_trtllm_sampler", [False, True])
+@pytest.mark.parametrize("use_torch_sampler", [False, True])
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
 def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
-                                           enable_trtllm_sampler: bool,
+                                           use_torch_sampler: bool,
                                            gather_context_logits: bool,
                                            gather_generation_logits: bool,
                                            return_log_probs: bool):
@@ -95,7 +94,7 @@ def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if not enable_trtllm_sampler and gather_context_logits:
+    if use_torch_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
     build_config = BuildConfig()
@@ -109,7 +108,7 @@ def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
-        enable_trtllm_sampler=enable_trtllm_sampler,
+        use_torch_sampler=use_torch_sampler,
         disable_overlap_scheduler=disable_overlap_scheduler,
     )
     sampling_params = SamplingParams(

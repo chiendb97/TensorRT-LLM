@@ -1,6 +1,6 @@
 """
 This transformation defines two main RoPE (Rotary Positional Embedding) pattern matchers used
-to identify and replace RoPE subgraphs with a custom op (`torch.ops.rope.flashinfer`).
+to identify and replace RoPE subgraphs with a custom op (`torch.ops.auto_deploy.flashinfer_rope`).
 
 Supported RoPE variants:
 
@@ -73,7 +73,7 @@ def _explicit_rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
 
 
 def _explicit_rope_repl(q, k, cos, sin, unsqueeze_dim):
-    return torch.ops.rope.torch_apply_rope_with_explicit_cos_sin.default(
+    return torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin.default(
         q, k, cos, sin, unsqueeze_dim
     )
 
@@ -91,7 +91,7 @@ def _interleaved_rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
 
 
 def _interleaved_rope_repl(q, k, cos, sin, unsqueeze_dim):
-    return torch.ops.rope.torch_apply_rope_with_qk_interleaving.default(
+    return torch.ops.auto_deploy.torch_rope_with_qk_interleaving.default(
         q, k, cos, sin, unsqueeze_dim
     )
 
@@ -109,7 +109,7 @@ def _complex_rope_pattern(xq, xk, freqs_cis, unsqueeze_dim=1):
 
 
 def _complex_rope_repl(q, k, freqs_cis, unsqueeze_dim):
-    return torch.ops.rope.torch_apply_rope_with_complex_freqs.default(
+    return torch.ops.auto_deploy.torch_rope_with_complex_freqs.default(
         q, k, freqs_cis, unsqueeze_dim
     )
 
@@ -119,7 +119,7 @@ def _explicit_not_interleaved(match: Match) -> bool:
     return not any(isinstance(n, Node) and _match_input_interleave_pattern(n) for n in (q, k))
 
 
-def match_rope_pattern(gm: GraphModule) -> GraphModule:
+def match_rope_pattern(gm: GraphModule) -> int:
     graph = gm.graph
     patterns = ADPatternMatcherPass()
 
@@ -140,6 +140,12 @@ def match_rope_pattern(gm: GraphModule) -> GraphModule:
         torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
         torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
         torch.randn(batch_size, seq_len, head_dim // 2, device="meta", dtype=torch.float16),
+    ]
+    # float32 input can change the graph when there's .float() in pattern
+    dummy_complex_2 = [
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float32),
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float32),
+        torch.randn(batch_size, seq_len, head_dim // 2, device="meta", dtype=torch.float32),
     ]
     register_ad_pattern(
         search_fn=_explicit_rope_pattern,
@@ -172,14 +178,24 @@ def match_rope_pattern(gm: GraphModule) -> GraphModule:
         },
         scalar_workaround={"unsqueeze_dim": 1},
     )
+    register_ad_pattern(
+        search_fn=_complex_rope_pattern,
+        replace_fn=_complex_rope_repl,
+        patterns=patterns,
+        dummy_args=dummy_complex_2,
+        op_ignore_types={
+            torch.ops.aten.reshape.default: (int,),
+        },
+        scalar_workaround={"unsqueeze_dim": 1},
+    )
 
     num_matches = patterns.apply(graph)
-    gm = canonicalize_graph(gm)
+    canonicalize_graph(gm)
     ad_logger.info(f"Found and matched {num_matches} RoPE patterns")
-    return gm, num_matches
+    return num_matches
 
 
-def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphModule:
+def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> None:
     """
     Match and transform input and output of rope ops to the layout specified to meet requirements of optimized ops.
     Supported layout is 'bsnd' (batch, seq, head, dim).
@@ -189,15 +205,15 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         ad_logger.warning(
             f"Unsupported RoPE layout '{expected_layout}'; expected '{supported}'. Skipping RoPE layout matching."
         )
-        return gm
+        return
 
     ad_logger.info(f"Match RoPE layout to {expected_layout}")
 
     graph = gm.graph
     rope_ops = {
-        torch.ops.rope.torch_apply_rope_with_explicit_cos_sin,
-        torch.ops.rope.torch_apply_rope_with_qk_interleaving,
-        torch.ops.rope.torch_apply_rope_with_complex_freqs,
+        torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin,
+        torch.ops.auto_deploy.torch_rope_with_qk_interleaving,
+        torch.ops.auto_deploy.torch_rope_with_complex_freqs,
     }
 
     need_transpose = False
@@ -206,7 +222,7 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         if not is_op(node, rope_ops):
             continue
 
-        if is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
+        if is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
             q_node, k_node, freqs_node, unsq = extract_op_args(
                 node,
                 "xq",  # argument name in schema
@@ -257,7 +273,7 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         q_for_op_contig.meta["val"] = q_node.meta["val"].transpose(1, 2)
         k_for_op_contig.meta["val"] = k_node.meta["val"].transpose(1, 2)
 
-        if is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
+        if is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
             new_args = (
                 q_for_op_contig,
                 k_for_op_contig,
@@ -291,12 +307,11 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         k_rope_new.args = (k_rope_old, 1, 2)
 
     if num_rope_layout_matches:
-        gm = canonicalize_graph(gm)
+        canonicalize_graph(gm)
     ad_logger.info(f"Found {num_rope_layout_matches} RoPE layout matches")
-    return gm
 
 
-def optimize_rope(gm: GraphModule) -> GraphModule:
+def optimize_rope(gm: GraphModule) -> None:
     """
     Scan the FX graph and replace calls to the torch-reference RoPE ops with
     the optimized `rope::flashinfer` kernel.
@@ -309,17 +324,16 @@ def optimize_rope(gm: GraphModule) -> GraphModule:
 
     num_rope_optimizations = 0
     for node in list(graph.nodes):
-        if is_op(node, torch.ops.rope.torch_apply_rope_with_explicit_cos_sin):
+        if is_op(node, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin):
             _optimize_explicit(graph, node, rope_flash_cache, rope_position_ids_cache)
-        elif is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
+        elif is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
             _optimize_complex(graph, node, rope_flash_cache, rope_position_ids_cache)
         else:
             continue
         num_rope_optimizations += 1
     if num_rope_optimizations:
-        gm = canonicalize_graph(gm)
+        canonicalize_graph(gm)
     ad_logger.info(f"Found {num_rope_optimizations} RoPE optimizations")
-    return gm
 
 
 def _optimize_explicit(
@@ -398,7 +412,7 @@ def _optimize_explicit(
             rope_position_ids_cache=pos_cache,
         )
         flash_node = graph.call_function(
-            torch.ops.rope.flashinfer,
+            torch.ops.auto_deploy.flashinfer_rope,
             args=(q_node, k_node, position_ids, fused_cos_sin_to, True),
         )
 
@@ -478,7 +492,7 @@ def _optimize_complex(
             graph, q_node, batch_dim=0, seq_dim=1, rope_position_ids_cache=pos_cache
         )
         flash_node = graph.call_function(
-            torch.ops.rope.flashinfer,
+            torch.ops.auto_deploy.flashinfer_rope,
             args=(q_node, k_node, position_ids, cos_sin_flash, False),
         )
 

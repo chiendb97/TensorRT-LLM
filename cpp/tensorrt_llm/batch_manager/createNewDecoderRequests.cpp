@@ -25,7 +25,6 @@
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
-#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -64,7 +63,10 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
     SizeType32 batchIdx{0};
     for (auto const& llmReq : contextRequests)
     {
-        auto const currentSequenceLen = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens();
+        auto const disaggFirstGenTokenSize
+            = llmReq->getContextPhaseParams() ? llmReq->getContextPhaseParams().value().getFirstGenTokens().size() : 0;
+        auto const currentSequenceLen
+            = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens() + disaggFirstGenTokenSize;
         // Get position of the current sequence in the decoder
         auto const seqSlot = llmReq->mSeqSlot.value();
         batchSlotsRange[batchIdx] = seqSlot;
@@ -137,8 +139,11 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
     std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
         [](auto const& llmReq) { return llmReq->isLastContextChunk(); });
 
-    copySequenceLengths(finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth,
-        bufferManager, runtimeStream);
+    if (!finishedContextRequests.empty())
+    {
+        copySequenceLengths(finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth,
+            bufferManager, runtimeStream);
+    }
 
     auto [lookaheadPrompt, lookaheadAlgoConfigs] = createDecoderRequests(finishedContextRequests,
         inputBuffers.inputsIds, decodingConfig, decoderState, bufferManager, logitsType, modelConfig, worldConfig,
@@ -171,7 +176,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     BufferManager manager{std::make_shared<CudaStream>(decoderStream.get())};
 
-    auto const batchSize = decoderState.getMaxBatchSize();
+    auto const batchSize = decoderState.getMaxNumSequences();
     TLLM_CHECK(0 <= batchSize && batchSlot < batchSize);
     auto const maxBeamWidth = decoderState.getMaxBeamWidth();
     auto const beamWidth = samplingConfig.beamWidth;
@@ -267,22 +272,8 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
         manager.setZero(*newTokensVec);
     }
 
-    // FIXME: we call setZero mMaxDecodingEngineTokens times for only 1 element
-    for (SizeType32 ti = 0; ti < decoderState.getMaxDecodingEngineTokens(); ++ti)
-    {
-        TensorPtr const finishedStepsView = ITensor::slice(decoderState.getFinishedSteps(), ti, 1);
-        finishedStepsView->squeeze(0);
-        TensorPtr const finishedSteps = ITensor::slice(finishedStepsView, batchSlot, 1);
-        if (ti < numDecodingEngineTokens)
-        {
-            manager.setZero(*finishedSteps);
-        }
-        else
-        {
-            runtime::kernels::invokeFill(
-                *finishedSteps, tk::FinishedState::skipDecoding().toUnderlying(), decoderStream);
-        }
-    }
+    TensorPtr const finishedStepsSlice = ITensor::slice(decoderState.getFinishReasons(), batchSlot, 1);
+    manager.setZero(*finishedStepsSlice);
 
     // cumLogProb is mandatory for beamWidth > 1
     if ((samplingConfig.cumLogProbs.has_value() && samplingConfig.cumLogProbs->at(0)) || beamWidth > 1)
@@ -306,6 +297,12 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
         auto parentIds = ITensor::slice(dJointOutput.parentIds, batchSlot, 1);
         parentIds->reshape(outputIdsShape);
         manager.setZero(*parentIds);
+
+        auto cacheIndirectionInput = ITensor::slice(dJointInput.cacheIndirection, batchSlot, 1);
+        manager.setZero(*cacheIndirectionInput);
+
+        auto cacheIndirectionOutput = ITensor::slice(dJointOutput.cacheIndirection, batchSlot, 1);
+        manager.setZero(*cacheIndirectionOutput);
 
         auto beamHypotheses = dJointOutput.beamHypotheses.slice(batchSlot, 1);
         beamHypotheses.init(manager, endId);

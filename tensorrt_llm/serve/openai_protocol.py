@@ -5,6 +5,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
+import torch
 from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
 from openai.types.chat import \
@@ -12,8 +13,38 @@ from openai.types.chat import \
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
+from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
+
+
+def _logit_bias_to_embedding_bias(logit_bias: Optional[Dict[str, float]],
+                                  vocab_size: int) -> Optional[torch.Tensor]:
+    """Convert OpenAI logit_bias dict to embedding_bias tensor for sampling."""
+    if logit_bias is None:
+        return None
+
+    # Create 1D zeros tensor as expected by executor API (will be unsqueezed to [1, vocab_size] internally)
+    embedding_bias = torch.zeros(vocab_size, dtype=torch.float32)
+
+    # Apply biases for specified token IDs
+    for token_str, bias in logit_bias.items():
+        try:
+            token_id = int(token_str)
+            if 0 <= token_id < vocab_size:
+                embedding_bias[token_id] = bias
+            else:
+                raise ValueError(
+                    f"Token ID {token_id} out of vocabulary range [0, {vocab_size})"
+                )
+        except ValueError as e:
+            if "invalid literal" in str(e):
+                raise ValueError(
+                    f"Invalid logit_bias key '{token_str}': must be a valid integer token ID"
+                )
+            raise
+
+    return embedding_bias
 
 
 class OpenAIBaseModel(BaseModel):
@@ -51,8 +82,9 @@ class StructuralTag(OpenAIBaseModel):
 
 
 class ResponseFormat(OpenAIBaseModel):
-    # type must be "json_object" or "text" or "structural_tag"
-    type: Literal["text", "json_object", "structural_tag"]
+    # type must be one of "text", "json", "json_object", or "structural_tag"
+    type: Literal["text", "json", "json_object", "structural_tag"]
+    schema: Optional[dict] = None
     structures: Optional[List[StructuralTag]] = None
     triggers: Optional[List[str]] = None
 
@@ -83,6 +115,7 @@ class CompletionLogProbs(OpenAIBaseModel):
 class CompletionResponseChoice(OpenAIBaseModel):
     index: int
     text: str
+    token_ids: Optional[List[int]] = None
     logprobs: Optional[CompletionLogProbs] = None
     context_logits: Optional[Union[List[float], List[List[
         float]]]] = None  # For reward models, the output is score logits instead of text.
@@ -106,12 +139,13 @@ class CompletionResponse(OpenAIBaseModel):
     usage: UsageInfo
     # Add prompt_tokens_ids to the response to remove the tokenization
     # in the generation server in disaggreated serving
-    prompt_token_ids: Optional[List[List[int]]] = None
+    prompt_token_ids: Optional[Union[List[List[int]], List[int]]] = None
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
     index: int
     text: str
+    token_ids: Optional[List[int]] = None
     logprobs: Optional[CompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = Field(
@@ -139,6 +173,12 @@ def _response_format_to_guided_decoding_params(
         return None
     elif response_format.type == "text":
         return None
+    elif response_format.type == "json":
+        if response_format.schema is None:
+            raise ValueError(
+                "The 'schema' field is required when response_format.type is 'json'."
+            )
+        return GuidedDecodingParams(json=response_format.schema)
     elif response_format.type == "json_object":
         return GuidedDecodingParams(json_object=True)
     elif response_format.type == "structural_tag":
@@ -170,6 +210,7 @@ class CompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     user: Optional[str] = None
+    lora_request: Optional[LoRARequest] = None
 
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
@@ -187,6 +228,7 @@ class CompletionRequest(OpenAIBaseModel):
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
     return_context_logits: bool = False
+    detokenize: bool = True
     # doc: end-completion-sampling-params
 
     # doc: begin-completion-extra-params
@@ -200,7 +242,7 @@ class CompletionRequest(OpenAIBaseModel):
         default=None,
         description=
         ("Similar to chat completion, this parameter specifies the format of "
-         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'} are "
+         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'}, {'type': 'json'} are "
          "supported."),
     )
 
@@ -211,7 +253,7 @@ class CompletionRequest(OpenAIBaseModel):
 
     # doc: end-completion-extra-params
 
-    def to_sampling_params(self) -> SamplingParams:
+    def to_sampling_params(self, vocab_size: int = 32000) -> SamplingParams:
         sampling_params = SamplingParams(
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
@@ -241,12 +283,17 @@ class CompletionRequest(OpenAIBaseModel):
             return_context_logits=self.return_context_logits,
             guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format),
+            detokenize=self.detokenize,
+
+            # logits_bias
+            embedding_bias=_logit_bias_to_embedding_bias(
+                self.logit_bias, vocab_size),
 
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
 
             # TODO: migrate to use logprobs and prompt_logprobs
-            _return_log_probs=self.logprobs,
+            _return_log_probs=bool(self.logprobs),
         )
         return sampling_params
 
@@ -447,6 +494,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    lora_request: Optional[LoRARequest] = None
     # doc: end-chat-completion-sampling-params
 
     # doc: begin-chat-completion-extra-params
@@ -501,7 +549,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     # doc: end-chat-completion-extra-params
 
-    def to_sampling_params(self) -> SamplingParams:
+    def to_sampling_params(self, vocab_size: int = 32000) -> SamplingParams:
 
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
@@ -532,11 +580,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
             guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format),
 
+            # logits_bias
+            embedding_bias=_logit_bias_to_embedding_bias(
+                self.logit_bias, vocab_size),
+
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
 
             # TODO: migrate to use logprobs and prompt_logprobs
-            _return_log_probs=self.logprobs,
+            _return_log_probs=bool(self.logprobs),
         )
         return sampling_params
 
@@ -565,13 +617,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         top_logprobs = data.get("top_logprobs")
         if top_logprobs is not None and top_logprobs > 0:
             raise ValueError("top_logprobs is not supported")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def verify_logit_processor(cls, data):
-        if data.get("logit_bias"):
-            raise ValueError("logit bias is not supported")
         return data
 
     @model_validator(mode="before")

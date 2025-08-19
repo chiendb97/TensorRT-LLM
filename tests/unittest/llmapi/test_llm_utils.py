@@ -37,23 +37,24 @@ def test_ModelLoader():
 
 def test_CachedModelLoader():
     # CachedModelLoader enables engine caching and multi-gpu building
-    args = LlmArgs(model=llama_model_path,
-                   kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-                   enable_build_cache=True)
+    args = TrtLlmArgs(
+        model=llama_model_path,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        enable_build_cache=True)
     stats = LlmBuildStats()
     model_loader = CachedModelLoader(args, llm_build_stats=stats)
     engine_dir, _ = model_loader()
     assert engine_dir
     assert engine_dir.exists() and engine_dir.is_dir()
-    model_format = ModelLoader.get_model_format(engine_dir)
+    model_format = get_model_format(engine_dir, trust_remote_code=True)
     assert model_format is _ModelFormatKind.TLLM_ENGINE
 
 
 def test_LlmArgs_default_gpus_per_node():
     # default
-    llm_args = LlmArgs(model=llama_model_path)
+    llm_args = TrtLlmArgs(model=llama_model_path)
     assert llm_args.gpus_per_node == torch.cuda.device_count()
 
     # set explicitly
-    llm_args = LlmArgs(model=llama_model_path, gpus_per_node=6)
+    llm_args = TrtLlmArgs(model=llama_model_path, gpus_per_node=6)
     assert llm_args.gpus_per_node == 6

@@ -3,17 +3,20 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
+import transformers
 from parameterized import parameterized
 from transformers import Llama4Config
 from transformers import \
     Llama4ForConditionalGeneration as HFLlama4ForConditionalGeneration
 from transformers.cache_utils import DynamicCache
-from utils.util import getSMVersion
+from utils.util import default_dtype, getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.llama4_weight_mapper import \
+    Llama4HfWeightMapper
 from tensorrt_llm._torch.models.modeling_llama import \
     Llama4ForConditionalGeneration
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -152,11 +155,12 @@ class TestLlama4MinLatency(unittest.TestCase):
         dtype = llama_config.torch_dtype
         device = torch.device('cuda')
 
-        model_config = ModelConfig(pretrained_config=llama_config,
-                                   quant_config=quant_config)
-        model_config.pytorch_backend_config = PyTorchConfig(
-            enable_min_latency=enable_min_latency)
-        llama = Llama4ForConditionalGeneration(model_config).to(device)
+        with torch.device(device), default_dtype(dtype):
+            model_config = ModelConfig(pretrained_config=llama_config,
+                                       quant_config=quant_config)
+            model_config.pytorch_backend_config = PyTorchConfig(
+                enable_min_latency=enable_min_latency)
+            llama = Llama4ForConditionalGeneration(model_config)
 
         input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
                                  dtype=torch.int,
@@ -262,6 +266,11 @@ class TestLlama4MinLatency(unittest.TestCase):
         attention_backend = "TRTLLM"
         metadata_cls = get_attention_backend(attention_backend).Metadata
 
+        if transformers.__version__ >= "4.55.0":
+            self.skipTest(
+                "The transformers 4.55.0 has accuracy issues while 4.33.1 works fine. "
+                "https://nvbugspro.nvidia.com/bug/5441729")
+
         torch.random.manual_seed(0)
         config_dict = deepcopy(LLAMA_4_MAVERICK_TWO_LAYER_CONFIG)
         # 17B * sizeof(float16) plus some extra for activations
@@ -275,16 +284,18 @@ class TestLlama4MinLatency(unittest.TestCase):
         dtype = llama_config.torch_dtype
         device = torch.device('cuda')
 
-        hf_llama = HFLlama4ForConditionalGeneration(llama_config).to(dtype).to(
-            device).eval()
+        with torch.device(device), default_dtype(dtype):
+            hf_llama = HFLlama4ForConditionalGeneration(llama_config).eval()
 
-        model_config = ModelConfig(pretrained_config=llama_config,
-                                   attn_backend=attention_backend)
-        model_config.pytorch_backend_config = PyTorchConfig(
-            enable_min_latency=enable_min_latency)
-        llama = Llama4ForConditionalGeneration(model_config).to(dtype).to(
-            device)
-        llama.load_weights(hf_llama.state_dict())
+            model_config = ModelConfig(pretrained_config=llama_config,
+                                       attn_backend=attention_backend)
+            model_config.pytorch_backend_config = PyTorchConfig(
+                enable_min_latency=enable_min_latency)
+            llama = Llama4ForConditionalGeneration(model_config)
+            weight_mapper = Llama4HfWeightMapper()
+            weight_mapper.init_model_and_config(llama, model_config)
+            llama.load_weights(hf_llama.state_dict(),
+                               weight_mapper=weight_mapper)
 
         num_blocks = 1
         tokens_per_block = 128

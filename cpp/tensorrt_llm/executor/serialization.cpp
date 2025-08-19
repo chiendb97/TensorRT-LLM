@@ -23,6 +23,7 @@
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include <cstddef>
 #include <iostream>
 #include <memory>
 #include <type_traits>
@@ -946,15 +947,18 @@ Response Serialization::deserializeResponse(std::istream& is)
 {
     auto requestId = su::deserialize<IdType>(is);
     auto errOrResult = su::deserialize<std::variant<std::string, Result>>(is);
+    auto clientId = su::deserialize<std::optional<IdType>>(is);
 
-    return std::holds_alternative<std::string>(errOrResult) ? Response{requestId, std::get<std::string>(errOrResult)}
-                                                            : Response{requestId, std::get<Result>(errOrResult)};
+    return std::holds_alternative<std::string>(errOrResult)
+        ? Response{requestId, std::get<std::string>(errOrResult), clientId}
+        : Response{requestId, std::get<Result>(errOrResult), clientId};
 }
 
 void Serialization::serialize(Response const& response, std::ostream& os)
 {
     su::serialize(response.mImpl->mRequestId, os);
     su::serialize(response.mImpl->mErrOrResult, os);
+    su::serialize(response.mImpl->mClientId, os);
 }
 
 size_t Serialization::serializedSize(Response const& response)
@@ -962,6 +966,7 @@ size_t Serialization::serializedSize(Response const& response)
     size_t totalSize = 0;
     totalSize += su::serializedSize(response.mImpl->mRequestId);
     totalSize += su::serializedSize(response.mImpl->mErrOrResult);
+    totalSize += su::serializedSize(response.mImpl->mClientId);
     return totalSize;
 }
 
@@ -1146,6 +1151,8 @@ void Serialization::serialize(ExecutorConfig const& executorConfig, std::ostream
 KvCacheConfig Serialization::deserializeKvCacheConfig(std::istream& is)
 {
     auto enableBlockReuse = su::deserialize<bool>(is);
+    auto enablePartialReuse = su::deserialize<bool>(is);
+    auto copyOnPartialReuse = su::deserialize<bool>(is);
     auto maxTokens = su::deserialize<std::optional<SizeType32>>(is);
     auto maxAttentionWindowVec = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
     auto sinkTokenLength = su::deserialize<std::optional<SizeType32>>(is);
@@ -1155,14 +1162,19 @@ KvCacheConfig Serialization::deserializeKvCacheConfig(std::istream& is)
     auto crossKvCacheFraction = su::deserialize<std::optional<FloatType>>(is);
     auto secondaryOffloadMinPriority = su::deserialize<std::optional<executor::RetentionPriority>>(is);
     auto eventBufferMaxSize = su::deserialize<size_t>(is);
+    auto useUvm = su::deserialize<bool>(is);
+    auto attentionDpEventsGatherPeriodMs = su::deserialize<SizeType32>(is);
 
     return KvCacheConfig{enableBlockReuse, maxTokens, maxAttentionWindowVec, sinkTokenLength, freeGpuMemoryFraction,
-        hostCacheSize, onboardBlocks, crossKvCacheFraction, secondaryOffloadMinPriority, eventBufferMaxSize};
+        hostCacheSize, onboardBlocks, crossKvCacheFraction, secondaryOffloadMinPriority, eventBufferMaxSize,
+        enablePartialReuse, copyOnPartialReuse, useUvm, attentionDpEventsGatherPeriodMs};
 }
 
 void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& os)
 {
     su::serialize(kvCacheConfig.getEnableBlockReuse(), os);
+    su::serialize(kvCacheConfig.getEnablePartialReuse(), os);
+    su::serialize(kvCacheConfig.getCopyOnPartialReuse(), os);
     su::serialize(kvCacheConfig.getMaxTokens(), os);
     su::serialize(kvCacheConfig.getMaxAttentionWindowVec(), os);
     su::serialize(kvCacheConfig.getSinkTokenLength(), os);
@@ -1172,6 +1184,8 @@ void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& 
     su::serialize(kvCacheConfig.getCrossKvCacheFraction(), os);
     su::serialize(kvCacheConfig.getSecondaryOffloadMinPriority(), os);
     su::serialize(kvCacheConfig.getEventBufferMaxSize(), os);
+    su::serialize(kvCacheConfig.getUseUvm(), os);
+    su::serialize(kvCacheConfig.getAttentionDpEventsGatherPeriodMs(), os);
 }
 
 size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
@@ -1179,6 +1193,8 @@ size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
 
     size_t totalSize = 0;
     totalSize += su::serializedSize(kvCacheConfig.getEnableBlockReuse());
+    totalSize += su::serializedSize(kvCacheConfig.getEnablePartialReuse());
+    totalSize += su::serializedSize(kvCacheConfig.getCopyOnPartialReuse());
     totalSize += su::serializedSize(kvCacheConfig.getMaxTokens());
     totalSize += su::serializedSize(kvCacheConfig.getMaxAttentionWindowVec());
     totalSize += su::serializedSize(kvCacheConfig.getSinkTokenLength());
@@ -1188,6 +1204,8 @@ size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
     totalSize += su::serializedSize(kvCacheConfig.getCrossKvCacheFraction());
     totalSize += su::serializedSize(kvCacheConfig.getSecondaryOffloadMinPriority());
     totalSize += su::serializedSize(kvCacheConfig.getEventBufferMaxSize());
+    totalSize += su::serializedSize(kvCacheConfig.getUseUvm());
+    totalSize += su::serializedSize(kvCacheConfig.getAttentionDpEventsGatherPeriodMs());
     return totalSize;
 }
 
@@ -1244,19 +1262,22 @@ size_t Serialization::serializedSize(SchedulerConfig const& schedulerConfig)
 // CacheTransceiverConfig
 CacheTransceiverConfig Serialization::deserializeCacheTransceiverConfig(std::istream& is)
 {
-    auto maxNumTokens = su::deserialize<std::optional<size_t>>(is);
-    return CacheTransceiverConfig{maxNumTokens};
+    auto backendType = su::deserialize<std::optional<CacheTransceiverConfig::BackendType>>(is);
+    auto maxTokensInBuffer = su::deserialize<std::optional<size_t>>(is);
+    return CacheTransceiverConfig{backendType, maxTokensInBuffer};
 }
 
 void Serialization::serialize(CacheTransceiverConfig const& cacheTransceiverConfig, std::ostream& os)
 {
-    su::serialize(cacheTransceiverConfig.getMaxNumTokens(), os);
+    su::serialize(cacheTransceiverConfig.getBackendType(), os);
+    su::serialize(cacheTransceiverConfig.getMaxTokensInBuffer(), os);
 }
 
 size_t Serialization::serializedSize(CacheTransceiverConfig const& cacheTransceiverConfig)
 {
     size_t totalSize = 0;
-    totalSize += su::serializedSize(cacheTransceiverConfig.getMaxNumTokens());
+    totalSize += su::serializedSize(cacheTransceiverConfig.getBackendType());
+    totalSize += su::serializedSize(cacheTransceiverConfig.getMaxTokensInBuffer());
     return totalSize;
 }
 
@@ -1860,13 +1881,13 @@ IterationStats Serialization::deserializeIterationStats(std::istream& is)
     auto crossKvCacheStats = su::deserialize<std::optional<KvCacheStats>>(is);
     auto staticBatchingStats = su::deserialize<std::optional<StaticBatchingStats>>(is);
     auto inflightBatchingStats = su::deserialize<std::optional<InflightBatchingStats>>(is);
-    auto specdecStats = su::deserialize<std::optional<SpecDecodingStats>>(is);
+    auto specDecodingStats = su::deserialize<std::optional<SpecDecodingStats>>(is);
 
     return IterationStats{timestamp, iter, iterLatencyMS, newActiveRequestsQueueLatencyMS, numNewActiveRequests,
         numActiveRequests, numQueuedRequests, numCompletedRequests, maxNumActiveRequests, maxBatchSizeStatic,
         maxBatchSizeTunerRecommended, maxBatchSizeRuntime, maxNumTokensStatic, maxNumTokensTunerRecommended,
         maxNumTokensRuntime, gpuMemUsage, cpuMemUsage, pinnedMemUsage, kvCacheStats, crossKvCacheStats,
-        staticBatchingStats, inflightBatchingStats, specdecStats};
+        staticBatchingStats, inflightBatchingStats, specDecodingStats};
 }
 
 IterationStats Serialization::deserializeIterationStats(std::vector<char>& buffer)
@@ -1904,7 +1925,7 @@ size_t Serialization::serializedSize(IterationStats const& iterStats)
     totalSize += su::serializedSize(iterStats.crossKvCacheStats);
     totalSize += su::serializedSize(iterStats.staticBatchingStats);
     totalSize += su::serializedSize(iterStats.inflightBatchingStats);
-    totalSize += su::serializedSize(iterStats.specDecStats);
+    totalSize += su::serializedSize(iterStats.specDecodingStats);
 
     return totalSize;
 }
@@ -1933,7 +1954,7 @@ void Serialization::serialize(IterationStats const& iterStats, std::ostream& os)
     su::serialize(iterStats.crossKvCacheStats, os);
     su::serialize(iterStats.staticBatchingStats, os);
     su::serialize(iterStats.inflightBatchingStats, os);
-    su::serialize(iterStats.specDecStats, os);
+    su::serialize(iterStats.specDecodingStats, os);
 }
 
 std::vector<char> Serialization::serialize(IterationStats const& iterStats)
@@ -2162,6 +2183,237 @@ std::vector<RequestStatsPerIteration> Serialization::deserializeRequestStatsPerI
         iterRequestStatsVec.emplace_back(Serialization::deserializeRequestStatsPerIteration(is));
     }
     return iterRequestStatsVec;
+}
+
+//  KVCacheEvents deque
+std::vector<char> Serialization::serialize(std::deque<KVCacheEvent> const& eventQueue)
+{
+    // Compute the size of serialized buffer
+    size_t totalSize = 0;
+    totalSize += sizeof(size_t);
+    for (auto const& event : eventQueue)
+    {
+        totalSize += su::serializedSize(event);
+    }
+
+    std::vector<char> buffer(totalSize);
+    std::stringbuf strbuf(std::ios_base::out | std::ios_base::in);
+    strbuf.pubsetbuf(buffer.data(), buffer.size());
+    std::ostream os(&strbuf);
+
+    su::serialize(eventQueue.size(), os);
+    for (auto const& event : eventQueue)
+    {
+        su::serialize(event, os);
+    }
+    return buffer;
+}
+
+std::deque<KVCacheEvent> Serialization::deserializeKVCacheEvents(std::vector<char>& buffer)
+{
+    std::deque<KVCacheEvent> kvCacheEvents;
+    su::VectorWrapBuf<char> strbuf(buffer);
+    std::istream is(&strbuf);
+    auto numEvents = su::deserialize<std::size_t>(is);
+    for (std::size_t event = 0; event < numEvents; ++event)
+    {
+        kvCacheEvents.emplace_back(Serialization::deserializeKVCacheEvent(is));
+    }
+    return kvCacheEvents;
+}
+
+//  KVCacheEvent
+size_t Serialization::serializedSize(KVCacheEvent const& event)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(event.eventId);
+    totalSize += su::serializedSize(event.data);
+    totalSize += su::serializedSize(event.windowSize);
+    totalSize += su::serializedSize(event.attentionDpRank);
+    return totalSize;
+}
+
+void Serialization::serialize(KVCacheEvent const& event, std::ostream& os)
+{
+    su::serialize(event.eventId, os);
+    su::serialize(event.data, os);
+    su::serialize(event.windowSize, os);
+    su::serialize(event.attentionDpRank, os);
+}
+
+KVCacheEvent Serialization::deserializeKVCacheEvent(std::istream& is)
+{
+    auto eventId = su::deserialize<IdType>(is);
+    auto data = su::deserialize<KVCacheEventData>(is);
+    auto windowSize = su::deserialize<SizeType32>(is);
+    auto attentionDpRank = su::deserialize<std::optional<SizeType32>>(is);
+
+    return KVCacheEvent{eventId, data, windowSize, attentionDpRank};
+}
+
+// KVCacheCreatedData
+size_t Serialization::serializedSize(KVCacheCreatedData const& data)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(data.numBlocksPerCacheLevel);
+    return totalSize;
+}
+
+void Serialization::serialize(KVCacheCreatedData const& data, std::ostream& os)
+{
+    su::serialize(data.numBlocksPerCacheLevel, os);
+}
+
+KVCacheCreatedData Serialization::deserializeKVCacheCreatedData(std::istream& is)
+{
+    auto numBlocksPerCacheLevel = su::deserialize<std::vector<SizeType32>>(is);
+    return KVCacheCreatedData{numBlocksPerCacheLevel};
+}
+
+// KVCacheStoredData
+size_t Serialization::serializedSize(KVCacheStoredData const& data)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(data.parentHash);
+    totalSize += su::serializedSize(data.blocks);
+    return totalSize;
+}
+
+void Serialization::serialize(KVCacheStoredData const& data, std::ostream& os)
+{
+    su::serialize(data.parentHash, os);
+    su::serialize(data.blocks, os);
+}
+
+KVCacheStoredData Serialization::deserializeKVCacheStoredData(std::istream& is)
+{
+    auto parentHash = su::deserialize<std::optional<IdType>>(is);
+    auto blocks = su::deserialize<std::vector<KVCacheStoredBlockData>>(is);
+    return KVCacheStoredData{parentHash, blocks};
+}
+
+// KVCacheStoredBlockData
+size_t Serialization::serializedSize(KVCacheStoredBlockData const& data)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(data.blockHash);
+    totalSize += su::serializedSize(data.tokens);
+    totalSize += su::serializedSize(data.loraId);
+    totalSize += su::serializedSize(data.cacheLevel);
+    totalSize += su::serializedSize(data.priority);
+    return totalSize;
+}
+
+void Serialization::serialize(KVCacheStoredBlockData const& data, std::ostream& os)
+{
+    su::serialize(data.blockHash, os);
+    su::serialize(data.tokens, os);
+    su::serialize(data.loraId, os);
+    su::serialize(data.cacheLevel, os);
+    su::serialize(data.priority, os);
+}
+
+KVCacheStoredBlockData Serialization::deserializeKVCacheStoredBlockData(std::istream& is)
+{
+    auto blockHash = su::deserialize<IdType>(is);
+    auto tokens = su::deserialize<tensorrt_llm::runtime::VecUniqueTokens>(is);
+    auto loraId = su::deserialize<std::optional<tensorrt_llm::runtime::LoraTaskIdType>>(is);
+    auto cacheLevel = su::deserialize<SizeType32>(is);
+    auto priority = su::deserialize<SizeType32>(is);
+
+    return KVCacheStoredBlockData{blockHash, tokens, loraId, cacheLevel, priority};
+}
+
+// KVcacheRemovedData
+
+size_t Serialization::serializedSize(KVCacheRemovedData const& data)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(data.blockHashes);
+    return totalSize;
+}
+
+void Serialization::serialize(KVCacheRemovedData const& data, std::ostream& os)
+{
+    su::serialize(data.blockHashes, os);
+}
+
+KVCacheRemovedData Serialization::deserializeKVCacheRemovedData(std::istream& is)
+{
+    auto blockHashes = su::deserialize<std::vector<IdType>>(is);
+    return KVCacheRemovedData{blockHashes};
+}
+
+// KVCacheEventDiff
+template <typename T>
+size_t Serialization::serializedSize(KVCacheEventDiff<T> const& data)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(data.oldValue);
+    totalSize += su::serializedSize(data.newValue);
+    return totalSize;
+}
+
+template <typename T>
+void Serialization::serialize(KVCacheEventDiff<T> const& data, std::ostream& os)
+{
+    su::serialize(data.oldValue, os);
+    su::serialize(data.newValue, os);
+}
+
+template <typename T>
+KVCacheEventDiff<T> Serialization::deserializeKVCacheEventDiff(std::istream& is)
+{
+    auto oldValue = su::deserialize<T>(is);
+    auto newValue = su::deserialize<T>(is);
+    return KVCacheEventDiff<T>{oldValue, newValue};
+}
+
+// KVCacheUpdatedData
+size_t Serialization::serializedSize(KVCacheUpdatedData const& data)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(data.blockHash);
+    totalSize += su::serializedSize(data.cacheLevel);
+    totalSize += su::serializedSize(data.priority);
+    return totalSize;
+}
+
+void Serialization::serialize(KVCacheUpdatedData const& data, std::ostream& os)
+{
+    su::serialize(data.blockHash, os);
+    su::serialize(data.cacheLevel, os);
+    su::serialize(data.priority, os);
+}
+
+KVCacheUpdatedData Serialization::deserializeKVCacheUpdatedData(std::istream& is)
+{
+    auto blockHash = su::deserialize<IdType>(is);
+    auto cacheLevel = su::deserialize<std::optional<KVCacheEventDiff<SizeType32>>>(is);
+    auto priority = su::deserialize<std::optional<KVCacheEventDiff<SizeType32>>>(is);
+    return KVCacheUpdatedData{blockHash, cacheLevel, priority};
+}
+
+// UniqueToken
+size_t Serialization::serializedSize(tensorrt_llm::runtime::UniqueToken const& token)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(token.tokenId);
+    totalSize += su::serializedSize(token.tokenExtraId);
+    return totalSize;
+}
+
+void Serialization::serialize(tensorrt_llm::runtime::UniqueToken const& token, std::ostream& os)
+{
+    su::serialize(token.tokenId, os);
+    su::serialize(token.tokenExtraId, os);
+}
+
+tensorrt_llm::runtime::UniqueToken Serialization::deserializeUniqueToken(std::istream& is)
+{
+    auto tokenId = su::deserialize<tensorrt_llm::runtime::TokenIdType>(is);
+    auto tokenExtraId = su::deserialize<tensorrt_llm::runtime::TokenExtraIdType>(is);
+    return tensorrt_llm::runtime::UniqueToken{tokenId, tokenExtraId};
 }
 
 // String

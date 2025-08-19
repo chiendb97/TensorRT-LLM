@@ -23,10 +23,10 @@ import scipy
 import yaml
 
 import tensorrt_llm.evaluate
-from tensorrt_llm._torch import LLM as PyTorchLLM
-from tensorrt_llm._torch.speculative import SpecConfig
+from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi import LLM, SamplingParams
+from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -147,15 +147,14 @@ class AccuracyTask:
                  llm: Union[LLM, PyTorchLLM],
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
-                 sampling_params: Optional[SamplingParams] = None):
+                 sampling_params: Optional[SamplingParams] = None,
+                 streaming: bool = False):
         assert self.EVALUATOR_CLS is not None
 
         if llm.args.speculative_config is None:
             spec_dec_algo = None
         elif isinstance(llm.args.speculative_config, DecodingBaseConfig):
             spec_dec_algo = llm.args.speculative_config.decoding_type
-        elif isinstance(llm.args.speculative_config, SpecConfig):
-            spec_dec_algo = llm.args.speculative_config.spec_dec_name
         else:
             raise ValueError(
                 f"Not recognized speculative_config: {llm.args.speculative_config}."
@@ -193,7 +192,7 @@ class AccuracyTask:
             evaluator_kwargs.update(extra_evaluator_kwargs)
         evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
                                        **evaluator_kwargs)
-        accuracy = evaluator.evaluate(llm, sampling_params)
+        accuracy = evaluator.evaluate(llm, sampling_params, streaming)
         if self.HIGHER_IS_BETTER:
             assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
         else:
@@ -702,26 +701,59 @@ class CliFlowAccuracyTestHarness:
             extra_build_args: Optional[list] = None,
             extra_summarize_args: Optional[list] = None,
             extra_eval_long_context_args: Optional[list] = None,
-            env: Optional[Dict[str, str]] = None):
-        self.install_requirements()
-        self.initialize_case(
-            tasks=tasks,
-            dtype=dtype,
-            quant_algo=quant_algo,
-            kv_cache_quant_algo=kv_cache_quant_algo,
-            spec_dec_algo=spec_dec_algo,
-            extra_acc_spec=extra_acc_spec,
-            tp_size=tp_size,
-            pp_size=pp_size,
-            cp_size=cp_size,
-            extra_convert_args=extra_convert_args,
-            extra_build_args=extra_build_args,
-            extra_summarize_args=extra_summarize_args,
-            extra_eval_long_context_args=extra_eval_long_context_args,
-            env=env)
-        self.convert()
-        self.build()
-        self.evaluate()
+            env: Optional[Dict[str, str]] = None,
+            timeout_manager=None):
+        """
+        Run all accuracy test phases with timeout management.
+        If timeout_manager is provided, each phase will be wrapped to track and deduct remaining timeout.
+        """
+        # Use timeout_manager to manage timeout for each phase
+        if timeout_manager is not None:
+            with timeout_manager.timed_operation("install_requirements"):
+                self.install_requirements()
+            with timeout_manager.timed_operation("initialize_case"):
+                self.initialize_case(
+                    tasks=tasks,
+                    dtype=dtype,
+                    quant_algo=quant_algo,
+                    kv_cache_quant_algo=kv_cache_quant_algo,
+                    spec_dec_algo=spec_dec_algo,
+                    extra_acc_spec=extra_acc_spec,
+                    tp_size=tp_size,
+                    pp_size=pp_size,
+                    cp_size=cp_size,
+                    extra_convert_args=extra_convert_args,
+                    extra_build_args=extra_build_args,
+                    extra_summarize_args=extra_summarize_args,
+                    extra_eval_long_context_args=extra_eval_long_context_args,
+                    env=env)
+            with timeout_manager.timed_operation("convert"):
+                self.convert()
+            with timeout_manager.timed_operation("build"):
+                self.build()
+            with timeout_manager.timed_operation("evaluate"):
+                self.evaluate()
+        else:
+            # fallback: no timeout management
+            self.install_requirements()
+            self.initialize_case(
+                tasks=tasks,
+                dtype=dtype,
+                quant_algo=quant_algo,
+                kv_cache_quant_algo=kv_cache_quant_algo,
+                spec_dec_algo=spec_dec_algo,
+                extra_acc_spec=extra_acc_spec,
+                tp_size=tp_size,
+                pp_size=pp_size,
+                cp_size=cp_size,
+                extra_convert_args=extra_convert_args,
+                extra_build_args=extra_build_args,
+                extra_summarize_args=extra_summarize_args,
+                extra_eval_long_context_args=extra_eval_long_context_args,
+                env=env)
+            self.convert()
+            self.build()
+            self.evaluate()
 
 
 class LlmapiAccuracyTestHarness:
@@ -736,3 +768,14 @@ class LlmapiAccuracyTestHarness:
         logger.set_level("info")
         yield
         logger.set_level(original_level)
+
+
+def get_accuracy_task(dataset_name: str):
+    try:
+        task_class = globals()[dataset_name]
+        if issubclass(task_class, AccuracyTask):
+            return task_class
+        else:
+            raise ValueError(f"Unknown dataset: {dataset_name}.")
+    except KeyError:
+        raise ValueError(f"Not registered dataset: {dataset_name}.")

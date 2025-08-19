@@ -38,7 +38,7 @@ class Mamba2Mixer(nn.Module):
         d_model: int,
         d_state: int,
         d_conv: int,
-        expand: int,
+        nheads: int,
         n_groups: int,
         head_dim: int,
         chunk_size: int,
@@ -60,8 +60,7 @@ class Mamba2Mixer(nn.Module):
         tp_rank = config.mapping.tp_rank
         tp_size = config.mapping.tp_size
 
-        d_inner = d_model * expand
-        nheads = d_inner // head_dim
+        d_inner = head_dim * nheads
         d_in_proj = 2 * d_inner + 2 * n_groups * d_state + nheads
         conv_dim = d_inner + 2 * n_groups * d_state
 
@@ -163,15 +162,8 @@ class Mamba2Mixer(nn.Module):
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         batch_split_size = [num_prefills, num_decodes]
 
-        state_indices = attn_metadata.kv_cache_manager.get_state_indices()
-
-        # warm up does not prepare resources, so no relevant state indices
-        is_warmup = state_indices.numel() == 0
-        if is_warmup:
-            # in this case, assume batch takes first indices in mamba cache
-            state_indices = torch.arange(num_prefills + num_decodes,
-                                         device=state_indices.device,
-                                         dtype=state_indices.dtype)
+        state_indices = attn_metadata.kv_cache_manager.get_state_indices(
+        )[:num_prefills + num_decodes]
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)
