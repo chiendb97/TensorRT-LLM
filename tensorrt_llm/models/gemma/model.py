@@ -74,7 +74,7 @@ class GemmaDecoderLayer(Module):
                 gemma3_config.query_pre_attn_scalar) / math.sqrt(
                     config.head_size)
             is_sliding = bool(
-                (layer_idx + 1) % gemma3_config.sliding_window_pattern)
+                (layer_idx + 1) % gemma3_config._sliding_window_pattern)
             rotary_base_local = config.rope_local_base_freq
 
         self.attention = Attention(
@@ -157,10 +157,10 @@ class GemmaDecoderLayer(Module):
                 if default_net().plugin_config.reduce_fusion else
                 AllReduceFusionOp.NONE,
                 residual=residual,
-                norm_weight=self.post_layernorm.weight.value,
-                norm_pre_residual_weight=self.pre_feedforward_layernorm.weight.
-                value if self.config.inter_layernorms else None,
-                eps=self.post_layernorm.eps))
+                norm_weight=self.pre_feedforward_layernorm.weight.value,
+                norm_pre_residual_weight=self.post_layernorm.weight.value
+                if self.config.inter_layernorms else None,
+                eps=self.pre_feedforward_layernorm.eps))
 
         if use_cache:
             attention_output, presents = attention_output

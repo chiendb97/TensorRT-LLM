@@ -8,7 +8,9 @@
 #SBATCH -e logs/trtllm-serve.err
 #SBATCH -J trtllm-serve
 
-### Run trtllm-serve with pytorch backend on Slurm
+### :title Run trtllm-serve with pytorch backend on Slurm
+### :order 2
+### :section Slurm
 
 # NOTE, this feature is experimental and may not work on all systems.
 # The trtllm-llmapi-launch is a script that launches the LLM-API code on
@@ -33,7 +35,6 @@
 #      not supported in Slurm mode, you need to download the model and put it in
 #      the LOCAL_MODEL directory.
 
-
 echo "Starting trtllm-serve..."
 # Just launch trtllm-serve job with trtllm-llmapi-launch command.
 srun -l \
@@ -50,6 +51,6 @@ srun -l \
         trtllm-llmapi-launch \
          trtllm-serve $LOCAL_MODEL \
             --tp_size 16 \
-            --backend pytorch \
+            --host 0.0.0.0 \
             ${ADDITIONAL_OPTIONS}
     "

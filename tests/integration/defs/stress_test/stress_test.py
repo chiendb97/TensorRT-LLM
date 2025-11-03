@@ -342,6 +342,10 @@ def check_server_health(server_url: str,
                     memory_requirement=12),
         # Configuration for DeepSeek-V3 model
         ModelConfig(model_dir="DeepSeek-V3", tp_size=8, memory_requirement=96),
+        # Configuration for DeepSeek-R1 model
+        ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1",
+                    tp_size=8,
+                    memory_requirement=96),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
 def test_run_stress_test(config, stress_time_timeout, backend,
@@ -360,12 +364,11 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     """
     # Create a new ModelConfig with the backend parameter
     # Convert 'trt' to None as expected by the ModelConfig
-    backend_param = None if backend == "trt" else backend
 
     new_config = ModelConfig(model_dir=config.model_dir,
                              tp_size=config.tp_size,
                              memory_requirement=config.memory_requirement,
-                             backend=backend_param)
+                             backend=backend)
 
     # Extract stress_time and stress_timeout from the tuple
     stress_time, stress_timeout = stress_time_timeout
@@ -440,28 +443,31 @@ def stress_test(config,
     if run_performance:
         performance_config = PerformanceParams()
 
-        # For DeepSeek-V3 specific parameters
-        if "DeepSeek-V3" in config.model_dir:
+        # For DeepSeek-V3 or DeepSeek-R1 specific parameters
+        if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
             performance_config = PerformanceParams(
                 test_timeout=
-                36000  # 10 hours for DeepSeek-V3, change this value if needed
+                36000  # 10 hours for DeepSeek-V3 or DeepSeek-R1, change this value if needed
             )
 
     # For DeepSeek-V3 specific server parameters
-    if "DeepSeek-V3" in config.model_dir:
+    if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
         test_server_config = ServerConfig(
             port=test_server_config.port,
             host=test_server_config.host,
             pp_size=test_server_config.pp_size,
-            ep_size=8,  # DeepSeek-V3 specific ep_size
-            max_batch_size=161,  # DeepSeek-V3 specific max_batch_size
-            max_num_tokens=1160,  # DeepSeek-V3 specific max_num_tokens
+            ep_size=8,  # DeepSeek-V3 or DeepSeek-R1 specific ep_size
+            max_batch_size=
+            161,  # DeepSeek-V3 or DeepSeek-R1 specific max_batch_size
+            max_num_tokens=
+            1160,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
             kv_cache_free_gpu_memory_fraction=
-            0.7,  # DeepSeek-V3 specific kv_cache fraction
+            0.7,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
             capacity_scheduler_policy=test_server_config.
             capacity_scheduler_policy,
             wait_interval=test_server_config.wait_interval,
-            max_wait_seconds=14400,  # DeepSeek-V3 specific wait time (4 hours)
+            max_wait_seconds=
+            28800,  # DeepSeek-V3 or DeepSeek-R1 specific wait time (8 hours)
             health_check_timeout=test_server_config.health_check_timeout)
 
     # Create a StressTestConfig with customized time parameters if provided
@@ -502,25 +508,21 @@ def stress_test(config,
             "capacity_scheduler_policy":
             test_server_config.capacity_scheduler_policy
         },
-        "pytorch_backend_config": {
-            "enable_overlap_scheduler": True,
-        },
     }
 
-    # Add DeepSeek-V3 specific configuration
-    if "DeepSeek-V3" in config.model_dir:
+    # Add DeepSeek-V3 or DeepSeek-R1 specific configuration
+    if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
 
         extra_llm_options["enable_attention_dp"] = True
 
         if config.backend == "pytorch":
-            extra_llm_options["pytorch_backend_config"] = {
-                "use_cuda_graph": True,
-                "cuda_graph_padding_enabled": True,
-                "cuda_graph_batch_sizes":
-                [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
+            extra_llm_options.update({
+                "cuda_graph_config": {
+                    "enable_padding": True,
+                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
+                },
                 "print_iter_log": True,
-                "enable_overlap_scheduler": True
-            }
+            })
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
                                      delete=False) as temp_file:
@@ -539,6 +541,8 @@ def stress_test(config,
         str(config.tp_size),
         "--pp_size",
         str(test_server_config.pp_size),
+        "--backend",
+        config.backend,
     ]
 
     # Only add ep_size parameter if it's not None
@@ -556,12 +560,6 @@ def stress_test(config,
         "--extra_llm_api_options",
         extra_llm_options_path,
     ])
-
-    # Add backend option only if specified
-    # backend = None means trt backend
-    # backend = pytorch means pytorch backend
-    if config.backend:
-        server_cmd.extend(["--backend", config.backend])
 
     # Log the command we're about to run
     print_info(f"Running command: {' '.join(server_cmd)}")
@@ -705,8 +703,6 @@ def create_genai_perf_command(model_name,
         model_name,
         "--tokenizer",
         model_path,
-        "--service-kind",
-        "openai",
         "--endpoint-type",
         "completions",
         "--random-seed",
@@ -1054,8 +1050,9 @@ def extract_stress_test_metrics(artifacts_dir="./artifacts",
                                             {}).get("avg", 0)
                 tokThroughput = results.get("output_token_throughput",
                                             {}).get("avg", 0)
-                conCurrency = results.get("input_config",
-                                          {}).get("concurrency", 0)
+                conCurrency = results.get("input_config", {}).get(
+                    "perf_analyzer", {}).get("stimulus",
+                                             {}).get("concurrency", 0)
 
                 # Try to determine model name from directory structure first
                 if first_dir in model_name_map:

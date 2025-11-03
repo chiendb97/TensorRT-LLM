@@ -139,8 +139,8 @@ private:
     static std::optional<SizeType32> const& checkNumReturnSequences(
         std::optional<SizeType32> const& numReturnSequences, SizeType32 beamWidth);
     static std::optional<FloatType> const& checkMinP(std::optional<FloatType> const& minP);
-    static std::optional<std::vector<SizeType32>> const& checkBeamWidthArray(
-        std::optional<std::vector<SizeType32>> const& beamWidthArray, std::optional<SizeType32> const beamWidth);
+    static std::pair<std::optional<std::vector<SizeType32>> const&, SizeType32 const> const checkBeamWidthArray(
+        std::optional<std::vector<SizeType32>> const& beamWidthArray, SizeType32 const beamWidth);
     void updateNumReturnBeams();
 
     friend class Serialization;
@@ -280,6 +280,27 @@ private:
 
     /// @brief The input token extra ids for KV Cache reuse when p-tuning is enabled
     std::optional<VecTokenExtraIds> mInputTokenExtraIds;
+};
+
+/// @brief Multimodal input data class
+class MultimodalInput
+{
+public:
+    explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
+        std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths);
+
+    [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
+    [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
+    [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
+
+private:
+    friend class Serialization;
+    /// @brief The multimodal hashes
+    std::vector<std::vector<SizeType32>> mMultimodalHashes;
+    /// @brief The multimodal positions
+    std::vector<SizeType32> mMultimodalPositions;
+    /// @brief The multimodal lengths
+    std::vector<SizeType32> mMultimodalLengths;
 };
 
 /// @brief Configuration for mrope
@@ -483,6 +504,9 @@ public:
         /// @brief The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar.
         /// EBNF grammar is widely-used to express context-free grammars.
         kEBNF_GRAMMAR = 3,
+
+        /// @brief The generated text is amenable to the XGrammar structural tag.
+        kSTRUCTURAL_TAG = 4,
     };
 
     explicit GuidedDecodingParams(GuideType guideType, std::optional<std::string> guide = std::nullopt);
@@ -557,11 +581,15 @@ public:
 
     explicit KvCacheRetentionConfig(std::vector<TokenRangeRetentionConfig> const& tokenRangeRetentionPriorities,
         RetentionPriority decodeRetentionPriority = kDefaultRetentionPriority,
-        std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt);
+        std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt,
+        KvCacheTransferMode transferMode = KvCacheTransferMode::DRAM,
+        std::optional<std::string> directory = std::nullopt);
 
     [[nodiscard]] std::vector<TokenRangeRetentionConfig> getTokenRangeRetentionConfigs() const;
     [[nodiscard]] RetentionPriority getDecodeRetentionPriority() const;
     [[nodiscard]] std::optional<std::chrono::milliseconds> getDecodeDurationMs() const;
+    [[nodiscard]] KvCacheTransferMode getTransferMode() const;
+    [[nodiscard]] std::optional<std::string> getDirectory() const;
 
     /// @brief Convert the token range data into an entry per kv block. Returns a tuple of vectors corresponding to the
     /// priorities and durations for each block.
@@ -572,7 +600,8 @@ public:
     {
         return mTokenRangeRetentionConfigs == other.mTokenRangeRetentionConfigs
             && mDecodeRetentionPriority == other.mDecodeRetentionPriority
-            && mDecodeDurationMs == other.mDecodeDurationMs;
+            && mDecodeDurationMs == other.mDecodeDurationMs && mTransferMode == other.mTransferMode
+            && mDirectory == other.mDirectory;
     }
 
 private:
@@ -584,6 +613,10 @@ private:
     RetentionPriority mDecodeRetentionPriority;
     /// @brief The duration in ms that decode blocks should remain at their assigned priority level.
     std::optional<std::chrono::milliseconds> mDecodeDurationMs;
+    /// @brief The transfer mode for the block.
+    KvCacheTransferMode mTransferMode;
+    /// @brief Name of the directory if transfer mode is GDS or POSIX_DEBUG_FALLBACK.
+    std::optional<std::string> mDirectory;
 };
 
 /// @brief A class that holds information about the request
@@ -607,6 +640,7 @@ public:
     /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
     /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
+    /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths}
     /// @param multimodalEmbedding The multimodal embedding tensor. Expected shape is [num_multimodal_tokens,
     /// hidden_dim]
     /// @param mRopeConfig The mrope configuration
@@ -646,6 +680,7 @@ public:
         std::optional<Tensor> embeddingBias = std::nullopt,
         std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig = std::nullopt,
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
+        std::optional<MultimodalInput> multimodalInput = std::nullopt,
         std::optional<Tensor> multimodalEmbedding = std::nullopt, std::optional<MropeConfig> mRopeConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
@@ -688,6 +723,7 @@ public:
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
     [[nodiscard]] std::optional<ExternalDraftTokensConfig> getExternalDraftTokensConfig() const;
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
+    [[nodiscard]] std::optional<MultimodalInput> getMultimodalInput() const;
     [[nodiscard]] std::optional<Tensor> getMultimodalEmbedding() const;
     [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
@@ -723,6 +759,7 @@ public:
     void setExternalDraftTokensConfig(ExternalDraftTokensConfig const& externalDraftTokensConfig);
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
     void setMultimodalEmbedding(Tensor const& multimodalEmbedding);
+    void setMultimodalInput(MultimodalInput const& multimodalInput);
     void setMropeConfig(MropeConfig const& mRopeConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig);
@@ -954,6 +991,8 @@ private:
 class KvCacheConfig
 {
 public:
+    static constexpr auto kDefaultGpuMemFraction = 0.9F;
+
     explicit KvCacheConfig(bool enableBlockReuse = true, std::optional<SizeType32> const& maxTokens = std::nullopt,
         std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> const& sinkTokenLength = std::nullopt,
@@ -961,8 +1000,9 @@ public:
         std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true,
         std::optional<FloatType> const& crossKvCacheFraction = std::nullopt,
         std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
-        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt,
-        bool enablePartialReuse = true, bool copyOnPartialReuse = true);
+        bool enablePartialReuse = true, bool copyOnPartialReuse = true, bool useUvm = false,
+        SizeType32 attentionDpEventsGatherPeriodMs = 5,
+        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] bool getEnablePartialReuse() const;
@@ -976,6 +1016,8 @@ public:
     [[nodiscard]] bool getOnboardBlocks() const;
     [[nodiscard]] std::optional<RetentionPriority> getSecondaryOffloadMinPriority() const;
     [[nodiscard]] size_t getEventBufferMaxSize() const;
+    [[nodiscard]] bool getUseUvm() const;
+    [[nodiscard]] SizeType32 getAttentionDpEventsGatherPeriodMs() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setEnablePartialReuse(bool enablePartialReuse);
@@ -989,7 +1031,10 @@ public:
     void setOnboardBlocks(bool onboardBlocks);
     void setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority);
     void setEventBufferMaxSize(size_t eventBufferMaxSize);
-    void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults runtimeDefaults);
+    void setUseUvm(bool useUvm);
+    void setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs);
+
+    void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
 private:
     friend class Serialization;
@@ -1040,6 +1085,12 @@ private:
 
     /// @brief Whether partially matched blocks that are in use can be reused after copying them
     bool mCopyOnPartialReuse;
+
+    /// @brief Whether to use UVM for the KV cache.
+    bool mUseUvm;
+
+    /// @brief The period in milliseconds to gather attention DP events across ranks
+    SizeType32 mAttentionDpEventsGatherPeriodMs;
 };
 
 /// @brief Configuration class for the runtime perf knobs
@@ -1314,6 +1365,8 @@ public:
     {
         /// @brief Enable guided decoding with XGrammar backend.
         kXGRAMMAR = 0,
+        /// @brief Enable guided decoding with LLGuidance backend.
+        kLLGUIDANCE = 1,
     };
 
     explicit GuidedDecodingConfig(GuidedDecodingBackend backend,
@@ -1383,18 +1436,29 @@ private:
 class CacheTransceiverConfig
 {
 public:
-    explicit CacheTransceiverConfig(std::optional<size_t> maxNumTokens = std::nullopt);
+    enum class BackendType : std::uint8_t
+    {
+        DEFAULT = 0,
+        MPI = 1,
+        UCX = 2,
+        NIXL = 3
+    };
+    explicit CacheTransceiverConfig(
+        std::optional<BackendType> backendType = std::nullopt, std::optional<size_t> maxNumTokens = std::nullopt);
 
     bool operator==(CacheTransceiverConfig const& other) const;
+    void setBackendType(std::optional<BackendType> backendType);
+    void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
 
-    [[nodiscard]] std::optional<size_t> getMaxNumTokens() const;
-    void setMaxNumTokens(size_t maxNumTokens);
+    [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
+    [[nodiscard]] std::optional<BackendType> getBackendType() const;
 
 private:
+    std::optional<BackendType> mBackendType;
     /// @brief The maximum number of tokens that the CacheTransceiver's pre-allocated buffer can hold. If the number of
     /// kvCache tokens to be transferred for a single request is greater than this value, the performance of the cache
     /// transfer may be degraded.
-    std::optional<size_t> mMaxNumTokens;
+    std::optional<size_t> mMaxTokensInBuffer;
 };
 
 /// @brief Configuration class for the model executor
@@ -1426,8 +1490,8 @@ public:
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
         std::optional<CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
-        bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false,
-        bool promptTableOffloading = false, bool enableTrtOverlap = false);
+        bool gatherGenerationLogits = false, bool promptTableOffloading = false, bool enableTrtOverlap = false,
+        bool failFastOnAttentionWindowTooLarge = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1459,10 +1523,10 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingConfig> getGuidedDecodingConfig() const;
     [[nodiscard]] std::optional<std::vector<AdditionalModelOutput>> getAdditionalModelOutputs() const;
     [[nodiscard]] bool getGatherGenerationLogits() const;
-    [[nodiscard]] bool getUseVariableBeamWidthSearch() const;
     [[nodiscard]] bool getPromptTableOffloading() const;
     [[nodiscard]] std::optional<CacheTransceiverConfig> getCacheTransceiverConfig() const;
     [[nodiscard]] bool getEnableTrtOverlap() const;
+    [[nodiscard]] bool getFailFastOnAttentionWindowTooLarge() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1489,10 +1553,10 @@ public:
     void setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig);
     void setAdditionalModelOutputs(std::vector<AdditionalModelOutput> const& additionalModelOutputs);
     void setGatherGenerationLogits(bool gatherGenerationLogits);
-    void setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch);
     void setPromptTableOffloading(bool promptTableOffloading);
     void setCacheTransceiverConfig(CacheTransceiverConfig const& cacheTransceiverConfig);
     void setEnableTrtOverlap(bool enableTrtOverlap);
+    void setFailFastOnAttentionWindowTooLarge(bool failFastOnAttentionWindowTooLarge);
 
 private:
     friend class Serialization;
@@ -1574,14 +1638,15 @@ private:
     /// @brief Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
     bool mGatherGenerationLogits{false};
 
-    /// @brief Controls if Variable-Beam-Width-Search is enabled.
-    bool mUseVariableBeamWidthSearch{false};
-
     /// @brief Controls if prompt table offloading is enabled.
     bool mPromptTableOffloading{false};
 
     /// @brief Controls whether preparation and TRT engine execution should be overlapped.
     bool mEnableTrtOverlap{false};
+
+    /// @brief Controls whether to fail fast when attention window is too large to fit even a single sequence in the KV
+    /// cache.
+    bool mFailFastOnAttentionWindowTooLarge{false};
 };
 
 struct KVCacheCreatedData
@@ -1643,6 +1708,12 @@ struct KVCacheUpdatedData
     explicit KVCacheUpdatedData(IdType blockHash)
         : blockHash{blockHash} {};
 
+    explicit KVCacheUpdatedData(IdType blockHash, std::optional<KVCacheEventDiff<SizeType32>> cacheLevel,
+        std::optional<KVCacheEventDiff<SizeType32>> priority)
+        : blockHash{blockHash}
+        , cacheLevel{cacheLevel}
+        , priority{priority} {};
+
     KVCacheUpdatedData& cacheLevelUpdated(SizeType32 oldValue, SizeType32 newValue)
     {
         cacheLevel = KVCacheEventDiff<SizeType32>{oldValue, newValue};
@@ -1667,13 +1738,17 @@ using KVCacheEventData = std::variant<KVCacheCreatedData, KVCacheStoredData, KVC
 
 struct KVCacheEvent
 {
-
-    KVCacheEvent(IdType eventId, KVCacheEventData data);
+    KVCacheEvent(IdType eventId, KVCacheEventData data, SizeType32 windowSize,
+        std::optional<SizeType32> attentionDpRank = std::nullopt);
 
     /// @brief The unique id of this event
     IdType eventId;
     /// @brief The data corresponding to this event
     KVCacheEventData data;
+    /// @brief The sliding window size
+    SizeType32 windowSize;
+    /// @brief The attention DP rank of the event, if applicable
+    std::optional<SizeType32> attentionDpRank;
 };
 
 /// @brief Exposes a limited set of KV cache manager functionalities
