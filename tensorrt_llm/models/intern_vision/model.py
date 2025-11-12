@@ -25,8 +25,8 @@ from ...parameter import Parameter
 
 from ..._common import default_net
 from ...functional import (ACT2FN, Tensor, concat, constant, cumsum, expand,
-                           index_select, select, shape, slice, unsqueeze, interpolate, identity, repeat_interleave,
-                           expand_dims, add, gelu)
+                           index_select, select, shape, slice, unsqueeze, interpolate,
+                           identity, repeat_interleave, expand_dims, add, gelu)
 from ...layers import MLP, BertAttention, Embedding, LayerNorm, Linear, Conv2d
 from ...mapping import Mapping
 from ...module import Module, ModuleList
@@ -34,6 +34,94 @@ from ..modeling_utils import QuantConfig
 from .config import InternVisionConfig
 from .convert import (load_hf_intern_vision_base, load_weights_from_hf_model)
 from ...logger import logger
+
+
+class InternVisionBase(PretrainedModel):
+    '''
+    Base class that provides from_huggingface() and prepare_inputs() methods
+    '''
+    config_class = InternVisionConfig
+
+    def __init__(self, config: InternVisionConfig):
+        super().__init__(config)
+
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'bfloat16',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        """
+        Create a InternVision object from give parameters
+        """
+        assert hf_model_or_dir is not None
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
+        else:
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
+
+        tllm_config = InternVisionConfig.from_hugging_face(
+            hf_config_or_dir=hf_config_or_dir,
+            dtype=dtype,
+            mapping=mapping,
+            quant_config=quant_config,
+            **kwargs)
+
+        setattr(tllm_config, 'architecture', cls.__name__)
+
+        if dtype == 'bfloat16':
+            torch_dtype = torch.bfloat16
+        elif dtype == 'float16':
+            torch_dtype = torch.float16
+        else:
+            torch_dtype = torch.float32
+
+        if not use_preloading:
+            load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+            hf_model = load_hf_intern_vision_base(model_dir=hf_model_dir,
+                                                  load_model_on_cpu=load_model_on_cpu,
+                                                  dtype=torch_dtype)
+        weights = load_weights_from_hf_model(hf_model=hf_model,
+                                             config=tllm_config)
+        model = cls(tllm_config)
+        model.load(weights)
+
+        return model
+
+    # Override the PretrainedModel's method, can unify in the future.
+    def prepare_inputs(self, max_batch_size, **kwargs):
+        # opt_shape is set to half of max batch_size and seq_len by default
+        # tune this according to real data distribution
+        bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
+        pixel_values = Tensor(
+            name='pixel_values',
+            dtype=trt.float16,
+            shape=[-1, 3, 448, 448],
+            dim_range=OrderedDict([('batch_size', [bs_range]),
+                                   ('in_channels', [[3, 3, 3]]),
+                                   ('latent_height', [[448, 448, 448]]),
+                                   ('latent_width', [[448, 448, 448]])]),
+        )
+
+        input_lengths = Tensor(
+            name='input_lengths',
+            dtype=trt.int32,
+            shape=[-1],
+            dim_range=OrderedDict([('batch_size', [bs_range])])
+        )
+
+        inputs = {
+            'pixel_values': pixel_values,
+            'input_lengths': input_lengths
+        }
+
+        return inputs
 
 
 class InternVisionEmbedding(Module):
@@ -64,8 +152,7 @@ class InternVisionEmbedding(Module):
 
     def forward(self, pixel_values: Tensor):
         batch_size = shape(pixel_values, 0)
-        target_dtype = self.patch_embedding.weight.dtype
-        patch_embeds = self.patch_embedding(pixel_values.cast(target_dtype))  # shape = [*, channel, width, height]
+        patch_embeds = self.patch_embedding(pixel_values)  # shape = [*, channel, width, height]
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
 
         expand_shape = concat([batch_size,
@@ -129,101 +216,13 @@ class InternVisionEncoderLayer(Module):
 
         self.ls2 = Parameter(shape=[self.hidden_size])
 
-    def forward(self, hidden_states):
-        hidden_states = hidden_states + self.attn(self.norm1(hidden_states)) * self.ls1.value
+    def forward(self, hidden_states, input_lengths):
+        hidden_states = hidden_states + self.attn(self.norm1(hidden_states),
+                                                  input_lengths=input_lengths) * self.ls1.value
 
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states)) * self.ls2.value
 
         return hidden_states
-
-
-class InternVisionBase(PretrainedModel):
-    '''
-    Base class that provides from_huggingface() and prepare_inputs() methods
-    '''
-    config_class = InternVisionConfig
-
-    def __init__(self, config: InternVisionConfig):
-        super().__init__(config)
-
-    @classmethod
-    def load_hf_intern_vision(cls, model_dir: str, load_model_on_cpu: bool,
-                              dtype: torch.dtype):
-        """
-        Use as the abstractmethod, load corresponding HF model.
-        Subclass must implement this method!
-        """
-
-        if cls.__name__ == "InternVisionModel":
-            return load_hf_intern_vision_base(model_dir, load_model_on_cpu, dtype)
-        else:
-            assert False, f"Unknown class {cls.__name__}!"
-
-    @classmethod
-    def from_hugging_face(
-            cls,
-            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
-            dtype: str = 'float16',
-            mapping: Optional[Mapping] = None,
-            quant_config: Optional[QuantConfig] = None,
-            **kwargs):
-        """
-        Create a InternVision object from give parameters
-        """
-        import transformers
-
-        assert hf_model_or_dir is not None
-        use_preloading = isinstance(hf_model_or_dir,
-                                    transformers.PreTrainedModel)
-        if use_preloading:
-            hf_model = hf_model_or_dir
-            hf_config_or_dir = hf_model.config
-        else:
-            hf_model_dir = hf_model_or_dir
-            hf_config_or_dir = hf_model_or_dir
-
-        load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
-        tllm_config = InternVisionConfig.from_hugging_face(
-            hf_config_or_dir=hf_config_or_dir,
-            dtype=dtype,
-            mapping=mapping,
-            quant_config=quant_config,
-            **kwargs)
-
-        setattr(tllm_config, 'architecture', cls.__name__)
-
-        torch_dtype = torch.float16 if dtype == 'float16' else torch.float32
-        if not use_preloading:
-            hf_model = cls.load_hf_intern_vision(model_dir=hf_model_dir,
-                                                 load_model_on_cpu=load_model_on_cpu,
-                                                 dtype=torch_dtype)
-        weights = load_weights_from_hf_model(hf_model=hf_model,
-                                             config=tllm_config)
-        model = cls(tllm_config)
-        model.load(weights)
-
-        return model
-
-    # Override the PretrainedModel's method, can unify in the future.
-    def prepare_inputs(self, max_batch_size, **kwargs):
-        # opt_shape is set to half of max batch_size and seq_len by default
-        # tune this according to real data distribution
-        bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
-        pixel_values = Tensor(
-            name='pixel_values',
-            dtype=trt.float32,
-            shape=[-1, 3, 448, 448],
-            dim_range=OrderedDict([('batch_size', [bs_range]),
-                                   ('in_channels', [[3, 3, 3]]),
-                                   ('latent_height', [[448, 448, 448]]),
-                                   ('latent_width', [[448, 448, 448]])]),
-        )
-
-        inputs = {
-            'pixel_values': pixel_values
-        }
-
-        return inputs
 
 
 class MLP1(Module):
@@ -278,11 +277,11 @@ class InternVisionModel(InternVisionBase):
         x = x.permute([0, 2, 1, 3])
         return x
 
-    def forward(self, pixel_values=None):
+    def forward(self, pixel_values, input_lengths=None):
         hidden_states = self.embedding(pixel_values)
 
         for idx, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states=hidden_states)
+            hidden_states = layer(hidden_states=hidden_states, input_lengths=input_lengths)
 
         new_sizes = concat([shape(hidden_states, 0), shape(hidden_states, 1) - 1, shape(hidden_states, 2)])
         hidden_states = slice(hidden_states, starts=[0, 1, 0], sizes=new_sizes)
