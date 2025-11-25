@@ -1,10 +1,10 @@
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm._torch.utils import (fp4_utils,
+from tensorrt_llm._torch.utils import (Fp4QuantizedTensor, fp4_utils,
                                        get_last_power_of_2_num_tokens_buckets,
                                        last_positive_power_of_2,
                                        next_positive_power_of_2)
@@ -122,11 +122,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.local_num_experts, self.routed_scaling_factor,
             self.routing_method_type, self.do_finalize, tactic)
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         args = FP4BlockScaleMoEInputs(*inputs)
 
@@ -272,6 +269,31 @@ def fp4_block_scale_moe_runner(routing_logits: torch.Tensor,
     return kernel_runner(inputs, tactic=best_tactic)
 
 
+def fp4_block_scale_fake_output_without_finalize(
+    hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
+    num_experts: int,
+    top_k: int,
+    routing_bias: Optional[torch.Tensor],
+):
+    num_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[1] * (2 if isinstance(
+        hidden_states, Fp4QuantizedTensor) else 1)
+
+    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
+
+    expanded_row_count = num_tokens * top_k
+    max_padding_required = (tile_tokens_dim - 1) * num_experts
+    max_num_padded_tokens = fp4_utils.pad_up(
+        expanded_row_count + max_padding_required, tile_tokens_dim)
+    wt_dtype = routing_bias.dtype if routing_bias is not None else torch.bfloat16
+    return [
+        hidden_states.new_empty((max_num_padded_tokens, hidden_size),
+                                dtype=torch.bfloat16),
+        hidden_states.new_empty((num_tokens, top_k), dtype=wt_dtype),
+        hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32)
+    ]
+
+
 @fp4_block_scale_moe_runner.register_fake
 def _(
     routing_logits,
@@ -296,27 +318,20 @@ def _(
     routing_method_type,
     do_finalize,
 ) -> List[torch.Tensor]:
-    num_tokens = hidden_states.shape[0]
-    hidden_size = hidden_states.shape[1] * 2
     if do_finalize:
+        num_tokens = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[1] * 2
         return [
             hidden_states.new_empty((num_tokens, hidden_size),
                                     dtype=torch.bfloat16)
         ]
 
-    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
-
-    expanded_row_count = num_tokens * top_k
-    max_padding_required = (tile_tokens_dim - 1) * num_experts
-    max_num_padded_tokens = fp4_utils.pad_up(
-        expanded_row_count + max_padding_required, tile_tokens_dim)
-    wt_dtype = routing_bias.dtype if routing_bias is not None else torch.bfloat16
-    return [
-        hidden_states.new_empty((max_num_padded_tokens, hidden_size),
-                                dtype=torch.bfloat16),
-        hidden_states.new_empty((num_tokens, top_k), dtype=wt_dtype),
-        hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32)
-    ]
+    return fp4_block_scale_fake_output_without_finalize(
+        hidden_states,
+        num_experts,
+        top_k,
+        routing_bias,
+    )
 
 
 @dataclass(frozen=True)
@@ -409,11 +424,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic)
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         args = FP8BlockScaleMoEInputs(*inputs)
 
@@ -670,11 +682,8 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic)
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         args = MxE4m3MxE2m1BlockScaleMoEInputs(*inputs)
 
@@ -907,11 +916,8 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic)
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         args = E4m3MxE2m1BlockScaleMoEInputs(*inputs)
 
@@ -1123,11 +1129,8 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.local_num_experts, self.routed_scaling_factor,
             self.routing_method_type, tactic)
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         args = Bf16MxE2m1BlockScaleMoEInputs(*inputs)
 

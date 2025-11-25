@@ -27,6 +27,10 @@ methods:
         annotation: Optional[int]
         default: null
         status: prototype
+      return_perf_metrics:
+        annotation: bool
+        default: False
+        status: prototype
       # Bindings and mirrored configs
       peft_cache_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
@@ -91,6 +95,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      mm_encoder_only:
+        annotation: bool
+        default: False
+        status: prototype
       disable_overlap_scheduler:
         annotation: bool
         default: False
@@ -107,9 +115,9 @@ methods:
         annotation: bool
         default: False
         status: beta
-      use_torch_sampler:
-        annotation: bool
-        default: False
+      sampler_type:
+        annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
+        default: auto
         status: beta
       enable_iter_perf_stats:
         annotation: bool
@@ -119,10 +127,18 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      batch_wait_timeout_ms:
+        annotation: float
+        default: 0
+        status: prototype
       print_iter_log:
         annotation: bool
         default: False
         status: beta
+      perf_metrics_max_requests:
+        annotation: int
+        default: 0
+        status: prototype
       torch_compile_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
         default: null
@@ -151,6 +167,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
         default: null
         status: deprecated
+      kv_connector_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConnectorConfig]
+        default: null
+        status: prototype
     return_annotation: None
   generate:
     parameters:
@@ -176,6 +196,9 @@ methods:
         annotation: Optional[tensorrt_llm.scheduling_params.SchedulingParams]
         default: null
         status: prototype
+      cache_salt:
+        annotation: Optional[str]
+        default: null
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   get_kv_cache_events:
     parameters:
