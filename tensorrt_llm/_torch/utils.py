@@ -12,7 +12,12 @@ from tensorrt_llm.quantization.utils import fp4_utils
 
 is_torch_compiling_flag = False
 
-aux_stream_name_list = ['Attention', 'MoeShared', 'MoeChunkingOverlap']
+aux_stream_name_list = [
+    'Attention',
+    'MoeShared',
+    'MoeChunkingOverlap',
+    'MoeBalancer',
+]
 AuxStreamType = Enum(
     'AuxStreamType',
     aux_stream_name_list,
@@ -75,7 +80,8 @@ def make_weak_ref(x):
 
     if isinstance(x, torch.Tensor):
         return convert_to_torch_tensor(
-            TensorWrapper(x.data_ptr(), x.dtype, x.shape)) if x.is_cuda else x
+            TensorWrapper(x.data_ptr(), x.dtype, x.shape,
+                          x.stride())) if x.is_cuda else x
     elif isinstance(x, tuple):
         return tuple(make_weak_ref(i) for i in x)
     elif isinstance(x, list):
@@ -260,3 +266,21 @@ def set_piecewise_cuda_graph_flag(enable: bool):
 def get_piecewise_cuda_graph_flag() -> bool:
     global _enable_piecewise_cuda_graph
     return _enable_piecewise_cuda_graph
+
+
+@contextlib.contextmanager
+def piecewise_cuda_graph(enable: bool):
+    prev_enable = get_piecewise_cuda_graph_flag()
+    set_piecewise_cuda_graph_flag(enable)
+    try:
+        yield
+    finally:
+        set_piecewise_cuda_graph_flag(prev_enable)
+
+
+def set_per_request_piecewise_cuda_graph_flag(enable: bool):
+    _global_attrs.per_request_piecewise_cuda_graph_flag = enable
+
+
+def get_per_request_piecewise_cuda_graph_flag() -> bool:
+    return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)

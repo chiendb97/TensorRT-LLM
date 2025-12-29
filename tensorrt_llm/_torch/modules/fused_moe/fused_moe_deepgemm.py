@@ -1,7 +1,6 @@
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -11,9 +10,10 @@ from tensorrt_llm._utils import nvtx_range
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import Fp4QuantizedTensor
+from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
-from .quantization import MoEWeightLoadingMode
+from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
+                           MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -87,6 +87,7 @@ def _masked_index_copy_group_quant_fp8(
 
 def masked_index_copy_group_quant_fp8(
     output: torch.Tensor,
+    output_s: torch.Tensor,
     input: torch.Tensor,
     start_offsets: torch.Tensor,
     row_indices: torch.Tensor,
@@ -107,14 +108,10 @@ def masked_index_copy_group_quant_fp8(
     col_size = output.shape[1]
     dim_size = output.shape[2]
 
-    # create padded output_s
     alignment = 4
     scale_dim = (dim_size + group_size - 1) // group_size
     padded_dim_size = (scale_dim + alignment - 1) // alignment * alignment
     padded_col_size = (col_size + alignment - 1) // alignment * alignment
-    output_s = torch.zeros((row_size, padded_dim_size // 4, padded_col_size),
-                           dtype=torch.int32,
-                           device='cuda')
 
     # get block/grid/stage/warp
     num_groups = (dim_size + group_size - 1) // group_size
@@ -218,34 +215,88 @@ def triton_masked_index_gather(output, input, start_offsets, row_indices):
     return
 
 
-@nvtx_range("[DG] act")
-@torch.compile(dynamic=True)
-def swiglu_fused_moe(x):
-    x, gate = x.chunk(2, dim=-1)
-    return F.silu(gate) * x
-
-
-@nvtx_range("[DG] indexing")
-@torch.compile(dynamic=True)
-def indexing(x, mask):
-    return x[mask > 0, :].contiguous()
+@triton.jit
+def _preprocess_after_permute_kernel(
+    expert_offsets_ptr,
+    masked_m_ptr,
+    token_map_ptr,
+    TOTAL_TOKENS: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    pid_x = tl.program_id(0)
+    pid_y = tl.program_id(1)
+    if pid_y == 0:
+        token_offsets = pid_x * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        token_mask = token_offsets < TOTAL_TOKENS
+        # get expert_id for each token in the block
+        expert_ids = tl.full((BLOCK_SIZE_M, ), NUM_EXPERTS - 1, dtype=tl.int32)
+        found_mask = tl.zeros((BLOCK_SIZE_M, ), dtype=tl.int1)
+        for i in tl.static_range(NUM_EXPERTS):
+            boundary = tl.load(expert_offsets_ptr + i + 1)
+            cond = (token_offsets < boundary) & ~found_mask
+            expert_ids = tl.where(cond, i, expert_ids)
+            found_mask = found_mask | cond
+        tl.store(token_map_ptr + token_offsets,
+                 expert_ids.to(tl.int64),
+                 mask=token_mask)
+    elif pid_y == 1:
+        # get num_tokens for each expert
+        expert_mask = pid_x < NUM_EXPERTS
+        next_offset = tl.load(expert_offsets_ptr + pid_x + 1,
+                              mask=expert_mask,
+                              other=0)
+        current_offset = tl.load(expert_offsets_ptr + pid_x,
+                                 mask=expert_mask,
+                                 other=0)
+        tokens_per_expert = next_offset - current_offset
+        tl.store(masked_m_ptr + pid_x,
+                 tokens_per_expert.to(tl.int32),
+                 mask=expert_mask)
 
 
 @nvtx_range("[DG] preprocess_after_permute")
 def preprocess_after_permute(expert_first_token_offset_tensor,
                              permuted_data_tensor):
-    # get tokens per expert
-    masked_m = expert_first_token_offset_tensor[
-        1:] - expert_first_token_offset_tensor[:-1]
-    token_to_expert_map = torch.searchsorted(
-        expert_first_token_offset_tensor[1:],
-        torch.arange(permuted_data_tensor.shape[0], device='cuda'),
-        right=True)
-    return masked_m.to(torch.int32), token_to_expert_map
+    """
+    Python wrapper that launches a single fused kernel to get the token-to-expert map
+    and the number of tokens per expert.
+    """
+    total_tokens = permuted_data_tensor.shape[0]
+    num_experts = expert_first_token_offset_tensor.shape[0] - 1
+
+    # create output tensors
+    masked_m = torch.empty(num_experts, dtype=torch.int32, device='cuda')
+    token_to_expert_map = torch.empty(total_tokens,
+                                      dtype=torch.int64,
+                                      device='cuda')
+
+    # calculate the grid size
+    DEFAULT_BLOCK_SIZE_M = 256
+    grid_m_size = triton.cdiv(total_tokens, DEFAULT_BLOCK_SIZE_M)
+    if grid_m_size >= num_experts:
+        BLOCK_SIZE_M = DEFAULT_BLOCK_SIZE_M
+        grid = (grid_m_size, 2)
+    else:
+        block_size_m = triton.cdiv(total_tokens, num_experts)
+        BLOCK_SIZE_M = triton.next_power_of_2(block_size_m)
+        grid = (num_experts, 2)
+
+    # launch the kernel
+    _preprocess_after_permute_kernel[grid](
+        expert_first_token_offset_tensor,
+        masked_m,
+        token_to_expert_map,
+        TOTAL_TOKENS=total_tokens,
+        NUM_EXPERTS=num_experts,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+    )
+    return masked_m, token_to_expert_map
 
 
 @nvtx_range("[DG]")
 def deepgemm_fp8_group_blockwise_gemm(
+    d: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
     sfa: torch.Tensor,
@@ -253,10 +304,6 @@ def deepgemm_fp8_group_blockwise_gemm(
     masked_m: torch.Tensor,
     expected_m: int,
 ) -> torch.Tensor:
-    d = torch.empty((a.shape[0], a.shape[1], b.shape[1]),
-                    device=b.device,
-                    dtype=torch.bfloat16)
-
     # NOTES: shape must be `[G, M, K] @ [G, N, K].mT`
     assert a.stride(-1) == 1
     assert b.stride(-1) == 1
@@ -286,7 +333,16 @@ def deepgemm_fp8_group_blockwise_gemm(
                                            masked_m,
                                            expected_m,
                                            disable_ue8m0_cast=True)
-    return d
+    return
+
+
+def set_strides(workspace: torch.Tensor, g: int, m: int, k: int):
+    workspace = workspace[0:g * m * k]
+    workspace = workspace.as_strided(
+        size=(g, m, k),
+        stride=(m * k, k, 1),
+    )
+    return workspace
 
 
 class DeepGemmFusedMoE(CutlassFusedMoE):
@@ -298,7 +354,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         top_k (int): Number of top experts to select for each input token.
         hidden_size (int): Size of the hidden state.
         intermediate_size (int): Size of the intermediate state.
-        aux_stream (Optional[torch.cuda.Stream]): Auxiliary CUDA stream to overlap chunks.
+        aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
@@ -319,12 +375,25 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
     ):
+        if model_config.moe_max_num_tokens is None:
+            moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+            # The default moe_max_num_tokens is calculated from the following formula:
+            # max_isl = 8196, max_batch_size = 1024, mtp = 0
+            # max_num_tokens = ((mtp+1)*max_batch_size+max_isl+128+63)//64*64 = 9344
+            # moe_max_num_tokens = max_num_tokens * 2 = 18688
+            # It can avoid OOM for 8k/1k cases.
+            default_moe_max_num_tokens = 18688
+            if moe_max_num_tokens > default_moe_max_num_tokens:
+                model_config._frozen = False
+                model_config.moe_max_num_tokens = default_moe_max_num_tokens
+                model_config._frozen = True
 
         super().__init__(
             routing_method=routing_method,
@@ -334,11 +403,54 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
-            aux_stream=aux_stream,
+            aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
         )
+
+    def get_workspace(self, m_max: int, group_size: int):
+        hidden_size = self.hidden_size
+        intermediate_size = self.intermediate_size_per_partition
+        num_experts = self.expert_size_per_partition
+
+        # create workspace
+        fp8_dim = max(hidden_size, intermediate_size)
+        workspace_0 = torch.empty((num_experts * m_max * fp8_dim),
+                                  dtype=torch.float8_e4m3fn,
+                                  device='cuda')
+        workspace_1 = torch.empty(
+            (num_experts * m_max * max(intermediate_size * 2, hidden_size)),
+            dtype=torch.bfloat16,
+            device='cuda')
+
+        # create workspace for scaling factors
+        m_padded = fp8_utils.align(m_max, 4)
+        scale_k = fp8_utils.ceil_div(fp8_dim, group_size)
+        scale_k_padded = fp8_utils.align(scale_k, 4)
+        workspace_sf = torch.empty(
+            (num_experts * (scale_k_padded // 4) * m_padded),
+            dtype=torch.int32,
+            device='cuda')
+
+        workspace = {
+            "workspace_0": workspace_0,
+            "workspace_1": workspace_1,
+            "workspace_sf": workspace_sf,
+        }
+        return workspace
+
+    def _get_quant_method(self):
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
+                exclude_kv_cache=True):
+            if self.quant_config.layer_quant_mode.has_fp8_block_scales():
+                return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
+            else:
+                raise ValueError(
+                    f"Unsupported quantization mode: {self.quant_config.quant_mode}"
+                )
+        else:
+            return UnquantizedFusedMoEMethod()
 
     @nvtx_range("[DG] forward")
     def forward_chunk(
@@ -348,6 +460,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -423,22 +536,38 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         masked_m, token_to_expert_map = preprocess_after_permute(
             expert_first_token_offset_tensor, permuted_data_tensor)
 
-        m_max = (x.shape[0] + 127) // 128 * 128
         expected_m = (token_selected_experts.numel() +
                       self.expert_size_per_partition -
                       1) // self.expert_size_per_partition
-        act_input_fp8 = torch.empty(
-            (self.expert_size_per_partition, m_max, self.hidden_size),
-            dtype=torch.float8_e4m3fn,
-            device='cuda')
+
+        # padding and quantization
+        m_max = fp8_utils.align(x.shape[0], 128)
+        act_input_fp8 = set_strides(workspace["workspace_0"],
+                                    self.expert_size_per_partition, m_max,
+                                    self.hidden_size)
+
+        m_padded = fp8_utils.align(m_max, 4)
+        scale_k = fp8_utils.ceil_div(self.hidden_size, 128)
+        scale_k_padded = fp8_utils.align(scale_k, 4)
+        act_input_sf = set_strides(workspace["workspace_sf"],
+                                   self.expert_size_per_partition,
+                                   scale_k_padded // 4, m_padded)
+
         act_input_sf = masked_index_copy_group_quant_fp8(
             act_input_fp8,
+            act_input_sf,
             permuted_data_tensor,
             expert_first_token_offset_tensor,
             token_to_expert_map,
             group_size=128)
 
-        h1 = deepgemm_fp8_group_blockwise_gemm(
+        # grouped gemm 1
+        h1 = set_strides(workspace["workspace_1"],
+                         self.expert_size_per_partition, m_max,
+                         self.intermediate_size_per_partition * 2)
+
+        deepgemm_fp8_group_blockwise_gemm(
+            d=h1,
             a=act_input_fp8,
             b=self.w3_w1_weight,
             sfa=act_input_sf,
@@ -446,9 +575,33 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             masked_m=masked_m,
             expected_m=expected_m,
         )
-        act_input_fp8, act_input_sf = fp8_utils.silu_and_mul_masked_post_quant_fwd(
-            input=h1, quant_group_size=128, masked_m=masked_m, scale_ue8m0=True)
-        h3 = deepgemm_fp8_group_blockwise_gemm(
+
+        # activation and quantization
+        act_input_fp8 = set_strides(workspace["workspace_0"],
+                                    self.expert_size_per_partition, m_max,
+                                    self.intermediate_size_per_partition)
+
+        scale_k = fp8_utils.ceil_div(self.intermediate_size_per_partition, 128)
+        scale_k_padded = fp8_utils.align(scale_k, 4)
+        act_input_sf = set_strides(workspace["workspace_sf"],
+                                   self.expert_size_per_partition,
+                                   scale_k_padded // 4, m_padded)
+
+        act_input_sf = fp8_utils.silu_and_mul_masked_post_quant_fwd(
+            output=act_input_fp8,
+            output_scale=act_input_sf,
+            input=h1,
+            quant_group_size=128,
+            masked_m=masked_m,
+            scale_ue8m0=True)
+
+        # grouped gemm 2
+        h3 = set_strides(workspace["workspace_1"],
+                         self.expert_size_per_partition, m_max,
+                         self.hidden_size)
+
+        deepgemm_fp8_group_blockwise_gemm(
+            d=h3,
             a=act_input_fp8,
             b=self.w2_weight,
             sfa=act_input_sf,
@@ -457,6 +610,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             expected_m=expected_m,
         )
 
+        # gather and finalize
         triton_masked_index_gather(permuted_data_tensor, h3,
                                    expert_first_token_offset_tensor,
                                    token_to_expert_map)
@@ -471,7 +625,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             expert_first_token_offset_tensor,
             False,  # enable_alltoall
             x.shape[0],  # num_rows
-            x.shape[1],  # hidden_size
+            x.shape[1],  # (possibly padded) hidden_size
+            self.unpadded_hidden_size,  # original hidden size
             self.routing_method.top_k,
             self.expert_size_per_partition,  # num_experts_per_node
             self.tp_size,
@@ -481,3 +636,138 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         )
 
         return final_hidden_states
+
+    def forward_impl(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,  # used by other MoE backends
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
+        if self.use_dp and self.parallel_size > 1:
+            assert all_rank_num_tokens is not None
+            assert use_dp_padding is not None
+            num_rows = sum(all_rank_num_tokens)
+        else:
+            num_rows = x.shape[0]
+
+        # In case of num_rows is larger than max_chunk_size * 2, we need to split the input into multiple chunks.
+        # Because we will use two streams in chunked moe and preallocate two workspaces.
+        num_chunks = 1
+        if num_rows > self.moe_max_num_tokens * 2:
+            num_chunks = (num_rows + self.moe_max_num_tokens -
+                          1) // self.moe_max_num_tokens
+
+        if use_dp_padding:
+            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
+                                          ] * len(all_rank_num_tokens)
+        else:
+            all_rank_num_tokens_padded = all_rank_num_tokens
+
+        if num_chunks == 1:
+            # create workspace
+            num_rows = x.shape[0]
+            if self.use_dp:
+                num_rows = sum(all_rank_num_tokens_padded)
+            m_max = fp8_utils.align(num_rows, 128)
+            workspace = self.get_workspace(m_max, 128)
+            outputs = self.forward_chunk(
+                x,
+                router_logits,
+                output_dtype,
+                all_rank_num_tokens=all_rank_num_tokens_padded,
+                use_dp_padding=use_dp_padding,
+                workspace=workspace)
+            outputs = self.reducescatter_or_allreduce(
+                outputs,
+                all_rank_num_tokens=all_rank_num_tokens_padded,
+                use_dp_padding=use_dp_padding)
+        else:
+            if self.use_dp:
+                all_rank_chunk_size_list = [
+                    self.split_chunk(val, num_chunks)
+                    for val in all_rank_num_tokens_padded
+                ]
+                all_rank_num_tokens_list = [[
+                    val[idx_chunk] for val in all_rank_chunk_size_list
+                ] for idx_chunk in range(num_chunks)]
+                chunk_size_list = all_rank_chunk_size_list[self.rank]
+            else:
+                all_rank_num_tokens_list = [None] * num_chunks
+                chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
+
+            # create workspace
+            chunk_size_0 = sum(all_rank_num_tokens_list[0]
+                               ) if self.use_dp else chunk_size_list[0]
+            chunk_size_1 = sum(all_rank_num_tokens_list[1]
+                               ) if self.use_dp else chunk_size_list[1]
+            workspace_0 = self.get_workspace(fp8_utils.align(chunk_size_0, 128),
+                                             128)
+            workspace_1 = self.get_workspace(fp8_utils.align(chunk_size_1, 128),
+                                             128)
+
+            x_list = x.split(chunk_size_list)
+            router_logits_list = router_logits.split(chunk_size_list)
+
+            self.event_dict[EventType.Main].record()
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.Main].wait()
+
+            def _forward_chunk(x_, router_logits_, idx, workspace):
+                return self.forward_chunk(
+                    x_,
+                    router_logits_,
+                    all_rank_num_tokens=all_rank_num_tokens_list[idx]
+                    if self.use_dp else None,
+                    use_dp_padding=use_dp_padding,
+                    workspace=workspace)
+
+            def _reducescatter_or_allreduce(x_, idx):
+                return self.reducescatter_or_allreduce(
+                    x_,
+                    all_rank_num_tokens=all_rank_num_tokens_list[idx],
+                    use_dp_padding=use_dp_padding)
+
+            outputs_list = []
+            # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
+            for idx_chunk, (x, router_logits) in enumerate(
+                    zip(x_list, router_logits_list)):
+
+                if idx_chunk % 2 == 0:
+                    with torch.cuda.stream(self.aux_stream):
+                        outputs = _forward_chunk(x, router_logits, idx_chunk,
+                                                 workspace_0)
+                    if idx_chunk > 0:
+                        outputs_list[-1] = _reducescatter_or_allreduce(
+                            outputs_list[-1], idx_chunk - 1)
+                else:
+                    outputs = _forward_chunk(x, router_logits, idx_chunk,
+                                             workspace_1)
+                    with torch.cuda.stream(self.aux_stream):
+                        outputs_list[-1] = _reducescatter_or_allreduce(
+                            outputs_list[-1], idx_chunk - 1)
+
+                outputs_list.append(outputs)
+
+            if num_chunks % 2 == 0:
+                outputs_list[-1] = _reducescatter_or_allreduce(
+                    outputs_list[-1], -1)
+            else:
+                with torch.cuda.stream(self.aux_stream):
+                    outputs_list[-1] = _reducescatter_or_allreduce(
+                        outputs_list[-1], -1)
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.MoeChunkingOverlap].record()
+            self.event_dict[EventType.MoeChunkingOverlap].wait()
+
+            outputs = torch.cat(outputs_list)
+
+        if self.use_dp and self.parallel_size > 1:
+            rank = self.mapping.tp_rank
+            outputs = outputs[:all_rank_num_tokens[rank]]
+        return outputs

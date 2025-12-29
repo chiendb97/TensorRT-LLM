@@ -3,30 +3,32 @@ import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.nn as nn
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel, Qwen2_5_VLForConditionalGeneration,
                           Qwen2VLForConditionalGeneration)
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ..._utils import nvtx_range_debug
 from ...functional import RopeEmbeddingUtils, RotaryScalingType
-from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
+from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       InputProcessor, MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (find_uncached_mm_embeds,
-                                        fuse_input_embeds)
-from .modeling_utils import register_auto_model
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_multimodal_embeddings)
+from .modeling_utils import register_auto_model, register_vision_encoder
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
-class Qwen2VLInputProcessorBase(InputProcessor):
+class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(self,
                  model_path: str,
@@ -42,6 +44,9 @@ class Qwen2VLInputProcessorBase(InputProcessor):
             trust_remote_code=trust_remote_code)
 
         self.tllm_multimodal_token_id = self.model_config.vocab_size + 1
+        # temporal patch size for video frames
+        self.temporal_patch_size = getattr(model_config.vision_config,
+                                           'temporal_patch_size', 1)
 
     @classmethod
     def get_rope_index(
@@ -217,38 +222,6 @@ class Qwen2VLInputProcessorBase(InputProcessor):
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    def get_num_tokens_per_image(
-        self,
-        *,
-        image_width: int,
-        image_height: int,
-        num_frames: int = 1,
-        do_resize: bool = True,
-    ):
-        patch_size = self.model_config.vision_config.patch_size
-        merge_size = self.model_config.vision_config.spatial_merge_size
-        temporal_patch_size = self.model_config.vision_config.temporal_patch_size
-        if do_resize:
-            resized_height, resized_width = smart_resize(
-                height=image_height,
-                width=image_width,
-                factor=patch_size * merge_size,
-                min_pixels=self.processor.image_processor.min_pixels,
-                max_pixels=self.processor.image_processor.max_pixels,
-            )
-            image_width, image_height = resized_width, resized_height
-
-        padded_num_frames = num_frames + num_frames % temporal_patch_size
-
-        grid_t = max(padded_num_frames // temporal_patch_size, 1)
-        grid_h = image_height // patch_size
-        grid_w = image_width // patch_size
-
-        num_patches = grid_t * grid_h * grid_w
-        num_vision_tokens = num_patches // (merge_size**2)
-
-        return num_vision_tokens
-
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
         images = mm_data.get("image")
@@ -307,7 +280,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                                                 mm_processor_kwargs)
         if not mm_data:
             fused_input_ids = processed_inputs['input_ids']
-            return fused_input_ids.to(torch.int32).tolist(), {}
+            return fused_input_ids.flatten().to(torch.int32).tolist(), {}
 
         pixel_values = processed_inputs.get('pixel_values', None)
         pixel_values_videos = processed_inputs.get('pixel_values_videos', None)
@@ -341,22 +314,29 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         }
 
 
-class Qwen2VisionModelBase:
+class Qwen2VisionModelBase(nn.Module):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  model_class: type[PreTrainedModel]):
-        self.pretrained_config = model_config.pretrained_config
+        super().__init__()
+        pretrained_config = model_config.pretrained_config
+        self.model_config = model_config
         self.device = f"cuda:{model_config.mapping.rank}"
 
-        model_path = self.pretrained_config._name_or_path
+        model_path = pretrained_config._name_or_path
         # TODO: Change the model class to TRT-LLM's Qwen2VisionModel
         # Currently, copying vision encoder on all devices.
         # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
         model = model_class.from_pretrained(
             model_path,
-            torch_dtype=self.pretrained_config.torch_dtype,
+            torch_dtype=pretrained_config.torch_dtype,
             attn_implementation='flash_attention_2').eval()
+        # TODO: Make vision model compatible with meta init mode and load_weights at the same place
         self.visual = model.visual.to(self.device)
+        self.post_config()
+
+    def post_config(self):
+        self.config = self.visual.config
 
     def _to_device(
         self, input_tensor: Union[torch.Tensor, List, None]
@@ -613,17 +593,19 @@ class Qwen2VLModelBase(PreTrainedModel):
 
         if len(multimodal_params) > 0:
             if not DISAGG:
-                mm_embeds = self.mm_encoder.forward(
-                    multimodal_params[:num_context_requests])
+                mm_embeds = get_multimodal_embeddings(
+                    encoder_forward_fn=self.mm_encoder.forward,
+                    multimodal_params=multimodal_params[:num_context_requests])
             else:
-                mm_embeds = [
-                    multimodal_param.multimodal_data["multimodal_embedding"]
-                    for multimodal_param in multimodal_params
-                ]
+                raise NotImplementedError(
+                    "Qwen2VLModel does not support disaggregated inference yet. Please unset "
+                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                )
             mrope_config = self._parse_and_concat_mrope_config(
                 multimodal_params, num_context_requests,
                 num_generation_requests)
-            mm_embeds = find_uncached_mm_embeds(
+
+            mm_embeds = find_input_mm_embeds(
                 mm_embeds, multimodal_params[:num_context_requests])
 
         if 'mrope_position_deltas' in kwargs:
@@ -631,7 +613,8 @@ class Qwen2VLModelBase(PreTrainedModel):
                 'mrope_position_deltas']
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
-                                                    input_ids, mm_embeds)
+                                                    input_ids, mm_embeds,
+                                                    **kwargs)
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
@@ -644,25 +627,45 @@ class Qwen2VLModelBase(PreTrainedModel):
         return output_prob
 
 
+@register_vision_encoder(Qwen2VisionModelBase,
+                         vlm_base_model=Qwen2VLForConditionalGeneration)
 @register_auto_model("Qwen2VLForConditionalGeneration")
-@register_input_processor(Qwen2VLInputProcessorBase, model_type="qwen2_vl")
+@register_input_processor(
+    Qwen2VLInputProcessorBase,
+    model_type="qwen2_vl",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "<|vision_start|><|image_pad|><|vision_end|>",
+            "video": "<|vision_start|><|video_pad|><|vision_end|>"
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class Qwen2VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
+        super().__init__(model_config, *args, **kwargs)
         if not DISAGG:
             self.mm_encoder = Qwen2VisionModelBase(
                 model_config, Qwen2VLForConditionalGeneration)
-        super().__init__(model_config, *args, **kwargs)
 
 
+@register_vision_encoder(Qwen2VisionModelBase,
+                         vlm_base_model=Qwen2_5_VLForConditionalGeneration)
 @register_auto_model("Qwen2_5_VLForConditionalGeneration")
-@register_input_processor(Qwen2VLInputProcessorBase, model_type="qwen2_5_vl")
+@register_input_processor(
+    Qwen2VLInputProcessorBase,
+    model_type="qwen2_5_vl",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "<|vision_start|><|image_pad|><|vision_end|>",
+            "video": "<|vision_start|><|video_pad|><|vision_end|>"
+        }))
 class Qwen2_5_VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
+        super().__init__(model_config, *args, **kwargs)
         if not DISAGG:
             self.mm_encoder = Qwen2VisionModelBase(
                 model_config, Qwen2_5_VLForConditionalGeneration)
-        super().__init__(model_config, *args, **kwargs)

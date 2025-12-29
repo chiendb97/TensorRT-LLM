@@ -1,10 +1,13 @@
+from collections.abc import Generator
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from itertools import pairwise
+from typing import Any, Dict, List, Optional, TypeAlias, Union
 
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
 
@@ -172,6 +175,7 @@ class PyResult:
             max_new_tokens, use_device_memory, exclude_last_generation_logits
         ) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
+        self._mm_embeddings = None
 
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
@@ -186,6 +190,10 @@ class PyResult:
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
+
+    def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
+        self._mm_embeddings = SharedTensorContainer.from_tensor(
+            mm_embeddings).dump_to_dict()
 
     def set_log_probs(self, log_probs: list[TokenLogprobs],
                       cum_log_probs: list[float]):
@@ -224,11 +232,16 @@ class PyResult:
     def cum_log_probs(self) -> list[float] | None:
         return self._log_probs and self._log_probs.cum_log_probs
 
+    @property
+    def mm_embedding_handle(self) -> Dict[str, Any] | None:
+        return self._mm_embeddings
+
 
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
-        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs'))
+        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
+         'mm_embedding_handle'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
@@ -249,6 +262,12 @@ class LlmResult:
     def deserialize(self):
         self._result = tensorrt_llm.bindings.executor.deserialize_result(
             self._result)
+
+    def get_result(self):
+        if tmp_res := tensorrt_llm.bindings.executor.deserialize_result(
+                self._result):
+            return tmp_res
+        return None
 
 
 @dataclass
@@ -322,7 +341,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
-        self.py_lora_task_layer_module_configs = None
+        self.py_lora_task_layer_module_configs: list[
+            tensorrt_llm.bindings.internal.runtime.
+            TaskLayerModuleConfig] | None = None
 
         self.py_return_log_probs = return_log_probs
         self.py_return_context_logits = return_context_logits
@@ -333,6 +354,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_seq_slot = seq_slot
         # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
+        self.use_draft_model = is_draft
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
@@ -404,7 +426,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.child_requests.append(py_request)
 
 
-def convert_wordlist(word_list) -> List[List[int]]:
+StopWordList: TypeAlias = list[list[int]]
+
+
+def convert_wordlist(word_list) -> StopWordList:
     """Converts a wordlist from format:
 
     [[word_0 token_0, word_0 token_1, ...], [word_1 token_0, ...], ...]]
@@ -439,6 +464,16 @@ def convert_wordlist(word_list) -> List[List[int]]:
     if len(tokens) > len(offsets):
         offsets.extend([-1] * (len(tokens) - len(offsets)))
     return [tokens, offsets]
+
+
+def produce_stop_words(
+        py_stop_words_list: StopWordList) -> Generator[list[int], None, None]:
+    """yield stop sequences from the output of `convert_wordlist` above."""
+    stop_words_list, prefix_sum = py_stop_words_list
+    for start, end in pairwise((0, *prefix_sum)):  # first element: prepend 0
+        if end == -1:  # -1 is a sentinel value in convert_wordlist
+            break
+        yield stop_words_list[start:end]
 
 
 def executor_request_to_llm_request(
@@ -526,6 +561,8 @@ def executor_request_to_llm_request(
         priority=0.5,
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
+        cache_salt_id=executor_request.cache_salt_id,
+        arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None))
     if child_req_ids:

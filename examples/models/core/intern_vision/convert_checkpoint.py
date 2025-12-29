@@ -34,8 +34,8 @@ def parse_arguments():
                         help='N-way pipeline parallelism size')
     parser.add_argument('--dtype',
                         type=str,
-                        default='float16',
-                        choices=['float32', 'float16'])
+                        default='bfloat16',
+                        choices=['float32', 'float16', 'bfloat16'])
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',

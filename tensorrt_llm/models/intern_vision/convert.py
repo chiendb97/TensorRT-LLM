@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 # isort: off
-from transformers import AutoModel
+from transformers import AutoModel, AutoConfig
 # isort: on
 from ...logger import logger
 from ..convert_utils import split, split_qkv_bias_tp, split_qkv_tp
@@ -43,9 +43,7 @@ def _load_weights_from_hf_intern_vision_model(hf_model,
     # use different prefix because InternVision is used both individually and as part of model
     trtllm_prefix = ""
     for k, v in hf_model.state_dict().items():
-        key = None
         v = v.to(torch_dtype).cpu()
-
         if 'mlp1.0.weight' in k:
             key = f'{trtllm_prefix}mlp1.norm.weight'
         elif 'mlp1.0.bias' in k:
@@ -155,28 +153,36 @@ def _load_weights_from_hf_intern_vision_model(hf_model,
 def load_hf_intern_vision_base(model_dir: str,
                                load_model_on_cpu: bool = False,
                                dtype: torch.dtype = torch.float16):
-
-
     """
     load huggingface BertModel and RobertaModel model
     """
 
     # Todo: Refactor
-    def _get_pos_embed(pos_embed, H, W):
+    def _get_pos_embed(pos_embed, H, W, image_size=448, patch_size=14):
         target_dtype = pos_embed.dtype
         pos_embed = pos_embed.float().reshape(
-            1, 448 // 14, 448 // 14, -1).permute(0, 3, 1, 2)
+            1, image_size // patch_size, image_size // patch_size, -1).permute(0, 3, 1, 2)
         pos_embed = F.interpolate(pos_embed, size=(H, W), mode='bicubic', align_corners=False). \
             reshape(1, -1, H * W).permute(0, 2, 1).to(target_dtype)
         return pos_embed
 
-    def get_position_embedding(position_embedding):
+    def get_position_embedding(position_embedding, config):
+        image_size = config.vision_config.image_size
+        patch_size = config.vision_config.patch_size
+
+        H = W = image_size // patch_size
+
         position_embedding = torch.cat([
             position_embedding[:, :1, :],
-            _get_pos_embed(position_embedding[:, 1:, :], 32, 32)
+            _get_pos_embed(position_embedding[:, 1:, :], H, W, image_size, patch_size)
         ], dim=1)
 
         return nn.Parameter(position_embedding)
+
+    config = AutoConfig.from_pretrained(
+        model_dir,
+        trust_remote_code=True
+    )
 
     model = AutoModel.from_pretrained(
         model_dir,
@@ -184,7 +190,8 @@ def load_hf_intern_vision_base(model_dir: str,
     )
 
     # Prepare position embedding with fixed image size
-    model.vision_model.embeddings.position_embedding = get_position_embedding(model.vision_model.embeddings.position_embedding)
+    model.vision_model.embeddings.position_embedding = get_position_embedding(
+        model.vision_model.embeddings.position_embedding, config)
 
     if not load_model_on_cpu:
         model.cuda().to(dtype)
@@ -203,12 +210,10 @@ def load_weights_from_hf_model(
 
     """
     # TODO: add quantization support
-    weights = {}
     tik = time.time()
 
     torch_dtype = getattr(torch, config.dtype)
 
-    no_match = {}
     if config.architecture in [
         "InternVLChatModel", "InternVisionModel"
     ]:

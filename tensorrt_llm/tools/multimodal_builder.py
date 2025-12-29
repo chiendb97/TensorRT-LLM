@@ -25,7 +25,7 @@ from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from safetensors.torch import save_file
+from safetensors.torch import load_model, save_file
 from transformers import CLIPImageProcessor
 
 from ..runtime.session import Session
@@ -41,7 +41,7 @@ def add_multimodal_arguments(parser):
 							'fuyu', 'pix2struct', 'neva', 'kosmos-2',
 							'video-neva', 'phi-3-vision', 'phi-4-multimodal',
 							'mllama', 'internvl', 'qwen2_vl',
-							'internlm-xcomposer2', 'qwen2_audio', 'pixtral'
+							'internlm-xcomposer2', 'qwen2_audio', 'pixtral', 'eclair'
 						],
 						help="Model type")
 	parser.add_argument(
@@ -101,10 +101,10 @@ class MultimodalEngineBuilder:
 			model_name = args.model_path.split('/')[-1]
 			args.output_dir = f'tmp/trt_engines/{model_name}/multimodal_encoder'
 
-
 		os.makedirs(args.output_dir, exist_ok=True)
 
 		self.args = args
+
 
 	def build(self):
 		args = self.args
@@ -145,6 +145,8 @@ class MultimodalEngineBuilder:
 			build_qwen2_audio_engine(args)
 		elif args.model_type == "pixtral":
 			build_pixtral_engine(args)
+		elif args.model_type == "eclair":
+			build_eclair_engine(args)
 		else:
 			raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -1026,155 +1028,153 @@ def build_phi_engine(args):
 
 
 def build_phi4mm_engine(args):
-    logger.warning(
+	logger.warning(
         "Skipping TRT engine build for Phi-4-multimodal encoder.  MultimodalModelRunner will use PyTorch vision & audio encoder. Flash/SDPA attention in CLIP encoder is not compatible with torch.onnx.export and eager attention is unstable in PyTorch."
     )
 
-    # Dump config.json needed by model runner
-    config_args = {
-        "builder_config": {
-            "precision": torch_dtype_to_str(torch.float16),
-            "model_type": "phi-4-multimodal",
-        }
-    }
-    os.makedirs(os.path.join(args.output_dir, "vision"), exist_ok=True)
-    os.makedirs(os.path.join(args.output_dir, "audio"), exist_ok=True)
-    to_json_file(config_args,
-                 os.path.join(args.output_dir, "vision", "config.json"))
-    to_json_file(config_args,
-                 os.path.join(args.output_dir, "audio", "config.json"))
-    return
+	# Dump config.json needed by model runner
+	config_args = {
+		"builder_config": {
+			"precision": torch_dtype_to_str(torch.float16),
+			"model_type": "phi-4-multimodal",
+		}
+	}
+	os.makedirs(os.path.join(args.output_dir, "vision"), exist_ok=True)
+	os.makedirs(os.path.join(args.output_dir, "audio"), exist_ok=True)
+	to_json_file(config_args,
+				 os.path.join(args.output_dir, "vision", "config.json"))
+	to_json_file(config_args,
+				 os.path.join(args.output_dir, "audio", "config.json"))
+	return
 
-    # Following code works ok with eager mode attention. Leaving it here so that it could
-    # be used once issues in torch / onnx mentioned above resolved.
-    processor = AutoProcessor.from_pretrained(args.model_path,
-                                              trust_remote_code=True)
-    raw_image = Image.new('RGB', [10, 10])  # dummy image
+	# Following code works ok with eager mode attention. Leaving it here so that it could
+	# be used once issues in torch / onnx mentioned above resolved.
+	processor = AutoProcessor.from_pretrained(args.model_path,
+											  trust_remote_code=True)
+	raw_image = Image.new('RGB', [10, 10])  # dummy image
 
-    import numpy as np
-    audio_feature_size = 500
-    audio_compression_rate = 8
-    audio_sampling_rate = 16000
-    audio_len = int((audio_feature_size * audio_compression_rate + 2) *
-                    audio_sampling_rate / 100)
-    raw_audio = (np.zeros(audio_len), audio_sampling_rate)  # dummy audio
+	import numpy as np
+	audio_feature_size = 500
+	audio_compression_rate = 8
+	audio_sampling_rate = 16000
+	audio_len = int((audio_feature_size * audio_compression_rate + 2) *
+					audio_sampling_rate / 100)
+	raw_audio = (np.zeros(audio_len), audio_sampling_rate)  # dummy audio
 
-    inputs = processor(text="<|image_1|><|audio_1|>\ndummy",
-                       images=[raw_image],
-                       audios=[raw_audio],
-                       return_tensors="pt")
+	inputs = processor(text="<|image_1|><|audio_1|>\ndummy",
+					   images=[raw_image],
+					   audios=[raw_audio],
+					   return_tensors="pt")
 
-    img_embeds = inputs['input_image_embeds'].to(args.device, torch.float16)
-    img_attention_mask = inputs['image_attention_mask'].to(
-        args.device, torch.bool)
-    img_embeds = img_embeds.flatten(0, 1)  # (2, 3, 448, 448)
-    img_attention_mask = img_attention_mask.flatten(0, 1)  # (2, 32, 32)
+	img_embeds = inputs['input_image_embeds'].to(args.device, torch.float16)
+	img_attention_mask = inputs['image_attention_mask'].to(
+		args.device, torch.bool)
+	img_embeds = img_embeds.flatten(0, 1)  # (2, 3, 448, 448)
+	img_attention_mask = img_attention_mask.flatten(0, 1)  # (2, 32, 32)
 
-    aud_embeds = inputs['input_audio_embeds'].to(args.device,
-                                                 torch.float16)  # (1, 4000, 80)
-    aud_len, aud_dim = aud_embeds.shape[1:]
-    aud_embeds = torch.cat(
-        [aud_embeds,
-         aud_embeds.new_zeros(1, 4000 - aud_len, aud_dim)], dim=1)
-    aud_attention_mask = torch.ones(1, aud_embeds.shape[1]).to(
-        args.device, torch.bool)
-    aud_attention_mask[0, aud_len:] = 0
+	aud_embeds = inputs['input_audio_embeds'].to(args.device,
+												 torch.float16)  # (1, 4000, 80)
+	aud_len, aud_dim = aud_embeds.shape[1:]
+	aud_embeds = torch.cat(
+		[aud_embeds,
+		 aud_embeds.new_zeros(1, 4000 - aud_len, aud_dim)], dim=1)
+	aud_attention_mask = torch.ones(1, aud_embeds.shape[1]).to(
+		args.device, torch.bool)
+	aud_attention_mask[0, aud_len:] = 0
 
-    class Phi4VisionWrapper(torch.nn.Module):
+	class Phi4VisionWrapper(torch.nn.Module):
 
-        def __init__(self, vision_model):
-            super().__init__()
-            self.vision_model = vision_model
+		def __init__(self, vision_model):
+			super().__init__()
+			self.vision_model = vision_model
 
-        @torch.no_grad
-        def forward(self, img_embeds, attention_mask):
-            features = self.vision_model.get_img_features(
-                img_embeds, attention_mask)
-            return self.vision_model.img_projection(features)
+		@torch.no_grad
+		def forward(self, img_embeds, attention_mask):
+			features = self.vision_model.get_img_features(
+				img_embeds, attention_mask)
+			return self.vision_model.img_projection(features)
 
-    class Phi4AudioWrapper(torch.nn.Module):
+	class Phi4AudioWrapper(torch.nn.Module):
 
-        def __init__(self, audio_model):
-            super().__init__()
-            self.audio_model = audio_model
+		def __init__(self, audio_model):
+			super().__init__()
+			self.audio_model = audio_model
 
-        @torch.no_grad
-        def forward(self, aud_embeds, attention_mask):
-            features, _ = self.audio_model.encoder(aud_embeds, attention_mask)
-            speech_out = self.audio_model.audio_projection['speech'](features)
-            vision_out = self.audio_model.audio_projection['vision'](features)
-            return torch.cat((speech_out, vision_out), dim=-1)
+		@torch.no_grad
+		def forward(self, aud_embeds, attention_mask):
+			features, _ = self.audio_model.encoder(aud_embeds, attention_mask)
+			speech_out = self.audio_model.audio_projection['speech'](features)
+			vision_out = self.audio_model.audio_projection['vision'](features)
+			return torch.cat((speech_out, vision_out), dim=-1)
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_path,
-                                                 torch_dtype='auto',
-                                                 trust_remote_code=True)
+	model = AutoModelForCausalLM.from_pretrained(args.model_path,
+												 torch_dtype='auto',
+												 trust_remote_code=True)
 
-    vision_model = model.model.embed_tokens_extend.image_embed
-    vision_model = vision_model.to(args.device, torch.float16)
-    vision_model.eval()
-    vision_wrapper = Phi4VisionWrapper(vision_model)
+	vision_model = model.model.embed_tokens_extend.image_embed
+	vision_model = vision_model.to(args.device, torch.float16)
+	vision_model.eval()
+	vision_wrapper = Phi4VisionWrapper(vision_model)
 
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    part_name = 'vision'
-    onnx_dir = f"{args.output_dir}/{part_name}/onnx"
+	Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+	part_name = 'vision'
+	onnx_dir = f"{args.output_dir}/{part_name}/onnx"
 
-    export_onnx(vision_wrapper,
-                input=(img_embeds, img_attention_mask),
-                onnx_dir=onnx_dir,
-                input_names=['input', 'attention_mask'],
-                dynamic_axes={
-                    'input': {
-                        0: "batch"
-                    },
-                    'attention_mask': {
-                        0: "batch"
-                    }
-                })
-    build_trt_engine(
-        args.model_type,
-        input_sizes=[[list(img_embeds.shape[1:]) for _ in range(3)],
-                     [list(img_attention_mask.shape[1:]) for _ in range(3)]],
-        onnx_dir=onnx_dir,
-        engine_dir=f"{args.output_dir}/{part_name}",
-        max_batch_size=args.max_batch_size,
-        engine_name=f"visual_encoder.engine",
-        dtype=torch.float16)
+	export_onnx(vision_wrapper,
+				input=(img_embeds, img_attention_mask),
+				onnx_dir=onnx_dir,
+				input_names=['input', 'attention_mask'],
+				dynamic_axes={
+					'input': {
+						0: "batch"
+					},
+					'attention_mask': {
+						0: "batch"
+					}
+				})
+	build_trt_engine(
+		args.model_type,
+		input_sizes=[[list(img_embeds.shape[1:]) for _ in range(3)],
+					 [list(img_attention_mask.shape[1:]) for _ in range(3)]],
+		onnx_dir=onnx_dir,
+		engine_dir=f"{args.output_dir}/{part_name}",
+		max_batch_size=args.max_batch_size,
+		engine_name=f"visual_encoder.engine",
+		dtype=torch.float16)
 
-    audio_model = model.model.embed_tokens_extend.audio_embed
-    audio_model = audio_model.to(args.device, torch.float16)
-    audio_model.eval()
-    audio_wrapper = Phi4AudioWrapper(audio_model)
+	audio_model = model.model.embed_tokens_extend.audio_embed
+	audio_model = audio_model.to(args.device, torch.float16)
+	audio_model.eval()
+	audio_wrapper = Phi4AudioWrapper(audio_model)
 
-    part_name = 'audio'
-    onnx_dir = f"{args.output_dir}/{part_name}/onnx"
+	part_name = 'audio'
+	onnx_dir = f"{args.output_dir}/{part_name}/onnx"
 
-    export_onnx(audio_wrapper,
-                input=(aud_embeds, aud_attention_mask),
-                onnx_dir=onnx_dir,
-                input_names=['input', 'attention_mask'],
-                dynamic_axes={
-                    'input': {
-                        0: "batch"
-                    },
-                    'attention_mask': {
-                        0: 'batch'
-                    }
-                })
-    build_trt_engine(
-        args.model_type,
-        input_sizes=[[list(aud_embeds.shape[1:]) for _ in range(3)],
-                     [list(aud_attention_mask.shape[1:]) for _ in range(3)]],
-        onnx_dir=onnx_dir,
-        engine_dir=f"{args.output_dir}/{part_name}",
-        max_batch_size=args.max_batch_size,
-        engine_name=f"audio_encoder.engine",
-        dtype=torch.float16)
+	export_onnx(audio_wrapper,
+				input=(aud_embeds, aud_attention_mask),
+				onnx_dir=onnx_dir,
+				input_names=['input', 'attention_mask'],
+				dynamic_axes={
+					'input': {
+						0: "batch"
+					},
+					'attention_mask': {
+						0: 'batch'
+					}
+				})
+	build_trt_engine(
+		args.model_type,
+		input_sizes=[[list(aud_embeds.shape[1:]) for _ in range(3)],
+					 [list(aud_attention_mask.shape[1:]) for _ in range(3)]],
+		onnx_dir=onnx_dir,
+		engine_dir=f"{args.output_dir}/{part_name}",
+		max_batch_size=args.max_batch_size,
+		engine_name=f"audio_encoder.engine",
+		dtype=torch.float16)
 
 
 def build_mllama_engine(args):
-
 	class MLLaMAVisionWrapper(torch.nn.Module):
-
 		def __init__(self, vision_model, output_proj):
 			super().__init__()
 			self.vision_model = vision_model
@@ -1193,29 +1193,36 @@ def build_mllama_engine(args):
 	model = MllamaForConditionalGeneration.from_pretrained(args.model_path,
 														   torch_dtype='auto',
 														   device_map='auto')
-	wrapper = MLLaMAVisionWrapper(model.vision_model,
-								  model.multi_modal_projector)
+
+	# Check if the model structure is updated to transformers >= 4.52.0
+	if hasattr(model, 'model') and hasattr(model.model, 'vision_model'):
+		vision_model = model.model.vision_model
+		multi_modal_projector = model.model.multi_modal_projector
+	else:
+		# transformers < 4.52.0
+		vision_model = model.vision_model
+		multi_modal_projector = model.multi_modal_projector
+
+	wrapper = MLLaMAVisionWrapper(vision_model, multi_modal_projector)
+
 	model_dtype = model.dtype
 	image = Image.new('RGB', [2048, 2688])  # dummy image
 	inputs = processor(images=image,
 					   return_tensors="pt").to(model_dtype).to(model.device)
 
-
-	# inputs["pixel_values"]: torch.Size([1, 1, 4, 3, 448, 448])
-
-    # inputs["aspect_ratio_ids"]: torch.Size([1, 1])
-    # inputs["aspect_ratio_mask"]: torch.Size([1, 1, 4])
+	# inputs["aspect_ratio_ids"]: torch.Size([1, 1])
+	# inputs["aspect_ratio_mask"]: torch.Size([1, 1, 4])
 	export_onnx(
 		wrapper,
-        input=tuple([value for key, value in inputs.items()]),
-        onnx_dir=f'{args.output_dir}/onnx',
-        input_names=[key for key in inputs],
-        output_names=['encoder_output'],
-        dynamic_axes={key: {
-            0: "batch"
-        }
-                      for key in inputs},
-    )
+		input=tuple([value for key, value in inputs.items()]),
+		onnx_dir=f'{args.output_dir}/onnx',
+		input_names=[key for key in inputs],
+		output_names=['encoder_output'],
+		dynamic_axes={key: {
+			0: "batch"
+		}
+					  for key in inputs},
+	)
 
 
 	build_trt_engine(
@@ -1324,6 +1331,7 @@ def compute_rotary_pos_emb(grid_thw, hf_config, VisionRotaryEmbedding):
 
 
 def build_qwen2_vl_engine(args):
+	import transformers
 	from qwen_vl_utils import process_vision_info
 	from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 	from transformers.models.qwen2_vl.configuration_qwen2_vl import \
@@ -1393,10 +1401,21 @@ def build_qwen2_vl_engine(args):
 			super().__init__(config)
 			self.head_dim = config.embed_dim // config.num_heads
 
+		def __init__(self, config: Qwen2VLVisionConfig):
+			# Fallback for compatibility with older transformers versions (for certain nvbugs/tests)
+			if transformers.__version__ >= '4.53.0':
+				super().__init__(config)
+				self.head_dim = config.embed_dim // config.num_heads
+			else:
+				num_heads = config.num_heads
+				dim = config.embed_dim
+				super().__init__(dim, num_heads)
+				self.head_dim = dim // num_heads
+
 		def forward(self,
-                    hidden_states: torch.Tensor,
-                    attention_mask: torch.Tensor,
-                    rotary_pos_emb: torch.Tensor = None) -> torch.Tensor:
+					hidden_states: torch.Tensor,
+					attention_mask: torch.Tensor,
+					rotary_pos_emb: torch.Tensor = None) -> torch.Tensor:
 			seq_length = hidden_states.shape[0]
 			q, k, v = self.qkv(hidden_states).reshape(seq_length, 3,
 													  self.num_heads,
@@ -1718,6 +1737,7 @@ def build_pixtral_engine(args):
 	part_name = 'vision'
 	onnx_dir = f"{args.output_dir}/{part_name}/onnx"
 
+
 	export_onnx(wrapper,
 				input=(pixel_values, attention_mask),
 				onnx_dir=onnx_dir,
@@ -1739,3 +1759,78 @@ def build_pixtral_engine(args):
 		max_batch_size=args.max_batch_size,
 		engine_name=f"model.engine",
 		dtype=torch.bfloat16)
+
+
+def build_eclair_engine(args):
+
+	class RadioWithNeck(torch.nn.Module):
+
+		def __init__(self):
+			super().__init__()
+
+			try:
+				self.model_encoder = torch.hub.load("NVlabs/RADIO",
+													"radio_model",
+													version="radio_v2.5-h")
+			except Exception as e:
+				raise RuntimeError(
+					f"Failed to load RADIO model from torch.hub: {e}")
+			self.model_encoder.summary_idxs = torch.tensor(4)
+
+			self.conv1 = torch.nn.Conv1d(1280, 1024, 1)
+			self.layer_norm1 = torch.nn.LayerNorm(1024,
+												  eps=1e-6,
+												  elementwise_affine=True)
+			self.conv2 = torch.nn.Conv2d(1024,
+										 1024,
+										 kernel_size=(1, 4),
+										 stride=(1, 4),
+										 padding=0,
+										 bias=False)
+			self.layer_norm2 = torch.nn.LayerNorm(1024,
+												  eps=1e-6,
+												  elementwise_affine=True)
+
+		@torch.no_grad
+		def forward(self, pixel_values):
+			_, feature = self.model_encoder(pixel_values)
+			output = self.conv1(feature.permute(0, 2, 1)).permute(0, 2, 1)
+			output = self.layer_norm1(output).permute(0, 2, 1)
+
+			b, d, _ = output.shape
+			h = pixel_values.shape[-2] // 16
+			w = pixel_values.shape[-1] // 16
+			output = self.conv2(output.reshape(b, d, h, w))
+			output = output.flatten(-2, -1).permute(0, 2, 1)
+			output = self.layer_norm2(output)
+			return output
+
+	processor = NougatProcessor.from_pretrained(args.model_path)
+	model = VisionEncoderDecoderModel.from_pretrained("facebook/nougat-base")
+	model.encoder = RadioWithNeck()
+	model.decoder.resize_token_embeddings(len(processor.tokenizer))
+	model.config.decoder_start_token_id = processor.tokenizer.eos_token_id  # 2
+	model.config.pad_token_id = processor.tokenizer.pad_token_id  # 1
+	checkpoint_path = os.path.join(args.model_path, "model.safetensors")
+	if not os.path.exists(checkpoint_path):
+		raise FileNotFoundError(
+			f"Model checkpoint not found at {checkpoint_path}")
+	load_model(model, checkpoint_path)
+
+	wrapper = model.encoder.to(args.device)
+	# temporary fix due to TRT onnx export bug
+	for block in wrapper.model_encoder.model.blocks:
+		block.attn.fused_attn = False
+
+	image = torch.randn((1, 3, 2048, 1648),
+						device=args.device,
+						dtype=torch.bfloat16)
+	export_onnx(wrapper, image, f'{args.output_dir}/onnx')
+	build_trt_engine(
+		args.model_type,
+		[image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+		f'{args.output_dir}/onnx',
+		args.output_dir,
+		args.max_batch_size,
+		dtype=torch.bfloat16,
+		engine_name='visual_encoder.engine')

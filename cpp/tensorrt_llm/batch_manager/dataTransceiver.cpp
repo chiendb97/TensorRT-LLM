@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <future>
@@ -91,6 +92,43 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     return totalSize;
 }
 
+void TransferSession::appendMeasure(double delay, double duration, size_t size)
+{
+    if (!mRecordMeasure)
+    {
+        return;
+    }
+    auto bandwidth = size * 8 / (duration / 1000) / 1e9; // byte, ms => Gbps
+    mMeasures.emplace_back(Measure{delay, duration, bandwidth});
+}
+
+void TransferSession::exportMeasure(std::ofstream& outFile, bool isContext) const
+{
+    if (mMeasures.empty())
+    {
+        return;
+    }
+    // write header if not exist
+    if (outFile.tellp() == 0)
+    {
+        outFile << "RequestID";
+        for (size_t i = 0; i < mMeasures.size(); i++)
+        {
+            outFile << ",Delay(ms),Duration(ms),Bandwidth(Gbps)";
+        }
+        outFile << '\n';
+    }
+    // write measures
+    TLLM_CHECK(isContext || mRequest->getContextPhaseParams().has_value());
+    auto reqId = isContext ? mRequest->mRequestId : mRequest->getContextPhaseParams().value().getReqId();
+    outFile << reqId;
+    for (auto const& measure : mMeasures)
+    {
+        outFile << "," << measure.delay << "," << measure.duration << "," << measure.bandwidth;
+    }
+    outFile << '\n' << std::flush;
+}
+
 class DataResponder::Impl
 {
 public:
@@ -153,11 +191,45 @@ private:
             mSender->release(id);
             resp.mPromise.set_value();
         }
+        catch (tensorrt_llm::common::RequestSpecificException const& e)
+        {
+            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
+            auto new_exception = TLLM_REQUEST_EXCEPTION(id, e.getErrorCode(), "%s", e.what());
+            resp.mPromise.set_exception(std::make_exception_ptr(new_exception));
+        }
         catch (std::exception const& e)
         {
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
             resp.mPromise.set_exception(std::current_exception());
         }
+    }
+
+    void sendResponse(std::vector<size_t> const& blockHashes, std::map<RequestIdType, Response>::iterator it)
+    {
+        auto reqId = mCurrentRequest.value();
+        auto count = --mRemainSendCount[reqId];
+        TLLM_CHECK(count >= 0);
+        if (count == 0)
+        {
+            mRemainSendCount.erase(reqId);
+
+            // TODO(zhengd): pass the hashes directly instead of update llmRequest
+            auto llmRequest = it->second.mRequest;
+            llmRequest->setRequestedBlockHashes(std::move(blockHashes));
+
+            if (common::getEnvParallelCacheSend())
+            {
+                // TODO: Use a thread pool and check for thread safety.
+                std::thread(&DataResponder::Impl::sendAndRemoveResponse, this, it->first, std::move(it->second))
+                    .detach();
+            }
+            else
+            {
+                DataResponder::Impl::sendAndRemoveResponse(it->first, std::move(it->second));
+            }
+            removeResponse(it);
+        }
+        mCurrentRequest = std::nullopt;
     }
 
     void response() noexcept
@@ -193,40 +265,22 @@ private:
                 auto it = getCurrentResponse();
                 if (it != mReadyResponses.end())
                 {
-                    auto reqId = mCurrentRequest.value();
-                    auto count = --mRemainSendCount[reqId];
-                    TLLM_CHECK(count >= 0);
-                    if (count == 0)
-                    {
-                        mRemainSendCount.erase(reqId);
-
-                        // TODO(zhengd): pass the hashes directly instead of update llmRequest
-                        auto llmRequest = it->second.mRequest;
-                        llmRequest->setRequestedBlockHashes(std::move(blockHashes));
-
-                        if (common::getEnvParallelCacheSend())
-                        {
-                            // TODO: Use a thread pool and check for thread safety.
-                            std::thread(
-                                &DataResponder::Impl::sendAndRemoveResponse, this, it->first, std::move(it->second))
-                                .detach();
-                        }
-                        else
-                        {
-                            DataResponder::Impl::sendAndRemoveResponse(it->first, std::move(it->second));
-                        }
-                        removeResponse(it);
-                    }
-                    mCurrentRequest = std::nullopt;
+                    sendResponse(blockHashes, it);
                 }
                 else
                 {
-                    TLLM_CHECK_WITH_INFO(!mCurrentRequest.has_value(),
-                        "This executor does not have a prepared KV cache for request ID: %zu, and the "
-                        "mReadyResponses size is: %zu. mpi rank :%d     ",
-                        mCurrentRequest.value(), mReadyResponses.size(), mpi::MpiComm::world().getRank());
-                    std::unique_lock lk(mCondMutex);
-                    mResponderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
+                    auto it = getCurrentResponse();
+                    while (it == mReadyResponses.end())
+                    {
+                        std::unique_lock lk(mCondMutex);
+                        mResponderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
+                        if (mTerminate)
+                        {
+                            break;
+                        }
+                        it = getCurrentResponse();
+                    }
+                    sendResponse(blockHashes, it);
                 }
             }
         }
@@ -458,6 +512,15 @@ private:
                     TLLM_CHECK_WITH_INFO(requestAndPromise.mRequest != nullptr, "requestAndPromise.mRequest is null");
                     requestSync(*requestAndPromise.mRequest);
                     requestAndPromise.mPromise->set_value();
+                }
+                catch (tensorrt_llm::common::RequestSpecificException const& err)
+                {
+                    TLLM_LOG_ERROR("Exception in DataRequester request(): request id:%zu , request context id:%zu : %s",
+                        requestAndPromise.mRequest->mRequestId,
+                        requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
+                    auto new_exception = TLLM_REQUEST_EXCEPTION(
+                        requestAndPromise.mRequest->mRequestId, err.getErrorCode(), "%s", err.what());
+                    requestAndPromise.mPromise->set_exception(std::make_exception_ptr(new_exception));
                 }
                 catch (std::exception const& err)
                 {

@@ -12,9 +12,7 @@ CUDNN_VER="9.10.2.21-1"
 # NGC PyTorch 25.06 image uses NCCL 2.27.3, while NCCL 2.27.5 resolves a perf regression issue.
 # Use NCCL version 2.27.5 instead.
 NCCL_VER="2.27.5-1+cuda12.9"
-# NGC PyTorch 25.06 image uses cuBLAS 12.9.1.4, but which leads to failures with MoE Lora (see https://nvbugs/5376270).
-# Continue using cuBLAS 12.9.0.13 until this issue is resolved.
-CUBLAS_VER="12.9.0.13-1"
+CUBLAS_VER="12.9.1.4-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="12.9.86-1"
@@ -68,7 +66,7 @@ install_ubuntu_requirements() {
     apt-get install -y --no-install-recommends \
         libcudnn9-cuda-12=${CUDNN_VER} \
         libcudnn9-dev-cuda-12=${CUDNN_VER} \
-	libcudnn9-headers-cuda-12=${CUDNN_VER} \
+        libcudnn9-headers-cuda-12=${CUDNN_VER} \
         libnccl2=${NCCL_VER} \
         libnccl-dev=${NCCL_VER} \
         libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
@@ -96,11 +94,11 @@ install_rockylinux_requirements() {
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
         "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
         "libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}"; do
-        wget -q --timeout=180 --tries=3 "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
+        wget --retry-connrefused --timeout=180 --tries=10 --continue "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
     done
 
     # Remove old packages
-    dnf remove -y "libnccl*" "cuda-compat*" "cuda-toolkit*" "libcublas*"
+    dnf remove -y "libnccl*"
 
     # Install new packages
     dnf -y install \
@@ -133,7 +131,7 @@ install_tensorrt() {
         RELEASE_URL_TRT="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/${TRT_VER_SHORT}/tars/TensorRT-${TRT_VER}.Linux.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz"
     fi
 
-    wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
+    wget --retry-connrefused --timeout=180 --tries=10 --continue ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     tar -xf /tmp/TensorRT.tar -C /usr/local/
     mv /usr/local/TensorRT-${TRT_VER} /usr/local/tensorrt
     pip3 install --no-cache-dir /usr/local/tensorrt/python/tensorrt-*-cp${PARSED_PY_VERSION}-*.whl
