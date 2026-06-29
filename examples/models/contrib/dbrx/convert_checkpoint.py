@@ -17,7 +17,8 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
-from tensorrt_llm._utils import release_gc
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
+from tensorrt_llm._utils import get_hf_rope_theta, release_gc
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import (generate_int8,
@@ -90,7 +91,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -503,6 +504,7 @@ def execute(workers, func, hf_model):
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
     world_size = args.tp_size * args.pp_size
@@ -555,7 +557,7 @@ if __name__ == '__main__':
             args.moe_top_k = 1
         args.clip_qkv = hf_config.attn_config.clip_qkv
         args.hidden_act = 'swiglu'
-        args.rotary_base = hf_config.attn_config.rope_theta
+        args.rotary_base = get_hf_rope_theta(hf_config.attn_config, 10000.0)
     args.moe_config = MoeConfig(
         num_experts=args.moe_num_experts,
         top_k=args.moe_top_k,
@@ -605,7 +607,7 @@ if __name__ == '__main__':
         hf_model = AutoModelForCausalLM.from_pretrained(model_dir,
                                                         trust_remote_code=True,
                                                         device_map="auto",
-                                                        torch_dtype=getattr(
+                                                        dtype=getattr(
                                                             torch, args.dtype),
                                                         config=hf_config)
         return hf_model

@@ -2,7 +2,6 @@
 Script that refits TRT-LLM engine(s) with weights in a TRT-LLM checkpoint.
 '''
 import argparse
-import copy
 import json
 import os
 import re
@@ -13,13 +12,14 @@ from pathlib import Path
 import tensorrt as trt
 
 from tensorrt_llm._common import _is_building
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import np_dtype_to_trt
 from tensorrt_llm.builder import EngineConfig, optimize_model_with_config
 from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 
 from ..logger import logger
 
-ENGINE_RE = re.compile('rank(\d+).engine')
+ENGINE_RE = re.compile(r'rank(\d+).engine')
 
 
 @_is_building
@@ -57,7 +57,7 @@ def refit_engine(engine_path: str, refit_engine_dir: str, checkpoint_dir: str,
 
     # There are weights preprocess during optimize model.
     tik = time.time()
-    build_config = copy.deepcopy(engine_config.build_config)
+    build_config = engine_config.build_config.model_copy(deep=True)
     optimize_model_with_config(model, build_config)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -120,6 +120,8 @@ def refit(engine_dir: str, checkpoint_dir: str, engine_config: EngineConfig,
 
 
 def main():
+    emit_engine_arch_deprecation("trtllm-refit")
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--engine_dir',

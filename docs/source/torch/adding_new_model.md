@@ -18,7 +18,7 @@ This guide provides a step-by-step process for adding a new model in PyTorch Bac
 ## Prerequisites
 
 Before you begin, ensure you have the following:
-- A working installation of TensorRT-LLM. Follow these [instructions](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/build-from-source-linux.md).
+- A working installation of TensorRT-LLM. Follow these [instructions](../installation/build-from-source.md).
 
 ## Step-by-Step Guide
 
@@ -183,7 +183,7 @@ __all__ = [
 
 #### Out-of-Tree Models
 
-Alternatively, you can register the new model as an out-of-tree model, so that you can use the new model without touching the TensorRT-LLM codebase. To do so, place `modeling_mymodel.py` (and potentially `configuration_mymodel.py`) in your working directory, and import the modeling code in your script:
+Alternatively, you can register the new model as an out-of-tree model, so that you can use the new model without touching the TensorRT LLM codebase. To do so, place `modeling_mymodel.py` (and potentially `configuration_mymodel.py`) in your working directory, and import the modeling code in your script:
 
 ```python
 from tensorrt_llm import LLM

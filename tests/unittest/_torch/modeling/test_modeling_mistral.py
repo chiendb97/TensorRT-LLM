@@ -7,7 +7,9 @@ from unittest import mock
 import pytest
 import torch
 import transformers
-from _torch.helpers import create_mock_engine
+import transformers.models.mistral3
+from _torch.helpers import create_mock_cuda_graph_runner
+from PIL import Image
 from utils.util import getSMVersion
 
 import tensorrt_llm
@@ -16,10 +18,12 @@ from tensorrt_llm._torch import metadata as metadata_lib
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_mistral
+from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.models import modeling_utils
+
+_PATCH_SIZE = 14
 
 
 @pytest.fixture
@@ -64,7 +68,7 @@ def mistral_small_3_1_24b_config():
             "num_attention_heads": 16,
             "num_channels": 3,
             "num_hidden_layers": 24,
-            "patch_size": 14,
+            "patch_size": _PATCH_SIZE,
             "rope_theta": 10000.0,
         },
         "vision_feature_layer": -1,
@@ -95,10 +99,9 @@ def init_hf_model(cls, config, dtype, device):
     Instead, we lazily instantiate the model, and initialize the weights only after moving it to
     the requested `device`.
     """
-    from transformers import modeling_utils as t_modeling_utils
-
-    with t_modeling_utils.no_init_weights():
-        model = cls(config).eval()
+    # transformers 5.x removed ``no_init_weights``; weights are initialized lazily
+    # via ``model.init_weights()`` below instead.
+    model = cls(config).eval()
 
     model.to(device=device)
     model.init_weights()
@@ -150,6 +153,21 @@ def test_mistral_3_vlm_rejects_disagg(mistral_small_3_1_24b_config):
                 )
             ),
         )
+
+
+def test_mistral_3_vlm_constructs_under_meta_init(mistral_small_3_1_24b_config):
+    config_dict = mistral_small_3_1_24b_config
+    config_dict["text_config"]["num_hidden_layers"] = 1
+    config_dict["vision_config"]["num_hidden_layers"] = 1
+
+    mistral_3_config = transformers.Mistral3Config.from_dict(config_dict)
+    model_config = model_config_lib.ModelConfig(pretrained_config=mistral_3_config)
+
+    with MetaInitMode():
+        model = modeling_mistral.Mistral3VLM(model_config)
+
+    assert "_image_token_ids" in dict(model.named_buffers())
+    assert "_image_token_ids" not in model.state_dict()
 
 
 @pytest.mark.parametrize("quant_algo", [None, "FP8"])
@@ -400,10 +418,7 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
 
-        graph_runner = None
-        if use_cuda_graph:
-            mock_engine = create_mock_engine(1)
-            graph_runner = CUDAGraphRunner(mock_engine)
+        graph_runner = create_mock_cuda_graph_runner(1) if use_cuda_graph else None
 
         def run_forward(input_ids, position_ids, attn_metadata):
             attn_metadata.prepare()
@@ -417,13 +432,14 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                graph_runner.capture(1, lambda inputs: mistral.forward(**inputs), inputs)
+                key = (1, 0, False)
+                graph_runner.capture(key, lambda inputs: mistral.forward(**inputs), inputs)
 
                 for _ in range(2):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.replay(1, inputs)
+                    logits = graph_runner.replay(key, inputs)
                 return logits
 
         if use_cuda_graph:
@@ -498,3 +514,118 @@ def test_batch_pixel_values(in_shapes, image_sizes, expected_out_shape):
         torch.testing.assert_close(padded_values, original_values)
 
         start_idx += batch_size
+
+
+@pytest.mark.parametrize("height, width", [(37, 91), (128, 256), (512, 512)])
+@torch.no_grad()
+def test_processor_get_num_tokens_per_image(
+    tmp_path,
+    mistral_small_3_1_24b_config,
+    height,
+    width,
+):
+    # NOTES:
+    # 1. Setting up a fake model checkpoint that `AutoTokenizer.from_pretrained` /
+    #    `AutoProcessor.from_pretrained` is too involved (need at least several config JSONs, as well
+    #    as tokenizer files like vocab files, etc.).
+    # 2. On the other hand, using an actual model checkpoint for what should be a simple unit test
+    #    feels overkill.
+    # We therefore settle for this intermediate approach where we check that the expected calls are
+    # are made by mocking the auto classes out.
+
+    mistral_3_config = transformers.Mistral3Config.from_dict(mistral_small_3_1_24b_config)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.modeling_mistral.AutoProcessor"
+    ) as mocked_auto_processor:
+        input_processor = modeling_mistral.Mistral3InputProcessor(
+            model_path=str(tmp_path),
+            config=mistral_3_config,
+            tokenizer=mock.MagicMock(),
+        )
+
+    input_processor.get_num_tokens_per_image(
+        image=Image.new("RGB", (width, height), color=(255, 128, 0))
+    )
+
+    mocked_auto_processor.from_pretrained.return_value._get_num_multimodal_tokens.assert_called_once_with(
+        [(height, width)]
+    )
+
+
+def test_mistral_attention_swa_wiring():
+    """Verify MistralAttention.forward passes sliding_window to Attention.forward."""
+    config = transformers.MistralConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        sliding_window=4096,
+    )
+    mc = model_config_lib.ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_lib.Mapping(world_size=1, tp_size=1, rank=0),
+    )
+    attn = modeling_mistral.MistralAttention(mc, layer_idx=0)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.modeling_mistral.Attention.forward"
+    ) as mocked_forward:
+        attn.forward(position_ids=None, hidden_states=None, attn_metadata=None)
+
+    mocked_forward.assert_called_once()
+    _, call_kwargs = mocked_forward.call_args
+    assert call_kwargs["attention_window_size"] == config.sliding_window
+
+
+def test_mistral_attention_swa_none_when_unset():
+    """Verify MistralAttention.forward passes None when sliding_window is unset."""
+    config = transformers.MistralConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        sliding_window=None,
+    )
+    mc = model_config_lib.ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_lib.Mapping(world_size=1, tp_size=1, rank=0),
+    )
+    attn = modeling_mistral.MistralAttention(mc, layer_idx=0)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.modeling_mistral.Attention.forward"
+    ) as mocked_forward:
+        attn.forward(position_ids=None, hidden_states=None, attn_metadata=None)
+
+    mocked_forward.assert_called_once()
+    _, call_kwargs = mocked_forward.call_args
+    assert call_kwargs["attention_window_size"] is None
+
+
+def test_mistral_attention_swa_layer_types():
+    """Ministral-style layer_types: sliding layers get SWA, full layers get None."""
+    config = transformers.MistralConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        sliding_window=32768,
+    )
+    # Ministral pattern: alternating sliding/full attention
+    config.layer_types = [
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+    ]
+
+    mc = model_config_lib.ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_lib.Mapping(world_size=1, tp_size=1, rank=0),
+    )
+
+    # Layer 0: sliding_attention → should use SWA
+    attn_sliding = modeling_mistral.MistralAttention(mc, layer_idx=0)
+    assert attn_sliding.attention_window_size == 32768
+
+    # Layer 1: full_attention → should be None
+    attn_full = modeling_mistral.MistralAttention(mc, layer_idx=1)
+    assert attn_full.attention_window_size is None

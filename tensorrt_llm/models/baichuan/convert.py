@@ -230,7 +230,7 @@ def smooth_baichuan_model(
     # Smooth the activation and weights with smoother = $\diag{s}$
     for name, module in model.named_modules():
         class_name = module.__class__.__name__
-        if not 'Layer' in class_name:
+        if 'Layer' not in class_name:
             continue
         print(f'smoothing module: {name}, class_name: {class_name}')
         # qkv_proj
@@ -481,7 +481,7 @@ def quantize(hf_model_dir: str,
     hf_model = AutoModelForCausalLM.from_pretrained(
         hf_model_dir,
         device_map='auto' if device != 'cpu' else 'cpu',
-        torch_dtype='auto'
+        dtype='auto'
         if not config.quantization._use_plugin_sq else torch.float16,
         trust_remote_code=trust_remote_code)
     tokenizer = AutoTokenizer.from_pretrained(

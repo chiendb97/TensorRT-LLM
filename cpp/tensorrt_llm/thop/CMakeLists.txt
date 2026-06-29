@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -40,11 +40,16 @@ add_library(
   mlaPreprocessOp.cpp
   allgatherOp.cpp
   allreduceOp.cpp
+  alltoallOp.cpp
+  asyncUlyssesOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
+  cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
+  cublasFp4ScaledMM.cpp
+  cudaNvfp4MM.cpp
   cudaScaledMM.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
@@ -61,47 +66,81 @@ add_library(
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
+  deepseekV4QNormOp.cpp
   fusedQKNormRopeOp.cpp
+  fusedDiTQKNormRopeOp.cpp
+  fusedDiTSplitQKNormRopeOp.cpp
+  fusedDiTSplitNormOp.cpp
+  ulyssesPostUnscatterOp.cpp
+  ulyssesPermuteScatterOp.cpp
+  fusedAddRMSNormQuant.cpp
+  fusedActivationQuant.cpp
+  fusedGatedRMSNormQuant.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
+  helixPostProcessOp.cpp
   llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
   moeUtilOp.cpp
+  moeGateOp.cpp
   moeCommOp.cpp
+  moeAlltoAllOp.cpp
   moeLoadBalanceOp.cpp
+  moeAlignOp.cpp
   mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
+  fusedCatFp4Op.cpp
+  fusedCatFp8Op.cpp
+  IndexerKCacheGatherOp.cpp
+  IndexerKCacheScatterOp.cpp
+  IndexerTopKOp.cpp
+  mlaRopeInplaceOp.cpp
   ncclCommunicatorOp.cpp
+  allocateOutput.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   redrafterCurandOp.cpp
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
   customMoeRoutingOp.cpp
+  mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   virtualMemoryAllocator.cpp
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
-  mtpOp.cpp
+  specDecOp.cpp
+  dynamicTreeOp.cpp
   loraOp.cpp
-  finegrained_mixed_dtype_gemm_thop.cpp)
+  finegrained_mixed_dtype_gemm_thop.cpp
+  tinygemm2.cpp
+  dsv3RopeOp.cpp
+  fusedGemmAllreduceOp.cpp
+  convertReqIndexToGlobalOp.cpp
+  trtllmGenQKVProcessOp.cpp
+  inplaceSliceCopyOp.cpp
+  mhcOp.cpp
+  compressorOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
-                                        ${Python3_LIBRARIES} ${SHARED_TARGET})
+target_link_libraries(
+  th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
+                    ${SHARED_TARGET} pg_utils)
+
+if(BUILD_DEEP_GEMM)
+  target_compile_definitions(th_common PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC)
+endif()
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common
                              PUBLIC "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")
-  message(STATUS "Enable open source Cutlass low latency gemm kernel")
 endif()
 
 if(USING_OSS_CUTLASS_FP4_GEMM)
@@ -112,10 +151,14 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   target_compile_definitions(th_common PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
+if(ENABLE_CUBLASLT_FP4_GEMM)
+  target_compile_definitions(th_common PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
+  target_link_libraries(th_common PRIVATE ${CUBLASLT_LIB})
+endif()
+
 if(ENABLE_MULTI_DEVICE)
   target_include_directories(th_common PUBLIC ${MPI_C_INCLUDE_DIRS})
-  target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB}
-                                          CUDA::nvml)
+  target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB})
 endif()
 
 if(NOT WIN32)

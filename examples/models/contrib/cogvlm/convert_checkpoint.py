@@ -12,6 +12,7 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
@@ -190,7 +191,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -313,6 +314,7 @@ def smooth_quant(model, args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     # TODO(qijun): Currently, the convert script depends on a torch op:
     # torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert
@@ -405,13 +407,13 @@ def main():
 
         if args.model_type == "llava":
             hf_llava = LlavaForConditionalGeneration.from_pretrained(
-                args.model_dir, torch_dtype="auto")
+                args.model_dir, dtype="auto")
             model = hf_llava.language_model
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 args.model_dir,
                 device_map='auto' if not args.load_model_on_cpu else 'cpu',
-                torch_dtype='auto' if not args.smoothquant else torch.float16,
+                dtype='auto' if not args.smoothquant else torch.float16,
                 trust_remote_code=True,
             )
         if args.smoothquant is not None or args.int8_kv_cache:

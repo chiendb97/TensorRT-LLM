@@ -11,11 +11,11 @@ from typing import Any, Callable, List, NamedTuple, Optional
 from strenum import StrEnum
 
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.llmapi.utils import enable_llm_debug, print_colored_debug
+from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
-from ..llmapi.utils import print_colored_debug
+from ..llmapi.utils import logger_debug
 from ..logger import logger
 
 
@@ -34,10 +34,13 @@ def get_spawn_proxy_process_ipc_addr_env() -> str | None:
     return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR)
 
 
-def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes | None:
+def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes:
     ''' Get the HMAC key for the spawn proxy process dynamically. '''
-    if key := os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"):
-        return bytes.fromhex(key)
+    key = os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY")
+    assert key is not None, (
+        f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY} is not set. "
+        "HMAC encryption is required for IPC communication.")
+    return bytes.fromhex(key)
 
 
 def get_spawn_proxy_process_env() -> bool:
@@ -52,14 +55,14 @@ def create_mpi_comm_session(
     if get_spawn_proxy_process_env():
         assert get_spawn_proxy_process_ipc_addr_env(
         ), f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR} is not set."
-        print_colored_debug(
+        logger_debug(
             f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
             "yellow")
-        get_spawn_proxy_process_ipc_hmac_key_env()
+        hmac_key = get_spawn_proxy_process_ipc_hmac_key_env()
         return RemoteMpiCommSessionClient(
-            addr=get_spawn_proxy_process_ipc_addr_env())
+            addr=get_spawn_proxy_process_ipc_addr_env(), hmac_key=hmac_key)
     else:
-        print_colored_debug(
+        logger_debug(
             f"Using MpiCommSession to bind to external MPI processes\n",
             "yellow")
         return MpiCommSession(n_workers=n_workers)
@@ -125,15 +128,23 @@ class IntraProcessQueue:
     def close(self):
         pass
 
+    def drain(self) -> list:
+        """Non-blocking drain: return all currently available messages."""
+        results = []
+        while True:
+            try:
+                results.append(self.queue.get_nowait())
+            except Empty:
+                break
+        return results
+
     def poll(self, timeout=None) -> bool:
-        try:
-            # Try to get an item from the queue without blocking
-            item = self.queue.get(timeout=timeout)
-            # If successful, put the item back to not alter the state
-            self.queue.put(item)
-            return True
-        except Empty:
-            # If the queue thread is empty, return False
+        with self.queue.not_empty:
+            if self.queue._qsize() > 0:
+                return True
+            if timeout is not None and timeout > 0:
+                self.queue.not_empty.wait(timeout=timeout)
+                return self.queue._qsize() > 0
             return False
 
 
@@ -142,12 +153,16 @@ class WorkerCommIpcAddrs(NamedTuple):
     request_queue_addr: tuple[str, Optional[bytes]]
     worker_init_status_queue_addr: tuple[str, Optional[bytes]]
     result_queue_addr: tuple[str, Optional[bytes]]
-    stats_queue_addr: tuple[str, Optional[bytes]]
-    kv_cache_events_queue_addr: tuple[str, Optional[bytes]]
+    resource_governor_queue_addr: Optional[tuple[str, Optional[bytes]]] = None
 
 
 def is_llm_response(instance):
-    return hasattr(instance, "result")
+    # Duck typing, expect one of:
+    #  tensorrt_llm.bindings.executor.Response
+    #  tensorrt_llm._torch.pyexecutor.llm_request.LlmResponse
+    # Avoid testing for "result", because an error bindings.executor.Response
+    # throws when accessing its result property.
+    return hasattr(instance, "has_error")
 
 
 def print_alive_threads():

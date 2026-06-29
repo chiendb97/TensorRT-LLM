@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,11 +17,12 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -70,8 +71,6 @@ enum class FmhaKernelType
     SwapsMmaAbForGeneration,
     // Keep tensor A and tensor B of Mma.
     KeepsMmaAbForGeneration,
-    // Speculative decoding (Medusa and Eagle) generation-phase attention kernels, where seqLenQ > 1.
-    SpecDecodingGeneration
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -88,9 +87,8 @@ FMHA_KERNEL_TYPE_FUNCTION(Context)
 FMHA_KERNEL_TYPE_FUNCTION(Generation)
 FMHA_KERNEL_TYPE_FUNCTION(SwapsMmaAbForGeneration)
 FMHA_KERNEL_TYPE_FUNCTION(KeepsMmaAbForGeneration)
-FMHA_KERNEL_TYPE_FUNCTION(SpecDecodingGeneration)
 
-#undef QKV_LAYOUT_FUNCTION
+#undef FMHA_KERNEL_TYPE_FUNCTION
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -130,6 +128,36 @@ QKV_LAYOUT_FUNCTION(PagedKv)
 QKV_LAYOUT_FUNCTION(ContiguousKv)
 
 #undef QKV_LAYOUT_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Sparse attention types.
+enum class SparseType : int32_t
+{
+    None = 0,
+    StaticTokenSparse = 1,
+    DynamicTokenSparse = 2,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper functions to check the sparse attention type.
+
+#define SPARSE_TYPE_FUNCTION(SparseTypeName)                                                                           \
+    inline bool is##SparseTypeName(SparseType sparseType)                                                              \
+    {                                                                                                                  \
+        return (sparseType == SparseType::SparseTypeName);                                                             \
+    }
+
+SPARSE_TYPE_FUNCTION(StaticTokenSparse)
+SPARSE_TYPE_FUNCTION(DynamicTokenSparse)
+
+#undef SPARSE_TYPE_FUNCTION
+
+inline bool isTokenSparse(SparseType sparseType)
+{
+    return sparseType == SparseType::StaticTokenSparse || sparseType == SparseType::DynamicTokenSparse;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -192,6 +220,8 @@ struct TllmGenFmhaRunnerParams
     TileScheduler mTileScheduler;
     // The multiCtasKvMode (i.e. multiBlockMode).
     bool mMultiCtasKvMode;
+    // Use block sparse attention.
+    bool mUseBlockSparseAttention;
 
     // Input QKV buffers.
     void const* qPtr;
@@ -199,18 +229,24 @@ struct TllmGenFmhaRunnerParams
     void const* vPtr;
     // Packed KV buffer
     void const* kvPtr;
+    // Base pointer for the DSv4 sparse MLA sliding-window KV pool.
+    void const* slidingWindowKvPoolBasePtr = nullptr;
     // Packed KV scaling factor buffer
     void const* kvSfPtr;
     // Packed QKV buffer
     void const* qkvPtr;
     // The attention sinks pointer (additional value per head in the denominator of the softmax).
     float const* attentionSinksPtr;
+    // The general packed custom mask ptr which does not meet specific format for trtllm gen kernels.
+    int32_t const* generalPackedCustoMaskPtr;
     // The custom mask ptr.
-    uint32_t const* customMaskPtr;
+    uint32_t* customMaskPtr;
     // The packed custom mask's offsets of each sequence.
-    int64_t const* customMaskOffsetsPtr;
+    int64_t* customMaskOffsetsPtr;
     // The first sparseMask offsets in the Kv sequence dimension.
-    int32_t const* firstSparseMaskOffsetsKvPtr;
+    int32_t* firstSparseMaskOffsetsKvPtr;
+    // The variable sparse MLA topK lengths with shape [numTokensQ].
+    int32_t const* ptrSparseMlaTopKLens = nullptr;
     // The counter for the multiCtasKv mode.
     int32_t* multiCtasKvCounterPtr;
     // The sequence length buffer for K/V.
@@ -238,6 +274,13 @@ struct TllmGenFmhaRunnerParams
     void* oPtr;
     // The output scaling factor buffer.
     void* oSfPtr;
+    // SageAttention scaling factors for Q, K, P and V.
+    float const* sageAttnSfsQPtr = nullptr;
+    float const* sageAttnSfsKPtr = nullptr;
+    float const* sageAttnSfsPPtr = nullptr;
+    float const* sageAttnSfsVPtr = nullptr;
+    // The sequence lengths for Q.
+    int const* seqLensQPtr;
 
     // Head dimension for Q and K.
     int mHeadDimQk;
@@ -255,6 +298,13 @@ struct TllmGenFmhaRunnerParams
     int mMaxSeqLenQ;
     // The max kv sequence length.
     int mMaxSeqLenKv;
+    // Optional JIT warmup shape.
+    bool mJITWarmup = false;
+    int mJITWarmupMaxNumRequests = 0;
+    int mJITWarmupMaxSeqLenQ = 0;
+    int mJITWarmupMaxSeqLenKv = 0;
+    // True when a prefill/context path intentionally uses a generation kernel.
+    bool mUseGenKernelForPrefill = false;
     // The attention window size for sliding window attention (sliding-window-attention is enabled when seqLenKv >
     // mAttentionWindowSize).
     int mAttentionWindowSize;
@@ -276,8 +326,23 @@ struct TllmGenFmhaRunnerParams
     // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase kernel when inflight
     // batching is enabled.
     int mSfStartTokenIdx;
+    // Skip softmax threshold scale factor.
+    float mSkipSoftmaxThresholdScaleFactor;
+    // Sparse attention type.
+    SparseType mSparseAttention;
+    // The top k value for sparse attention.
+    int mSparseTopK;
     // The cuda stream.
     cudaStream_t stream;
+    // The layer index.
+    int32_t mLayerIdx = 0;
+    // Whether the spec-dec tree is used.
+    bool mIsSpecDecTree = false;
+    // The max seqLenQ used as row stride for generalPackedCustoMaskPtr.
+    // When seqlensQPtr[i] < mPackedMaskMaxSeqLenQ, the packed mask tensor has
+    // row stride ceilDiv(mPackedMaskMaxSeqLenQ, 32) rather than ceilDiv(seqLenQ, 32).
+    int32_t mPackedMaskMaxSeqLenQ = 0;
+    int32_t mSpecDecodingTargetMaxGenLen = 0;
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)
@@ -321,16 +386,22 @@ struct TllmGenSelectKernelParams
     bool mForceGmemReduction;
     // The mask type.
     TrtllmGenAttentionMaskType mMaskType;
+    // The number of tokens per page.
+    int mNumTokensPerPage;
     // Reuse smemK for V or not (only work with MLA generation kernels).
     bool mReuseSmemKForV;
     // Do we need to select a new kernel as the parameters have been updated.
     bool mSelectNewKernel;
     // The tile scheduler.
     TileScheduler mTileScheduler;
+    // The tile size for Q.
+    int mTileSizeQ;
     // The tile size for Kv.
     int mTileSizeKv;
     // Use 2 CTA MMA or not.
     bool mUses2CtaMma;
+    // Skips softmax or not.
+    bool mSkipsSoftmaxWhenPossible;
 
     // The constructor.
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -340,12 +411,16 @@ struct TllmGenSelectKernelParams
         , mMultiCtasKvMode(params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::Disabled)
         , mForceGmemReduction(false)
         , mMaskType(params.mMaskType)
+        , mNumTokensPerPage(params.mNumTokensPerPage)
         , mReuseSmemKForV(false)
         , mSelectNewKernel(false)
         , mTileScheduler(params.mTileScheduler)
+        , mTileSizeQ(128)
         , mTileSizeKv(128)
-        , mUses2CtaMma(false){};
+        , mUses2CtaMma(false)
+        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f){};
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

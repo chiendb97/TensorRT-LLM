@@ -53,7 +53,6 @@ def build_engine(model_name, request):
 
     llm = LLM(model_path,
               tensor_parallel_size=tp_size,
-              auto_parallel_world_size=tp_size,
               build_config=build_config)
 
     engine_dir = TemporaryDirectory(suffix="-engine_dir")
@@ -84,9 +83,7 @@ def async_client(server: RemoteOpenAIServer):
     return server.get_async_client()
 
 
-@pytest.mark.parametrize("model_name", [
-    "llama-3.1-model/Meta-Llama-3.1-70B-Instruct", "Mixtral-8x7B-Instruct-v0.1"
-],
+@pytest.mark.parametrize("model_name", ["Mixtral-8x7B-Instruct-v0.1"],
                          indirect=True)
 @skip_nvlink_inactive
 @skip_num_gpus_less_than(4)
@@ -129,9 +126,7 @@ async def test_multi_consistent_sync_chat(client: openai.OpenAI,
     assert not bool(pattern.search(content)), content
 
 
-@pytest.mark.parametrize("model_name", [
-    "llama-3.1-model/Meta-Llama-3.1-70B-Instruct", "Mixtral-8x7B-Instruct-v0.1"
-],
+@pytest.mark.parametrize("model_name", ["Mixtral-8x7B-Instruct-v0.1"],
                          indirect=True)
 @skip_nvlink_inactive
 @skip_num_gpus_less_than(4)

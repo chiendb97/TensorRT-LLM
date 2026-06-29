@@ -363,7 +363,7 @@ class TestSmoothQuant(unittest.TestCase):
             # Get output tensor for SQ Linear
             with self.assertRaisesRegex(
                     ValueError,
-                    "SmoothQuant Linear has to have act\+weight quantization mode set"
+                    r"SmoothQuant Linear has to have act\+weight quantization mode set"
             ):
                 linear_cls(32, 64, bias=False, quant_mode=quant_mode, **args)
 
@@ -934,7 +934,7 @@ class TestSmoothQuant(unittest.TestCase):
             embd_pdrop=0,
             attn_pdrop=0,
             hidden_act='gelu',
-            torch_dtype=dtype,
+            dtype=dtype,
         )
         n_positions = configuration.n_positions
 

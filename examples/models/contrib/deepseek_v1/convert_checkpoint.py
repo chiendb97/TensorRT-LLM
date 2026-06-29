@@ -19,6 +19,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.mapping import Mapping
@@ -79,7 +80,7 @@ def parse_arguments():
                         type=str,
                         default='trtllm_checkpoint',
                         required=True,
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -178,6 +179,7 @@ def convert_and_save_hf(args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
 

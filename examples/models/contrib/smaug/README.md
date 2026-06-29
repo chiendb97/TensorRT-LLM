@@ -1,12 +1,18 @@
 # Smaug
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document elaborates how to build the [Smaug-72B-v0.1](https://huggingface.co/abacusai/Smaug-72B-v0.1) model to runnable engines on multi-GPU node and perform a summarization task using these engines.
 
 ## Overview
 
-The TensorRT-LLM support for Smaug-72B-v0.1 is based on the LLaMA model, the implementation can be found in [tensorrt_llm/models/llama/model.py](../../../../tensorrt_llm/models/llama/model.py). Smaug model resembles LLaMA very much except it uses bias term in its attention module, we therefore reuse the [LLaMA example code](../../../llama) for Smaug,
+The TensorRT LLM support for Smaug-72B-v0.1 is based on the LLaMA model, the implementation can be found in [tensorrt_llm/models/llama/model.py](../../../../tensorrt_llm/models/llama/model.py). Smaug model resembles LLaMA very much except it uses bias term in its attention module, we therefore reuse the [LLaMA example code](../../core/llama) for Smaug,
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the LLaMA model into tensorrt-llm checkpoint format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the LLaMA model into TensorRT LLM checkpoint format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -19,7 +25,7 @@ In addition, there are two shared files in the parent folder [`examples`](../../
 
 ## Usage
 
-This section gives a whole process where we convert HF models, build TensorRT-LLM engines and ultimately perform summarization.
+This section gives a whole process where we convert HF models, build TensorRT LLM engines and ultimately perform summarization.
 
 ### Build TensorRT engine(s)
 
@@ -43,7 +49,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
 
 ### Run Summarization
 
-After building TRT engine, we can use it to perform various tasks. TensorRT-LLM provides handy code to run summarization on [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset and get [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores. The `ROUGE-1` score can be used to validate model implementations.
+After building TRT engine, we can use it to perform various tasks. TensorRT LLM provides handy code to run summarization on [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset and get [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores. The `ROUGE-1` score can be used to validate model implementations.
 
 ```bash
 mpirun -n 8 -allow-run-as-root python ../../../summarize.py \

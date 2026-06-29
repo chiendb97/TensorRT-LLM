@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -56,7 +61,7 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         EXPECT_EQ(llmReq.getState(), tb::LlmRequestState::kCONTEXT_INIT);
         EXPECT_FALSE(llmReq.mSeqSlot);
         // No speculative decoding config, draft tokens should be empty
-        EXPECT_EQ(llmReq.getDraftTokens()->size(), 0);
+        EXPECT_EQ(llmReq.getNumDraftTokens(), 0);
         EXPECT_FALSE(llmReq.getEmbeddingBias().has_value());
         EXPECT_FALSE(llmReq.getBadWordsList().has_value());
         EXPECT_FALSE(llmReq.getStopWordsList().has_value());
@@ -744,6 +749,44 @@ TEST_P(ParamTest, createResponse)
             EXPECT_TRUE(result.isFinal) << "seqIdx " << seqIdx;
         }
     }
+}
+
+// Regression test for nvbug/5961736: createResult() must produce a valid
+// response with contextPhaseParams when the request is in
+// kDISAGG_CONTEXT_COMPLETE, not just kDISAGG_CONTEXT_TRANS_IN_PROGRESS.
+// Without the fix, createResult() returns nullopt for CONTEXT_COMPLETE,
+// causing ctx_request_id=None in the disaggregated serving response.
+TEST_F(LlmRequestTest, createResultDisaggContextComplete)
+{
+    VecTokens inputTokens{1, 2, 3, 4, 5};
+    SizeType32 maxNewTokens{10};
+    texec::IdType requestId{42};
+
+    // Build an executor::Request and configure it as context-only with ContextPhaseParams.
+    texec::Request execReq(inputTokens, maxNewTokens);
+    execReq.setRequestType(texec::RequestType::REQUEST_TYPE_CONTEXT_ONLY);
+    texec::ContextPhaseParams ctxParams({100}, requestId, static_cast<void*>(nullptr), std::nullopt);
+    execReq.setContextPhaseParams(std::move(ctxParams));
+
+    tb::LlmRequest llmReq(requestId, execReq);
+    EXPECT_TRUE(llmReq.isContextOnlyRequest());
+
+    // Add a generated token (required by createResult's firstGenTokens extraction).
+    llmReq.addNewTokens(VecTokens{42});
+
+    // Verify isFinished() covers DISAGG_CONTEXT_COMPLETE.
+    llmReq.setState(tb::LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+    EXPECT_TRUE(llmReq.isFinished());
+
+    // This is the regression case — without the fix, createResult() returns nullopt
+    // because DISAGG_CONTEXT_COMPLETE was not handled by createResult's early guard
+    // or its context-phase branch.
+    auto response = llmReq.createResult(/*useFastLogits=*/false, /*mpiWorldRank=*/0);
+    ASSERT_TRUE(response.has_value()) << "createResult() must not return nullopt for DISAGG_CONTEXT_COMPLETE";
+    EXPECT_TRUE(response->contextPhaseParams.has_value())
+        << "contextPhaseParams must be populated for context-only DISAGG_CONTEXT_COMPLETE requests";
+    EXPECT_EQ(response->contextPhaseParams->getReqId(), requestId);
+    EXPECT_TRUE(response->isSequenceFinal);
 }
 
 INSTANTIATE_TEST_SUITE_P(LlmRequestTest, ParamTest,

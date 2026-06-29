@@ -19,6 +19,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.baichuan.config import BaichuanConfig
 from tensorrt_llm.models.baichuan.convert import load_weights_from_gptq
@@ -53,7 +54,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -235,6 +236,7 @@ def execute(workers, func, args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
     world_size = args.tp_size * args.pp_size

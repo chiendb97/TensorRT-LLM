@@ -1,6 +1,6 @@
 # KV Cache System
 
-The KV cache stores previously computed key-value pairs for reuse during generation in order to avoid redundant calculations. The TensorRT-LLM KV cache system also supports reuse across requests and uses a suite of tools like offloading and prioritized eviction to increase reuse. It supports variable attention window sizes and Multi-Head Attention (MHA) optimization techniques such as MQA and GQA.
+The KV cache stores previously computed key-value pairs for reuse during generation in order to avoid redundant calculations. The TensorRT LLM KV cache system also supports reuse across requests and uses a suite of tools like offloading and prioritized eviction to increase reuse. It supports variable attention window sizes and Multi-Head Attention (MHA) optimization techniques such as MQA and GQA.
 
 ## The Basics
 
@@ -34,11 +34,11 @@ Reuse across requests is supported by all speculative decoding models. Please se
 
 ## Limited Attention Window Size
 
-TensorRT-LLM takes advantage of layers with limited attention window size in order to reduce computations and memory usage. Blocks that leave the attention window are freed and placed on the radix search tree so they can be reused.
+TensorRT LLM takes advantage of layers with limited attention window size in order to reduce computations and memory usage. Blocks that leave the attention window are freed and placed on the radix search tree so they can be reused.
 
 ## MQA / GQA
 
-TensorRT-LLM takes advantage of grouped query attention in order to save memory. KV cache will create blocks with only enough space to store state for the discrete query head groups. For MHA, there is one group per head, for MQA there is a single group for all the heads. GQA strikes a balance between these two.
+TensorRT LLM takes advantage of grouped query attention in order to save memory. KV cache will create blocks with only enough space to store state for the discrete query head groups. For MHA, there is one group per head, for MQA there is a single group for all the heads. GQA strikes a balance between these two.
 
 ## Controlling KV Cache Behavior
 
@@ -58,11 +58,52 @@ Property ```free_gpu_memory_fraction``` is a ratio > 0 and < 1 that specifies ho
 
 Block reuse across requests is enabled by default, but can be disabled by setting ```enable_block_reuse``` to False.
 
+### KV Cache Salting for Secure Reuse
+
+KV cache salting provides a security mechanism to control which requests can reuse cached KV states. When a `cache_salt` parameter is provided with a request, the KV cache system will only allow reuse of cached blocks given the same cache salt value. This prevents potential security issues such as prompt theft attacks, where malicious users might try to infer information from cached states of other users' requests.
+
+To use cache salting, specify the `cache_salt` parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be any non-empty string, such as a user ID, tenant ID, or hash string.
+
+### Multimodal UUID Support for Cache Identification
+
+When working with multimodal models (e.g., vision-language models), the KV cache system needs to identify which cached blocks correspond to which multimodal inputs (images, videos, etc.). By default, the system uses content-based hashing to generate unique identifiers for each multimodal input. However, this approach has limitations for cache management across sessions, as the same content must be re-processed to generate the same hash.
+
+To enable deterministic cache management, you can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. When provided, these UUIDs are returned in KV cache events instead of computed content hashes, while the cache key itself is computed from **both** the UUID and content together for correctness.
+
+**Usage Example:**
+
+```python
+from tensorrt_llm.inputs import TextPrompt
+
+# Provide custom UUIDs for your images
+prompt = TextPrompt(
+    prompt="Describe these images.",
+    multi_modal_data={"image": [image1, image2]},
+    multi_modal_uuids={"image": ["image-uuid-001", "image-uuid-002"]}
+)
+```
+
+**Key Features:**
+
+- **Cache Correctness**: When a UUID is provided, the cache key is computed from both the UUID and content together using `BLAKE3(UUID || Content)`. This ensures different content always produces different cache entries, even with the same UUID.
+- **User Isolation**: Same content with different UUIDs produces different cache entries, enabling per-user or per-session cache isolation.
+- **Stable Event Identifiers**: The original UUID string is preserved and returned in KV cache events via `get_kv_cache_events()`, enabling deterministic external cache management.
+- **Partial UUID Support**: You can provide UUIDs for some items and use `None` for others to fall back to content-only hashing.
+- **Cross-Modality Support**: Different modalities (images, videos) can each have their own UUIDs.
+
+**UUID Format:**
+
+- Can be any string (e.g., "image-123", "user-session-img-a", database keys)
+- Original UUID strings are preserved and returned in KV cache events
+
+
 ### Enable Offloading to Host Memory
 
 Before a block is evicted from GPU memory, it can optionally be offloaded to host (CPU) memory. The block remains reusable until it is evicted from host memory. When an offloaded block is reused, it is first copied back into GPU memory. Offloading is controlled with property ```host_cache_size``` which specifies how much host memory (in bytes) should be allocated for offloading. The default is 0.
 
 When offloading is enabled, the client can prevent specific blocks from being offloaded by toggling block priority. Blocks with lower priority than a certain threshold are not offloaded; they are evicted directly from GPU memory to reduce traffic between GPU and host. This priority is set with ```secondary_offload_min_priority```. Default value is 35, meaning any block with lower priority than 35 will not be offloaded.
+
+Here is an [example](../../../examples/llm-api/llm_kv_cache_offloading.py) to show how to enable host offloading.
 
 ### Partial Reuse
 
@@ -76,4 +117,8 @@ Property ```max_attention_window``` specifies the maximum attention window size 
 
 ### Deprecated Properties
 
-Properties ```use_uvm``` and ```sink_token_length``` have been deprecated and will be removed in a future release.
+Property ```use_uvm``` has been deprecated and will be removed in a future release.
+
+Property ```sink_token_length``` is deprecated and silently ignored on the PyTorch backend.
+The PyTorch attention kernels do not support StreamingLLM, so any non-``None`` value is
+dropped before reaching the executor.

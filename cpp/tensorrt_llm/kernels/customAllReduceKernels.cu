@@ -15,6 +15,7 @@
  */
 
 #include "customAllReduceKernels.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -26,7 +27,9 @@
 #include <tuple>
 #include <type_traits>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 using tensorrt_llm::common::divUp;
@@ -1952,24 +1955,38 @@ void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataTy
     sync_check_cuda_error(stream);
 }
 
-template <typename T>
-void launchResidualRmsNormKernel(kernels::AllReduceParams& params, cudaStream_t stream, AllReduceFusionOp fusionOp)
+template <typename T, bool Residual>
+void launchResidualRmsNormKernelDispatch(
+    kernels::AllReduceParams& params, cudaStream_t stream, AllReduceFusionOp fusionOp)
 {
     if (params.fusion_params.bias_buffer && params.fusion_params.weight_buffer)
     {
-        reduce_fusion::rms_norm_kernel_launcher<T, true, true, true>(params, stream, fusionOp);
+        reduce_fusion::rms_norm_kernel_launcher<T, true, Residual, true>(params, stream, fusionOp);
     }
     else if (params.fusion_params.bias_buffer && !params.fusion_params.weight_buffer)
     {
-        reduce_fusion::rms_norm_kernel_launcher<T, true, true, false>(params, stream, fusionOp);
+        reduce_fusion::rms_norm_kernel_launcher<T, true, Residual, false>(params, stream, fusionOp);
     }
     else if (!params.fusion_params.bias_buffer && params.fusion_params.weight_buffer)
     {
-        reduce_fusion::rms_norm_kernel_launcher<T, false, true, true>(params, stream, fusionOp);
+        reduce_fusion::rms_norm_kernel_launcher<T, false, Residual, true>(params, stream, fusionOp);
     }
     else
     {
-        reduce_fusion::rms_norm_kernel_launcher<T, false, true, false>(params, stream, fusionOp);
+        reduce_fusion::rms_norm_kernel_launcher<T, false, Residual, false>(params, stream, fusionOp);
+    }
+}
+
+template <typename T>
+void launchResidualRmsNormKernel(kernels::AllReduceParams& params, cudaStream_t stream, AllReduceFusionOp fusionOp)
+{
+    if (params.fusion_params.residual_buffer)
+    {
+        launchResidualRmsNormKernelDispatch<T, true>(params, stream, fusionOp);
+    }
+    else
+    {
+        launchResidualRmsNormKernelDispatch<T, false>(params, stream, fusionOp);
     }
 }
 
@@ -2014,4 +2031,6 @@ void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, c
     sync_check_cuda_error(stream);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

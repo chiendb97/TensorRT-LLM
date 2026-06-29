@@ -1,14 +1,17 @@
 from abc import ABC, abstractmethod
 from os import getenv
+from typing import Any, Dict, List, Optional
 
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.bindings import WorldConfig
-from tensorrt_llm.bindings.executor import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest
+from .mamba_cache_manager import (BaseMambaCacheManager,
+                                  CppMambaHybridCacheManager)
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
@@ -29,20 +32,27 @@ def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 
 
 def create_kv_cache_transceiver(
-        mapping: Mapping, dist: Distributed, kv_cache_manager: KVCacheManager,
+        mapping: Mapping,
+        dist: Distributed,
+        kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
-        cache_transceiver_config: CacheTransceiverConfig):
+        cache_transceiver_config: CacheTransceiverConfig,
+        mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
 
-    if cache_transceiver_config.backend == BackendTypeCpp.DEFAULT:
+    if cache_transceiver_config.backend == "DEFAULT":
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
-        # UCX is the default backend
-        cache_transceiver_config.backend = BackendTypeCpp.UCX
+        # NIXL is the default backend for non hybrid models
+        cache_transceiver_config.backend = "NIXL"
         # Ordered by priority
-        env_vars = [("TRTLLM_USE_NIXL_KVCACHE", BackendTypeCpp.NIXL),
-                    ("TRTLLM_USE_MPI_KVCACHE", BackendTypeCpp.MPI)]
+        env_vars = [
+            ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
+            ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
+            ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
+            ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
+        ]
         for env_var, be_type in env_vars:
             if getenv(env_var) == "1":
                 logger.warning(
@@ -51,17 +61,36 @@ def create_kv_cache_transceiver(
                 cache_transceiver_config.backend = be_type
                 break
 
-    if cache_transceiver_config.backend == BackendTypeCpp.MPI:
+    if cache_transceiver_config.backend == "MPI":
         logger.warning(
             "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
-    elif cache_transceiver_config.backend == BackendTypeCpp.UCX:
+    elif cache_transceiver_config.backend == "UCX":
         logger.info(
             f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
 
+    # Select transceiver implementation based on transceiver_runtime
+    # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
+    # transceiver_runtime == "PYTHON" -> use Python transceiver
+    if cache_transceiver_config.transceiver_runtime == "PYTHON":
+        # Python transceiver currently only supports NIXL and DEFAULT backend
+        if cache_transceiver_config.backend not in ("DEFAULT", "NIXL"):
+            raise ValueError(
+                f"Python transceiver currently only supports NIXL or DEFAULT backend, "
+                f"got {cache_transceiver_config.backend}. "
+                f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
+            )
+        from tensorrt_llm._torch.disaggregation.transceiver import \
+            KvCacheTransceiverV2
+        logger.info("Using KvCacheTransceiverV2")
+        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
+                                    cache_transceiver_config)
+
+    # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
-                                  attention_type, cache_transceiver_config)
+                                  attention_type, cache_transceiver_config,
+                                  mamba_cache_manager)
 
 
 class KvCacheTransceiver(ABC):
@@ -90,27 +119,92 @@ class KvCacheTransceiver(ABC):
     def check_gen_transfer_complete(self):
         raise NotImplementedError
 
+    @abstractmethod
+    def cancel_request(self, req: LlmRequest):
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_context_requests(self, requests: List[LlmRequest]):
+        """
+        Prepare the context request for the cache transceiver in generation-first mode.
+        This method should set the context request state to DISAGG_CONTEXT_WAIT_SCHEDULER
+        so that it won't be scheduled if the responding generation kvcache request is not
+        yet received otherwise set it to CONTEXT_INIT.
+        """
+        ...
+
+    @abstractmethod
+    def get_disaggregated_params(self) -> Dict[str, Any]:
+        """
+        Return a dictionary form of DisaggregatedParams to be set in the generation request.
+        The generation server will use it to get kvcache in generation-first mode.
+        """
+        ...
+
+    def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
+        """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
+
+    def shutdown(self):
+        """Shut down the transceiver and release registered resources."""
+
 
 class BindKvCacheTransceiver(KvCacheTransceiver):
 
-    def __init__(self, mapping: Mapping, dist: Distributed,
+    def __init__(self,
+                 mapping: Mapping,
+                 dist: Distributed,
                  kv_cache_manager: KVCacheManager,
                  attention_type: AttentionTypeCpp,
-                 cache_transceiver_config: CacheTransceiverConfig):
+                 cache_transceiver_config: CacheTransceiverConfig,
+                 mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
         world_config = mapping_to_world_config(mapping)
-        total_num_kv_heads_per_layer = kv_cache_manager.total_num_kv_heads_per_layer
+        # Filter out mamba/recurrent state layers (kv_heads == 0) so that
+        # CacheState::ModelConfig::mNbKvHeadsPerLayer only contains attention
+        # layers — matching the factory path (modelConfig.getNumKvHeadsPerLayer()).
+        # This is critical: splitKVCacheDispatch uses mNbKvHeadsPerLayer.size()
+        # as the layer count for the CUDA kernel grid dimension.
+        total_num_kv_heads_per_layer = [
+            h for h in kv_cache_manager.total_num_kv_heads_per_layer if h > 0
+        ]
         head_dim = kv_cache_manager.head_dim
         tokens_per_block = kv_cache_manager.tokens_per_block
         dtype = kv_cache_manager.dtype
-        # get the layer num per pp rank, which is required by cache transceiver.
-        pp_layer_num = len(kv_cache_manager.pp_layers)
+        # Get the *attention* layer count per PP rank (C++ uses this as
+        # mAttentionLayerNumPerPP).  For CppMambaHybridCacheManager the local
+        # pp_layers list includes mamba layers (kv_heads == 0); those must be
+        # excluded so the C++ buffer-size calculations stay correct.
+        pp_layer_num = sum(1 for h in kv_cache_manager.num_kv_heads_per_layer
+                           if h > 0)
         pp_layer_num_per_pp_rank = dist.pp_allgather(pp_layer_num)
-        self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
-                                        total_num_kv_heads_per_layer, head_dim,
-                                        tokens_per_block, world_config,
-                                        pp_layer_num_per_pp_rank, dtype,
-                                        attention_type,
-                                        cache_transceiver_config)
+
+        self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
+        self.kv_transfer_sender_future_timeout_ms = cache_transceiver_config.kv_transfer_sender_future_timeout_ms
+
+        # Get RNN state manager and layer distribution if mamba_cache_manager is provided.
+        rnn_state_manager = None
+        rnn_layer_num_per_pp_rank = []
+        if mamba_cache_manager is not None:
+            if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
+                # Unified pool path: RNN model config is in LinearAttentionMetadata,
+                # C++ reads it from BlockManager during CacheTransceiver construction.
+                rnn_layer_num_per_pp_rank = dist.pp_allgather(
+                    mamba_cache_manager.local_num_mamba_layers)
+            else:
+                rnn_state_manager = mamba_cache_manager._impl.mamba_impl
+                # Get the number of local RNN layers and allgather across PP ranks
+                rnn_local_layer_num = rnn_state_manager.get_num_local_layers()
+                rnn_layer_num_per_pp_rank = dist.pp_allgather(
+                    rnn_local_layer_num)
+                logger.info(
+                    f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
+                )
+
+        self.impl = CacheTransceiverCpp(
+            kv_cache_manager.impl, total_num_kv_heads_per_layer, head_dim,
+            tokens_per_block, world_config,
+            pp_layer_num_per_pp_rank, dtype, attention_type,
+            cache_transceiver_config._to_pybind(), rnn_state_manager,
+            rnn_layer_num_per_pp_rank)
 
     def respond_and_send_async(self, req: LlmRequest):
         return self.impl.respond_and_send_async(req)
@@ -130,6 +224,18 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def check_gen_transfer_complete(self):
         return self.impl.check_gen_transfer_complete()
 
+    def cancel_request(self, req: LlmRequest):
+        return self.impl.cancel_request(req)
+
+    def prepare_context_requests(self, requests: List[LlmRequest]):
+        # not implemented, an empty placeholder to allow being invoked unconditionally
+        ...
+
+    def get_disaggregated_params(self):
+        # Cpp kv cache transceiver will set the disaggregated params to context response
+        # Only new py cache transceiver will support gen-first disagg
+        return {}
+
 
 class CacheTransBufferManager:
 
@@ -138,7 +244,10 @@ class CacheTransBufferManager:
                                                max_num_tokens)
 
     @staticmethod
-    def pre_alloc_buffer_size(kv_cache_size_per_token: int,
-                              cache_transceiver_config: CacheTransceiverConfig):
+    def pre_alloc_buffer_size(
+            kv_cache_size_bytes_per_token_per_window: dict[int, int],
+            tokens_per_block: int,
+            cache_transceiver_config: CacheTransceiverConfig):
         return CacheTransBufferManagerCpp.pre_alloc_buffer_size(
-            kv_cache_size_per_token, cache_transceiver_config)
+            kv_cache_size_bytes_per_token_per_window, tokens_per_block,
+            cache_transceiver_config)

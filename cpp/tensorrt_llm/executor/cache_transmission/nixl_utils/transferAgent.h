@@ -36,6 +36,21 @@ struct NixlHelper
     [[nodiscard]] static nixl_xfer_dlist_t convertXferDist(FileDescs const& descs);
     static void posixGpuToFileFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
     static void posixFileToGpuFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
+
+    /// @brief Coalesce contiguous memory regions to reduce memory registration overhead.
+    /// Adjacent memory regions with the same deviceId will be merged into a single region.
+    /// @param descs Memory descriptors to coalesce
+    /// @return Coalesced MemoryDescs
+    [[nodiscard]] static MemoryDescs coalesceMemoryDescs(MemoryDescs const& descs);
+
+    /// @brief Coalesce contiguous memory regions in src and dst to reduce transfer count.
+    /// If src[i] and src[i+1] are contiguous, and dst[i] and dst[i+1] are also contiguous
+    /// (with same deviceId), they will be merged into a single transfer.
+    /// @param srcDescs Source memory descriptors
+    /// @param dstDescs Destination memory descriptors
+    /// @return Pair of coalesced (src, dst) MemoryDescs
+    [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> coalesceTransferDescs(
+        TransferDescs const& srcDescs, TransferDescs const& dstDescs);
 };
 
 class NixlTransferStatus final : public TransferStatus
@@ -45,7 +60,7 @@ public:
 
     [[nodiscard]] bool isCompleted() const override;
 
-    void wait() const override;
+    [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
 
 private:
     nixlAgent* mRawAgent{};
@@ -84,9 +99,9 @@ public:
 
     [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> getNotifiedSyncMessages() override;
 
-    ConnectionInfoType getConnectionInfo() override;
+    ConnectionInfoType getLocalConnectionInfo() override;
 
-    void connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
+    void loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
 
     bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
 
@@ -99,6 +114,13 @@ private:
 
     std::vector<char> mDRamSrcBuffer;
     std::vector<char> mDRamDstBuffer;
+
+    /// Local VMM region info (from registerMemory). Keyed by local virtual address.
+    VramRegionMap mLocalVramRegionInfo;
+
+    /// Remote VMM region info (from loadRemoteAgent). Keyed by {agentName → {addr → info}}.
+    /// Per-agent maps because different remote agents may have overlapping virtual addresses.
+    std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
 };
 
 class NixlLoopbackAgent final : public BaseLoopbackAgent

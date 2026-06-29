@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from transformers import AutoModelForCausalLM
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.llmapi import QuantConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import GPTJConfig, GPTJForCausalLM
@@ -61,7 +62,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -87,7 +88,7 @@ def convert_and_save_hf(args):
     quant_config = args_to_quant_config(args)
 
     hf_model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                    torch_dtype='auto',
+                                                    dtype='auto',
                                                     trust_remote_code=True)
 
     def convert_and_save_rank(args, rank):
@@ -126,6 +127,7 @@ def convert_and_save_hf(args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
 

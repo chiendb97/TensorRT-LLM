@@ -5,6 +5,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.falcon.model import FalconForCausalLM
@@ -74,7 +75,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -129,10 +130,7 @@ def convert_and_save_hf(args: argparse.Namespace):
     import transformers
     if not args.load_by_shard and quant_config.quant_mode.has_any_quant():
         hf_model = transformers.FalconForCausalLM.from_pretrained(
-            model_dir,
-            trust_remote_code=True,
-            torch_dtype='auto',
-            device_map='auto')
+            model_dir, trust_remote_code=True, dtype='auto', device_map='auto')
     else:
         # Initialize huggingface local cache.
         # Huggingface copies the external configuration source (`configuration_falcon.py` here) into its local cache at
@@ -142,7 +140,7 @@ def convert_and_save_hf(args: argparse.Namespace):
         # Preload the config once to initialize local cache, so subsequent multithread loading won't fail.
         _ = transformers.FalconConfig.from_pretrained(model_dir,
                                                       trust_remote_code=True,
-                                                      torch_dtype='auto',
+                                                      dtype='auto',
                                                       device_map='auto')
 
     def convert_and_save_rank(args, rank: int):
@@ -185,6 +183,7 @@ def execute(workers, func, args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
     tik = time.time()

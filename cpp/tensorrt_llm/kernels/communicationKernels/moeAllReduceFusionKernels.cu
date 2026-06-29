@@ -13,13 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 
-namespace tensorrt_llm::kernels::ar_fusion::moe
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ar_fusion::moe
 {
 template <int NRanks>
 struct LamportComm
@@ -28,9 +31,9 @@ struct LamportComm
     {
         counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
         flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
-        clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
+        clear_ptr = &reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[0];
         flag_value = *flag_ptr;
-        int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
+        auto comm_size = reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[1];
         clear_size = *clear_ptr;
         int data_offset = flag_value % 3;
         int clear_offset = (flag_value + 2) % 3;
@@ -46,7 +49,7 @@ struct LamportComm
         }
     }
 
-    __device__ __forceinline__ void update(int new_clear_size)
+    __device__ __forceinline__ void update(int64_t new_clear_size)
     {
         if (blockIdx.x == 0 && threadIdx.x == 0)
         {
@@ -61,10 +64,10 @@ struct LamportComm
 
     int* counter_ptr;
     int* flag_ptr;
-    int* clear_ptr;
+    int64_t* clear_ptr;
     uint8_t* data_bufs[NRanks];
     uint8_t* clear_buf;
-    int clear_size;
+    int64_t clear_size;
     int flag_value;
 };
 
@@ -133,14 +136,22 @@ template <bool ResidualOut, bool NormOut, bool QuantOut, typename DType, typenam
 __device__ __forceinline__ void fused_op(
     PackedType const& val, int access_id, int token_id, int access_id_in_token, AllReduceFusionParams& params)
 {
-    float4 residual_val = reinterpret_cast<float4*>(params.residual_in)[access_id];
     float4 gamma_val = reinterpret_cast<float4*>(params.rms_gamma)[access_id_in_token];
-    residual_val = add128<DType>(val, residual_val);
-    if constexpr (ResidualOut)
+    float4 norm_input;
+    if (params.residual_in)
     {
-        reinterpret_cast<float4*>(params.residual_out)[access_id] = residual_val;
+        float4 residual_val = reinterpret_cast<float4*>(params.residual_in)[access_id];
+        norm_input = add128<DType>(val, residual_val);
+        if constexpr (ResidualOut)
+        {
+            reinterpret_cast<float4*>(params.residual_out)[access_id] = norm_input;
+        }
     }
-    float4 norm_val = rms_norm<DType>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
+    else
+    {
+        norm_input = val;
+    }
+    float4 norm_val = rms_norm<DType>(norm_input, gamma_val, params.rms_eps, params.hidden_dim);
     if constexpr (NormOut)
     {
         reinterpret_cast<float4*>(params.norm_out)[access_id] = norm_val;
@@ -440,7 +451,7 @@ void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& p
         MOE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                       \
     }
 
-    TLLM_CHECK(params.residual_in && params.rms_gamma);
+    TLLM_CHECK(params.rms_gamma);
     TLLM_CHECK(params.moe_reduction_scale_input && params.moe_reduction_active_experts_token_input
         && params.moe_reduction_token_input);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
@@ -728,6 +739,7 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
     }
 
     TLLM_CHECK(params.allreduce_in && params.expanded_idx_to_permuted_idx && params.top_k);
+    TLLM_CHECK(params.rms_gamma);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
     TLLM_CHECK(params.hidden_dim % kElemsPerAccess == 0);
     if (params.residual_out && not params.norm_out && params.quant_out)
@@ -765,9 +777,21 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
         MOE_FINALIZE_DISPATCH0(8, true, true, true);
         MOE_FINALIZE_DISPATCH0(16, true, true, true);
     }
-    TLLM_CHECK_WITH_INFO(false, "moefinalize_allreduce_fusion_op: unsupported pattern!");
+    // Reaching here means none of the above branches dispatched. Spell out the actual params so
+    // a future dtype/scale_dtype mismatch (e.g. bf16 hidden + fp32 expert weights, see PR #13328)
+    // is debuggable from the assert message alone.
+    TLLM_CHECK_WITH_INFO(false,
+        "moefinalize_allreduce_fusion_op: unsupported pattern! "
+        "nranks=%d, dtype=%d, scale_dtype=%d, "
+        "residual_out=%d, norm_out=%d, quant_out=%d. "
+        "Supported dispatch requires nranks in {2,4,8,16}, dtype==scale_dtype in {kHALF, kBF16}, "
+        "and (residual_out, norm_out, quant_out) in {(1,0,1),(0,1,0),(1,1,0),(1,1,1)}.",
+        params.nranks, static_cast<int>(params.dtype), static_cast<int>(params.scale_dtype),
+        params.residual_out != nullptr, params.norm_out != nullptr, params.quant_out != nullptr);
 #undef MOE_FINALIZE_DISPATCH0
 #undef MOE_FINALIZE_DISPATCH1
 }
 
-}; // namespace tensorrt_llm::kernels::ar_fusion::moe
+}; // namespace kernels::ar_fusion::moe
+
+TRTLLM_NAMESPACE_END

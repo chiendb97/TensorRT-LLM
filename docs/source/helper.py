@@ -1,9 +1,13 @@
+import importlib.util
 import logging
+import os
 import re
 from dataclasses import dataclass
 from itertools import chain, groupby
 from pathlib import Path
 from typing import Optional
+
+import pygit2
 
 
 def underline(title: str, character: str = "=") -> str:
@@ -60,8 +64,18 @@ LLMAPI_SECTIONS = ["Basics", "Customization", "Slurm"]
 def generate_examples():
     root_dir = Path(__file__).parent.parent.parent.resolve()
     ignore_list = {
-        '__init__.py', 'quickstart_example.py', 'quickstart_advanced.py',
-        'quickstart_multimodal.py', 'star_attention.py'
+        '__init__.py',
+        'quickstart_example.py',
+        'quickstart_advanced.py',
+        'quickstart_multimodal.py',
+        'star_attention.py',
+        # Older VisualGen example scripts without ### :title metadata; opt
+        # in by adding the metadata block and removing the entry below.
+        'visual_gen_flux.py',
+        'visual_gen_ltx2.py',
+        'visual_gen_wan_i2v.py',
+        'visual_gen_wan_t2v.py',
+        'visual_gen_mgmn_distributed.sh'
     }
     doc_dir = root_dir / "docs/source/examples"
 
@@ -80,14 +94,23 @@ def generate_examples():
     llmapi_doc_paths = [
         doc_dir / f"{path.stem}.rst" for path in llmapi_script_paths
     ]
-    llmapi_script_base_url = "https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api"
+    repo = pygit2.Repository('.')
+    commit_hash = str(repo.head.target)
+    llmapi_script_base_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/{commit_hash}/examples/llm-api"
 
     # Collect source paths for trtllm-serve examples
     serve_script_paths = collect_script_paths("serve")
     serve_doc_paths = [
         doc_dir / f"{path.stem}.rst" for path in serve_script_paths
     ]
-    serve_script_base_url = "https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve"
+    serve_script_base_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/{commit_hash}/examples/serve"
+
+    # Collect source paths for VisualGen examples
+    visual_gen_script_paths = collect_script_paths("visual_gen")
+    visual_gen_doc_paths = [
+        doc_dir / f"{path.stem}.rst" for path in visual_gen_script_paths
+    ]
+    visual_gen_script_base_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/{commit_hash}/examples/visual_gen"
 
     def _get_lines_without_metadata(filename: str) -> str:
         """Get line ranges that exclude metadata lines.
@@ -145,7 +168,6 @@ def generate_examples():
                 logging.warning(f"Ignoring file: {script_path.name}")
                 continue
             script_url = f"{base_url}/{script_path.name}"
-
             # Determine language based on file extension
             language = "python" if script_path.suffix == ".py" else "bash"
 
@@ -262,6 +284,18 @@ def generate_examples():
                 example_name="Online Serving Examples",
                 section_order=[])
 
+    # Generate the toctree for VisualGen example scripts. No section_order
+    # while the example set is small; add one alongside ### :section
+    # metadata on the scripts once we have enough examples to group.
+    visual_gen_metas = write_scripts(visual_gen_script_base_url,
+                                     visual_gen_script_paths,
+                                     visual_gen_doc_paths)
+    write_index(metas=visual_gen_metas,
+                doc_template_path=doc_dir / "llm_examples_index.template.rst_",
+                doc_path=doc_dir / "visual_gen_examples.rst",
+                example_name="VisualGen Examples",
+                section_order=[])
+
 
 def extract_all_and_eval(file_path):
     ''' Extract the __all__ variable from a Python file.
@@ -310,6 +344,14 @@ def generate_llmapi():
     public_classes_names = extract_all_and_eval(llmapi_all_file)['__all__']
 
     content = underline("API Reference", "-") + "\n\n"
+    content += ".. note::\n"
+    content += "    Since version 1.0, we have attached a status label to `LLM`, `LlmArgs` and `TorchLlmArgs` Classes.\n\n"
+    content += "    1. :tag:`stable` - The item is stable and will keep consistent.\n"
+    content += '    2. :tag:`prototype` - The item is a prototype and is subject to change.\n'
+    content += '    3. :tag:`beta` - The item is in beta and approaching stability.\n'
+    content += '    4. :tag:`deprecated` - The item is deprecated and will be removed in a future release.\n'
+    content += "\n"
+
     for cls_name in public_classes_names:
         cls_name = cls_name.strip()
         options = [
@@ -328,9 +370,40 @@ def generate_llmapi():
 
         content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
         content += "\n".join(options) + "\n\n"
-
     with open(doc_path, "w+") as f:
         f.write(content)
+
+
+def update_version():
+    """Replace the placeholder container version in all docs source files."""
+    version_path = (Path(__file__).parent.parent.parent / "tensorrt_llm" /
+                    "version.py").resolve()
+    spec = importlib.util.spec_from_file_location("version_module",
+                                                  version_path)
+    version_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(version_module)
+    version = version_module.__version__
+
+    docs_source_dir = Path(__file__).parent.resolve()
+    md_files = list(docs_source_dir.rglob("*.md"))
+
+    # Default is to replace `release:x.y.z` placeholders; set to 0 to disable.
+    if os.environ.get("TRTLLM_DOCS_REPLACE_CONTAINER_TAG", "1") != "1":
+        return
+
+    for file_path in md_files:
+        with open(file_path, "r") as f:
+            content = f.read()
+        updated = content.replace(
+            "nvcr.io/nvidia/tensorrt-llm/release:x.y.z",
+            f"nvcr.io/nvidia/tensorrt-llm/release:{version}",
+        ).replace(
+            "nvcr.io/nvidia/tensorrt-llm/devel:x.y.z",
+            f"nvcr.io/nvidia/tensorrt-llm/devel:{version}",
+        )
+        if updated != content:
+            with open(file_path, "w") as f:
+                f.write(updated)
 
 
 if __name__ == "__main__":

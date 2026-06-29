@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +21,6 @@
 #include <limits>
 #include <sstream>
 #define UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper"
-
 #if defined(_WIN32)
 #include <windows.h>
 #define dllOpen(name) LoadLibrary(name ".dll")
@@ -37,25 +36,183 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/contextProgress.h"
-#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
+#include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/kvCacheType.h"
+#include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/mlaCacheFormatter.h"
+#include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
+#include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <algorithm>
 #include <cstddef>
 #include <numeric>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace tensorrt_llm::batch_manager
 {
 
 std::mutex CacheTransceiver::mDllMutex;
+
+namespace
+{
+
+using RequestIdType = LlmRequest::RequestIdType;
+
+enum class TransferConsensusState : std::uint64_t
+{
+    kCompleted = 1,
+    kFailed = 2,
+};
+
+struct TransferStateCounts
+{
+    int completedCount{0};
+    int failedCount{0};
+};
+
+struct TransferConsensusOutcome
+{
+    std::unordered_set<RequestIdType> completedRequestIds;
+    std::unordered_set<RequestIdType> failedRequestIds;
+};
+
+void appendPackedTransferState(
+    std::vector<std::uint64_t>& packedStates, RequestIdType requestId, TransferConsensusState state)
+{
+    packedStates.push_back(requestId);
+    packedStates.push_back(static_cast<std::uint64_t>(state));
+}
+
+std::vector<std::uint64_t> gatherPackedTransferStates(
+    std::shared_ptr<CacheTransceiverComm> const& comm, std::vector<std::uint64_t> const& packedStates)
+{
+    int localSize = static_cast<int>(packedStates.size());
+    std::vector<int> sizes(comm->getSize());
+    std::vector<std::uint64_t> gatheredStates;
+    if (useMPI())
+    {
+        comm->allgather(&localSize, sizes.data(), 1, mpi::MpiType::kINT32);
+        std::vector<int> displs(comm->getSize());
+        size_t totalSize = 0;
+        for (int i = 0; i < comm->getSize(); i++)
+        {
+            displs[i] = static_cast<int>(totalSize);
+            totalSize += sizes[i];
+        }
+        gatheredStates.resize(totalSize);
+        comm->allgatherv(packedStates.data(), static_cast<int>(packedStates.size()), mpi::MpiType::kUINT64,
+            gatheredStates.data(), sizes, displs, mpi::MpiType::kUINT64);
+    }
+    else
+    {
+        comm->allgather(&localSize, std::ref(sizes), {});
+        size_t totalSize = std::accumulate(sizes.begin(), sizes.end(), 0);
+        gatheredStates.resize(totalSize);
+        comm->allgatherv(std::ref(packedStates), std::ref(gatheredStates), std::cref(sizes), {});
+    }
+    return gatheredStates;
+}
+
+TransferConsensusOutcome reduceTransferStates(std::shared_ptr<CacheTransceiverComm> const& comm,
+    std::unordered_set<RequestIdType> const& completedRequestIds,
+    std::unordered_set<RequestIdType> const& failedRequestIds)
+{
+    std::vector<std::uint64_t> localStates;
+    localStates.reserve((completedRequestIds.size() + failedRequestIds.size()) * 2);
+    for (auto const requestId : completedRequestIds)
+    {
+        if (failedRequestIds.find(requestId) == failedRequestIds.end())
+        {
+            appendPackedTransferState(localStates, requestId, TransferConsensusState::kCompleted);
+        }
+    }
+    for (auto const requestId : failedRequestIds)
+    {
+        appendPackedTransferState(localStates, requestId, TransferConsensusState::kFailed);
+    }
+
+    int const syncSize = (comm != nullptr) ? comm->getSize() : 1;
+    auto const gatheredStates
+        = ((comm != nullptr) && syncSize > 1) ? gatherPackedTransferStates(comm, localStates) : std::move(localStates);
+
+    constexpr size_t kPackedStateFields = 2;
+    TLLM_CHECK_WITH_INFO(gatheredStates.size() % kPackedStateFields == 0,
+        "Packed transfer state consensus payload must contain request/state pairs.");
+
+    std::unordered_map<RequestIdType, TransferStateCounts> stateCounts;
+    for (size_t idx = 0; idx < gatheredStates.size(); idx += kPackedStateFields)
+    {
+        auto const requestId = gatheredStates.at(idx);
+        auto const state = static_cast<TransferConsensusState>(gatheredStates.at(idx + 1));
+        auto& counts = stateCounts[requestId];
+        switch (state)
+        {
+        case TransferConsensusState::kCompleted: counts.completedCount++; break;
+        case TransferConsensusState::kFailed: counts.failedCount++; break;
+        }
+    }
+
+    TransferConsensusOutcome outcome;
+    for (auto const& [requestId, counts] : stateCounts)
+    {
+        auto const terminalCount = counts.completedCount + counts.failedCount;
+        if (terminalCount == syncSize && counts.failedCount > 0)
+        {
+            outcome.failedRequestIds.insert(requestId);
+        }
+        else if (counts.completedCount == syncSize)
+        {
+            outcome.completedRequestIds.insert(requestId);
+        }
+    }
+    return outcome;
+}
+
+TransferConsensusOutcome reduceTransferStates(std::shared_ptr<CacheTransceiverComm> const& firstComm,
+    std::shared_ptr<CacheTransceiverComm> const& secondComm,
+    std::unordered_set<RequestIdType> const& completedRequestIds,
+    std::unordered_set<RequestIdType> const& failedRequestIds)
+{
+    auto const firstOutcome = reduceTransferStates(firstComm, completedRequestIds, failedRequestIds);
+    return reduceTransferStates(secondComm, firstOutcome.completedRequestIds, firstOutcome.failedRequestIds);
+}
+
+void recordLocalTransferOutcome(RequestIdType requestId, std::shared_ptr<LlmRequest> request, bool failed,
+    std::unordered_set<RequestIdType>& completedRequestIds, std::unordered_set<RequestIdType>& failedRequestIds,
+    std::unordered_map<RequestIdType, std::shared_ptr<LlmRequest>>& requestsAwaitingConsensus)
+{
+    requestsAwaitingConsensus[requestId] = std::move(request);
+    if (failed)
+    {
+        completedRequestIds.erase(requestId);
+        failedRequestIds.insert(requestId);
+    }
+    else if (failedRequestIds.find(requestId) == failedRequestIds.end())
+    {
+        completedRequestIds.insert(requestId);
+    }
+}
+
+void eraseLocalTransferOutcome(RequestIdType requestId, std::unordered_set<RequestIdType>& completedRequestIds,
+    std::unordered_set<RequestIdType>& failedRequestIds,
+    std::unordered_map<RequestIdType, std::shared_ptr<LlmRequest>>& requestsAwaitingConsensus)
+{
+    completedRequestIds.erase(requestId);
+    failedRequestIds.erase(requestId);
+    requestsAwaitingConsensus.erase(requestId);
+}
+
+} // namespace
 
 std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransceiver(
     kv_cache_manager::BaseKVCacheManager* cacheManager, runtime::ModelConfig const& modelConfig,
@@ -80,6 +237,11 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
             backendType = executor::CacheTransceiverConfig::BackendType::NIXL;
             TLLM_LOG_INFO("Enable NIXL KV cache transport.");
         }
+        else if (common::getEnvUseMooncakeKvCache())
+        {
+            backendType = executor::CacheTransceiverConfig::BackendType::MOONCAKE;
+            TLLM_LOG_INFO("Enable MOONCAKE KV cache transport.");
+        }
         else if (common::getEnvUseMPIKvCache())
         {
             backendType = executor::CacheTransceiverConfig::BackendType::MPI;
@@ -88,7 +250,7 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
         }
         else
         {
-            backendType = executor::CacheTransceiverConfig::BackendType::UCX;
+            backendType = executor::CacheTransceiverConfig::BackendType::NIXL;
         }
     }
     cacheTransceiverConfig.value().setBackendType(backendType);
@@ -112,46 +274,59 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
     std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
     executor::kv_cache::CacheState::AttentionType attentionType,
-    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
-    : mMpiGroupComm(std::addressof(tensorrt_llm::mpi::MpiComm::session()))
-    , mCacheTransceiverConfig{cacheTransceiverConfig}
+    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
+    rnn_state_manager::RnnStateManager* rnnStateManager, std::vector<SizeType32> const& rnnLayerNumPerPP)
+    : mCacheTransceiverConfig{cacheTransceiverConfig}
+    , mRnnStateManager{rnnStateManager}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
+    if (useMPI())
+    {
+        mGroupComm = std::make_shared<CacheTransceiverComm>(std::addressof(tensorrt_llm::mpi::MpiComm::session()));
+    }
+    else
+    {
+        mGroupComm = std::make_shared<CacheTransceiverComm>(tensorrt_llm::pg_utils::get_world_pg());
+    }
+
+    if (worldConfig.isTensorParallel() || worldConfig.isContextParallel())
+    {
+        mGroupTensorParaComm = std::make_shared<CacheTransceiverComm>(
+            mGroupComm->split(worldConfig.getPipelineParallelRank(), worldConfig.getRank()));
+    }
     if (worldConfig.isPipelineParallel())
     {
-        mMpiGroupPipeParaComm = std::make_shared<tensorrt_llm::mpi::MpiComm>(
-            mMpiGroupComm->split(worldConfig.getTensorParallelRank(), worldConfig.getPipelineParallelRank()));
-    }
-    if (worldConfig.isTensorParallel())
-    {
-        mMpiGroupTensorParaComm = std::make_shared<tensorrt_llm::mpi::MpiComm>(
-            mMpiGroupComm->split(worldConfig.getPipelineParallelRank(), worldConfig.getTensorParallelRank()));
+        auto const ppGroupColor = worldConfig.getTensorParallelRank() * worldConfig.getContextParallelism()
+            + worldConfig.getContextParallelRank();
+        mGroupPipeParaComm
+            = std::make_shared<CacheTransceiverComm>(mGroupComm->split(ppGroupColor, worldConfig.getRank()));
     }
     int kvFactor = 2;
     if (cacheManager->getCacheType() == kv_cache_manager::CacheType::kSELFKONLY)
     {
         kvFactor = 1;
     }
-    mCacheState = std::make_unique<executor::kv_cache::CacheState>(
-        cacheStateModelCfg, worldConfig, attentionLayerNumPerPP, dataType, attentionType, kvFactor);
+    mCacheState
+        = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig, attentionLayerNumPerPP,
+            dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(), cacheManager->isEnablePartialReuse(),
+            cacheManager->isEnableIndexerKCache(), cacheManager->getIndexerKCacheIndexHeadDim(),
+            cacheManager->getIndexerKCacheQuantBlockSize(), cacheManager->getIndexerKCacheUseFp4());
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
-        int TPSizeInDPGroup
-            = mCacheState->getParallelConfig().mTensorParallelism / mCacheState->getParallelConfig().mDPsize;
-        int DPSize = mCacheState->getParallelConfig().mDPsize;
-        int TPRankInDPGroup = worldConfig.getTensorParallelRank() % TPSizeInDPGroup;
+        int dpSize = mCacheState->getParallelConfig().mDPsize;
 
-        int DPRank = (worldConfig.getRank() - TPSizeInDPGroup * DPSize * worldConfig.getPipelineParallelRank()
-                         - TPRankInDPGroup)
-            / TPSizeInDPGroup;
-        // <PP,DP,TP>
-        mMpiGroupDataComm
-            = std::make_shared<tensorrt_llm::mpi::MpiComm>(mMpiGroupComm->split(DPRank, worldConfig.getRank()));
-        if (worldConfig.isTensorParallel())
+        // dpRank is derived from the tensor parallel rank, which already accounts for CP.
+        // Layout: rank = ppRank * (TP * CP) + tpRank * CP + cpRank.
+        // getTensorParallelRank() correctly extracts tpRank regardless of CP.
+        int dpRank = mCacheState->getParallelConfig().mDPrank;
+        // <PP,DP,TP,CP>
+        mGroupDataComm = std::make_shared<CacheTransceiverComm>(mGroupComm->split(dpRank, worldConfig.getRank()));
+        if (worldConfig.isTensorParallel() || worldConfig.isContextParallel())
         {
-            mMpiGroupTPInDPComm = std::make_shared<tensorrt_llm::mpi::MpiComm>(
-                mMpiGroupComm->split(worldConfig.getRank() / TPSizeInDPGroup, worldConfig.getRank()));
+            // Group ranks with same (ppRank, dpRank) accounting for CP.
+            mGroupTPInDPComm = std::make_shared<CacheTransceiverComm>(
+                mGroupComm->split(worldConfig.getPipelineParallelRank() * dpSize + dpRank, worldConfig.getRank()));
         }
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
@@ -163,7 +338,93 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
 
     std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
 
-    mCacheTransBufferManager = std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens);
+    mCacheTransBufferManagers.push_back(
+        std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens));
+    if (isMLA && cacheManager->isEnableIndexerKCache())
+    {
+        mCacheTransBufferManagers.push_back(
+            std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, true));
+    }
+
+    // RNN specific setup
+    if (mRnnStateManager != nullptr)
+    {
+        TLLM_LOG_DEBUG("Setting up RNN cache transfer components.");
+        TLLM_CHECK(!rnnLayerNumPerPP.empty());
+
+        mRnnCacheTransBufferManager
+            = std::make_unique<rnn_state_manager::RnnCacheTransBufferManager>(mRnnStateManager, maxNumTokens);
+
+        auto rnnModelCfg = mRnnStateManager->getRnnCacheStateModelConfig();
+
+        auto const convStateDataType = mRnnStateManager->getConvStateDataType();
+        auto const ssmStateDataType = mRnnStateManager->getSsmStateDataType();
+
+        mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
+
+        TLLM_LOG_INFO("RNN cache transfer components initialized.");
+    }
+
+    // Unified pool path (CppMambaHybridCacheManager): build RnnModelConfig from
+    // LinearAttentionMetadata. Detected by rnnLayerNumPerPP set but no RnnStateManager.
+    if (mRnnStateManager == nullptr && !rnnLayerNumPerPP.empty())
+    {
+        auto const& blockManager = cacheManager->getBlockManager();
+        auto const& linearMeta = blockManager.getLinearAttentionMetadata();
+        TLLM_CHECK_WITH_INFO(linearMeta.has_value(), "LinearAttentionMetadata not found for unified pool RNN config");
+
+        executor::kv_cache::CacheState::RnnModelConfig rnnModelCfg{};
+        rnnModelCfg.mNumHeads = linearMeta->rnnNumHeads;
+        rnnModelCfg.mHeadDim = linearMeta->rnnHeadDim;
+        rnnModelCfg.mDState = linearMeta->rnnDState;
+        rnnModelCfg.mDConv = linearMeta->rnnDConv;
+        rnnModelCfg.mNGroups = linearMeta->rnnNGroups;
+        rnnModelCfg.mHiddenSize = linearMeta->rnnHeadDim * linearMeta->rnnNumHeads;
+        rnnModelCfg.mConvSectionLayout = static_cast<executor::kv_cache::CacheState::RnnModelConfig::ConvSectionLayout>(
+            linearMeta->rnnConvSectionLayout);
+
+        // Derive actual SSM and conv dtypes from metadata byte sizes.
+        // Pool dtype is UINT8 (raw byte storage), so we cannot use pool->getDataType().
+        // Only the byte size matters for split/concat kernel stride calculations — the actual
+        // dtype enum is not interpreted numerically, just used for getDTypeSize() dispatch.
+        auto dtypeFromSize = [](SizeType32 size) -> nvinfer1::DataType
+        {
+            switch (size)
+            {
+            case 4: return nvinfer1::DataType::kFLOAT;
+            case 2: return nvinfer1::DataType::kBF16;
+            case 1: return nvinfer1::DataType::kFP8;
+            default: TLLM_THROW("Unsupported RNN state dtype size: %d", size);
+            }
+        };
+        TLLM_CHECK_WITH_INFO(linearMeta->rnnSsmDtypeSize > 0, "rnnSsmDtypeSize not set in LinearAttentionMetadata");
+        TLLM_CHECK_WITH_INFO(linearMeta->rnnConvDtypeSize > 0, "rnnConvDtypeSize not set in LinearAttentionMetadata");
+        nvinfer1::DataType ssmDtype = dtypeFromSize(linearMeta->rnnSsmDtypeSize);
+        nvinfer1::DataType convDtype = dtypeFromSize(linearMeta->rnnConvDtypeSize);
+        mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convDtype, ssmDtype);
+
+        // Create RnnCacheTransBufferManager for unified pool path.
+        mRnnCacheTransBufferManager
+            = std::make_unique<rnn_state_manager::RnnCacheTransBufferManager>(cacheManager, *mCacheState, maxNumTokens);
+
+        TLLM_LOG_INFO(
+            "Unified pool RNN config: numHeads=%d, headDim=%d, dState=%d, dConv=%d, "
+            "nGroups=%d, hiddenSize=%d, convSectionLayout=%d",
+            rnnModelCfg.mNumHeads, rnnModelCfg.mHeadDim, rnnModelCfg.mDState, rnnModelCfg.mDConv, rnnModelCfg.mNGroups,
+            rnnModelCfg.mHiddenSize, static_cast<int>(rnnModelCfg.mConvSectionLayout));
+    }
+
+    mCacheTransBufferManagerPtrs.clear();
+    mCacheTransBufferManagerPtrs.reserve(mCacheTransBufferManagers.size() + (mRnnCacheTransBufferManager ? 1 : 0));
+    for (auto& manager : mCacheTransBufferManagers)
+    {
+        mCacheTransBufferManagerPtrs.push_back(manager.get());
+    }
+    if (mRnnCacheTransBufferManager)
+    {
+        mCacheTransBufferManagerPtrs.push_back(mRnnCacheTransBufferManager.get());
+    }
+
     if (backendType.value() == executor::CacheTransceiverConfig::BackendType::UCX)
     {
         std::lock_guard<std::mutex> lock(mDllMutex);
@@ -174,7 +435,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         {
             void* ret = dllGetSym(handle, name);
             TLLM_CHECK_WITH_INFO(ret != nullptr,
-                "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+                "Unable to load UCX wrapper library symbol, possible cause is that TensorRT LLM library is not "
                 "built with UCX support, please rebuild in UCX-enabled environment.");
             return ret;
         };
@@ -185,9 +446,19 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL)
     {
+        auto rnnState
+            = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManager.get(), *mCacheState);
+            mCacheTransBufferManagerPtrs, *mCacheState, "nixl", rnnState);
         TLLM_LOG_INFO("NIXL Connection Manager created");
+    }
+    else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
+    {
+        auto rnnState
+            = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
+        mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
+            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake", rnnState);
+        TLLM_LOG_INFO("MOONCAKE Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
     {
@@ -200,20 +471,48 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         TLLM_THROW("Unsupported cache transceiver backend type ");
     }
 
-    using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
     auto makeFormatter = [cacheManager, isMLA, this]()
-    { return createCacheFormatter(cacheManager, mCacheTransBufferManager.get(), isMLA); };
+    {
+        std::vector<kv_cache_manager::CacheTransBufferManager*> kvBufferPtrs;
+        kvBufferPtrs.reserve(mCacheTransBufferManagers.size());
+        for (auto& mgr : mCacheTransBufferManagers)
+        {
+            kvBufferPtrs.push_back(mgr.get());
+        }
+        return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
+    };
 
-    mDataResponder = std::make_unique<DataResponder>(
-        std::make_unique<DataSenderImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
-    mDataRequester = std::make_unique<DataRequester>(
-        std::make_unique<DataReceiverImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+    auto makeRnnFormatter = [this, cacheManager]() -> std::unique_ptr<RnnCacheFormatter>
+    {
+        if (mRnnStateManager != nullptr && mRnnCacheTransBufferManager != nullptr)
+        {
+            // Slot-based path (CppMambaCacheManager)
+            return std::make_unique<RnnCacheFormatter>(mRnnStateManager, mRnnCacheTransBufferManager.get());
+        }
+        // Unified pool path (CppMambaHybridCacheManager)
+        if (mCacheState->hasRnnConfig() && mRnnCacheTransBufferManager != nullptr)
+        {
+            return std::make_unique<RnnCacheFormatter>(cacheManager, mRnnCacheTransBufferManager.get());
+        }
+        return nullptr;
+    };
+
+    auto makeCacheTransferLayer
+        = [&]() { return CacheTransferLayer(*mCacheState, makeFormatter(), makeRnnFormatter()); };
+
+    mCacheSender = std::make_unique<CacheSender>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
+    mCacheReceiver = std::make_unique<CacheReceiver>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
 
     initializeCommState();
 }
 
 CacheTransceiver::~CacheTransceiver()
 {
+    // Stop sender/receiver workers while the connection manager and transfer
+    // plugin are still alive. The workers can access both during termination.
+    mCacheSender.reset();
+    mCacheReceiver.reset();
+
     if (mWrapperLibHandle)
     {
         std::lock_guard<std::mutex> lock(mDllMutex);
@@ -223,7 +522,7 @@ CacheTransceiver::~CacheTransceiver()
 
 void CacheTransceiver::initializeCommState()
 {
-    mCommState = std::addressof(mDataResponder->getCommState());
+    mCommState = std::addressof(mCacheSender->getCommState());
 }
 
 void CacheTransceiver::setContextState(LlmRequest* llmRequest)
@@ -244,7 +543,7 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     }
 }
 
-void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
+void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
     llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS);
@@ -258,9 +557,9 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
         }
         return;
     }
-    setContextState(llmRequest);
-    auto future = mDataResponder->respondAndSendAsync(*llmRequest);
-    mResponderFutures.emplace_back(llmRequest, std::move(future));
+    setContextState(llmRequest.get());
+    auto future = mCacheSender->sendAsync(llmRequest);
+    mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -275,62 +574,74 @@ void CacheTransceiver::respondAndSendLayerWise(
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
-        auto future = mDataResponder->respondAndSendAsync(*llmRequest);
-        mResponderFutures.emplace_back(llmRequest.get(), std::move(future));
+        auto future = mCacheSender->sendAsync(llmRequest);
+        mSenderFutures.emplace_back(llmRequest, std::move(future));
     }
 }
 
-void CacheTransceiver::requestAndReceiveSync(LlmRequest* llmRequest)
+void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
     {
-        auto future = mDataRequester->requestAndReceiveAsync(*llmRequest);
+        auto future = mCacheReceiver->receiveAsync(llmRequest);
         future.get();
     }
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 }
 
-void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
+void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
 
+    auto const requestId = llmRequest->mRequestId;
     if (std::find_if(mRequesterFutures.begin(), mRequesterFutures.end(),
-            [llmRequest](auto const& pair) { return pair.first->mRequestId == llmRequest->mRequestId; })
+            [requestId](auto const& pair) { return pair.first->mRequestId == requestId; })
         != mRequesterFutures.end())
     {
-        TLLM_LOG_WARNING("Request ID %zu is already in mRequestFutures.", llmRequest->mRequestId);
+        TLLM_LOG_WARNING("Request ID %zu is already in mRequestFutures.", requestId);
         return;
     }
 
-    auto future = mDataRequester->requestAndReceiveAsync(*llmRequest);
-    mRequesterFutures.emplace_back(llmRequest, std::move(future));
-    llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto future = mCacheReceiver->receiveAsync(llmRequest);
+    auto* requestPtr = llmRequest.get();
+    mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
+    requestPtr->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
 }
 
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
-    mpi::MpiComm const& mpiComm, std::vector<LlmRequest::RequestIdType> const& requestIds)
+    std::shared_ptr<CacheTransceiverComm> const& mComm, std::vector<LlmRequest::RequestIdType> const& requestIds)
 {
     int localSize = static_cast<int>(requestIds.size());
-    std::vector<int> sizes(mpiComm.getSize());
-    mpiComm.allgather(&localSize, sizes.data(), 1, mpi::MpiType::kINT32);
-    // std::vector<LlmRequest::RequestIdType> all_data(total_size);
-    std::vector<int> displs(mpiComm.getSize());
-    int totalSize = 0;
-    for (int i = 0; i < mpiComm.getSize(); i++)
+    std::vector<int> sizes(mComm->getSize());
+    std::vector<LlmRequest::RequestIdType> retData;
+    if (useMPI())
     {
-        displs[i] = totalSize;
-        totalSize += sizes[i];
+        mComm->allgather(&localSize, sizes.data(), 1, mpi::MpiType::kINT32);
+        std::vector<int> displs(mComm->getSize());
+        size_t totalSize = 0;
+        for (int i = 0; i < mComm->getSize(); i++)
+        {
+            displs[i] = totalSize;
+            totalSize += sizes[i];
+        }
+        retData.resize(totalSize);
+        mComm->allgatherv(requestIds.data(), static_cast<int>(requestIds.size()), mpi::MpiType::kUINT64, retData.data(),
+            sizes, displs, mpi::MpiType::kUINT64);
     }
-    std::vector<LlmRequest::RequestIdType> retData(totalSize);
-    mpiComm.allgatherv(requestIds.data(), static_cast<int>(requestIds.size()), mpi::MpiType::kUINT64, retData.data(),
-        sizes, displs, mpi::MpiType::kUINT64);
+    else
+    {
+        mComm->allgather(&localSize, std::ref(sizes), {});
+        size_t totalSize = std::accumulate(sizes.begin(), sizes.end(), 0);
+        retData.resize(totalSize);
+        mComm->allgatherv(std::ref(requestIds), std::ref(retData), std::cref(sizes), {});
+    }
     return retData;
 }
 
-void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
+void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm, LlmRequest* request)
 {
     namespace su = executor::serialize_utils;
-    int worldSize = mpiComm.getSize();
+    int worldSize = mComm->getSize();
 
     std::ostringstream oStream;
     su::serialize(request->getKvCacheTransferStart(), oStream);
@@ -342,7 +653,14 @@ void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
     auto recvBufferSize = sendBufferSize * worldSize;
     std::vector<char> recvBuffer(recvBufferSize);
 
-    mpiComm.allgather(sendBuffer.data(), recvBuffer.data(), sendBufferSize, mpi::MpiType::kCHAR);
+    if (useMPI())
+    {
+        mComm->allgather(sendBuffer.data(), recvBuffer.data(), sendBufferSize, mpi::MpiType::kCHAR);
+    }
+    else
+    {
+        mComm->allgather(std::ref(sendBuffer), std::ref(recvBuffer), {});
+    }
 
     su::VectorWrapBuf<char> strbuf(recvBuffer);
     std::istream is(&strbuf);
@@ -360,7 +678,14 @@ void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
     std::size_t localKVCacheSize = request->getKvCacheSize();
     std::vector<std::size_t> allKVCacheSizes(worldSize, 0);
 
-    mpiComm.allgather(&localKVCacheSize, allKVCacheSizes.data(), 1, mpi::MpiType::kUINT64);
+    if (useMPI())
+    {
+        mComm->allgather(&localKVCacheSize, allKVCacheSizes.data(), 1, mpi::MpiType::kUINT64);
+    }
+    else
+    {
+        mComm->allgather(&localKVCacheSize, std::ref(allKVCacheSizes), {});
+    }
 
     std::size_t totalKVCacheSize = 0;
     for (int rank = 0; rank < worldSize; rank++)
@@ -369,7 +694,7 @@ void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
     }
 
     // Update the latest KV cache transfer time for leader rank
-    if (mpiComm.getRank() == 0)
+    if (mComm->getRank() == 0)
     {
         request->setKvCacheTransferStart(minStartTime);
         request->setKvCacheTransferEnd(maxEndTime);
@@ -377,12 +702,27 @@ void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
     }
 }
 
-void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
+RequestStatuses CacheTransceiver::checkContextTransferStatus(
+    std::optional<int> const& atLeastRequestNum, bool markComplete)
 {
     bool blockAll = !atLeastRequestNum.has_value();
-    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupTPInDPComm : mMpiGroupTensorParaComm;
+    std::optional<int> senderFutureTimeoutMs = std::nullopt;
+    // If blockAll is true, we want to block and not use a timeout
+    if (!blockAll && mCacheTransceiverConfig.has_value())
+    {
+        senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+    }
+    // Observe-only: WARN per-request when the wall-clock transfer time exceeds
+    // kvTransferTimeoutMs. No cancellation, eviction, or state transition.
+    std::optional<int> kvTransferTimeoutMs = std::nullopt;
+    if (mCacheTransceiverConfig.has_value())
+    {
+        kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
+    }
+
+    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
     std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
-    for (auto&& [request, future] : mResponderFutures)
+    for (auto&& [request, future] : mSenderFutures)
     {
         if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
         {
@@ -393,7 +733,7 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
     if ((syncComm) && syncComm->getSize() > 1)
     {
-        auto gatherRequestIdVec = gatherRequestIds(*syncComm, contextCompleteRequestIds);
+        auto gatherRequestIdVec = gatherRequestIds(syncComm, contextCompleteRequestIds);
         for (auto&& requestId : gatherRequestIdVec)
         {
             frequencyMap[requestId]++;
@@ -422,38 +762,111 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
 
     // Make sure there are at least atLeastRequestNum requests in toCompleteIdSet.
     // This will preserve the order of insertion for KVCache transfer requests.
-    for (auto it = mResponderFutures.begin();
-         atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()) && it != mResponderFutures.end();
-         ++it)
+    for (auto it = mSenderFutures.begin();
+         atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()) && it != mSenderFutures.end(); ++it)
     {
         auto& [request, future] = *it;
         toCompleteIdSet.insert(request->mRequestId);
     }
 
-    // Complete all the requests in toCompleteIdSet
-    for (auto it = mResponderFutures.begin(); it != mResponderFutures.end();)
+    // Record local terminal outcomes for requests selected this round. The
+    // request is reported only after all ranks in the sync group agree that the
+    // request reached a terminal state.
+    for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
         auto& [request, future] = *it;
+        if (kvTransferTimeoutMs.has_value())
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
+            auto elapsedMs = static_cast<long>(elapsed.count());
+            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutSenderIds.insert(request->mRequestId).second)
+            {
+                TLLM_LOG_WARNING(
+                    "Context KV cache transfer for request %ld exceeded configured timeout: "
+                    "elapsed %ld ms > limit %d ms (observe-only).",
+                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+            }
+        }
         if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
         {
+            auto const requestId = request->mRequestId;
             try
             {
-                future.get();
-                request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                // Wait for up to a specified timeout
+                auto status = future.wait_for(std::chrono::milliseconds(senderFutureTimeoutMs.value_or(0)));
+                if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
+                {
+                    future.get();
+                    bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                    recordLocalTransferOutcome(requestId, request, failed, mCompletedSenderRequestIds,
+                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                    it = mSenderFutures.erase(it);
+                }
+                else if (status == std::future_status::timeout)
+                {
+                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
+                        senderFutureTimeoutMs.value());
+                    ++it;
+                }
+                else
+                {
+                    TLLM_LOG_ERROR(
+                        "Future returned unexpected status for request %ld. Recording as failed.", requestId);
+
+                    recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
+                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                    it = mSenderFutures.erase(it);
+                }
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_ERROR(
-                    "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
-                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                TLLM_LOG_ERROR("Error occurred during context transfer for request %ld: %s", requestId, e.what());
+                recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
+                    mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                it = mSenderFutures.erase(it);
             }
-            it = mResponderFutures.erase(it);
         }
         else
         {
             ++it;
         }
     }
+
+    RequestStatuses requestsStatus{};
+    auto const consensusOutcome
+        = reduceTransferStates(syncComm, mGroupPipeParaComm, mCompletedSenderRequestIds, mFailedSenderRequestIds);
+    for (auto const requestId : consensusOutcome.failedRequestIds)
+    {
+        auto const requestIt = mSenderRequestsAwaitingConsensus.find(requestId);
+        if (requestIt == mSenderRequestsAwaitingConsensus.end())
+        {
+            continue;
+        }
+        requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+        requestsStatus.errorRequestIds.insert(requestId);
+        mTimedOutSenderIds.erase(requestId);
+        eraseLocalTransferOutcome(
+            requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+    }
+    for (auto const requestId : consensusOutcome.completedRequestIds)
+    {
+        auto const requestIt = mSenderRequestsAwaitingConsensus.find(requestId);
+        if (requestIt == mSenderRequestsAwaitingConsensus.end())
+        {
+            continue;
+        }
+        requestsStatus.completedRequestIds.insert(requestId);
+        if (markComplete)
+        {
+            requestIt->second->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+        }
+        mTimedOutSenderIds.erase(requestId);
+        eraseLocalTransferOutcome(
+            requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+    }
+
+    return requestsStatus;
 }
 
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
@@ -470,10 +883,10 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
 
     std::vector<LlmRequest::RequestIdType> toBlockRequestIds;
-    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupDataComm.get() : mMpiGroupComm;
+    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
     if ((syncComm) && syncComm->getSize() > 1)
     {
-        auto gatherRequestIdVec = gatherRequestIds(*syncComm, genTransferReadyRequestIds);
+        auto gatherRequestIdVec = gatherRequestIds(syncComm, genTransferReadyRequestIds);
         for (auto&& requestId : gatherRequestIdVec)
         {
             frequencyMap[requestId]++;
@@ -501,8 +914,16 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             break;
         }
         toCompleteIdSet.insert(freqVec.at(idx).first);
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " checkGenTransferStatus at least from freqVec requestId: %zu ",
-            freqVec.at(idx).first);
+        if (useMPI())
+        {
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+                " checkGenTransferStatus at least from freqVec requestId: %zu ", freqVec.at(idx).first);
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
+                " checkGenTransferStatus at least from freqVec requestId: %zu ", freqVec.at(idx).first);
+        }
         idx++;
     }
     idx = 0;
@@ -517,9 +938,18 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         if (toCompleteIdSet.find(mRequesterFutures.at(idx).first->mRequestId) == toCompleteIdSet.end())
         {
             toCompleteIdSet.insert(mRequesterFutures.at(idx).first->mRequestId);
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
-                mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
+            if (useMPI())
+            {
+                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+                    " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
+                    mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
+            }
+            else
+            {
+                TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
+                    " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
+                    mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
+            }
         }
         idx++;
     }
@@ -529,38 +959,85 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             toCompleteIdSet.insert(requestId);
         }
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ",
-            requestId, freq);
+        if (useMPI())
+        {
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ",
+                requestId, freq);
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
+                " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ", requestId, freq);
+        }
     }
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
-        atLeastRequestNum.value_or(0));
+    if (useMPI())
+    {
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+            " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
+            atLeastRequestNum.value_or(0));
+    }
+    else
+    {
+        TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
+            " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
+            atLeastRequestNum.value_or(0));
+    }
+    // Observe-only: gen-side mirror of the context-side timeout WARN.
+    std::optional<int> kvTransferTimeoutMs = std::nullopt;
+    if (mCacheTransceiverConfig.has_value())
+    {
+        kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
+    }
     for (auto it = mRequesterFutures.begin(); it != mRequesterFutures.end();)
     {
-        if (blockAll || toCompleteIdSet.find(it->first->mRequestId) != toCompleteIdSet.end())
+        auto& request = it->first;
+        auto const requestId = request->mRequestId;
+        if (kvTransferTimeoutMs.has_value())
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
+            auto elapsedMs = static_cast<long>(elapsed.count());
+            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutRequesterIds.insert(request->mRequestId).second)
+            {
+                TLLM_LOG_WARNING(
+                    "Generation KV cache transfer for request %ld exceeded configured timeout: "
+                    "elapsed %ld ms > limit %d ms (observe-only).",
+                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+            }
+        }
+        if (blockAll || toCompleteIdSet.find(requestId) != toCompleteIdSet.end())
         {
             try
             {
                 it->second.get();
-                it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
-
-                // Gather the kv cache transfer time from all workers and update to leader rank
-                if (!common::getEnvKVCacheTransferOutputPath().empty())
+                bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                if (failed)
                 {
-                    auto syncComm
-                        = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupDataComm.get() : mMpiGroupComm;
-                    updateKVCacheTransferBW(*syncComm, it->first);
+                    // The receiver uses the error state as a local transfer-failed signal.
+                    // Keep that signal local until the consensus outcome commits it globally.
+                    request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
                 }
+                recordLocalTransferOutcome(requestId, request, failed, mCompletedRequesterRequestIds,
+                    mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_ERROR(
-                    "Error occurred during generation transfer for request %ld: %s", it->first->mRequestId, e.what());
-                it->first->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                TLLM_LOG_ERROR("Error occurred during generation transfer for request %ld: %s", requestId, e.what());
+                recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedRequesterRequestIds,
+                    mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
             }
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
-                it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
+            if (useMPI())
+            {
+                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+                    "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***", requestId,
+                    request->getContextPhaseParams().value().getReqId());
+            }
+            else
+            {
+                TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
+                    "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***", requestId,
+                    request->getContextPhaseParams().value().getReqId());
+            }
             it = mRequesterFutures.erase(it);
         }
         else
@@ -568,11 +1045,57 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             ++it;
         }
     }
+
+    auto const consensusOutcome
+        = reduceTransferStates(syncComm, mCompletedRequesterRequestIds, mFailedRequesterRequestIds);
+    for (auto const requestId : consensusOutcome.failedRequestIds)
+    {
+        auto const requestIt = mRequesterRequestsAwaitingConsensus.find(requestId);
+        if (requestIt == mRequesterRequestsAwaitingConsensus.end())
+        {
+            continue;
+        }
+        requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+        mTimedOutRequesterIds.erase(requestId);
+        eraseLocalTransferOutcome(
+            requestId, mCompletedRequesterRequestIds, mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
+    }
+    for (auto const requestId : consensusOutcome.completedRequestIds)
+    {
+        auto const requestIt = mRequesterRequestsAwaitingConsensus.find(requestId);
+        if (requestIt == mRequesterRequestsAwaitingConsensus.end())
+        {
+            continue;
+        }
+        requestIt->second->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+
+        // Gather the kv cache transfer time from all workers and update to leader rank.
+        if (!common::getEnvKVCacheTimeOutputPath().empty())
+        {
+            updateKVCacheTransferBW(syncComm, requestIt->second.get());
+        }
+        mTimedOutRequesterIds.erase(requestId);
+        eraseLocalTransferOutcome(
+            requestId, mCompletedRequesterRequestIds, mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
+    }
 }
 
 bool CacheTransceiver::checkGenTransferComplete() const
 {
-    return mRequesterFutures.empty();
+    return mRequesterFutures.empty() && mCompletedRequesterRequestIds.empty() && mFailedRequesterRequestIds.empty();
+}
+
+bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
+{
+    if (llmRequest->isContextOnlyRequest())
+    {
+        return mCacheSender->cancelRequest(*llmRequest);
+    }
+    else if (llmRequest->isGenerationOnlyRequest())
+    {
+        return mCacheReceiver->cancelRequest(*llmRequest);
+    }
+    return false;
 }
 
 } // namespace tensorrt_llm::batch_manager

@@ -5,6 +5,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -42,7 +43,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -127,6 +128,7 @@ def execute(workers, func, args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
     logger.set_level(args.log_level)

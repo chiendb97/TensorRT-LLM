@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/delayStream.h"
+#include "tensorrt_llm/kernels/globalTimerKernel.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -124,11 +125,6 @@ void initBindings(nb::module_& m)
         .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, nb::arg("tag"),
             nb::call_guard<nb::gil_scoped_release>());
 
-    nb::class_<tr::BufferManager>(m, "BufferManager")
-        .def(nb::init<tr::BufferManager::CudaStreamPtr, bool>(), nb::arg("stream"), nb::arg("trim_pool") = false,
-            nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("stream", &tr::BufferManager::getStream);
-
     nb::class_<tr::TllmRuntime>(m, "TllmRuntime")
         .def(
             "__init__",
@@ -169,15 +165,6 @@ void initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("logits_dtype_from_engine",
             [](tr::TllmRuntime& self) { return self.getEngine().getTensorDataType("logits"); });
-
-    nb::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
-        .def(nb::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), nb::arg("logits"),
-            nb::arg("max_decoding_engine_tokens"), nb::call_guard<nb::gil_scoped_release>())
-        .def(nb::init<std::vector<tr::ITensor::SharedConstPtr>>(), nb::arg("logits"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def_rw("logits", &tr::decoder_batch::Input::logits)
-        .def_rw("max_decoder_steps", &tr::decoder_batch::Input::maxDecoderSteps)
-        .def_rw("batch_slots", &tr::decoder_batch::Input::batchSlots);
 
     nb::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")
         .def(nb::init<tr::SizeType32, tr::SizeType32, tr::BufferManager const&>(), nb::arg("max_num_sequences"),
@@ -330,6 +317,17 @@ void initBindings(nb::module_& m)
         },
         "Delay kernel launch on the default stream");
     m.def(
+        "record_global_timer",
+        [](int64_t data_ptr, nb::object py_stream)
+        {
+            auto* ptr = reinterpret_cast<uint64_t*>(data_ptr);
+            auto stream_ptr = nb::cast<int64_t>(py_stream.attr("cuda_stream"));
+            cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+            nb::gil_scoped_release release;
+            tensorrt_llm::kernels::invokeReadGlobalTimer(ptr, stream);
+        },
+        "Record GPU global timer value to device memory");
+    m.def(
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations",
@@ -345,23 +343,23 @@ void initBindings(nb::module_& m)
         nb::rv_policy::reference);
 
     m.def(
-        "set_virtual_memory_allocator",
+        "push_virtual_memory_allocator",
         [](std::string const& tag, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
         {
             static_assert(sizeof(uintptr_t) == sizeof(cudaStream_t));
-            tr::setVirtualMemoryAllocator(tag, mode,
+            tr::pushVirtualMemoryAllocator(tag, mode,
                 std::make_shared<tr::CudaStream>(
                     reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
         },
-        "Set the virtual memory allocator and start allocating virtual memory for CUDA allocations",
-        nb::call_guard<nb::gil_scoped_release>());
+        "Push a virtual memory allocator onto the allocator stack.", nb::call_guard<nb::gil_scoped_release>());
 
-    m.def("clear_virtual_memory_allocator", &tr::clearVirtualMemoryAllocator,
-        "Reset the current virtual memory allocator and stop allocating virtual memory for CUDA allocations",
-        nb::call_guard<nb::gil_scoped_release>());
+    m.def("pop_virtual_memory_allocator", &tr::popVirtualMemoryAllocator,
+        "Pop the top virtual memory allocator from the allocator stack", nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
-        .def(nb::init<size_t, uint32_t, uint32_t, at::Device, bool>(), nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<size_t, uint32_t, uint32_t, uint32_t, bool, int64_t>(), nb::arg("buf_size"),
+            nb::arg("group_size"), nb::arg("group_rank"), nb::arg("device_idx"), nb::arg("mn_nvlink"),
+            nb::arg("mpi_comm_fortran_handle"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer,
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer,
@@ -395,6 +393,11 @@ void initBindings(nb::module_& m)
 
 void initBindingsEarly(nb::module_& m)
 {
+    nb::class_<tr::BufferManager>(m, "BufferManager")
+        .def(nb::init<tr::BufferManager::CudaStreamPtr, bool>(), nb::arg("stream"), nb::arg("trim_pool") = false,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("stream", &tr::BufferManager::getStream);
+
     nb::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
         .def(nb::init<tr::SpeculativeDecodingMode::UnderlyingType>(), nb::arg("state"))
         .def_static("NoneType", &tr::SpeculativeDecodingMode::None)

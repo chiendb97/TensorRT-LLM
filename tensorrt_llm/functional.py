@@ -33,7 +33,7 @@ from ._utils import (QuantModeWrapper, bf16_array, bool_array,
                      fp16_array, fp32_array, get_sm_version, int32_array,
                      int64_array, np_dtype_to_trt, str_dtype_to_trt,
                      trt_dtype_to_np, trt_dtype_to_str)
-from .network import PluginInfo, set_np_weight, set_plugin_info
+from .network import PluginInfo, get_np_weight, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
 
@@ -590,7 +590,7 @@ class Tensor(object):
             return id(None)
 
     def __repr__(self):
-        return f"TensorRT-LLM Tensor: {self.name=} {self.dtype=} {self.shape=}"
+        return f"TensorRT LLM Tensor: {self.name=} {self.dtype=} {self.shape=}"
 
     def __xor__(self, b):
         '''
@@ -604,7 +604,7 @@ class Tensor(object):
 
 def _create_tensor(trt_tensor: trt.ITensor, producer: trt.ILayer) -> Tensor:
     '''
-    A helper function to create a TensorRT-LLM Tensor object that encapsulates
+    A helper function to create a TensorRT LLM Tensor object that encapsulates
     the connection between the TensorRT tensor (trt.ITensor) and the layer
     (trt.ILayer) that produces it.
 
@@ -626,7 +626,7 @@ def _create_tensor(trt_tensor: trt.ITensor, producer: trt.ILayer) -> Tensor:
             The producer.
 
     Returns:
-        The TensorRT-LLM tensor (functional.Tensor) that encapsulates the
+        The TensorRT LLM tensor (functional.Tensor) that encapsulates the
         TensorRT tensor and the layer that produces it. The former is
         accessible through the attribute 'trt_tensor' and the latter using the
         attribute 'producer'.
@@ -680,8 +680,16 @@ class RotaryScalingType(IntEnum):
 
     @staticmethod
     def from_string(s):
+        if isinstance(s, RotaryScalingType):
+            return s
+        if s is None:
+            return RotaryScalingType.none
+        key = str(s).lower()
+        # Hugging Face Transformers v5+ uses type "default" for unscaled / standard RoPE.
+        if key == "default":
+            return RotaryScalingType.none
         try:
-            return RotaryScalingType[s]
+            return RotaryScalingType[key]
         except KeyError:
             raise ValueError(f'Unsupported rotary scaling type: {s}')
 
@@ -722,6 +730,9 @@ class PositionEmbeddingType(IntEnum):
 
     @staticmethod
     def from_string(s):
+        # Transformers 5.x uses "default" for standard RoPE (no scaling).
+        if s == "default":
+            return PositionEmbeddingType.rope_gpt_neox
         try:
             return PositionEmbeddingType[s]
         except KeyError:
@@ -2051,8 +2062,8 @@ def expand_dims_like(left: Union[Tensor, int, float], right: Tensor) -> Tensor:
     return left
 
 
-# If dim is None, return a 1-D TensorRT-LLM tensor of the size
-# If dim is not None, return a 0-D TensorRT-LLM tensor of the dimension size
+# If dim is None, return a 1-D TensorRT LLM tensor of the size
+# If dim is not None, return a 0-D TensorRT LLM tensor of the dimension size
 def shape(input: Tensor,
           dim: Optional[int] = None,
           cast_to_dtype: Optional[Union[str, trt.DataType]] = None,
@@ -3279,8 +3290,6 @@ def identity(input: Tensor) -> Tensor:
     '''
     Add an identity operation.
 
-    TODO: Document why it can be done using a plugin!!!
-
     Parameters:
         input : Tensor
             The input tensor.
@@ -3471,7 +3480,7 @@ def softplus(input: Tensor, beta: float, threshold: float) -> Tensor:
 
     Parameters:
         input : Tensor
-            Input TensorRT-LLM Tensor.
+            Input TensorRT LLM Tensor.
         beta : float
             The parameter for softplus computation.
         threshold : float
@@ -3545,6 +3554,24 @@ def avg_pool2d(input: Tensor,
     return output
 
 
+def _get_trt_weight(weight: Tensor) -> Tuple[trt.Weights, bool]:
+    is_weight_constant = (weight.producer is not None
+                          and weight.producer.type == trt.LayerType.CONSTANT)
+    if is_weight_constant:
+        ndarray = get_np_weight(default_trtnet(), weight.producer.name)
+        if ndarray is not None:
+            trt_weight = trt.Weights(np_dtype_to_trt(ndarray.dtype),
+                                     ndarray.ctypes.data,
+                                     int(np.prod(ndarray.shape)))
+        else:
+            weight.producer.__class__ = trt.IConstantLayer
+            trt_weight = weight.producer.weights
+    else:
+        trt_weight = trt.Weights()
+
+    return trt_weight, is_weight_constant
+
+
 def conv1d(input: Tensor,
            weight: Tensor,
            bias: Optional[Tensor] = None,
@@ -3555,30 +3582,32 @@ def conv1d(input: Tensor,
 
     noutput = weight.size()[0]
     kernel_size = weight.size()[-2]
-    is_weight_constant = (weight.producer is not None
-                          and weight.producer.type == trt.LayerType.CONSTANT)
-    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+    kernel_shape = trt.Dims([kernel_size, 1])
+
+    trt_weight, is_weight_constant = _get_trt_weight(weight)
+    weight_tensor = weight
 
     if bias is not None:
-        is_bias_constant = (bias.producer is not None
-                            and bias.producer.type == trt.LayerType.CONSTANT)
-        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+        bias_tensor = bias
+        trt_bias, is_bias_constant = _get_trt_weight(bias)
+    else:
+        bias_tensor = None
+        trt_bias = None
 
     input_shuffled = stack([input], dim=input.ndim())
-    kernel_size = trt.Dims([kernel_size, 1])
 
     layer = default_trtnet().add_convolution_nd(input_shuffled.trt_tensor,
-                                                noutput, kernel_size, weight,
-                                                bias)
+                                                noutput, kernel_shape,
+                                                trt_weight, trt_bias)
     layer.stride_nd = (stride, 2)
     layer.padding_nd = (padding, 0)
     layer.dilation_nd = (dilation, 2)
     layer.num_groups = groups
 
     if not is_weight_constant:
-        layer.set_input(1, weight.trt_tensor)
-    if bias is not None and not is_bias_constant:
-        layer.set_input(2, bias.trt_tensor)
+        layer.set_input(1, weight_tensor.trt_tensor)
+    if bias_tensor is not None and not is_bias_constant:
+        layer.set_input(2, bias_tensor.trt_tensor)
 
     output_2d = _create_tensor(layer.get_output(0), layer)
     output_1d = squeeze(output_2d, dim=-1)
@@ -3604,18 +3633,21 @@ def conv2d(input: Tensor,
 
     noutput = weight.size()[0]
     kernel_size = (weight.size()[-2], weight.size()[-1])
+    kernel_shape = trt.Dims(list(kernel_size))
 
-    is_weight_constant = (weight.producer is not None
-                          and weight.producer.type == trt.LayerType.CONSTANT)
-    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+    trt_weight, is_weight_constant = _get_trt_weight(weight)
+    weight_tensor = weight
 
     if bias is not None:
-        is_bias_constant = (bias.producer is not None
-                            and bias.producer.type == trt.LayerType.CONSTANT)
-        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+        bias_tensor = bias
+        trt_bias, is_bias_constant = _get_trt_weight(bias)
+    else:
+        bias_tensor = None
+        trt_bias = None
 
     layer = default_trtnet().add_convolution_nd(input.trt_tensor, noutput,
-                                                kernel_size, weight, bias)
+                                                kernel_shape, trt_weight,
+                                                trt_bias)
     layer.stride_nd = stride
     layer.padding_nd = padding
     layer.dilation_nd = dilation
@@ -3627,9 +3659,9 @@ def conv2d(input: Tensor,
         layer.post_padding = post_padding
 
     if not is_weight_constant:
-        layer.set_input(1, weight.trt_tensor)
-    if bias is not None and not is_bias_constant:
-        layer.set_input(2, bias.trt_tensor)
+        layer.set_input(1, weight_tensor.trt_tensor)
+    if bias_tensor is not None and not is_bias_constant:
+        layer.set_input(2, bias_tensor.trt_tensor)
 
     output = _create_tensor(layer.get_output(0), layer)
 
@@ -3668,18 +3700,21 @@ def conv3d(input: Tensor,
 
     noutput = weight.size()[0]
     kernel_size = (weight.size()[-3], weight.size()[-2], weight.size()[-1])
+    kernel_shape = trt.Dims(list(kernel_size))
 
-    is_weight_constant = (weight.producer is not None
-                          and weight.producer.type == trt.LayerType.CONSTANT)
-    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+    trt_weight, is_weight_constant = _get_trt_weight(weight)
+    weight_tensor = weight
 
     if bias is not None:
-        is_bias_constant = (bias.producer is not None
-                            and bias.producer.type == trt.LayerType.CONSTANT)
-        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+        bias_tensor = bias
+        trt_bias, is_bias_constant = _get_trt_weight(bias)
+    else:
+        bias_tensor = None
+        trt_bias = None
 
     layer = default_trtnet().add_convolution_nd(input.trt_tensor, noutput,
-                                                kernel_size, weight, bias)
+                                                kernel_shape, trt_weight,
+                                                trt_bias)
     layer.stride_nd = stride
     layer.padding_nd = padding
     layer.dilation_nd = dilation
@@ -3687,9 +3722,9 @@ def conv3d(input: Tensor,
     layer.dilation_nd = dilation
 
     if not is_weight_constant:
-        layer.set_input(1, weight.trt_tensor)
-    if bias is not None and not is_bias_constant:
-        layer.set_input(2, bias.trt_tensor)
+        layer.set_input(1, weight_tensor.trt_tensor)
+    if bias_tensor is not None and not is_bias_constant:
+        layer.set_input(2, bias_tensor.trt_tensor)
 
     output = _create_tensor(layer.get_output(0), layer)
     return output
@@ -3715,26 +3750,29 @@ def conv_transpose2d(input: Tensor,
 
     noutput = weight.size()[1]
     kernel_size = (weight.size()[-2], weight.size()[-1])
+    kernel_shape = trt.Dims(list(kernel_size))
 
-    is_weight_constant = (weight.producer is not None
-                          and weight.producer.type == trt.LayerType.CONSTANT)
-    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+    trt_weight, is_weight_constant = _get_trt_weight(weight)
+    weight_tensor = weight
 
     if bias is not None:
-        is_bias_constant = (bias.producer is not None
-                            and bias.producer.type == trt.LayerType.CONSTANT)
-        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+        bias_tensor = bias
+        trt_bias, is_bias_constant = _get_trt_weight(bias)
+    else:
+        bias_tensor = None
+        trt_bias = None
 
     layer = default_trtnet().add_deconvolution_nd(input.trt_tensor, noutput,
-                                                  kernel_size, weight, bias)
+                                                  kernel_shape, trt_weight,
+                                                  trt_bias)
     layer.stride_nd = stride
     layer.padding_nd = padding
     layer.num_groups = groups
 
     if not is_weight_constant:
-        layer.set_input(1, weight.trt_tensor)
-    if bias is not None and not is_bias_constant:
-        layer.set_input(2, bias.trt_tensor)
+        layer.set_input(1, weight_tensor.trt_tensor)
+    if bias_tensor is not None and not is_bias_constant:
+        layer.set_input(2, bias_tensor.trt_tensor)
 
     output = _create_tensor(layer.get_output(0), layer)
 
@@ -3883,6 +3921,7 @@ class AllReduceStrategy(IntEnum):
     LOWPRECISION = 6
     MNNVL = 7
     NCCL_SYMMETRIC = 8
+    SYMM_MEM = 9  # PyTorch symmetric memory with MULTIMEM
 
 
 class AllReduceFusionOp(IntEnum):
@@ -3895,6 +3934,7 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
+    RMS_NORM = 9
 
 
 class AllReduceParams():
@@ -3921,8 +3961,9 @@ class AllReduceParams():
         # For torch path only, has no effect on TRT path
         self.enable_allreduce = enable_allreduce
         self.trigger_completion_at_end = trigger_completion_at_end
-        assert fusion_op == AllReduceFusionOp.NONE.value or (residual
-                                                             is not None)
+        assert fusion_op in (AllReduceFusionOp.NONE.value,
+                             AllReduceFusionOp.RMS_NORM.value) or (residual
+                                                                   is not None)
 
     def has_affine(self):
         return 1 if self.norm_weight is not None else 0
@@ -4022,12 +4063,16 @@ def create_allreduce_plugin(
     pfc = trt.PluginFieldCollection(pfc)
     ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
     plug_inputs = [tensor]
-    if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
+    if all_reduce_params.strategy not in {
+            AllReduceStrategy.NCCL, AllReduceStrategy.UB,
+            AllReduceStrategy.NCCL_SYMMETRIC
+    }:
         plug_inputs.append(workspace)
     if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
         if all_reduce_params.has_bias() == 1:
             plug_inputs.append(all_reduce_params.bias.trt_tensor)
-        plug_inputs.append(all_reduce_params.residual.trt_tensor)
+        if all_reduce_params.residual is not None:
+            plug_inputs.append(all_reduce_params.residual.trt_tensor)
         if all_reduce_params.has_affine() == 1:
             plug_inputs.append(all_reduce_params.norm_weight.trt_tensor)
             if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM:
@@ -4094,7 +4139,7 @@ def allreduce(
     workspace = None
     if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
         if current_all_reduce_helper().workspace is None:
-            all_reduce_params.strategy = AllReduceStrategy.NCCL
+            all_reduce_params.strategy = AllReduceStrategy.NCCL_SYMMETRIC
         else:
             workspace = current_all_reduce_helper().workspace.trt_tensor
     if all_reduce_params.strategy == AllReduceStrategy.UB:
@@ -4726,6 +4771,7 @@ class RopeEmbeddingUtils:
             scale_type: RotaryScalingType = RotaryScalingType.none,
             # Other scaling configs that only used by certain scaling types.
             rope_scaling_config: dict = None,
+            duplicate_data: bool = False,
             dtype=np.float32):
         if scale_type == RotaryScalingType.linear:
             scale = 1.0 / scale
@@ -4751,6 +4797,8 @@ class RopeEmbeddingUtils:
                                                 inv_freq,
                                                 dtype=dtype),
                                       axis=-1)
+        if duplicate_data:
+            sinusoid_inp = np.concatenate((sinusoid_inp, sinusoid_inp), axis=-2)
         # fuse cos/sin into float2 (cos, sin).
         concat = np.concatenate(
             (np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
@@ -4845,15 +4893,15 @@ class RopeEmbeddingUtils:
                         scaling_long_factors, False, True), short_mscale
 
     @staticmethod
-    def create_sinusoidal_positions_long_rope(
-            num_pos: int,
-            dim: int,
-            theta: float,
-            original_max_pos: int,
-            short_factor: List[float],
-            long_factor: List[float],
-            dtype=np.float32,
-            max_seq_len: Optional[int] = None):
+    def create_sinusoidal_positions_long_rope(num_pos: int,
+                                              dim: int,
+                                              theta: float,
+                                              original_max_pos: int,
+                                              short_factor: List[float],
+                                              long_factor: List[float],
+                                              dtype=np.float32,
+                                              max_seq_len: Optional[int] = None,
+                                              duplicate_data: bool = False):
         short_factor = np.array(short_factor, dtype=np.float32)
         long_factor = np.array(long_factor, dtype=np.float32)
 
@@ -4873,6 +4921,9 @@ class RopeEmbeddingUtils:
         else:
             scaling_factor = np.sqrt(1.0 +
                                      np.log(scale) / np.log(original_max_pos))
+
+        if duplicate_data:
+            sinusoid_inp = np.concatenate((sinusoid_inp, sinusoid_inp), axis=-2)
 
         # fuse cos/sin into float2 (cos, sin).
         concat = np.concatenate(
@@ -5358,7 +5409,7 @@ def gpt_attention(
             An INT32 tensor of shape [1].
             by default, the max_attention_window_size is determined by the shape of cache_indir_table.
             And we support independent max_attention_window_size for each layer.
-            This controls the sliding-window-attention/cyclic-kv-cache features.
+            This controls the sliding-window-attention kv-cache features.
 
         context_lengths: Tensor (On GPU)
             The tensor that stores the context-phase sequence length of each request. Its shape

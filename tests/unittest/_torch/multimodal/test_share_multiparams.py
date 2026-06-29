@@ -146,6 +146,64 @@ class TestMultimodalParamsDeviceTransfer(unittest.TestCase):
         result = params.multimodal_data["image"]["pixel_values"]
         self.assertEqual(result.device, torch.device("cuda:0"))
 
+    def test_to_device_with_target_keywords(self):
+        """Test converting data to device with keyword."""
+        params = MultimodalParams()
+        params.multimodal_data = self.sample_multimodal_data.copy()
+
+        params.to_device("multimodal_data",
+                         device="cuda:0",
+                         pin_memory=True,
+                         target_keywords=["image.pixel_values"])
+
+        result = params.multimodal_data["image"]["pixel_values"]
+        self.assertEqual(result.device, torch.device("cuda:0"))
+
+        result = params.multimodal_data["mrope_config"]["mrope_rotary_cos_sin"]
+        self.assertEqual(result.device, torch.device("cpu"))
+
+        result = params.multimodal_data["mrope_config"]["mrope_position_deltas"]
+        self.assertEqual(result.device, torch.device("cpu"))
+
+    def test_to_device_keeps_cumsum_on_cpu(self):
+        """`multimodal_embed_mask_cumsum` is CPU-only metadata and must stay on CPU.
+
+        Covers both containment paths:
+        - full recursive move (`target_keywords=None`) silently skips the key
+        - explicit targeting via `target_keywords` warns once and skips
+        """
+        cumsum = torch.arange(8, dtype=torch.int64)
+
+        params = MultimodalParams()
+        params.multimodal_data = {
+            "image": {
+                "pixel_values": torch.randn(1, 3, 8, 8),
+            },
+            "multimodal_embed_mask_cumsum": cumsum,
+        }
+
+        params.to_device("multimodal_data", device="cuda:0", pin_memory=True)
+
+        self.assertEqual(
+            params.multimodal_data["image"]["pixel_values"].device,
+            torch.device("cuda:0"),
+        )
+        self.assertEqual(
+            params.multimodal_data["multimodal_embed_mask_cumsum"].device,
+            torch.device("cpu"),
+        )
+
+        # Targeted path: explicitly asking to move the CPU-only key is a no-op.
+        params.to_device(
+            "multimodal_data",
+            device="cuda:0",
+            target_keywords=["multimodal_embed_mask_cumsum"],
+        )
+        self.assertEqual(
+            params.multimodal_data["multimodal_embed_mask_cumsum"].device,
+            torch.device("cpu"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

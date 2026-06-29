@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -57,6 +57,11 @@ class MpiWaitThread;
 
 namespace tensorrt_llm::batch_manager
 {
+class BaseCacheTransceiver;
+}
+
+namespace tensorrt_llm::batch_manager
+{
 
 namespace kv_cache_manager
 {
@@ -79,7 +84,7 @@ class LlmRequest;
 class RuntimeBuffers;
 class BasePeftCacheManager;
 class GuidedDecoder;
-class BaseCacheTransceiver;
+class TrtGptModelTest;
 
 // Algorithms
 class CapacityScheduler;
@@ -147,6 +152,19 @@ public:
         executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode);
 
     ~TrtGptModelInflightBatching() override;
+
+    /// @brief Calculate the cache size per token for the disaggregated serving.
+    /// @param modelConfig Model configuration.
+    /// @param worldConfig World configuration.
+    /// @param maxAttentionWindowVec Maximum attention window vector. (may have fewer elements than numLayers, in which
+    /// case it cycles)
+    /// @param isCrossAttention Whether the attention is cross attention.
+    /// @param kvFactor KV factor.
+    /// @return Cache size per token for the disaggregated layers. Note that window size is not included in the result
+    /// here.
+    [[nodiscard]] static std::map<SizeType32, SizeType32> calculateCacheSizePerTokenForDisagg(
+        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
+        std::vector<SizeType32> const& maxAttentionWindowVec, bool isCrossAttention, SizeType32 kvFactor);
 
     void terminateRequest(LlmRequestPtr const& llmRequest, bool pause = false) override;
 
@@ -218,7 +236,11 @@ public:
         return mModelConfig.getSpeculativeDecodingMode();
     }
 
+    [[nodiscard]] SizeType32 numCachedCudaGraphs() const;
+
 private:
+    friend class TrtGptModelTest;
+
     [[nodiscard]] SizeType32 getContextBufferId() const
     {
         return mMicroBatchId;
@@ -325,6 +347,12 @@ private:
     /// and overwrites the llmRequest tokens buffer.
     /// Called either on request finishing, or at every step when doing beam search and streaming.
     void postProcessRequest(LlmRequest& llmReq, std::vector<SizeType32> const& numDroppedTokens);
+    /// @brief Reorders generation logits to match finalized beam paths after gatherTree.
+    /// During beam search, logits are stored by beam slot. After finalization, output_ids are
+    /// reordered by parentIds, but logits are not. This method traces parentIds on the host
+    /// to build the slot mapping and reindexes the logits accordingly.
+    void reorderGenerationLogitsForBeamSearch(LlmRequest& llmReq, SizeType32 seqSlot, SizeType32 reqBeamWidth,
+        SizeType32 maxSeqLength, TokenIdType const* outputIdsHostData, SizeType32 const* sequenceLengthsHostData);
     /// @brief Calls gatherTree (via finalize) and transmits the received data across ranks if PP>1
     void getDecoderSlotHostOutputs(
         SizeType32 seqSlot, bool returnLogProbs, runtime::SamplingConfig const& samplingConfig, bool streaming);
@@ -551,8 +579,6 @@ private:
     std::vector<std::unique_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
     // PEFT table for each micro batch
     std::vector<PeftTable> mPeftTables;
-    // Decoder input for each micro batch.
-    std::vector<std::unique_ptr<runtime::decoder_batch::Input>> mDecodingInputs;
 
     /******************** Book keeping ********************/
     // List of requests in each micro batch
@@ -581,7 +607,12 @@ private:
     std::atomic<bool> mDraftModelThreadShouldExit{false};
     bool mIsLeaderInOrchMode{false};
     // List of completed draft requests which logits will need to be sent to the target model.
+    // Guarded by mDraftRequestsMtx (shared with the background logits sender thread).
     RequestVector mDraftRequestsWaitingToSendLogits;
+    // Draft requests whose logits have been sent — pending termination by main thread.
+    // Guarded by mDraftRequestsMtx.
+    RequestVector mDraftRequestsDoneSendingLogits;
+    std::mutex mDraftRequestsMtx;
     SizeType32 mSeamlessLADMaxDraftLen{0};
     bool mUseSeamlessLookahead{false};
     RewindInputs mRewindInputs;

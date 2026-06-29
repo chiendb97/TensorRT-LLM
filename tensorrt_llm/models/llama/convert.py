@@ -53,7 +53,7 @@ def smooth_llama_model(model, scales, alpha, llama_qkv_para, llama_smoother):
     for name, module in model.named_modules():
         if not isinstance(
                 module,
-                LlamaDecoderLayer) and not module.__class__.__name__ in [
+                LlamaDecoderLayer) and module.__class__.__name__ not in [
                     "InternLMDecoderLayer", "MistralDecoderLayer"
                 ]:
             continue
@@ -480,7 +480,7 @@ def load_hf_llama(model_dir: str, load_model_on_cpu: bool = False):
     model = model_cls.from_pretrained(
         model_dir,
         device_map='auto' if not load_model_on_cpu else 'cpu',
-        torch_dtype='auto',
+        dtype='auto',
         trust_remote_code=True,
     )
     if hf_config.model_type in ["llava", "llava_next"]:
@@ -1135,7 +1135,7 @@ def quantize(hf_model_dir: str,
     hf_model = AutoModelForCausalLM.from_pretrained(
         hf_model_dir,
         device_map='auto' if device != 'cpu' else 'cpu',
-        torch_dtype='auto' if not use_smooth_quant else torch.float16,
+        dtype='auto' if not use_smooth_quant else torch.float16,
         trust_remote_code=trust_remote_code)
 
     os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(

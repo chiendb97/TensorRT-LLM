@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,8 +29,7 @@ import torch
 import torch.nn as nn
 import yaml
 from tqdm import tqdm
-from transformers import (AutoModelForCausalLM, AutoModelForVision2Seq,
-                          AutoTokenizer)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers.pytorch_utils import Conv1D
 
@@ -878,7 +877,7 @@ def quantize(hf_model_dir: str,
     hf_model = AutoModelForCausalLM.from_pretrained(
         hf_model_dir,
         device_map='auto' if device != 'cpu' else 'cpu',
-        torch_dtype='auto' if not use_smooth_quant else torch.float16,
+        dtype='auto' if not use_smooth_quant else torch.float16,
         trust_remote_code=trust_remote_code)
 
     os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
@@ -910,13 +909,17 @@ def quantize(hf_model_dir: str,
 
 def load_hf_gpt(model_dir: str, load_model_on_cpu: bool = False):
     if 'kosmos-2' in model_dir:
+        # AutoModelForVision2Seq was removed in transformers 5.x; import lazily
+        # so `import tensorrt_llm` works under newer transformers versions even
+        # though kosmos-2 conversion itself still requires transformers<5.
+        from transformers import AutoModelForVision2Seq
         hf_model = AutoModelForVision2Seq.from_pretrained(
             model_dir, trust_remote_code=True)
     else:
         hf_model = AutoModelForCausalLM.from_pretrained(
             model_dir,
             device_map='auto' if not load_model_on_cpu else 'cpu',
-            torch_dtype='auto',
+            dtype='auto',
             trust_remote_code=True,
         )
     return hf_model

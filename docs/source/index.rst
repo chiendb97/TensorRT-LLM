@@ -14,6 +14,7 @@ Welcome to TensorRT LLM's Documentation!
    overview.md
    quick-start-guide.md
    installation/index.rst
+   supported-hardware.md
 
 
 .. toctree::
@@ -22,9 +23,11 @@ Welcome to TensorRT LLM's Documentation!
    :name: Deployment Guide
 
    examples/llm_api_examples.rst
+   examples/visual_gen_examples.rst
    examples/trtllm_serve_examples
    examples/dynamo_k8s_example.rst
    deployment-guide/index.rst
+   deployment-guide/configuring-cpu-affinity.md
 
 .. toctree::
    :maxdepth: 2
@@ -32,6 +35,7 @@ Welcome to TensorRT LLM's Documentation!
    :name: Models
 
    models/supported-models.md
+   models/visual-generation.md
    models/adding-new-model.md
 
 
@@ -70,85 +74,48 @@ Welcome to TensorRT LLM's Documentation!
    features/parallel-strategy.md
    features/quantization.md
    features/sampling.md
+   features/additional-outputs.md
+   features/post-processor-hook.md
+   features/guided-decoding.md
    features/speculative-decoding.md
    features/checkpoint-loading.md
    features/auto_deploy/auto-deploy.md
+   features/auto_deploy/transforms.rst
+   features/ray-orchestrator.md
+   features/torch_compile_and_piecewise_cuda_graph.md
+   features/helix.md
+   features/kv-cache-connector.md
+   features/sparse-attention.md
+
 
 .. toctree::
    :maxdepth: 2
    :caption: Developer Guide
 
-   architecture/overview.md
+   developer-guide/overview.md
    developer-guide/perf-analysis.md
    developer-guide/perf-benchmarking.md
    developer-guide/ci-overview.md
    developer-guide/dev-containers.md
-
-
-.. .. toctree::
-..    :maxdepth: 2
-..    :caption: Architecture
-..    :name: Architecture
-
-..    architecture/overview.md
-..    architecture/core-concepts.md
-..    architecture/checkpoint.md
-..    architecture/workflow.md
-..    architecture/add-model.md
-
-.. .. toctree::
-..    :maxdepth: 2
-..    :caption: Advanced
-..    :name: Advanced
-
-..    advanced/gpt-attention.md
-..    advanced/gpt-runtime.md
-..    advanced/executor.md
-..    advanced/graph-rewriting.md
-..    advanced/inference-request.md
-..    advanced/lora.md
-..    advanced/expert-parallelism.md
-..    advanced/kv-cache-management.md
-..    advanced/kv-cache-reuse.md
-..    advanced/speculative-decoding.md
-..    advanced/disaggregated-service.md
-
-.. .. toctree::
-..    :maxdepth: 2
-..    :caption: Performance
-..    :name: Performance
-
-..    performance/perf-overview.md
-..    Benchmarking <performance/perf-benchmarking.md>
-..    performance/performance-tuning-guide/index
-..    performance/perf-analysis.md
-
-
-.. .. toctree::
-..    :maxdepth: 2
-..    :caption: Reference
-..    :name: Reference
-
-..    reference/troubleshooting.md
-..    reference/support-matrix.md
-
-..    .. reference/upgrading.md
-
-..    reference/precision.md
-..    reference/memory.md
+   developer-guide/api-change.md
+   developer-guide/kv-transfer.md
+   developer-guide/telemetry.md
+   developer-guide/sparse-attention-development-guide.md
 
 
 .. toctree::
    :maxdepth: 2
    :caption: Blogs
    :glob:
+   :reversed:
 
-   blogs/tech_blog/*
-   blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md
-   blogs/H200launch.md
-   blogs/XQA-kernel.md
+   blogs/quantization-in-TRT-LLM.md
+   blogs/Falcon180B-H200.md
    blogs/H100vsA100.md
-
+   blogs/XQA-kernel.md
+   blogs/H200launch.md
+   blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md
+   blogs/tech_blog/*
 
 
 .. toctree::

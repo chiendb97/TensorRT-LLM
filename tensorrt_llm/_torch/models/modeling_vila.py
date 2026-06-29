@@ -1,4 +1,4 @@
-# Copyright 2024 NVIDIA CORPORATION & AFFILIATES
+# Copyright 2024-2026 NVIDIA CORPORATION & AFFILIATES
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,12 +31,13 @@ from huggingface_hub import repo_exists, snapshot_download
 from huggingface_hub.utils import HFValidationError
 from PIL import Image
 from transformers import (AutoConfig, AutoImageProcessor, AutoModel,
-                          AutoTokenizer, LlavaConfig, PretrainedConfig,
-                          PreTrainedModel)
+                          AutoProcessor, AutoTokenizer, LlavaConfig,
+                          PretrainedConfig, PreTrainedModel)
 
 from ..._utils import nvtx_range
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -46,11 +47,15 @@ from ..modules.embedding import Embedding, LMHead
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import (VisionTower, VisionTowerDynamicS2,
                                           VisionTowerS2)
+# yapf: disable
 from .modeling_multimodal_utils import (dynamic_preprocess_dispatch,
                                         dynamic_s2_preprocess_dispatch,
-                                        fuse_input_embeds, merge_chessboard,
+                                        filter_mm_token_from_input_ids,
+                                        find_input_mm_embeds, fuse_input_embeds,
+                                        merge_chessboard,
                                         merge_features_for_dynamic_s2,
                                         preprocess_dispatch, split_chessboard)
+# yapf: enable
 from .modeling_utils import ModelConfig, register_auto_model
 
 SENTINEL_TOKEN = "<vila/sentinel>"  # nosec B105
@@ -58,6 +63,28 @@ MEDIA_TOKENS = {
     "image": "<image>",
     "video": "<vila/video>",
 }
+
+
+def _validate_vila_mm_alignment(
+    input_ids: torch.IntTensor,
+    embedding_layer: Embedding,
+    mm_embeds: List[torch.Tensor],
+) -> Tuple[torch.IntTensor, torch.IntTensor]:
+    # VILA expands multimodal placeholders into out-of-vocab ids during
+    # preprocessing, so counting OOV ids here gives the active multimodal span
+    # for the current chunk. Reuse the indices for fusion to avoid an extra sync.
+    text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
+        input_ids=input_ids,
+        vocab_size=embedding_layer.num_embeddings,
+    )
+    expected_tokens = mm_token_indices.shape[0]
+    actual_embeds = sum(embed.shape[0] for embed in mm_embeds)
+    if expected_tokens != actual_embeds:
+        raise ValueError(
+            "[VILA] Multimodal token count mismatch after slicing: "
+            f"found {expected_tokens} image tokens in input_ids but received "
+            f"{actual_embeds} image embeddings.")
+    return text_token_indices, mm_token_indices
 
 
 def _convert_dtype(dtype):
@@ -218,7 +245,7 @@ def process_images(images: Union[List[Image.Image], List[torch.Tensor]],
     block_sizes = None
     if isinstance(images[0], tuple):
         # VILA 2.0 dynamic S2 has block_sizes parameter
-        images, block_sizes = zip(*images)
+        images, block_sizes = zip(*images, strict=True)
         block_sizes = list(block_sizes)
 
     if all(x.shape[1:] == images[0].shape[1:] for x in images):
@@ -464,6 +491,7 @@ class VilaMultimodalProjector(PreTrainedModel):
                 self.layers = nn.Sequential(*modules)
             else:
                 raise ValueError(f"Unknown projector type: {mm_projector_type}")
+        self.post_init()
 
     def forward(self, x, *args, **kwargs):
         return self.layers(x)
@@ -864,30 +892,56 @@ def _apply_chat_template(text, conv, tokenizer):
     return text
 
 
-class VilaInputProcessor(InputProcessor):
+class VilaInputProcessor(BaseMultimodalInputProcessor,
+                         BaseMultimodalDummyInputsBuilder):
 
     def __init__(self,
-                 model_path,
-                 model_config,
-                 tokenizer,
-                 trust_remote_code: bool = True):
-        self.model_config = model_config
+                 model_path: str,
+                 config: PretrainedConfig,
+                 tokenizer: AutoTokenizer,
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
+        self._config = config
+        self._model_path = model_path
         llm_path, vision_tower_path, mm_projector_path = _get_model_paths(
-            self.model_config)
-        self.device = 'cuda'
-        self.model_dtype = _convert_dtype(self.model_config.model_dtype)
-        self.conv_mode = _get_conversation_mode(llm_path)
-
-        self.tokenizer = init_tokenizer(
+            self.config)
+        self._dtype = self.config.model_dtype
+        self._tokenizer = init_tokenizer(
             llm_path) if tokenizer is None else tokenizer
+
+        self.device = 'cuda'
+        self.conv_mode = _get_conversation_mode(llm_path)
         self.vision_tower, self.image_processor = init_vision_tower(
-            vision_tower_path, self.model_config)
-        self.mm_projector = init_mm_projector(mm_projector_path,
-                                              self.model_config)
+            vision_tower_path, self.config)
+        self.mm_projector = init_mm_projector(mm_projector_path, self.config)
 
         # must be fp16
         self.vision_tower.to(device=self.device, dtype=torch.float16)
         self.mm_projector.to(device=self.device, dtype=torch.float16)
+
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def processor(self) -> AutoProcessor:
+        return None
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
+    def model_path(self) -> str:
+        return self._model_path
 
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self,
@@ -904,21 +958,22 @@ class VilaInputProcessor(InputProcessor):
             images = mm_data["image"]
             return process_images(images,
                                   self.image_processor,
-                                  self.model_config,
+                                  self.config,
                                   enable_dynamic_res=True,
                                   enable_dynamic_s2=True,
                                   use_fast=use_fast,
                                   device='cuda',
                                   dtype=self.vision_tower.dtype)
         elif "video" in mm_data and len(mm_data["video"]) > 0:
-            videos = mm_data["video"]
+            video_datas = mm_data["video"]
+            videos = [video_data.frames for video_data in video_datas]
             mm_tensors = []
             block_sizes = []
             for video in videos:
                 mm_tensor, block_sizes = process_images(
                     video,
                     self.image_processor,
-                    self.model_config,
+                    self.config,
                     enable_dynamic_res=False,
                     enable_dynamic_s2=False,
                     use_fast=use_fast,
@@ -934,7 +989,7 @@ class VilaInputProcessor(InputProcessor):
         """Extract multimodal features from multimodal input"""
 
         mm_tensor = mm_tensor.to(self.vision_tower.dtype)  # must be fp16
-        if getattr(self.model_config, "dynamic_s2", False):
+        if getattr(self.config, "dynamic_s2", False):
             # dynamic S2 logic in https://github.com/NVlabs/VILA/blob/main/llava/model/llava_arch.py::encoder_images()
             if block_sizes is None:
                 block_sizes = [None] * len(mm_tensor)
@@ -943,8 +998,8 @@ class VilaInputProcessor(InputProcessor):
                 self.vision_tower, visual_features, block_sizes)
 
             visual_features = [
-                split_chessboard(x, block_size[0], block_size[1])
-                for x, block_size in zip(visual_features, new_block_sizes)
+                split_chessboard(x, block_size[0], block_size[1]) for x,
+                block_size in zip(visual_features, new_block_sizes, strict=True)
             ]  # list of B * C * H * W tensors
             visual_features = torch.cat(
                 [rearrange(x, "b c h w -> b (h w) c") for x in visual_features],
@@ -957,8 +1012,8 @@ class VilaInputProcessor(InputProcessor):
                 ],
                                       dim=0))
             visual_features = [
-                merge_chessboard(x, block_size[0], block_size[1])
-                for x, block_size in zip(visual_features, new_block_sizes)
+                merge_chessboard(x, block_size[0], block_size[1]) for x,
+                block_size in zip(visual_features, new_block_sizes, strict=True)
             ]  # list of 1 * C * H * W tensors
             visual_features = [
                 rearrange(x, "1 c h w -> (h w) c") for x in visual_features
@@ -1011,7 +1066,7 @@ class VilaInputProcessor(InputProcessor):
             raise ValueError(
                 f"Invalid multimodal features type: {type(mm_features)}")
         mm_total_length = sum(mm_lengths_per_split)
-        assert mm_hidden_dim == self.model_config.hidden_size, "Multimodal embedding_dim must match model hidden_size"
+        assert mm_hidden_dim == self.config.hidden_size, "Multimodal embedding_dim must match model hidden_size"
 
         ## split input_ids into segments by isolating mm tokens
         vocab_size = len(self.tokenizer)  # vocab including special tokens
@@ -1074,7 +1129,7 @@ class VilaInputProcessor(InputProcessor):
         return fused_input_ids, mm_features
 
     @torch.inference_mode()  # critical to minimize memory footprint
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """
@@ -1129,6 +1184,9 @@ class VilaInputProcessor(InputProcessor):
             "video": "<vila/video>"
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        # VILA handles its own chat template and placeholder insertion
+        # in VilaInputProcessor.
+        content_format=ContentFormat.PASSTHROUGH,
     ))
 class VilaModel(PreTrainedModel):
     config_class = VilaConfig
@@ -1177,16 +1235,39 @@ class VilaModel(PreTrainedModel):
         """
 
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
+        logger.debug(f"{num_context_requests=}, {num_generation_requests=}")
         multimodal_params = kwargs.get("multimodal_params", [])
+        context_multimodal_params = multimodal_params[:num_context_requests]
         mm_embeds = []
-        if len(multimodal_params) > 0:
+        text_token_indices = None
+        mm_token_indices = None
+        if len(context_multimodal_params) > 0:
             mm_embeds = [
                 multimodal_param.multimodal_data["multimodal_embedding"]
-                for multimodal_param in multimodal_params
+                for multimodal_param in context_multimodal_params
             ]
+            # Other multimodal models already slice batched embeddings with
+            # find_input_mm_embeds() before fusion. VILA previously skipped
+            # that step and could feed the full cached embedding tensor into a
+            # chunked context batch, which breaks token/embed alignment.
+            mm_embeds = find_input_mm_embeds(mm_embeds,
+                                             context_multimodal_params)
+            if input_ids is not None:
+                text_token_indices, mm_token_indices = _validate_vila_mm_alignment(
+                    input_ids=input_ids,
+                    embedding_layer=self.llm.model.embed_tokens,
+                    mm_embeds=mm_embeds,
+                )
 
+        if text_token_indices is not None and mm_token_indices is not None:
+            kwargs["text_token_indices"] = text_token_indices
+            kwargs["mm_token_indices"] = mm_token_indices
         input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens, input_ids, mm_embeds, **kwargs)
+            self.llm.model.embed_tokens,
+            input_ids,
+            mm_embeds,
+            **kwargs,
+        )
         logits = self.llm.forward(attn_metadata=attn_metadata,
                                   input_ids=input_ids,
                                   position_ids=position_ids,
@@ -1212,6 +1293,10 @@ class VilaModel(PreTrainedModel):
             _resize_token_embeddings(self.llm, len(self.tokenizer))
             self.vocab_size = len(self.tokenizer)
 
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
@@ -1221,5 +1306,5 @@ class VilaModel(PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
 
 
-AutoConfig.register(VilaConfig.model_type, VilaConfig)
+AutoConfig.register(VilaConfig.model_type, VilaConfig, exist_ok=True)
 AutoModel.register(VilaConfig, VilaModel)

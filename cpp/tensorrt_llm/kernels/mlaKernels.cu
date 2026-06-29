@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -31,8 +32,8 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -184,10 +185,10 @@ inline __device__ void dequantCopy(
 }
 
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
-__global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T const* fuse_buf, KVCacheBuffer kv_cache,
-    float2 const* cos_sin_cache, size_t head_num, int head_size, int c_k, int* cu_q_seqlens,
-    int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
-    float const* quant_scale_kv)
+__global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k_ptr, T const* fuse_buf,
+    KVCacheBuffer kv_cache, int q_pe_ld, int q_pe_stride, float2 const* cos_sin_cache, size_t head_num, int head_size,
+    int c_k, int* cu_q_seqlens, int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
+    float const* quant_scale_kv, int32_t const* helix_position_offsets, bool absorption_mode)
 {
 
     // Constants.
@@ -210,6 +211,10 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
     size_t const batch_idx = blockIdx.y;
     size_t const head_idx = blockIdx.z;
 
+    // The nope head_size for q.
+    // Use the latent_space head size in the absorption mode.
+    int nope_head_size_q = absorption_mode ? c_k : head_size;
+
     if (head_idx < head_num)
     {
         size_t const head_dim_vec_idx = (threadIdx.x % VECS_PER_HEAD);
@@ -226,23 +231,38 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
 
             int const global_token_offset = cu_q_seqlens[batch_idx];
             int const cache_seq_len = kv_cache_lengths[batch_idx];
-            int token_idx_in_kv_cache = local_token_idx;
-            bool const valid_token = token_idx_in_kv_cache < cache_seq_len;
+
+            // Derive cached offset and current input length
+            int const current_seq_len = cu_q_seqlens[batch_idx + 1] - global_token_offset;
+            int const cached_offset = cache_seq_len - current_seq_len;
+
+            int token_idx_in_kv_cache = local_token_idx + cached_offset;
+            // Check against BOTH total cache length (valid slot) AND input length (valid read)
+            bool const valid_token = (token_idx_in_kv_cache < cache_seq_len) && (local_token_idx < current_seq_len);
+
             // Limit the token_idx to cache seq length (we need all threads in this block to be involved).
             token_idx_in_kv_cache = std::min(token_idx_in_kv_cache, cache_seq_len - 1);
-            local_token_idx = std::min(local_token_idx, cache_seq_len - 1);
-            int const global_token_idx = local_token_idx + global_token_offset;
+            int const safe_local_token_idx = std::min(local_token_idx, current_seq_len - 1);
+            int const global_token_idx = safe_local_token_idx + global_token_offset;
 
-            auto const position_id = local_token_idx;
+            auto const position_id
+                = helix_position_offsets ? helix_position_offsets[global_token_idx] : token_idx_in_kv_cache;
             float2 const* rotary_coef_cache_buffer
                 = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
             VecT q, k;
             auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
-            auto const src_q_global_offset = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
+            auto src_q_global_offset = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
                 + (head_size + ROPE_DIM) * head_idx + head_size;
+            // In the absorption mode, we load pe from q_pe instead of q_ptr.
+            T* q_pe_input = q_ptr;
+            if (absorption_mode)
+            {
+                q_pe_input = q_pe;
+                src_q_global_offset = static_cast<size_t>(global_token_idx) * q_pe_stride + q_pe_ld * head_idx;
+            }
 
-            q = *reinterpret_cast<VecT const*>(&q_ptr[src_q_global_offset + head_dim_idx]);
+            q = *reinterpret_cast<VecT const*>(&q_pe_input[src_q_global_offset + head_dim_idx]);
             k = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
 
             // Pack two elements into one for gptj rotary embedding.
@@ -273,12 +293,16 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
                     else
                         reinterpret_cast<VecT*>(kDst)[inBlockIdx] = k;
                 }
-                auto const dst_q_idx = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
-                    + head_idx * (head_size + ROPE_DIM) + head_size + head_dim_idx;
+                auto const dst_q_idx = static_cast<size_t>(global_token_idx) * head_num * (nope_head_size_q + ROPE_DIM)
+                    + head_idx * (nope_head_size_q + ROPE_DIM) + nope_head_size_q + head_dim_idx;
                 auto const dst_k_idx = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
                     + head_idx * (head_size + ROPE_DIM) + head_size + head_dim_idx;
                 reinterpret_cast<VecT*>(q_ptr)[dst_q_idx / ELTS_PER_VEC] = q;
-                reinterpret_cast<VecT*>(k_ptr)[dst_k_idx / ELTS_PER_VEC] = k;
+                // Only write to k_pe to k_buf in the non-absorption mode.
+                if (!absorption_mode)
+                {
+                    reinterpret_cast<VecT*>(k_ptr)[dst_k_idx / ELTS_PER_VEC] = k;
+                }
             }
         }
     }
@@ -301,12 +325,19 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
 
             int const global_token_offset = cu_q_seqlens[batch_idx];
             int const cache_seq_len = kv_cache_lengths[batch_idx];
-            int token_idx_in_kv_cache = local_token_idx;
-            bool const valid_token = token_idx_in_kv_cache < cache_seq_len;
+
+            // Derive cached offset and current input length (same as first loop)
+            int const current_seq_len = cu_q_seqlens[batch_idx + 1] - global_token_offset;
+            int const cached_offset = cache_seq_len - current_seq_len;
+
+            int token_idx_in_kv_cache = local_token_idx + cached_offset;
+            // Check against BOTH total cache length (valid slot) AND input length (valid read)
+            bool const valid_token = (token_idx_in_kv_cache < cache_seq_len) && (local_token_idx < current_seq_len);
+
             // Limit the token_idx to cache seq length (we need all threads in this block to be involved).
             token_idx_in_kv_cache = std::min(token_idx_in_kv_cache, cache_seq_len - 1);
-            local_token_idx = std::min(local_token_idx, cache_seq_len - 1);
-            int const global_token_idx = local_token_idx + global_token_offset;
+            int const safe_local_token_idx = std::min(local_token_idx, current_seq_len - 1);
+            int const global_token_idx = safe_local_token_idx + global_token_offset;
 
             if (valid_token)
             {
@@ -335,9 +366,9 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     int* seqQOffset, uint32_t* fmha_tile_counter, int32_t const* kv_cache_lengths, int* seqKVOffsets, int q_pe_ld,
     int q_pe_stride, KvCacheDataType cache_type, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
     float const* quant_scale_q, float const* quant_scale_kv, float const* dequant_scale_q,
-    float const* dequant_scale_kv, float host_bmm1_scale)
+    float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
+    bool const* helix_is_inactive_rank)
 {
-
     // Constants.
     using VecT = typename VecType<T>::Type;
     using GPTJEltT = typename VecType<T>::GPTJEltType;
@@ -357,7 +388,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     // Block/Head idx.
     size_t const head_idx = blockIdx.y;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
 
     if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
@@ -409,7 +440,9 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             if (valid_token)
             {
 
-                auto const position_id = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                auto const position_id
+                    = (helix_position_offsets != nullptr ? helix_position_offsets[global_token_idx]
+                                                         : kv_cache_lengths[batch_idx] - seq_len + local_token_idx);
                 float2 const* rotary_coef_cache_buffer
                     = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
@@ -444,21 +477,25 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             {
                 if (head_idx == head_num)
                 {
-                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
-
+                    // If helix parallelism is being used, only write to KV cache if current rank is active.
+                    if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
                     {
-                        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
-                        auto inBlockIdx = kv_cache.getKVLocalIdx(
-                            token_kv_idx, 0, TOTAL_VEC_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
-                        if (cache_type == KvCacheDataType::FP8)
-                        {
+                        auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
 
-                            quantCopy<T, ELTS_PER_VEC>(
-                                reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
-                                reinterpret_cast<T const*>(&data), quant_scale_kv_val);
+                        {
+                            auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
+                            auto inBlockIdx = kv_cache.getKVLocalIdx(
+                                token_kv_idx, 0, TOTAL_VEC_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
+                            if (cache_type == KvCacheDataType::FP8)
+                            {
+
+                                quantCopy<T, ELTS_PER_VEC>(
+                                    reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
+                                    reinterpret_cast<T const*>(&data), quant_scale_kv_val);
+                            }
+                            else
+                                reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
                         }
-                        else
-                            reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
                     }
                 }
                 else
@@ -503,21 +540,26 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                     seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
                 }
 
-                auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
-                auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
-
+                // If helix parallelism is being used, only write to KV cache if current rank is active.
+                if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
                 {
-                    auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
-                    auto inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, TOTAL_VEC_PER_HEAD, head_dim_vec_idx);
+                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                    auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 
-                    if (cache_type == KvCacheDataType::FP8)
                     {
-                        quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
-                            fuse_buf + src_kv_global_offset + head_dim_idx, quant_scale_kv_val);
+                        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
+                        auto inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, TOTAL_VEC_PER_HEAD, head_dim_vec_idx);
+
+                        if (cache_type == KvCacheDataType::FP8)
+                        {
+                            quantCopy<T, ELTS_PER_VEC>(
+                                reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
+                                fuse_buf + src_kv_global_offset + head_dim_idx, quant_scale_kv_val);
+                        }
+                        else
+                            reinterpret_cast<VecT*>(kDst)[inBlockIdx]
+                                = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
                     }
-                    else
-                        reinterpret_cast<VecT*>(kDst)[inBlockIdx]
-                            = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
                 }
             }
         }
@@ -554,7 +596,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
     // The implementation of the parallel scan in the thread block (see CUB for details).
@@ -817,7 +859,7 @@ __global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, T*
     }
 }
 
-template <typename T, int BLOCK_SIZE, int QK_NOPE_HEAD_DIM, int QK_ROPE_HEAD_DIM, int V_HEAD_DIM>
+template <typename T, int BLOCK_SIZE, int QK_NOPE_HEAD_DIM, int QK_ROPE_HEAD_DIM, int V_HEAD_DIM, bool ABSORPTION_MODE>
 __global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quant_q_buf, T const* k_buf,
     __nv_fp8_e4m3* quant_k_buf, T const* v_buf, __nv_fp8_e4m3* quant_v_buf, int total_q_len, int total_kv_len,
     float const* quant_scale_qkv_ptr, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
@@ -835,7 +877,8 @@ __global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quan
     constexpr auto QK_VECS_PER_HEAD = QK_HEAD_DIM * BYTES_PER_ELT / BYTES_PER_LOAD;
     constexpr auto V_VECS_PER_HEAD = V_HEAD_DIM * BYTES_PER_ELT / BYTES_PER_LOAD;
     static_assert(BLOCK_SIZE % QK_VECS_PER_HEAD == 0, "Kernel block should be able to handle entire heads.");
-    static_assert(BLOCK_SIZE % V_VECS_PER_HEAD == 0, "Kernel block should be able to handle entire heads.");
+    static_assert(ABSORPTION_MODE || (BLOCK_SIZE % V_VECS_PER_HEAD) == 0,
+        "Kernel block should be able to handle entire heads in non-absorption mode.");
     constexpr auto QK_TOKENS_PER_BLOCK = BLOCK_SIZE / QK_VECS_PER_HEAD;
     constexpr auto V_TOKENS_PER_BLOCK = BLOCK_SIZE / V_VECS_PER_HEAD;
 
@@ -890,31 +933,34 @@ __global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quan
         }
     }
 
-    // Quantize K, both src and dst are contiguous
-    for (int k_token_idx = (threadIdx.x / QK_VECS_PER_HEAD) + blockIdx.x * QK_TOKENS_PER_BLOCK;
-         k_token_idx < k_len_loop_end; k_token_idx += QK_TOKENS_PER_BLOCK * gridDim.x)
+    // Only quantize K and V in non-absorption mode.
+    if constexpr (!ABSORPTION_MODE)
     {
-        if (k_token_idx < total_kv_len)
+        // Quantize K, both src and dst are contiguous
+        for (int k_token_idx = (threadIdx.x / QK_VECS_PER_HEAD) + blockIdx.x * QK_TOKENS_PER_BLOCK;
+             k_token_idx < k_len_loop_end; k_token_idx += QK_TOKENS_PER_BLOCK * gridDim.x)
         {
-            auto const src_k_idx
-                = static_cast<size_t>(k_token_idx) * QK_HEAD_DIM * head_num + head_idx * QK_HEAD_DIM + qk_head_dim_idx;
-            auto const dst_k_idx = src_k_idx;
-            quantCopy<T, ELTS_PER_VEC>(quant_k_buf + dst_k_idx, &k_buf[src_k_idx], quant_scale_qkv_val);
+            if (k_token_idx < total_kv_len)
+            {
+                auto const src_k_idx = static_cast<size_t>(k_token_idx) * QK_HEAD_DIM * head_num
+                    + head_idx * QK_HEAD_DIM + qk_head_dim_idx;
+                auto const dst_k_idx = src_k_idx;
+                quantCopy<T, ELTS_PER_VEC>(quant_k_buf + dst_k_idx, &k_buf[src_k_idx], quant_scale_qkv_val);
+            }
         }
-    }
-
-    // Quantize V, dst V is contiguous, but src V is not contiguous, so we need to calculate the stride
-    size_t const src_v_token_stride = (QK_NOPE_HEAD_DIM + V_HEAD_DIM) * head_num;
-    for (int v_token_idx = (threadIdx.x / V_VECS_PER_HEAD) + blockIdx.x * V_TOKENS_PER_BLOCK;
-         v_token_idx < v_len_loop_end; v_token_idx += V_TOKENS_PER_BLOCK * gridDim.x)
-    {
-        if (v_token_idx < total_kv_len)
+        // Quantize V, dst V is contiguous, but src V is not contiguous, so we need to calculate the stride
+        size_t const src_v_token_stride = (QK_NOPE_HEAD_DIM + V_HEAD_DIM) * head_num;
+        for (int v_token_idx = (threadIdx.x / V_VECS_PER_HEAD) + blockIdx.x * V_TOKENS_PER_BLOCK;
+             v_token_idx < v_len_loop_end; v_token_idx += V_TOKENS_PER_BLOCK * gridDim.x)
         {
-            auto const src_v_idx
-                = static_cast<size_t>(v_token_idx) * src_v_token_stride + head_idx * V_HEAD_DIM + v_head_dim_idx;
-            auto const dst_v_idx
-                = static_cast<size_t>(v_token_idx) * V_HEAD_DIM * head_num + head_idx * V_HEAD_DIM + v_head_dim_idx;
-            quantCopy<T, ELTS_PER_VEC>(quant_v_buf + dst_v_idx, &v_buf[src_v_idx], quant_scale_qkv_val);
+            if (v_token_idx < total_kv_len)
+            {
+                auto const src_v_idx
+                    = static_cast<size_t>(v_token_idx) * src_v_token_stride + head_idx * V_HEAD_DIM + v_head_dim_idx;
+                auto const dst_v_idx
+                    = static_cast<size_t>(v_token_idx) * V_HEAD_DIM * head_num + head_idx * V_HEAD_DIM + v_head_dim_idx;
+                quantCopy<T, ELTS_PER_VEC>(quant_v_buf + dst_v_idx, &v_buf[src_v_idx], quant_scale_qkv_val);
+            }
         }
     }
 }
@@ -924,10 +970,22 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 {
     dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
     auto head_size = params.meta.qk_nope_head_dim;
-    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
-        params.k_buf, params.latent_cache, kv_cache_buffer, params.cos_sin_cache, params.head_num, head_size,
-        params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len,
-        params.cache_type, params.quant_scale_kv);
+    if (params.meta.rope_append)
+    {
+        applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
+            params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld, params.q_pe_stride,
+            params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
+            params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv,
+            params.helix_position_offsets, params.absorption_mode);
+    }
+    else
+    {
+        applyMLARopeAndAssignQKVKernelOptContext<T, 256, 448, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
+            params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld, params.q_pe_stride,
+            params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
+            params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv,
+            params.helix_position_offsets, params.absorption_mode);
+    }
 }
 
 template <typename T>
@@ -935,30 +993,86 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
 {
     TLLM_CHECK_WITH_INFO(params.cache_type == KvCacheDataType::FP8, "MLA Context: cache_type must be FP8");
     TLLM_CHECK_WITH_INFO(params.q_buf != nullptr, "MLA Context: q_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.k_buf != nullptr, "MLA Context: k_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.v_buf != nullptr, "MLA Context: v_buf must be non-null");
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.k_buf != nullptr,
+        "MLA Context: k_buf must be non-null in non-absorption mode");
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.v_buf != nullptr,
+        "MLA Context: v_buf must be non-null in non-absorption mode");
     TLLM_CHECK_WITH_INFO(params.quant_q_buf != nullptr, "MLA Context: quant_q_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.quant_k_buf != nullptr, "MLA Context: quant_k_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.quant_v_buf != nullptr, "MLA Context: quant_v_buf must be non-null");
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.quant_k_buf != nullptr,
+        "MLA Context: quant_k_buf must be non-null in non-absorption mode");
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.quant_v_buf != nullptr,
+        "MLA Context: quant_v_buf must be non-null in non-absorption mode");
 
     TLLM_LOG_DEBUG("MLA RoPE Context: Quantizing separate qkv to FP8");
 
     if (params.acc_q_len > 0)
     {
-        constexpr int threads_per_block = 384;
-        dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, 48)), 1, params.head_num);
+        // The Q tensor has layout of [num_tokens, head_num, 576] in the absorption mode.
+        // Convert Q to FP8 in absorption mode.
+        if (params.absorption_mode)
+        {
 
-        TLLM_LOG_DEBUG(
-            "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-            "total_kv_len: %d, acc_q_len: %d",
-            grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len);
+            if (params.meta.rope_append)
+            {
+                constexpr int threads_per_block = 288;
+                constexpr int num_tokens_per_block = threads_per_block * 16 / 576 * sizeof(T);
+                dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
 
-        quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128>
-            <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
-                params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
-                static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len, params.quant_scale_qkv,
-                params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, params.dequant_scale_q,
-                params.dequant_scale_kv, params.host_bmm1_scale);
+                TLLM_LOG_DEBUG(
+                    "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+                    "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
+                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+
+                quantizeCopyInputToFp8Kernel<T, threads_per_block, 512, 64, 512, true>
+                    <<<grid, threads_per_block, 0, stream>>>(params.q_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_q_buf), params.k_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                        params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+                        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+            }
+            else
+            {
+                constexpr int threads_per_block = 256;
+                constexpr int num_tokens_per_block = threads_per_block * 16 / 512 * sizeof(T);
+                dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+
+                TLLM_LOG_DEBUG(
+                    "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+                    "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
+                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+
+                quantizeCopyInputToFp8Kernel<T, threads_per_block, 448, 64, 512, true>
+                    <<<grid, threads_per_block, 0, stream>>>(params.q_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_q_buf), params.k_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                        params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+                        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+            }
+        }
+        else
+        {
+            // The Q or K tensor has layout of [num_tokens, head_num, 192] in the non-absorption mode.
+            // The V tensor has layout of [num_tokens, head_num, 128] in the non-absorption mode.
+            // Convert Q, K, V to FP8 in non-absorption mode.
+
+            constexpr int threads_per_block = 384;
+            constexpr int num_tokens_per_block = threads_per_block * 16 / 192 * sizeof(T);
+            dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+
+            TLLM_LOG_DEBUG(
+                "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+                "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
+                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+
+            quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128, false>
+                <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
+                    params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                    static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                    params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+                    params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+        }
     }
     else
     {
@@ -977,6 +1091,10 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
     auto seq_len = params.acc_q_len / params.batch_size;
 
     auto* kernel_instance = &applyMLARopeAndAssignQKVKernelGeneration<T, 256, 512, 64, KVCacheBuffer>;
+    if (!params.meta.rope_append)
+    {
+        kernel_instance = &applyMLARopeAndAssignQKVKernelGeneration<T, 256, 448, 64, KVCacheBuffer>;
+    }
     cudaLaunchConfig_t config;
     config.gridDim = grid;
     config.blockDim = 256;
@@ -992,7 +1110,7 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
         params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld,
         params.q_pe_stride, params.cache_type, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
         params.quant_scale_q, params.quant_scale_kv, params.dequant_scale_q, params.dequant_scale_kv,
-        params.host_bmm1_scale);
+        params.host_bmm1_scale, params.helix_position_offsets, params.helix_is_inactive_rank);
 }
 
 template <typename T, typename TCache>
@@ -1017,11 +1135,20 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* late
     float const* kv_scale_orig_quant_ptr, cudaStream_t stream)
 {
     dim3 grid(int(tensorrt_llm::common::divUp(max_input_uncached_seq_len, 32)), num_requests, head_num + 1 + 8);
-    TLLM_CHECK_WITH_INFO(lora_size == 512, "lora_size should be equal to %d", 512);
+    TLLM_CHECK_WITH_INFO(lora_size == 512 || lora_size == 448, "lora_size should be equal to %d or %d", 512, 448);
     TLLM_CHECK_WITH_INFO(rope_size == 64, "rope_size should be equal to %d", 64);
-    applyMLARopeAppendPagedKVAssignQKernel<T, TCache, 256, 512, 64><<<grid, 256, 0, stream>>>(kv_cache, q_ptr,
-        latent_cache_ptr, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
-        nope_size, kv_scale_orig_quant_ptr);
+    if (lora_size == 512)
+    {
+        applyMLARopeAppendPagedKVAssignQKernel<T, TCache, 256, 512, 64><<<grid, 256, 0, stream>>>(kv_cache, q_ptr,
+            latent_cache_ptr, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
+            nope_size, kv_scale_orig_quant_ptr);
+    }
+    else
+    {
+        applyMLARopeAppendPagedKVAssignQKernel<T, TCache, 256, 448, 64><<<grid, 256, 0, stream>>>(kv_cache, q_ptr,
+            latent_cache_ptr, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
+            nope_size, kv_scale_orig_quant_ptr);
+    }
 }
 
 #define INSTANTIATE_MLA_ROPE(T, KVCacheBuffer)                                                                         \
@@ -1059,6 +1186,151 @@ INSTANTIATE_RW_KVCACHE_MLA(half, __nv_fp8_e4m3);
 INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_bfloat16);
 INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_fp8_e4m3);
 
+// In-place MLA RoPE: apply RoPE to the last rope_dim elements of each [nope_dim + rope_dim] head.
+// Uses 16-byte vectorized load/store (VecType) and mmha::rotary_embedding_transform for the
+// interleaved path. Each thread handles ELTS_PER_VEC elements (8 bf16 = 4 rotation pairs).
+// Grid: (num_tokens, ceil(num_heads / HPB)), Block: (VECS_PER_ROPE, HPB)
+// cos_sin_cache layout: [max_positions, 2, half_rope] float (cos block then sin block)
+template <typename T, bool IS_INVERSE, bool IS_NEOX, int HEADS_PER_BLOCK>
+__global__ void mlaRoPEInplaceKernel(T* __restrict__ data, int32_t const* __restrict__ position_ids,
+    float const* __restrict__ cos_sin_cache, int num_heads, int nope_dim, int rope_dim)
+{
+    using VecT = typename VecType<T>::Type;
+    using GPTJEltT = typename VecType<T>::GPTJEltType;
+    constexpr int BYTES_PER_ELT = sizeof(T);
+    constexpr int BYTES_PER_LOAD = 16;
+    constexpr int ELTS_PER_VEC = BYTES_PER_LOAD / BYTES_PER_ELT;
+
+    int const tid = threadIdx.x;
+    int const half_rope = rope_dim / 2;
+    // Neox: each thread handles one VecT from each half → half_rope elements per half
+    // Interleaved: each thread handles one VecT of interleaved pairs → rope_dim elements
+    int const vecs_per_rope
+        = IS_NEOX ? (half_rope * BYTES_PER_ELT / BYTES_PER_LOAD) : (rope_dim * BYTES_PER_ELT / BYTES_PER_LOAD);
+    int const head_idx = blockIdx.y * HEADS_PER_BLOCK + threadIdx.y;
+    if (head_idx >= num_heads || tid >= vecs_per_rope)
+        return;
+
+    int const head_size = nope_dim + rope_dim;
+    T* head_ptr = data + (static_cast<int64_t>(blockIdx.x) * num_heads + head_idx) * head_size;
+
+    int const pos = position_ids[blockIdx.x];
+    int const elem_offset = tid * ELTS_PER_VEC;
+    // cos at [pos, 0, ...], sin at [pos, 1, ...]
+    float const* cos_ptr = cos_sin_cache + pos * 2 * half_rope + elem_offset;
+    float const* sin_ptr = cos_ptr + half_rope;
+
+    if constexpr (IS_NEOX)
+    {
+        // Neox: first half = x1[0..half), second half = x2[0..half) — two separate 16-byte loads
+        VecT v1 = *reinterpret_cast<VecT const*>(&head_ptr[nope_dim + elem_offset]);
+        VecT v2 = *reinterpret_cast<VecT const*>(&head_ptr[nope_dim + half_rope + elem_offset]);
+
+        // Each GPTJEltT holds 2 consecutive elements from the same half.
+        // For neox, we rotate (v1[j], v2[j]) independently for each element j.
+#pragma unroll
+        for (int i = 0; i < ELTS_PER_VEC / 2; i++)
+        {
+            GPTJEltT& e1 = reinterpret_cast<GPTJEltT*>(&v1)[i];
+            GPTJEltT& e2 = reinterpret_cast<GPTJEltT*>(&v2)[i];
+
+            // Construct (x1, x2) pairs and rotate — 2 pairs per GPTJElt
+            float2 coef0{cos_ptr[i * 2], IS_INVERSE ? -sin_ptr[i * 2] : sin_ptr[i * 2]};
+            float2 coef1{cos_ptr[i * 2 + 1], IS_INVERSE ? -sin_ptr[i * 2 + 1] : sin_ptr[i * 2 + 1]};
+
+            float2 p1 = mmha::rotary_embedding_transform(float2{static_cast<float>(reinterpret_cast<T*>(&e1)[0]),
+                                                             static_cast<float>(reinterpret_cast<T*>(&e2)[0])},
+                coef0);
+            float2 p2 = mmha::rotary_embedding_transform(float2{static_cast<float>(reinterpret_cast<T*>(&e1)[1]),
+                                                             static_cast<float>(reinterpret_cast<T*>(&e2)[1])},
+                coef1);
+
+            reinterpret_cast<T*>(&e1)[0] = static_cast<T>(p1.x);
+            reinterpret_cast<T*>(&e1)[1] = static_cast<T>(p2.x);
+            reinterpret_cast<T*>(&e2)[0] = static_cast<T>(p1.y);
+            reinterpret_cast<T*>(&e2)[1] = static_cast<T>(p2.y);
+        }
+
+        *reinterpret_cast<VecT*>(&head_ptr[nope_dim + elem_offset]) = v1;
+        *reinterpret_cast<VecT*>(&head_ptr[nope_dim + half_rope + elem_offset]) = v2;
+    }
+    else
+    {
+        // Interleaved: (x1, x2) adjacent pairs — matches GPTJ layout, single 16-byte load
+        VecT v = *reinterpret_cast<VecT const*>(&head_ptr[nope_dim + elem_offset]);
+
+        // For interleaved, cos_ptr/sin_ptr index by pair (half the element count)
+        float const* cos_pair = cos_sin_cache + pos * 2 * half_rope + (elem_offset / 2);
+        float const* sin_pair = cos_pair + half_rope;
+
+#pragma unroll
+        for (int i = 0; i < ELTS_PER_VEC / 2; i++)
+        {
+            GPTJEltT& elt = reinterpret_cast<GPTJEltT*>(&v)[i];
+            float2 coef{cos_pair[i], IS_INVERSE ? -sin_pair[i] : sin_pair[i]};
+            elt = mmha::rotary_embedding_transform(elt, coef);
+        }
+
+        *reinterpret_cast<VecT*>(&head_ptr[nope_dim + elem_offset]) = v;
+    }
+}
+
+template <typename T>
+void invokeMLARoPEInplace(T* data, int32_t const* position_ids, float const* cos_sin_cache, int num_tokens,
+    int num_heads, int nope_dim, int rope_dim, bool inverse, bool is_neox, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(rope_dim % 4 == 0, "rope_dim must be divisible by 4");
+    constexpr int BYTES_PER_LOAD = 16;
+    int const elt_size = static_cast<int>(sizeof(T));
+
+    auto launch = [&](auto inverse_tag, auto neox_tag)
+    {
+        constexpr bool INV = decltype(inverse_tag)::value;
+        constexpr bool NEOX = decltype(neox_tag)::value;
+        // Neox loads from two halves → threads = half_rope elements / ELTS_PER_VEC
+        // Interleaved loads contiguous → threads = rope_dim elements / ELTS_PER_VEC
+        int const active_elts = NEOX ? (rope_dim / 2) : rope_dim;
+        int const vecs_per_rope = active_elts * elt_size / BYTES_PER_LOAD;
+
+        constexpr int kMaxBlockSize = 256;
+        constexpr int kMaxHeadsPerBlock = 16;
+        int const hpb = std::max(1, std::min({kMaxBlockSize / vecs_per_rope, num_heads, kMaxHeadsPerBlock}));
+        dim3 grid(num_tokens, (num_heads + hpb - 1) / hpb);
+
+        if (hpb <= 4)
+        {
+            mlaRoPEInplaceKernel<T, INV, NEOX, 4><<<grid, dim3(vecs_per_rope, 4), 0, stream>>>(
+                data, position_ids, cos_sin_cache, num_heads, nope_dim, rope_dim);
+        }
+        else if (hpb <= 8)
+        {
+            mlaRoPEInplaceKernel<T, INV, NEOX, 8><<<grid, dim3(vecs_per_rope, 8), 0, stream>>>(
+                data, position_ids, cos_sin_cache, num_heads, nope_dim, rope_dim);
+        }
+        else
+        {
+            mlaRoPEInplaceKernel<T, INV, NEOX, 16><<<grid, dim3(vecs_per_rope, 16), 0, stream>>>(
+                data, position_ids, cos_sin_cache, num_heads, nope_dim, rope_dim);
+        }
+    };
+
+    if (inverse && is_neox)
+        launch(std::true_type{}, std::true_type{});
+    else if (inverse && !is_neox)
+        launch(std::true_type{}, std::false_type{});
+    else if (!inverse && is_neox)
+        launch(std::false_type{}, std::true_type{});
+    else
+        launch(std::false_type{}, std::false_type{});
+}
+
+#define INSTANTIATE_MLA_ROPE_INPLACE(T)                                                                                \
+    template void invokeMLARoPEInplace<T>(T * data, int32_t const* position_ids, float const* cos_sin_cache,           \
+        int num_tokens, int num_heads, int nope_dim, int rope_dim, bool inverse, bool is_neox, cudaStream_t stream);
+
+INSTANTIATE_MLA_ROPE_INPLACE(__nv_bfloat16);
+INSTANTIATE_MLA_ROPE_INPLACE(half);
+
 } // namespace kernels
 
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

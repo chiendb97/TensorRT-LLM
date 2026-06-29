@@ -20,7 +20,8 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from tensorrt_llm.layers import MoeConfig
 
-from ..._utils import pad_vocab_size, release_gc, str_dtype_to_torch
+from ..._utils import (get_hf_rope_theta, pad_vocab_size, release_gc,
+                       str_dtype_to_torch)
 from ...logger import logger
 from ...mapping import Mapping
 from ..convert_utils import get_tllm_linear_weight
@@ -52,7 +53,7 @@ def create_trt_config_from_hf(model_dir,
     vocab_size = hf_config.vocab_size
     n_positions = hf_config.max_position_embeddings
     hidden_act = 'swiglu'  # TRT-LLM request make gated activation explicit for MOE implementation
-    rotary_base = hf_config.rope_theta
+    rotary_base = get_hf_rope_theta(hf_config, 10000.0)
     rms_norm_eps = hf_config.rms_norm_eps
     rotary_scaling_beta_fast = hf_config.rope_scaling['beta_fast']
     rotary_scaling_beta_slow = hf_config.rope_scaling['beta_slow']
@@ -168,7 +169,7 @@ def load_hf_deepseek(model_dir, load_model_on_cpu=False):
         model = AutoModelForCausalLM.from_pretrained(model_dir,
                                                      config=hf_config,
                                                      device_map='cpu',
-                                                     torch_dtype='auto',
+                                                     dtype='auto',
                                                      trust_remote_code=True)
     else:
         # Deepseek-v2 236B parameters with FP16 dtype need at least 472G GPU memory
@@ -197,7 +198,7 @@ def load_hf_deepseek(model_dir, load_model_on_cpu=False):
                                                      config=hf_config,
                                                      device_map=device_map,
                                                      max_memory=max_memory,
-                                                     torch_dtype='auto',
+                                                     dtype='auto',
                                                      trust_remote_code=True)
 
     return model

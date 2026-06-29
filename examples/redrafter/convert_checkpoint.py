@@ -28,6 +28,7 @@ import torch
 from transformers.models.auto import AutoModel
 
 import tensorrt_llm.models.modeling_utils
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
@@ -102,7 +103,7 @@ def parse_arguments():
         "--output_dir",
         type=str,
         default="tllm_checkpoint",
-        help="The path to save the TensorRT-LLM checkpoint",
+        help="The path to save the TensorRT LLM checkpoint",
     )
     parser.add_argument(
         "--workers",
@@ -409,6 +410,7 @@ def create_and_save_config(args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     args = parse_arguments()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
@@ -421,7 +423,7 @@ def main():
         # TODO: When ReDrafter is added to Transformers
         # hf_drafter_model = AutoModel.from_pretrained(
         #     args.drafter_model_dir,
-        #     torch_dtype="auto",
+        #     dtype="auto",
         # )
         ckpt_file = Path(args.drafter_model_dir, "model.safetensors")
         if not Path.exists(ckpt_file):

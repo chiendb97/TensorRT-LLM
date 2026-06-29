@@ -1,37 +1,32 @@
-import io
+import os
+from pathlib import Path
 
 import pytest
-import requests
-from PIL import Image
 from transformers import AutoConfig, AutoTokenizer
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._torch.models.modeling_llava_next import \
     LlavaNextInputProcessor
 from tensorrt_llm._torch.models.modeling_qwen2vl import \
     Qwen2VLInputProcessorBase
+from tensorrt_llm._torch.models.modeling_qwen3vl import \
+    Qwen3VLInputProcessorBase
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.inputs import default_multimodal_input_loader
-from tensorrt_llm.inputs.utils import load_video
+from tensorrt_llm.inputs.utils import load_image, load_video
 
+test_data_root = Path(
+    os.path.join(llm_models_root(), "multimodals", "test_data"))
 example_images = [
-    "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
-    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-    "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+    str(test_data_root / "seashore.png"),
+    str(test_data_root / "inpaint.png"),
+    str(test_data_root / "61.jpg"),
 ]
-
 example_videos = [
-    "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4",
-    "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/world.mp4",
+    str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
+    str(test_data_root / "world.mp4"),
 ]
-
-
-def download_image(url: str) -> Image.Image:
-    """Download image from URL and return as PIL Image."""
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    img = Image.open(io.BytesIO(response.content))
-    return img.convert("RGB")
 
 
 @pytest.fixture(scope="function")
@@ -40,11 +35,19 @@ def multimodal_model_configs():
     model_configs = {
         'llava-v1.6-mistral-7b-hf': {
             'hf_model_dir': 'llava-hf/llava-v1.6-mistral-7b-hf',
+            'model_dir':
+            llm_models_root() / "multimodals" / "llava-v1.6-mistral-7b-hf",
             'model_type': 'llava_next',
         },
         'qwen2.5-vl': {
             'hf_model_dir': 'Qwen/Qwen2.5-VL-3B-Instruct',
+            'model_dir': llm_models_root() / "Qwen2.5-VL-3B-Instruct",
             'model_type': 'qwen2_5_vl',
+        },
+        'qwen3-vl': {
+            'hf_model_dir': 'Qwen/Qwen3-VL-8B-Instruct',
+            'model_dir': llm_models_root() / "Qwen3" / "Qwen3-VL-8B-Instruct",
+            'model_type': 'qwen3_vl',
         },
     }
     return model_configs
@@ -66,7 +69,7 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
         pytest.skip(f"Skipping test for {model_key} - model not available")
 
     model_config = multimodal_model_configs[model_key]
-    encoder_model_dir = model_config['hf_model_dir']
+    encoder_model_dir = model_config['model_dir']
     model_type = model_config['model_type']
 
     # Test configuration
@@ -88,13 +91,13 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
         if model_type == 'llava_next':
             input_processor = LlavaNextInputProcessor(
                 model_path=encoder_model_dir,
-                model_config=model_config_dict,
+                config=model_config_dict,
                 tokenizer=tokenizer,
                 trust_remote_code=True)
         elif model_type == 'qwen2_5_vl':
             input_processor = Qwen2VLInputProcessorBase(
                 model_path=encoder_model_dir,
-                model_config=model_config_dict,
+                config=model_config_dict,
                 tokenizer=tokenizer,
                 trust_remote_code=True)
         else:
@@ -119,16 +122,20 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
             example_images
         ), f"Expected {len(example_images)} encoder outputs, got {len(encoder_outputs)}"
 
-        for image_idx, test_image_url in enumerate(example_images):
+        for image_idx, test_image in enumerate(example_images):
 
             # Get test image dimensions
-            test_image = download_image(test_image_url)
-            image_width, image_height = test_image.size
+            test_image = load_image(test_image)
+            image_height, image_width = test_image.shape[-2:]
 
             # Get actual embedding tensor for this image
+            disagg_params = encoder_outputs[image_idx].disaggregated_params
+            assert disagg_params is not None
+            mm_embedding_handles = disagg_params.multimodal_embedding_handles
+            assert mm_embedding_handles is not None
+            assert len(mm_embedding_handles) == 1
             actual_embedding = SharedTensorContainer.from_dict(
-                encoder_outputs[image_idx].mm_embedding_handle).get_local_view(
-                )
+                mm_embedding_handles[0]).get_local_view()
 
             # The first dimension should be the number of image tokens
             actual_num_tokens = actual_embedding.shape[0]
@@ -160,6 +167,7 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
 
 @pytest.mark.parametrize("model_key", [
     "qwen2.5-vl",
+    "qwen3-vl",
 ])
 def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
     """Test that get_num_tokens_per_video predicts the correct number of tokens.
@@ -173,7 +181,7 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
         pytest.skip(f"Skipping test for {model_key} - model not available")
 
     model_config = multimodal_model_configs[model_key]
-    encoder_model_dir = model_config['hf_model_dir']
+    encoder_model_dir = model_config['model_dir']
     model_type = model_config['model_type']
 
     # Test configuration
@@ -195,13 +203,19 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
         if model_type == 'llava_next':
             input_processor = LlavaNextInputProcessor(
                 model_path=encoder_model_dir,
-                model_config=model_config_dict,
+                config=model_config_dict,
                 tokenizer=tokenizer,
                 trust_remote_code=True)
         elif model_type == 'qwen2_5_vl':
             input_processor = Qwen2VLInputProcessorBase(
                 model_path=encoder_model_dir,
-                model_config=model_config_dict,
+                config=model_config_dict,
+                tokenizer=tokenizer,
+                trust_remote_code=True)
+        elif model_type == 'qwen3_vl':
+            input_processor = Qwen3VLInputProcessorBase(
+                model_path=encoder_model_dir,
+                config=model_config_dict,
                 tokenizer=tokenizer,
                 trust_remote_code=True)
         else:
@@ -226,17 +240,21 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
             example_videos
         ), f"Expected {len(example_videos)} encoder outputs, got {len(encoder_outputs)}"
 
-        for video_idx, test_video_url in enumerate(example_videos):
+        for video_idx, test_video in enumerate(example_videos):
 
             # Get test video dimensions
-            test_video = load_video(test_video_url, num_frames=8, format="pil")
-            # load_video returns a list of frames, we only have one video
-            video_width, video_height = test_video[0].size
+            video_data = load_video(test_video, num_frames=8, format="pil")
+            # load_video returns VideoData with frames and metadata
+            video_width, video_height = video_data.frames[0].size
 
             # Get actual embedding tensor for this image
+            disagg_params = encoder_outputs[video_idx].disaggregated_params
+            assert disagg_params is not None
+            mm_embedding_handles = disagg_params.multimodal_embedding_handles
+            assert mm_embedding_handles is not None
+            assert len(mm_embedding_handles) == 1
             actual_embedding = SharedTensorContainer.from_dict(
-                encoder_outputs[video_idx].mm_embedding_handle).get_local_view(
-                )
+                mm_embedding_handles[0]).get_local_view()
 
             # The first dimension should be the number of image tokens
             actual_num_tokens = actual_embedding.shape[0]
@@ -244,10 +262,16 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
             # Get predicted number of tokens using get_num_tokens_per_video
             if model_type == 'llava_next':
                 predicted_num_tokens = input_processor.get_num_tokens_per_video(
-                    video=test_video)
+                    video=video_data.frames)
             elif model_type == 'qwen2_5_vl':
                 predicted_num_tokens = input_processor.get_num_tokens_per_video(
-                    video=test_video)
+                    video=video_data.frames)
+            elif model_type == 'qwen3_vl':
+                processed_inputs = input_processor._preprocess(
+                    "dummy", {"video": [video_data]}, {})
+                predicted_num_tokens = input_processor.get_num_tokens_per_video(
+                    video=video_data.frames,
+                    video_grid_thw=processed_inputs["video_grid_thw"])
 
             # The key assertion: predicted should match actual
             assert predicted_num_tokens == actual_num_tokens, \

@@ -13,6 +13,7 @@ from safetensors import safe_open
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import (get_weight, get_weight_and_bias,
@@ -76,7 +77,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -610,6 +611,7 @@ def convert_hf_gptneox(hf_model,
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     # TODO(qijun): Currently, the convert script depends on a torch op:
     # torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert
@@ -639,7 +641,7 @@ if __name__ == '__main__':
 
     hf_config = AutoConfig.from_pretrained(args.model_dir)
     hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                    torch_dtype="auto")
+                                                    dtype="auto")
 
     config = {
         'architecture': hf_config.architectures[0],

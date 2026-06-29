@@ -14,6 +14,8 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import \
     CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING
+from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 
 class BaseCheckpointLoader(ABC):
@@ -51,10 +53,34 @@ class BaseCheckpointLoader(ABC):
         ...
 
     def load_config(self, checkpoint_dir: str, **kwargs) -> ModelConfig:
+        logger.debug(f"Loading config from {checkpoint_dir}")
         return self.config_loader.load(checkpoint_dir, **kwargs)
 
-    def load_weights(self, checkpoint_dir: str, **kwargs) -> dict[str, Any]:
-        return self.weight_loader.load_weights(checkpoint_dir, **kwargs)
+    def load_weights(self, checkpoint_dir: str, mapping: Mapping,
+                     **kwargs) -> dict[str, Any]:
+        logger.debug(
+            f"Loading weights from {checkpoint_dir} with mapping {mapping.to_dict()}"
+        )
+        return self.weight_loader.load_weights(checkpoint_dir,
+                                               mapping=mapping,
+                                               **kwargs)
+
+    def is_weights_preloaded(self) -> bool:
+        """Whether the last load wrote weights directly into the model."""
+        return False
+
+    def post_load_apply(self,
+                        model: nn.Module,
+                        *,
+                        weights_preloaded: bool = False) -> None:
+        """Apply format-specific state after weights have been loaded."""
+
+    def post_load_publish(self,
+                          model: nn.Module,
+                          *,
+                          checkpoint_dir: str,
+                          weights_preloaded: bool = False) -> None:
+        """Publish format-specific loaded weights after the load path."""
 
     @classmethod
     def get(cls, checkpoint_format: str, **kwargs) -> "BaseCheckpointLoader":

@@ -1,6 +1,12 @@
 # Whisper
 
-This document shows how to build and run a [whisper model](https://github.com/openai/whisper/tree/main) in TensorRT-LLM on a single GPU.
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
+This document shows how to build and run a [whisper model](https://github.com/openai/whisper/tree/main) in TensorRT LLM on a single GPU.
 
 - [Whisper](#whisper)
   - [Overview](#overview)
@@ -16,7 +22,7 @@ This document shows how to build and run a [whisper model](https://github.com/op
 
 ## Overview
 
-The TensorRT-LLM Whisper example code is located in [`examples/models/core/whisper`](./).
+The TensorRT LLM Whisper example code is located in [`examples/models/core/whisper`](./).
 
  * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert weights from OpenAI Whisper format to TRT-LLM format.
  * `trtllm-build` to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Whisper model.
@@ -29,7 +35,7 @@ The TensorRT-LLM Whisper example code is located in [`examples/models/core/whisp
 
 ## Usage
 
-The TensorRT-LLM Whisper example code locates at [examples/models/core/whisper](./). It takes whisper pytorch weights as input, and builds the corresponding TensorRT engines.
+The TensorRT LLM Whisper example code locates at [examples/models/core/whisper](./). It takes whisper pytorch weights as input, and builds the corresponding TensorRT engines.
 
 ### Build TensorRT engine(s)
 
@@ -44,7 +50,7 @@ wget --directory-prefix=assets https://raw.githubusercontent.com/yuekaizhang/Tri
 wget --directory-prefix=assets https://openaipublic.azureedge.net/main/whisper/models/e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb/large-v3.pt
 ```
 
-TensorRT-LLM Whisper builds TensorRT engine(s) from the pytorch checkpoint.
+TensorRT LLM Whisper builds TensorRT engine(s) from the pytorch checkpoint.
 
 ```bash
 # install requirements first
@@ -57,7 +63,7 @@ MAX_BATCH_SIZE=8
 checkpoint_dir=whisper_large_v3_weights_${WEIGHT_ONLY_PRECISION}
 output_dir=whisper_large_v3_${WEIGHT_ONLY_PRECISION}
 
-# Convert the large-v3 model weights into TensorRT-LLM format.
+# Convert the large-v3 model weights into TensorRT LLM format.
 python3 convert_checkpoint.py \
                 --use_weight_only \
                 --weight_only_precision $WEIGHT_ONLY_PRECISION \
@@ -90,7 +96,7 @@ Different types of runtime are provided for whisper models. Following an order o
 - (NEW) Python binding of C++ runtime w/ Paged KV Cache and Inflight Batching (IFB)
 - Python runtime w/ Static Batching
 
-Please refer to the documentation for the details of [paged kv cache](../../../../docs/source/advanced/gpt-attention.md#paged-kv-cache) and [inflight batching](../../../../docs/source/advanced/gpt-attention.md#inflight-batching).
+Please refer to the documentation for the details of [paged kv cache](../../../../docs/source/legacy/advanced/gpt-attention.md#paged-kv-cache) and [inflight batching](../../../../docs/source/legacy/advanced/gpt-attention.md#inflight-batching).
 
 #### Run C++ runtime
 **Note: to use inflight batching and paged kv cache features in C++ runtime, please make sure you have set `--paged_kv_cache enable` and `--remove_input_padding enable` (which is by default enabled) in the `trtllm-build` command. Meanwhile, if using Python runtime, it is recommended to disable these flag by `--paged_kv_cache disable` and `--remove_input_padding disable` to avoid any unnecessary overhead.**
@@ -136,7 +142,7 @@ Calculates the character error rate (CER) instead of the word error rate (WER) f
 These options allow you to select different decoding audio datasets from Hugging Face.
 
 ### Distil-Whisper
-TensorRT-LLM also supports using [distil-whisper's](https://github.com/huggingface/distil-whisper) different models by first converting their params and weights from huggingface's naming format to [openai whisper](https://github.com/openai/whisper) naming format.
+TensorRT LLM also supports using [distil-whisper's](https://github.com/huggingface/distil-whisper) different models by first converting their params and weights from huggingface's naming format to [openai whisper](https://github.com/openai/whisper) naming format.
 You can do so by running the script [distil_whisper/convert_from_distil_whisper.py](./convert_from_distil_whisper.py) as follows:
 
 ```bash
@@ -196,4 +202,4 @@ python3 run.py --engine_dir $output_dir --dataset hf-internal-testing/librispeec
 
 ### Acknowledgment
 
-This implementation of TensorRT-LLM for Whisper has been adapted from the [NVIDIA TensorRT-LLM Hackathon 2023](https://github.com/NVIDIA/trt-samples-for-hackathon-cn/tree/master/Hackathon2023) submission of Jinheng Wang, which can be found in the repository [Eddie-Wang-Hackathon2023](https://github.com/Eddie-Wang1120/Eddie-Wang-Hackathon2023) on GitHub. We extend our gratitude to Jinheng for providing a foundation for the implementation.
+This implementation of TensorRT LLM for Whisper has been adapted from the [NVIDIA TensorRT LLM Hackathon 2023](https://github.com/NVIDIA/trt-samples-for-hackathon-cn/tree/master/Hackathon2023) submission of Jinheng Wang, which can be found in the repository [Eddie-Wang-Hackathon2023](https://github.com/Eddie-Wang1120/Eddie-Wang-Hackathon2023) on GitHub. We extend our gratitude to Jinheng for providing a foundation for the implementation.

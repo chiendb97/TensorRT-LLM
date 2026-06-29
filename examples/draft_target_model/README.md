@@ -1,10 +1,16 @@
 # Draft-Target-Model Speculative Decoding (DTM)
 
-This document shows how to build and run a model using DTM speculative decoding (also known as `Speculative-Sampling`, [`Paper`](https://arxiv.org/abs/2302.01318)) in TensorRT-LLM on single GPU, or single node multiple GPU.
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
+This document shows how to build and run a model using DTM speculative decoding (also known as `Speculative-Sampling`, [`Paper`](https://arxiv.org/abs/2302.01318)) in TensorRT LLM on single GPU, or single node multiple GPU.
 
 ## Overview
 
-We provide two styles of running DTM now: using TensorRT-LLM-BLS in Triton Inference Server, or using TensorRT-LLM directly. Here we introduce the detailed steps of running DTM in both workflows.
+We provide two styles of running DTM now: using TensorRT-LLM-BLS in Triton Inference Server, or using TensorRT LLM directly. Here we introduce the detailed steps of running DTM in both workflows.
 
 ## Support Matrix
   * GPU Compute Capability >= 8.0 (Ampere or newer)
@@ -64,7 +70,7 @@ trtllm-build \
     --max_seq_len=${MAX_SEQ_LEN}
 ```
 
-### TensorRT-LLM workflow
+### TensorRT LLM workflow
 
 + `--draft_engine_dir` and `--engine_dir` must be specified for the draft and target engines respectively.
 + `--draft_target_model_config` is corresponding configuration of DTM, which has 4 hyperparameters that you need to specify to control the process of generation:

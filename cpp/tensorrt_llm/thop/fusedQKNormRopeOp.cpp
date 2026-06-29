@@ -20,6 +20,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -32,6 +34,7 @@ void fused_qk_norm_rope(
     int64_t num_heads_k,         // Number of key heads
     int64_t num_heads_v,         // Number of value heads
     int64_t head_dim,            // Dimension per head
+    int64_t rotary_dim,          // Dimension for RoPE
     double eps,                  // Epsilon for RMS normalization
     torch::Tensor& q_weight,     // RMSNorm weights for query [head_dim]
     torch::Tensor& k_weight,     // RMSNorm weights for key [head_dim]
@@ -42,12 +45,20 @@ void fused_qk_norm_rope(
     double factor, // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
     double low,    // threshold for high frequency
     double high,   // threshold for low frequency
-    double attention_factor // attention_factor applied on cos and sin
+    double attention_factor, // attention_factor applied on cos and sin
+    bool is_qk_norm,         // Whether to apply QK norm
+    bool use_gemma,          // Whether QK norm uses Gemma-style RMSNorm (scale by (1 + weight))
+    bool use_mrope,          // Whether to use interleaved mRoPE position selection
+    int64_t mrope_section1,  // mrope_section[1] (height); ignored when use_mrope is false
+    int64_t mrope_section2   // mrope_section[2] (width)
 )
 {
     // Input validation
     TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]");
-    TORCH_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
+    // Plain RoPE: position_ids is 1D [num_tokens]. Interleaved mRoPE: 2D [3, num_tokens].
+    TORCH_CHECK(position_ids.dim() == 1 || (position_ids.dim() == 2 && position_ids.size(0) == 3),
+        "Position IDs must be 1D [num_tokens] (plain RoPE) or 2D [3, num_tokens] (mRoPE)");
+    TORCH_CHECK(!use_mrope || position_ids.dim() == 2, "use_mrope requires 2D [3, num_tokens] position_ids");
     TORCH_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
     TORCH_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
     TORCH_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
@@ -59,7 +70,7 @@ void fused_qk_norm_rope(
     CHECK_INPUT(k_weight, torch::kBFloat16);
 
     int64_t num_tokens = qkv.size(0);
-    TORCH_CHECK(position_ids.size(0) == num_tokens, "Number of tokens in position_ids must match QKV");
+    TORCH_CHECK(position_ids.size(-1) == num_tokens, "Number of tokens in position_ids must match QKV");
 
     int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
     TORCH_CHECK(
@@ -69,21 +80,24 @@ void fused_qk_norm_rope(
 
     tensorrt_llm::kernels::launchFusedQKNormRope(reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr()),
         static_cast<int>(num_tokens), static_cast<int>(num_heads_q), static_cast<int>(num_heads_k),
-        static_cast<int>(num_heads_v), static_cast<int>(head_dim), static_cast<float>(eps),
-        reinterpret_cast<__nv_bfloat16*>(q_weight.data_ptr()), reinterpret_cast<__nv_bfloat16*>(k_weight.data_ptr()),
-        static_cast<float>(base),
+        static_cast<int>(num_heads_v), static_cast<int>(head_dim), static_cast<int>(rotary_dim),
+        static_cast<float>(eps), reinterpret_cast<__nv_bfloat16*>(q_weight.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(k_weight.data_ptr()), static_cast<float>(base),
         !is_neox, // interleave
         reinterpret_cast<int const*>(position_ids.data_ptr()), static_cast<float>(factor), static_cast<float>(low),
-        static_cast<float>(high), static_cast<float>(attention_factor), stream);
+        static_cast<float>(high), static_cast<float>(attention_factor), stream, is_qk_norm, use_gemma, use_mrope,
+        static_cast<int>(mrope_section1), static_cast<int>(mrope_section2));
 }
 
 // Register the PyTorch operators
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "fused_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float "
+        "fused_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, int "
+        "rotary_dim, float "
         "eps, Tensor q_weight, Tensor k_weight, float base, bool is_neox, Tensor position_ids, float factor, float "
-        "low, float high, float attention_factor) -> ()");
+        "low, float high, float attention_factor, bool is_qk_norm, bool use_gemma, bool use_mrope, int "
+        "mrope_section1, int mrope_section2) -> ()");
 }
 
 // Register the CUDA implementation
@@ -93,3 +107,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 }
 
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

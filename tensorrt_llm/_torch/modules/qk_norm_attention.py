@@ -19,6 +19,8 @@ from typing import Optional
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm.mapping import Mapping
+
 from ..attention_backend.interface import PositionalEmbeddingParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
@@ -156,11 +158,26 @@ class QKNormRoPEAttention(Attention):
         config: ModelConfig,
         q_scaling: float = 1.0,
         disable_deep_gemm: bool = False,
+        use_gemma_rms_norm: bool = False,
+        attn_output_gate: Optional[bool] = None,
+        is_qk_norm: bool = True,
+        reduce_output: bool = True,
+        rope_fusion: bool = True,
+        mapping_with_cp: Optional[Mapping] = None,
     ):
         self.pretrained_config = config.pretrained_config
 
         self.fuse_qk_norm_rope = fuse_qk_norm_rope
         self.skip_rope = skip_rope
+        # Gemma-style RMSNorm (scale by (1 + weight)) is supported by the fused
+        # qk_norm_rope kernel via the use_gemma flag threaded through below.
+        self.use_gemma_rms_norm = use_gemma_rms_norm
+
+        # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb
+        # will be skipped in the overridden apply_rope.
+        rope_fusion &= (not self.fuse_qk_norm_rope and not skip_rope
+                        and not attn_output_gate and not use_gemma_rms_norm)
+        self.is_qk_norm = is_qk_norm
         assert not (fuse_qk_norm_rope and skip_rope
                     ), "Fusing qk norm and skipping rope is not supported"
 
@@ -171,25 +188,28 @@ class QKNormRoPEAttention(Attention):
             max_position_embeddings=max_position_embeddings,
             bias=bias,
             pos_embd_params=pos_embd_params,
-            # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP,
-            # and self.rotary_emb will be skipped in the overridden apply_rope.
-            rope_fusion=not self.fuse_qk_norm_rope and not skip_rope,
+            rope_fusion=rope_fusion,
             layer_idx=layer_idx,
             dtype=dtype,
             dense_bias=dense_bias,
             config=config,
             q_scaling=q_scaling,
             disable_deep_gemm=disable_deep_gemm,
+            attn_output_gate=attn_output_gate,
+            reduce_output=reduce_output,
+            mapping_with_cp=mapping_with_cp,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=self.pretrained_config.rms_norm_eps,
                               dtype=self.pretrained_config.torch_dtype,
-                              has_weights=True)
+                              has_weights=is_qk_norm,
+                              use_gemma=use_gemma_rms_norm)
         self.k_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=self.pretrained_config.rms_norm_eps,
                               dtype=self.pretrained_config.torch_dtype,
-                              has_weights=True)
+                              has_weights=is_qk_norm,
+                              use_gemma=use_gemma_rms_norm)
         self.aux_stream = torch.cuda.Stream()
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
@@ -209,6 +229,7 @@ class QKNormRoPEAttention(Attention):
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
+            disable_on_compile=True,
         )
 
         return q, k
@@ -216,13 +237,39 @@ class QKNormRoPEAttention(Attention):
     def apply_qk_norm_rope(self, qkv, position_ids):
         factor, low, high, attention_factor = compute_yarn_parameters(
             self.pretrained_config)
+
+        partial_rotary_factor = self.pretrained_config.partial_rotary_factor if hasattr(
+            self.pretrained_config, "partial_rotary_factor") else 1.0
+        rotary_dim = int(self.head_dim * partial_rotary_factor)
+
+        # Interleaved mRoPE: position_ids is 3D [3, ...] (temporal/height/width)
+        # and each rotary half-dim picks a section per
+        # MRotaryEmbedding.apply_interleaved_rope. Fall back to plain RoPE for
+        # 2D/1D position_ids (e.g. dummy requests), mirroring the unfused path.
+        mrope_section = getattr(self.pos_embd_params, "mrope_section", None)
+        use_mrope = bool(
+            getattr(self.pos_embd_params, "mrope_interleaved", False)
+        ) and mrope_section is not None and position_ids.dim() == 3
+        if use_mrope:
+            # [3, num_tokens] row-major (sec*num_tokens + token); the upstream 3D
+            # position_ids may be a non-contiguous view, and the op requires
+            # contiguous, so force it here.
+            position_ids_arg = position_ids.reshape(3, -1).contiguous().to(
+                torch.int32)
+            mrope_section1, mrope_section2 = mrope_section[1], mrope_section[2]
+        else:
+            position_ids_arg = position_ids.reshape(-1).contiguous().to(
+                torch.int32)
+            mrope_section1, mrope_section2 = 0, 0
+
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv, self.num_heads, self.num_key_value_heads,
-            self.num_key_value_heads, self.head_dim,
+            self.num_key_value_heads, self.head_dim, rotary_dim,
             self.q_norm.variance_epsilon, self.q_norm.weight,
-            self.k_norm.weight,
-            self.pos_embd_params.rope.theta, self.pos_embd_params.is_neox,
-            position_ids.view(-1), factor, low, high, attention_factor)
+            self.k_norm.weight, self.pos_embd_params.rope.theta,
+            self.pos_embd_params.is_neox, position_ids_arg, factor, low, high,
+            attention_factor, self.is_qk_norm, self.use_gemma_rms_norm,
+            use_mrope, mrope_section1, mrope_section2)
         return qkv, None, None
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
@@ -240,6 +287,7 @@ class QKNormRoPEAttention(Attention):
             else:
                 return q, k, v
 
-        assert k is None and v is None, "The input should be a concatenated qkv tensor to apply_qk_norm_rope"
         qkv = q
+        if k is not None and v is not None:
+            qkv = torch.concat([q, k, v], dim=-1)
         return self.apply_qk_norm_rope(qkv, position_ids)

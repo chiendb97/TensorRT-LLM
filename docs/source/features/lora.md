@@ -10,12 +10,13 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique that e
 3. [Advanced Usage](#advanced-usage)
    - [LoRA with Quantization](#lora-with-quantization)
    - [NeMo LoRA Format](#nemo-lora-format)
+   - [Routed-Expert MoE LoRA](#routed-expert-moe-lora)
    - [Cache Management](#cache-management)
 4. [TRTLLM serve with LoRA](#trtllm-serve-with-lora)
    - [YAML Configuration](#yaml-configuration)
    - [Starting the Server](#starting-the-server)
    - [Client Usage](#client-usage)
-5. [TRTLLM bench with LORA](#trtllm-bench-with-lora)
+5. [TRTLLM bench with LoRA](#trtllm-bench-with-lora)
    - [YAML Configuration](#yaml-configuration)
    - [Run trtllm-bench](#run-trtllm-bench)
 
@@ -135,6 +136,79 @@ lora_request = LoRARequest(
 )
 ```
 
+### Routed-Expert MoE LoRA
+
+LoRA can be applied to the routed-expert projections of a Mixture-of-Experts (MoE) layer in addition to the attention modules. The PyTorch backend's Cutlass MoE kernel fuses the LoRA application into the MoE forward pass, so multi-adapter batches run without an extra GEMM pass per layer.
+
+#### Supported configuration
+
+| Aspect | Supported |
+|---|---|
+| MoE backend | `CUTLASS` only (other backends raise an error at construction). |
+| Base-weight dtype | bf16 / fp16. Quantized base weights (FP8, NVFP4, INT4, INT8) are not yet supported. |
+| Adapter modules | `moe_h_to_4h` (gate side of SwiGLU), `moe_gate` (up side), `moe_4h_to_h` (down). `moe_h_to_4h` and `moe_4h_to_h` must both be present; `moe_gate` is optional (gated activations only). |
+| Adapter layout | Per-expert (stacked `[num_experts, ...]`). |
+| Multi-LoRA in flight | Yes. Reuses the existing slot manager. |
+| Execution paths | Eager, plus CUDA-graph capture/replay via the slot-indexed device path (see below). |
+| min-latency mode | Not supported with MoE LoRA. |
+| Alltoall (WideEP) | Not supported with MoE LoRA. |
+| DoRA on MoE modules | Not supported (and rejected at load time). |
+| `register_to_config` + `torch.compile` | Not supported with MoE LoRA. |
+
+#### Enabling routed-expert MoE LoRA
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.lora_manager import LoraConfig
+
+lora_config = LoraConfig(
+    lora_target_modules=[
+        "attn_q", "attn_k", "attn_v",  # optional: standard attention LoRA
+        "moe_h_to_4h",                 # gate/SiLU projection (required for MoE LoRA)
+        "moe_4h_to_h",                 # down projection (required for MoE LoRA)
+        "moe_gate",                    # up/linear projection (optional; gated activations)
+    ],
+    max_lora_rank=16,
+    max_loras=8,
+    max_cpu_loras=8,
+)
+
+llm = LLM(
+    model="/path/to/moe_base_model",
+    lora_config=lora_config,
+    # The MoE LoRA path requires the Cutlass backend. Other moe_backend values
+    # raise ValueError at construction.
+    moe_backend="CUTLASS",
+)
+```
+
+Adapters are loaded via `LoRARequest` exactly like attention-only LoRA; no API change.
+
+#### Adapter layout
+
+Each routed expert has its own `(A, B)` matrices, stored as stacked `[num_experts, rank, in_dim]` and `[num_experts, out_dim, rank]` tensors. This is the standard HuggingFace PEFT export shape for MoE LoRA; the MoE kernel reads each expert's slice at offset `expert_index * dim * rank`.
+
+A helper for assembling synthetic per-expert adapters (for unit tests and experimentation) is provided at `tensorrt_llm._torch.peft.lora.moe_layout`:
+
+```python
+from tensorrt_llm._torch.peft.lora.moe_layout import make_per_expert_lora
+
+fc1_adapter = make_per_expert_lora(
+    num_experts=8, rank=16, in_dim=2048, out_dim=5632,
+    dtype=torch.bfloat16,
+)
+# fc1_adapter["A"].shape == (8, 16, 2048)  -- independent per expert
+# fc1_adapter["B"].shape == (8, 5632, 16)  -- independent per expert
+```
+
+#### CUDA-graph decode
+
+CUDA-graph capture/replay of a LoRA-active routed-expert MoE layer is supported via the slot-indexed device path. In CUDA-graph decode, `CudaGraphLoraManager` drives a fully on-device slot→token expansion (no host-side `cudaEventSynchronize`), so the per-token `(rank, A, B)` tables are produced on the stream and reassigning a slot's adapter is reflected on replay without re-capture. The legacy per-request host path is not capturable: it performs a host-side `cudaEventSynchronize` after a device-to-host pointer-expansion copy, so when an MoE LoRA is active on that path the fused MoE op detects the capturing stream and raises a clear error.
+
+#### What is rejected, and where
+
+If you supply MoE LoRA on a non-Cutlass backend or with quantization, `create_moe` raises at construction with a message pointing at the offending setting. At runtime, the fused MoE op also rejects min-latency mode + LoRA, alltoall + LoRA, and CUDA-graph capture on the non-capturable per-request host path (use the slot-indexed device path for capture).
+
 ### Cache Management
 
 ```python
@@ -157,7 +231,13 @@ llm = LLM(
 
 ### YAML Configuration
 
-Create an `extra_llm_api_options.yaml` file:
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
+Create a `config.yaml` file:
 
 ```yaml
 lora_config:
@@ -168,7 +248,7 @@ lora_config:
 ```bash
 python -m tensorrt_llm.commands.serve
      /path/to/model \
-    --extra_llm_api_options extra_llm_api_options.yaml
+    --config config.yaml
 ```
 
 ### Client Usage
@@ -192,11 +272,17 @@ response = client.completions.create(
 )
 ```
 
-## TRTLLM bench with LORA
+## TRTLLM bench with LoRA
 
 ### YAML Configuration
 
-Create an `extra_llm_api_options.yaml` file:
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
+Create a `config.yaml` file:
 
 ```yaml
 lora_config:
@@ -216,5 +302,5 @@ lora_config:
 ```
 ### Run trtllm-bench
 ```bash
-trtllm-bench --model $model_path throughput --dataset $dataset_path --extra_llm_api_options extra_llm_api_options.yaml --num_requests 64 --concurrency 16
+trtllm-bench --model $model_path throughput --dataset $dataset_path --config config.yaml --num_requests 64 --concurrency 16
 ```

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import re
 import warnings
 from subprocess import CalledProcessError
 
@@ -76,6 +77,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     else:
         test_prefix = "unittest"
 
+    waives_file = request.config.getoption("--waives-file")
+    run_ray = request.config.getoption("--run-ray")
+
     num_workers = 1
 
     # This dataframe is not manually edited. Infra team will regularly generate this dataframe based on test execution results.
@@ -116,15 +120,32 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     import shlex
     arg_list = shlex.split(case)
-    case_fn = case.replace('/', '-')
+    case_fn = re.sub(r'[/\s"\']+', '-', case)
     if len(case_fn) > 80:
         case_fn = case_fn[:80]
-    output_xml = os.path.join(output_dir,
-                              f'results-sub-unittests-{case_fn}.xml')
+    # MoE entries expand to too many sub-tests, which introduces noise into
+    # the overall TRT-LLM test quality metrics. Skip per-sub-test reporting
+    # for MoE by prefixing with "moe-" (CI only collects files starting
+    # with "results" for JUnit reporting).
+    if case.startswith("unittest/_torch/modules/moe/"):
+        output_xml = os.path.join(output_dir,
+                                  f'moe-results-sub-unittests-{case_fn}.xml')
+    else:
+        output_xml = os.path.join(output_dir,
+                                  f'results-sub-unittests-{case_fn}.xml')
 
     command = [
-        '-m', 'pytest', ignore_opt, "-v", "--timeout=2400",
-        "--timeout-method=thread"
+        '-m',
+        'pytest',
+        ignore_opt,
+        "-vv",
+        "--tb=short",
+        "-rF",
+        "--timeout=2400",
+        "--timeout-method=thread",
+        "--periodic-junit",
+        "--periodic-batch-size=1",
+        "--periodic-save-unfinished-test",
     ]
     if test_prefix:
         command += [f"--test-prefix={test_prefix}"]
@@ -132,20 +153,47 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if dry_run:
         command += ['--collect-only']
 
+    if waives_file:
+        waives_file = os.path.abspath(waives_file)
+        command += [f"--waives-file={waives_file}"]
+
+    if run_ray:
+        command += ["--run-ray"]
+
     command += arg_list
 
-    print(f"Running unit test:'{command}'")
+    print(f"Running unit test:\"python {' '.join(command)}\"")
 
-    def run_command(cmd):
+    def run_command(cmd, num_workers=1):
         try:
-            llm_venv.run_cmd(cmd, cwd=test_root)
-        except CalledProcessError:
+            pythonpath = os.environ.get("PYTHONPATH", "")
+            env = {'PYTHONPATH': f"{llm_root}/tests/unittest:{pythonpath}"}
+            if num_workers > 1:
+                env['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
+            llm_venv.run_cmd(
+                cmd,
+                cwd=test_root,
+                env=env,
+            )
+        except CalledProcessError as e:
+            print(f"\n{'='*60}")
+            print(f"UNITTEST FAILED with exit code: {e.returncode}")
+            print(f"Command: {' '.join(cmd)}")
+            if hasattr(e, 'stdout') and e.stdout:
+                print(
+                    f"STDOUT:\n{e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout}"
+                )
+            if hasattr(e, 'stderr') and e.stderr:
+                print(
+                    f"STDERR:\n{e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr}"
+                )
+            print(f"{'='*60}\n")
             return False
         return True
 
     if num_workers == 1:
         # Do not bother with pytest-xdist at all if we don't need parallel execution
-        command += ["-p", "no:xdist", f"--junitxml={output_xml}"]
+        command += ["-p", "no:xdist", f"--periodic-junit-xmlpath={output_xml}"]
         passed = run_command(command)
     else:
         # Avoid .xml extension to prevent CI from reading failures from it
@@ -153,9 +201,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             output_dir,
             f'parallel-sub-results-unittests-{case_fn}.xml.intermediate')
         parallel_command = command + [
-            "-n", f"{num_workers}", f"--junitxml={parallel_output_xml}"
+            "-n", f"{num_workers}",
+            f"--periodic-junit-xmlpath={parallel_output_xml}"
         ]
-        passed = run_command(parallel_command)
+        passed = run_command(parallel_command, num_workers)
 
         assert os.path.exists(
             parallel_output_xml
@@ -170,7 +219,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 f'retry-sub-results-unittests-{case_fn}.xml.intermediate')
             # Run failed case sequentially.
             retry_command = command + [
-                "-p", "no:xdist", '--lf', f"--junitxml={retry_output_xml}"
+                "-p", "no:xdist", '--lf',
+                f"--periodic-junit-xmlpath={retry_output_xml}"
             ]
             passed = run_command(retry_command)
 

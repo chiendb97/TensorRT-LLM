@@ -4,10 +4,10 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput
-from transformers.modeling_utils import (get_parameter_device,
-                                         get_parameter_dtype)
 from transformers.models.clip.configuration_clip import CLIPVisionConfig
 from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
+
+from tensorrt_llm._utils import prefer_pinned
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            PredefinedAttentionMask)
@@ -15,7 +15,20 @@ from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.mlp import MLP
+from .hf_parameter_utils import get_parameter_device, get_parameter_dtype
 from .modeling_utils import _load_weights_impl, register_auto_model
+
+try:
+    # Available in transformers<5
+    from transformers.modeling_utils import (get_parameter_device,
+                                             get_parameter_dtype)
+except ImportError:
+    # Removed in transformers>=5
+    def get_parameter_device(module):
+        return next(module.parameters()).device
+
+    def get_parameter_dtype(module):
+        return next(module.parameters()).dtype
 
 
 class CLIPAttention(Attention):
@@ -182,29 +195,39 @@ class CLIPVisionModel(nn.Module):
         self.model_config = model_config
         self.config = self.model_config.pretrained_config  # HF Vision Config
         self.vision_model = CLIPVisionTransformer(self.model_config)
+
+        # Needed for prepare_attn_metadata
+        self.image_size = self.config.image_size
+        self.patch_size = self.config.patch_size
+
         self.metadata_cls = get_attention_backend(
             model_config.attn_backend).Metadata
+        self.attn_metadata = self.metadata_cls(
+            max_num_requests=
+            8192,  #TODO(yechank-nvidia): Make this along with the LLM's max_num_requests
+            max_num_tokens=model_config.max_num_tokens,
+            kv_cache_manager=None,
+        )
 
     def prepare_attn_metadata(self, batch_size):
         """
         To simplify the usage of the model, this function aims to fill the metadata for Attention
         Call this function before forward pass
         """
-        seq_len = (self.config.image_size // self.config.patch_size)**2 + 1
+        seq_len = (self.image_size // self.patch_size)**2 + 1
         request_ids = list(range(1, batch_size + 1))
         prompt_lens = [seq_len] * batch_size
-        attn_metadata = self.metadata_cls(
-            seq_lens=torch.tensor([seq_len] * batch_size, dtype=torch.int),
-            num_contexts=batch_size,
-            max_num_requests=batch_size,
-            max_num_tokens=seq_len * batch_size,
-            kv_cache_manager=None,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-        )
-        attn_metadata.max_seq_len = seq_len
-        attn_metadata.prepare()
-        return attn_metadata
+        seq_lens = torch.tensor([seq_len] * batch_size,
+                                dtype=torch.int,
+                                pin_memory=prefer_pinned())
+
+        self.attn_metadata.num_contexts = batch_size
+        self.attn_metadata.request_ids = request_ids
+        self.attn_metadata.prompt_lens = prompt_lens
+        self.attn_metadata.seq_lens = seq_lens
+        self.attn_metadata.max_seq_len = seq_len
+        self.attn_metadata.prepare()
+        return self.attn_metadata
 
     @property
     def dtype(self):

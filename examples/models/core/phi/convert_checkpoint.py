@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from transformers import AutoConfig
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import Phi3ForCausalLM, PhiForCausalLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -81,7 +82,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -126,6 +127,7 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
     assert args.pp_size == 1, "Pipeline parallelism is not supported."

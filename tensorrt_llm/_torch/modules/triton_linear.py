@@ -4,20 +4,15 @@ from typing import Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
+from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig, matmul_ogs
+from triton_kernels.numerics import InFlexData
 
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.mapping import Mapping
 
 from ...models.modeling_utils import QuantConfig
-# Reuse the common Triton import setup
-from .fused_moe.fused_moe_triton import (IS_TRITON_KERNELS_AVAILABLE,
-                                         maybe_update_stride,
-                                         swizzle_weight_and_scale)
-
-if IS_TRITON_KERNELS_AVAILABLE:
-    from triton_kernels.matmul_ogs import (FlexCtx, PrecisionConfig, matmul_ogs)
-    from triton_kernels.numerics import InFlexData
-
+from .fused_moe.fused_moe_triton import (swizzle_weight_and_scale,
+                                         update_weight_stride)
 from .linear import (Linear, LinearMethodBase, TensorParallelMode,
                      WeightsLoadingConfig, copy_weight, load_weight_shard,
                      load_weights_fused_gate_up_helper,
@@ -60,7 +55,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
 
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
         load_weights_vanilla_helper(module, weights, **self.param_transform)
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]):
@@ -70,7 +65,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
             (q_weight, k_weight, v_weight), axis=-1
         )  #Each of them has shape (1, in_features, out_features_part)
         copy_weight(module.weight, fused_weight)
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]):
@@ -80,7 +75,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
             (gate_weight, up_weight), axis=-1
         )  #Each of them has shape (1, in_features, out_features_part)
         copy_weight(module.weight, fused_weight)
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
 
 class TritonFP8QDQLinearMethod(LinearMethodBase):
@@ -163,7 +158,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             # Dynamic quantization
             module.input_scale = None
         copy_weight(module.weight_scale, weight_scale[0])
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]):
@@ -188,7 +183,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             torch.float8_e4m3fn)
         copy_weight(module.weight,
                     self.param_transform["weight_transform"](fused_weight))
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]):
@@ -211,7 +206,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             torch.float8_e4m3fn)
         copy_weight(module.weight,
                     self.param_transform["weight_transform"](fused_weight))
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
 
 class TritonMXFP4LinearMethod(LinearMethodBase):
@@ -383,9 +378,6 @@ class TritonLinear(Linear):
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
     ):
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            raise ImportError("Triton kernels are not available. "
-                              "Please install the required dependencies.")
         assert not use_custom_cublas_mm, "TritonLinear does not support custom cublas mm."
 
         super().__init__(

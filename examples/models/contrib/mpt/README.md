@@ -1,6 +1,12 @@
 # MPT
 
-This document explains how to build the [MPT](https://huggingface.co/mosaicml/mpt-7b) model using TensorRT-LLM and run on a single GPU and a single node with multiple GPUs.
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
+This document explains how to build the [MPT](https://huggingface.co/mosaicml/mpt-7b) model using TensorRT LLM and run on a single GPU and a single node with multiple GPUs.
 
 - [MPT](#mpt)
   - [Overview](#overview)
@@ -22,9 +28,9 @@ This document explains how to build the [MPT](https://huggingface.co/mosaicml/mp
 
 ## Overview
 
-The TensorRT-LLM MPT implementation can be found in [`tensorrt_llm/models/mpt/model.py`](../../tensorrt_llm/models/mpt/model.py). The TensorRT-LLM MPT example code is located in [`examples/models/contrib/mpt`](./). There is one main file:
+The TensorRT LLM MPT implementation can be found in [`tensorrt_llm/models/mpt/model.py`](../../tensorrt_llm/models/mpt/model.py). The TensorRT LLM MPT example code is located in [`examples/models/contrib/mpt`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 

@@ -1,9 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import atexit
 import concurrent.futures
+import json
+import os
 import threading
-import time
 import weakref
-from typing import Dict, Optional, Union
+from queue import Empty
+from typing import Dict, List, Optional, Union
 
 import torch
 import zmq
@@ -12,19 +28,19 @@ import zmq.asyncio
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
-from ..llmapi.llm_args import KvCacheConnectorConfig
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            enable_llm_debug, print_colored,
-                            print_colored_debug)
+                            enable_llm_debug, logger_debug, print_colored)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import PostprocWorkerConfig
+from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
-from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
+from .rpc import RPCClient
+from .rpc.rpc_common import RPCError, get_unique_ipc_addr
+from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
                     create_mpi_comm_session, get_spawn_proxy_process_env,
                     is_llm_response, print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
@@ -32,6 +48,27 @@ from .worker import GenerationExecutorWorker, worker_main
 __all__ = [
     "GenerationExecutorProxy",
 ]
+
+
+def _check_collective_rpc_guard(
+    model_world_size: int,
+    unique_reply_rank: Optional[int],
+    target_ranks: Optional[Union[int, List[int]]],
+) -> None:
+    """Validate collective_rpc preconditions shared by IPC and RPC proxies.
+
+    Raises:
+        NotImplementedError: If ``model_world_size > 1``, or if
+            ``unique_reply_rank`` or ``target_ranks`` are provided.
+    """
+    if model_world_size > 1:
+        raise NotImplementedError(
+            "MPI collective_rpc only supports model_world_size == 1; "
+            "use the Ray executor for multi-rank deployments.")
+    if unique_reply_rank is not None or target_ranks is not None:
+        raise NotImplementedError(
+            "unique_reply_rank and target_ranks are not supported; "
+            "this shim only reaches rank-0.")
 
 
 class GenerationExecutorProxy(GenerationExecutor):
@@ -46,7 +83,6 @@ class GenerationExecutorProxy(GenerationExecutor):
         worker_cls: type = GenerationExecutorWorker,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     ) -> None:
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
@@ -65,13 +101,13 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         if mpi_session is None:
             if mpi_process_pre_spawned:
-                print_colored_debug('create comm session ...\n', "yellow")
+                logger_debug('create comm session ...\n', "yellow")
                 self.mpi_session = create_mpi_comm_session(model_world_size)
             else:
-                print_colored_debug('create pool session ...\n', "yellow")
+                logger_debug('create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
-            print_colored_debug('using external mpi session ...\n', "yellow")
+            logger_debug('using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
 
         if isinstance(self.mpi_session,
@@ -88,23 +124,46 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.model_world_size = model_world_size
 
-        self.garbage_collection_gen0_threshold = worker_kwargs[
-            "llm_args"].garbage_collection_gen0_threshold if worker_kwargs.get(
-                "llm_args", None) is not None else None
+        _llm_args = worker_kwargs.get("llm_args", None)
+        self.garbage_collection_gen0_threshold = _llm_args.garbage_collection_gen0_threshold if _llm_args is not None else None
+        _backend = None if _llm_args is None else _llm_args.backend
+        self._is_pytorch_backend = _backend in ["pytorch", "_autodeploy"]
+        self._enable_resource_governor = bool(
+            getattr(_llm_args, "enable_resource_governor", False))
+
+        # Generate RPC address and key for stats RPC
+        self.rpc_addr = get_unique_ipc_addr()
+        self.hmac_key = os.urandom(32)
 
         worker_kwargs = dict(**worker_kwargs,
                              worker_queues=self._setup_queues(),
                              postproc_worker_config=postproc_worker_config,
                              is_llm_executor=False,
-                             kv_connector_config=kv_connector_config)
+                             rpc_addr=self.rpc_addr,
+                             hmac_key=self.hmac_key)
 
         if "log_level" not in worker_kwargs:
             worker_kwargs["log_level"] = logger.level
 
         self.dispatch_result_thread: Optional[ManagedThread] = None
-        self.dispatch_stats_thread: Optional[ManagedThread] = None
-        self.dispatch_kv_cache_events_thread: Optional[ManagedThread] = None
+        self.rpc_client: Optional[RPCClient] = None
         self._start_executor_workers(worker_kwargs)
+
+        # Create RPC client after workers are started (worker starts RPC server)
+        self.rpc_client = RPCClient(self.rpc_addr, hmac_key=self.hmac_key)
+
+        # Event used to wake the error monitor thread for a clean shutdown
+        # instead of polling with sleep loops.
+        self._shutdown_event = threading.Event()
+
+        # Start a background thread that monitors for fatal errors (e.g. MPI
+        # worker crash) and triggers shutdown even when no health checks or
+        # generate() calls are in flight.
+        self._error_monitor_thread = threading.Thread(
+            target=self._error_monitor_loop,
+            daemon=True,
+            name="proxy_error_monitor")
+        self._error_monitor_thread.start()
 
         # MPI registers its joiner using threading._register_atexit if possible.
         # These functions run before atexit.register, so to avoid deadlock,
@@ -115,12 +174,109 @@ class GenerationExecutorProxy(GenerationExecutor):
         except AttributeError:
             atexit.register(self.pre_shutdown)
 
+    def _check_mpi_futures(self) -> bool:
+        """Check if any MPI worker future has completed (crashed/exited).
+
+        If a dead worker is found, records the fatal error and calls
+        ``pre_shutdown()``.
+
+        Returns:
+            True if a dead worker was detected.
+        """
+        if not hasattr(self, 'mpi_futures') or not self.mpi_futures:
+            return False
+        for f in self.mpi_futures:
+            if f.done():
+                exc = f.exception() if not f.cancelled() else None
+                error = exc or RuntimeError("MPI worker exited unexpectedly")
+                self._set_fatal_error(error)
+                if not self.doing_shutdown:
+                    self.pre_shutdown()
+                return True
+        return False
+
+    def _drain_error_queue(self) -> bool:
+        """Drain all queued errors, skipping per-request errors.
+
+        Sets ``_fatal_error`` and calls ``pre_shutdown()`` on the first
+        system-level error found.
+
+        Returns:
+            True if any items were drained from the queue.
+        """
+        drained = False
+        while True:
+            try:
+                e = self._error_queue.get_nowait()
+                self._error_queue.task_done()
+                drained = True
+                if isinstance(e, (str, RequestError)):
+                    continue
+                self._set_fatal_error(e)
+                if not self.doing_shutdown:
+                    self.pre_shutdown()
+                break
+            except Empty:
+                break
+        return drained
+
+    def check_health(self) -> bool:
+        """Check executor health including MPI worker liveness.
+
+        Inlines the base ``check_health()`` logic instead of calling
+        ``super().check_health()`` so that fatal queue items trigger
+        ``pre_shutdown()`` (non-blocking) rather than ``shutdown()``
+        (which blocks on ``f.result()`` for surviving MPI workers).
+
+        Returns:
+            True if the executor and all MPI workers are healthy.
+        """
+        if self.doing_shutdown or self._fatal_error is not None:
+            return False
+
+        if self._drain_error_queue():
+            return self._fatal_error is None and not self.doing_shutdown
+
+        if self._check_mpi_futures():
+            return False
+
+        return True
+
+    def _error_monitor_loop(self) -> None:
+        """Background thread that polls for fatal errors every ~5 seconds.
+
+        Checks MPI worker futures and drains the error queue using
+        the shared ``_check_mpi_futures()`` and ``_drain_error_queue()``
+        helpers.
+
+        Uses ``_shutdown_event`` for clean wakeup instead of a sleep loop,
+        so shutdown is immediate rather than waiting up to 5 seconds.
+        """
+        while not self.doing_shutdown and self._fatal_error is None:
+            try:
+                if self._check_mpi_futures():
+                    logger.error("Error monitor: MPI worker crash detected, "
+                                 "shutting down")
+                    return
+
+                self._drain_error_queue()
+                if self._fatal_error is not None:
+                    return
+            except Exception as exc:
+                logger.debug(f"Error monitor: unexpected exception (ignored): "
+                             f"{exc!r}")
+
+            # Wait up to 5s, but wake immediately if _shutdown_event is set
+            self._shutdown_event.wait(timeout=5.0)
+
     def _setup_queues(self) -> WorkerCommIpcAddrs:
 
         self.request_queue = IpcQueue(is_server=True,
                                       name="proxy_request_queue")
         self.worker_init_status_queue = IpcQueue(
-            is_server=True, name="worker_init_status_queue")
+            is_server=True,
+            socket_type=zmq.ROUTER,
+            name="worker_init_status_queue")
         # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
         # multiple senders from multiple processes.
@@ -130,20 +286,21 @@ class GenerationExecutorProxy(GenerationExecutor):
             socket_type=zmq.PULL
             if self.enable_postprocess_parallel else zmq.PAIR,
             name="proxy_result_queue")
-        self.mp_stats_queue = FusedIpcQueue(is_server=True,
-                                            fuse_message=False,
-                                            name="proxy_stats_queue")
-        self.kv_cache_events_queue = FusedIpcQueue(
-            is_server=True,
-            fuse_message=False,
-            name="proxy_kv_cache_events_queue")
+        self._resource_governor_queue = IpcQueue(
+            is_server=True, name="proxy_resource_governor_queue"
+        ) if self._enable_resource_governor else None
+        # Stats and KV events are now fetched via RPC, not IPC queues.
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
             worker_init_status_queue_addr=self.worker_init_status_queue.address,
             result_queue_addr=self.result_queue.address,
-            stats_queue_addr=self.mp_stats_queue.address,
-            kv_cache_events_queue_addr=self.kv_cache_events_queue.address,
+            resource_governor_queue_addr=self._resource_governor_queue.address
+            if self._resource_governor_queue is not None else None,
         )
+
+    @property
+    def resource_governor_queue(self):
+        return self._resource_governor_queue
 
     def abort_request(self, request_id: int) -> None:
         ''' Abort a request by sending a cancelling request to the request queue.
@@ -159,9 +316,8 @@ class GenerationExecutorProxy(GenerationExecutor):
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
-        with customized_gc_thresholds(self.garbage_collection_gen0_threshold):
-            if (res := self.result_queue.get()) is None:
-                return False  # shutdown the thread
+        if (res := self.result_queue.get()) is None:
+            return False  # shutdown the thread
 
         async_queues = []
         event_loop = None
@@ -171,7 +327,14 @@ class GenerationExecutorProxy(GenerationExecutor):
             nonlocal event_loop
             nonlocal async_queues
 
-            queue = self._results[client_id].queue
+            # The result may already be finalized and popped below — e.g. a
+            # `terminate` verdict sent a final Output while the
+            # engine still has in-flight responses (abort is async). Drop such
+            # late responses instead of crashing with a KeyError.
+            result = self._results.get(client_id)
+            if result is None:
+                return
+            queue = result.queue
             if isinstance(queue, _SyncQueue):
                 queue.put_nowait(res)
                 async_queues.append(queue)
@@ -180,9 +343,13 @@ class GenerationExecutorProxy(GenerationExecutor):
             else:
                 queue.put(res)
 
+            # FIXME: Add type annotations and make 'res' type more homogeneous (e.g.
+            #        include PostprocWorker.Output in is_llm_response and unify is_final APIs).
             if (is_llm_response(res) and res.result.is_final) or isinstance(
-                    res, ErrorResponse):
-                self._results.pop(client_id)
+                    res,
+                    ErrorResponse) or (isinstance(res, PostprocWorker.Output)
+                                       and res.is_final):
+                self._results.pop(client_id, None)
 
         res = res if isinstance(res, list) else [res]
 
@@ -193,73 +360,17 @@ class GenerationExecutorProxy(GenerationExecutor):
             process_res(i)
 
         if async_queues:
-            _SyncQueue.notify_many(event_loop, async_queues)
+            try:
+                _SyncQueue.notify_many(event_loop, async_queues)
+            except AsyncQueue.EventLoopShutdownError:
+                logger.warning(
+                    "proxy.py: EventLoopShutdownError because event loop is not running"
+                )
 
         return True  # success
 
-    def _iteration_result_task(self, queue: Union[FusedIpcQueue,
-                                                  IntraProcessQueue],
-                               result_singleton: IterationResult) -> bool:
-        # iteration result is not urgent, so we can sleep a bit
-        time.sleep(0.2)
-
-        try:
-            data = queue.get()
-        except:
-            logger.debug(
-                "proxy.py: Error in _iteration_result_task: queue.get()")
-            return False
-
-        if data is None:
-            logger.debug("proxy.py: _iteration_result_task: data is None")
-            return False  # shutdown the thread
-
-        data = data if isinstance(data, list) else [data]
-        queue = result_singleton.queue
-        async_queues = []
-
-        while queue.full():
-            queue.get()
-
-        try:
-            for d in data:
-                if d is None:
-                    logger.debug("proxy.py: _iteration_result_task: d is None")
-                    return False
-
-                if isinstance(queue, _SyncQueue):
-                    queue.put_nowait(d)
-                    async_queues.append(queue)
-                else:
-                    queue.put(d)
-
-            if async_queues:
-                _SyncQueue.notify_many(queue.loop, async_queues)
-
-        except AsyncQueue.EventLoopShutdownError:
-            # This happens in the last loop while the generate workflow is
-            # stopped, or when get_stats() or aget_stats() are not called by users
-            # and therefore event loop can already be closed.
-            logger.debug("proxy.py: EventLoopShutdownError")
-        except Exception as e:
-            logger.debug(f"proxy.py: Error in _iteration_result_task: {e}")
-            raise e
-
-        return True  # success
-
-    def dispatch_stats_task(self) -> bool:
-        if not self._iter_stats_result:
-            # This can happen temporarily because the WAR in tensorrt_llm/bench/benchmark/throughput.py
-            # is not synchronized with self.dispatch_stats_thread.
-            logger.debug(
-                f"Skipping stats dispatch while self._iter_stats_result=None")
-            return True  # Intended behavior, not an error
-        return self._iteration_result_task(self.mp_stats_queue,
-                                           self._iter_stats_result)
-
-    def dispatch_kv_cache_events_task(self) -> bool:
-        return self._iteration_result_task(self.kv_cache_events_queue,
-                                           self._iter_kv_events_result)
+    # NOTE: _iteration_result_task, dispatch_stats_task, and dispatch_kv_cache_events_task
+    # have been removed as stats and kv_events are now fetched via RPC directly.
 
     def _start_dispatch_threads(self):
         if self.dispatch_result_thread is None:
@@ -267,25 +378,12 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.dispatch_result_thread = ManagedThread(
                 weakref.WeakMethod(self.dispatch_result_task),
                 error_queue=self._error_queue,
-                name="proxy_dispatch_result_thread")
-            self.dispatch_stats_thread = ManagedThread(
-                weakref.WeakMethod(self.dispatch_stats_task),
-                error_queue=self._error_queue,
-                name="proxy_dispatch_stats_thread")
-            self.dispatch_kv_cache_events_thread = ManagedThread(
-                weakref.WeakMethod(self.dispatch_kv_cache_events_task),
-                error_queue=self._error_queue,
-                name="proxy_dispatch_kv_cache_events_thread")
+                name="proxy_dispatch_result_thread",
+                context=customized_gc_thresholds(
+                    self.garbage_collection_gen0_threshold),
+            )
 
             self.dispatch_result_thread.start()
-
-            # Only collect stats when submission
-            # is via LLM API
-            if self._iter_stats_result:
-                self.dispatch_stats_thread.start()
-
-            if self._iter_kv_events_result:
-                self.dispatch_kv_cache_events_thread.start()
 
         self._handle_background_error()
 
@@ -304,9 +402,20 @@ class GenerationExecutorProxy(GenerationExecutor):
         ) else None
         from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
         torch.cuda.Stream()
+
+        # Strip the tokenizer from worker_kwargs to avoid MPI pickle failures.
+        # Tokenizers using trust_remote_code=True reference classes in the
+        # dynamic 'transformers_modules' namespace that cannot be deserialized
+        # on remote MPI worker nodes.  The tokenizer is not needed by workers
+        # (it is only consumed by the proxy / rank-0 leader).
+        mpi_worker_kwargs = {
+            k: v
+            for k, v in worker_kwargs.items() if k != 'tokenizer'
+        }
+
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
-            **worker_kwargs,
+            **mpi_worker_kwargs,
             worker_cls=self.worker_cls,
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
@@ -320,6 +429,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         while True:
             if self.worker_init_status_queue.poll(1):
                 ready_signal, error_trace = self.worker_init_status_queue.get()
+                # Send ACK to the worker
+                self.worker_init_status_queue.put("ACK")
+                logger.info("get signal from executor worker")
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
@@ -340,17 +452,36 @@ class GenerationExecutorProxy(GenerationExecutor):
     def pre_shutdown(self):
         if not self.workers_started:
             return
-        print_colored_debug('Proxy.pre_shutdown...\n', "yellow")
+        logger_debug('Proxy.pre_shutdown...\n', "yellow")
 
         if self.doing_shutdown:
             return
         else:
             self.doing_shutdown = True
 
+        # Wake the error monitor thread immediately so it exits cleanly
+        if hasattr(self, '_shutdown_event'):
+            self._shutdown_event.set()
+
         self._abort_all_requests()
 
-        # notify the workers to quit
-        if all(not f.done() for f in self.mpi_futures):
+        # Notify surviving workers to quit.  Send the sentinel when:
+        #   (a) ``mpi_futures`` is empty -- the
+        #       ``RemoteMpiCommSessionClient`` case where workers run in a
+        #       separate ``mgmn_leader_node`` process (used by
+        #       ``trtllm-llmapi-launch``) and ``submit()`` returns ``[]``.
+        #       Without this branch the sentinel would be silently dropped
+        #       and the ``dispatch_result_thread`` would block forever on
+        #       ``result_queue.get()``.
+        #   (b) at least one tracked worker future is still alive (covers
+        #       the in-process ``MpiPoolSession`` / ``MpiCommSession`` cases
+        #       and the partial-crash scenario where some workers exited
+        #       early).
+        # The original ``all(not f.done() ...)`` was vacuously True for an
+        # empty list and therefore covered case (a) by accident.  Switching
+        # to bare ``any(...)`` to better handle partial crashes regressed
+        # case (a); keep both behaviours explicit.
+        if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
             self.request_queue.put_noblock(None, retry=4)
 
     def shutdown(self):
@@ -360,7 +491,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         if not self.doing_shutdown:
             self.pre_shutdown()
 
-        print_colored_debug('Proxy.shutdown...\n', "yellow")
+        logger_debug('Proxy.shutdown...\n', "yellow")
 
         for f in self.mpi_futures:
             try:
@@ -371,27 +502,29 @@ class GenerationExecutorProxy(GenerationExecutor):
                 pass
 
         # step2: notify the background threads to quit
+        if (hasattr(self, '_error_monitor_thread')
+                and self._error_monitor_thread.is_alive() and
+                threading.current_thread() is not self._error_monitor_thread):
+            self._error_monitor_thread.join(timeout=5)
+
         if self.dispatch_result_thread is not None and self.dispatch_result_thread.is_alive(
         ):
             self.dispatch_result_thread.stop()
             self.dispatch_result_thread.join()
-        if self.dispatch_stats_thread is not None and self.dispatch_stats_thread.is_alive(
-        ):
-            self.dispatch_stats_thread.stop()
-            self.dispatch_stats_thread.join()
-        if self.dispatch_kv_cache_events_thread is not None and self.dispatch_kv_cache_events_thread.is_alive(
-        ):
-            self.dispatch_kv_cache_events_thread.stop()
-            self.dispatch_kv_cache_events_thread.join()
 
         # step3: finish all remaining work
+
+        # close the RPC client
+        if self.rpc_client is not None:
+            self.rpc_client.close()
+            self.rpc_client = None
 
         # close all the sockets
         self.request_queue.close()
         self.worker_init_status_queue.close()
         self.result_queue.close()
-        self.mp_stats_queue.close()
-        self.kv_cache_events_queue.close()
+        if self._resource_governor_queue is not None:
+            self._resource_governor_queue.close()
 
         self.workers_started = False
         self.mpi_session.shutdown()
@@ -428,6 +561,163 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._handle_background_error()
 
         return result
+
+    def collective_rpc(
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+        non_block: bool = False,
+        unique_reply_rank: Optional[int] = None,
+        target_ranks: Optional[Union[int, List[int]]] = None,
+    ) -> List:
+        """Execute a method call on the rank-0 GPU worker via the RPC client.
+
+        Rank-0-only shim; only ``model_world_size == 1`` is supported.
+        Shares the :meth:`RayExecutor.collective_rpc` signature for uniform
+        dispatch from :meth:`~tensorrt_llm.llmapi.llm.LLM._collective_rpc`,
+        but does not broadcast to all workers.
+
+        Args:
+            method: Name of the worker method to invoke.
+            args: Positional arguments forwarded to the worker method.
+            kwargs: Keyword arguments forwarded to the worker method.
+            non_block: If ``True``, return a ``Future`` without waiting.
+            unique_reply_rank: Must be ``None``.
+            target_ranks: Must be ``None``.
+
+        Returns:
+            A list containing the single return value when ``non_block=False``,
+            or a list containing the pending
+            :class:`~concurrent.futures.Future` when ``non_block=True``.
+
+        Raises:
+            RuntimeError: If the RPC client has not been initialised yet.
+            NotImplementedError: If ``model_world_size > 1``, or if
+                ``unique_reply_rank`` or ``target_ranks`` are provided.
+        """
+        if self.rpc_client is None:
+            raise RuntimeError(
+                "RPC client is not initialised — collective_rpc() cannot be "
+                "called before the executor workers have started.")
+        _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
+                                    target_ranks)
+        kwargs = kwargs or {}
+        remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
+        if non_block:
+            return [remote_call.remote_future()]
+        return [remote_call.remote()]
+
+    def get_stats(self, timeout: float) -> List[dict]:
+        """Get iteration statistics from the runtime via RPC.
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            List[dict]: A list of runtime stats as dict.
+        """
+        if self.rpc_client is None:
+            logger.warning("RPC client not initialized, cannot get stats")
+            return []
+
+        stats = self.rpc_client.fetch_stats_wait_async(timeout=timeout).remote()
+        return [json.loads(s) if isinstance(s, str) else s for s in stats]
+
+    def get_disaggregated_params(self) -> dict:
+        """Get disaggregated params from worker runtime via RPC."""
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get disaggregated params")
+            return {}
+        try:
+            params = self.rpc_client.get_disaggregated_params().remote()
+            return params if isinstance(params, dict) else {}
+        except RPCError as e:
+            logger.warning(f"Error fetching disaggregated params via RPC: {e}")
+            return {}
+
+    def aget_stats(self, timeout: float) -> IterationResult:
+        """Get iteration statistics from the runtime via RPC (async).
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            IterationResult: An async iterable object containing runtime stats.
+        """
+        # Initialize iteration result if needed
+        self._maybe_initialize_iteration_results()
+
+        if self._iter_stats_result is None:
+            logger.warning("Iteration statistics are not available yet.")
+            from .executor import empty_async_iterable
+            return empty_async_iterable()
+
+        # Fetch stats via RPC and populate the result
+        try:
+            stats = self.rpc_client.fetch_stats_wait_async(
+                timeout=timeout).remote()
+        except Exception as e:
+            logger.debug(f"Error fetching stats via RPC: {e}")
+            stats = []
+
+        for stat in stats:
+            self._iter_stats_result.queue.put(stat)
+
+        self._iter_stats_result.set_timeout(timeout)
+        return self._iter_stats_result
+
+    def get_kv_events(self, timeout: float) -> List[dict]:
+        """Get iteration KV events from the runtime via RPC.
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            List[dict]: A list of runtime events as dict.
+        """
+        if self.rpc_client is None:
+            logger.warning("RPC client not initialized, cannot get kv events")
+            return []
+
+        try:
+            events = self.rpc_client.fetch_kv_cache_events_wait_async(
+                timeout=timeout).remote()
+            return [json.loads(e) if isinstance(e, str) else e for e in events]
+        except Exception as e:
+            logger.error(f"Error fetching kv events via RPC: {e}")
+            return []
+
+    def aget_kv_events(self, timeout: float) -> IterationResult:
+        """Get iteration KV events from the runtime via RPC (async).
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            IterationResult: An async iterable object containing runtime events.
+        """
+        # Initialize iteration result if needed
+        self._maybe_initialize_iteration_results()
+
+        if self._iter_kv_events_result is None:
+            from .executor import empty_async_iterable
+            return empty_async_iterable()
+
+        # Fetch kv events via RPC and populate the result
+        try:
+            events = self.rpc_client.fetch_kv_cache_events_wait_async(
+                timeout=timeout).remote()
+        except Exception as e:
+            logger.debug(f"Error fetching kv events via RPC: {e}")
+            events = []
+
+        for event in events:
+            self._iter_kv_events_result.queue.put(event)
+
+        self._iter_kv_events_result.set_timeout(timeout)
+        return self._iter_kv_events_result
 
     def __del__(self):
         self.shutdown()
