@@ -38,7 +38,7 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
 from .._utils import get_hf_rope_theta, release_gc, str_dtype_to_torch
 from ..logger import logger
 from ..mapping import Mapping
-from .image_processing import MllamaImageProcessor
+from .image_processing import InternVLImageProcessor, MllamaImageProcessor
 from .mode import QuantAlgo
 
 EMPTY_CFG = {
@@ -236,8 +236,54 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
     return tokenizer
 
 
-def get_processor(ckpt_path, max_seq_length=2048, model_type=None, device=None):
-    logger.info(f"Initializing tokenizer from {ckpt_path}")
+def get_processor(ckpt_path,
+                  max_seq_length=2048,
+                  model_type=None,
+                  device=None,
+                  hf_config=None,
+                  messages=None,
+                  max_num=None,
+                  dtype=None):
+    logger.info(f"Initializing processor from {ckpt_path}")
+
+    if model_type == 'internvl':
+        # InternVL ships no combined HF AutoProcessor (and typically no
+        # AutoImageProcessor), so load just the tokenizer and let
+        # InternVLImageProcessor reproduce InternVL's own dynamic-tiling
+        # transform. Tiling parameters are derived from the HF config.
+        tokenizer = AutoTokenizer.from_pretrained(
+            ckpt_path,
+            model_max_length=max_seq_length,
+            padding_side="left",
+            trust_remote_code=True,
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        assert tokenizer.pad_token is not None, f"Pad token for {model_type} cannot be set!"
+
+        vision_config = getattr(hf_config, "vision_config", None)
+        image_size = getattr(hf_config, "force_image_size", None) or getattr(
+            vision_config, "image_size", 448)
+        patch_size = getattr(vision_config, "patch_size", 14)
+        downsample_ratio = getattr(hf_config, "downsample_ratio", 0.5)
+        num_image_token = int(
+            (image_size // patch_size)**2 * (downsample_ratio**2))
+        min_num = getattr(hf_config, "min_dynamic_patch", 1)
+        cfg_max_num = getattr(hf_config, "max_dynamic_patch", 12)
+        if not getattr(hf_config, "dynamic_image_size", True):
+            cfg_max_num = 1
+        use_thumbnail = getattr(hf_config, "use_thumbnail", True)
+        return InternVLImageProcessor(
+            tokenizer,
+            num_image_token=num_image_token,
+            image_size=image_size,
+            min_num=min_num,
+            max_num=cfg_max_num if max_num is None else max_num,
+            use_thumbnail=use_thumbnail,
+            messages=messages,
+            device=device,
+            dtype=dtype or torch.bfloat16)
+
     processor = AutoProcessor.from_pretrained(
         ckpt_path,
         model_max_length=max_seq_length,
@@ -464,8 +510,12 @@ def get_model(ckpt_path: str,
             device_map=device_map if device != "cpu" else "cpu",
             dtype="auto",
             trust_remote_code=True)
-        if hf_config.model_type in ["llava", "internvl_chat"]:
+        if hf_config.model_type == "llava":
             model = model.language_model
+        # InternVL (model_type == "internvl_chat") is intentionally kept whole
+        # here; quantize_and_export() reduces it to language_model after (or
+        # before) calibration depending on whether the calibration is
+        # multimodal, so image features can flow through the language layers.
         elif hf_config.model_type == "qwen2_vl":
             #WAR for Qwen2-VL because its lm_head is outside of LLM
             lm_head = model.lm_head
@@ -511,6 +561,23 @@ def _is_cnn_dailymail_local_repo(path: str) -> bool:
     return False
 
 
+def _load_local_multimodal_dataset(dataset_dir):
+    # A local multimodal calibration dataset (built like ScienceQA: an "image"
+    # column plus a text "prompt"/"question" column). Support both datasets saved
+    # via Dataset.save_to_disk and loose loadable dataset repos.
+    from datasets import load_from_disk
+    try:
+        dataset = load_from_disk(dataset_dir)
+    except FileNotFoundError:
+        dataset = load_dataset(dataset_dir,
+                               split="train",
+                               trust_remote_code=True)
+    if hasattr(dataset, "keys") and not hasattr(dataset, "column_names"):
+        # A DatasetDict; prefer the train split.
+        dataset = dataset[list(dataset.keys())[0]]
+    return dataset
+
+
 def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                          tokenizer=None,
                          batch_size=1,
@@ -536,7 +603,13 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
             dataset = load_dataset("derek-thomas/ScienceQA",
                                    split="train",
                                    trust_remote_code=True)
-        dataset = dataset.select(range(calib_size))
+        # Some VLMs (e.g. InternVL) require an image in every calibration
+        # sample; drop the text-only rows before sampling so calibration stays
+        # multimodal.
+        if getattr(tokenizer, "requires_image", False):
+            dataset = dataset.filter(
+                lambda example: example.get("image") is not None)
+        dataset = dataset.select(range(min(calib_size, len(dataset))))
     elif "cnn_dailymail" in dataset_name_or_dir or _is_cnn_dailymail_local_repo(
             dataset_name_or_dir):
         # Bare "cnn_dailymail" id is rejected by newer huggingface_hub; use the namespaced repo.
@@ -549,6 +622,15 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
             trust_remote_code=True,
         )
         dataset = dataset["article"][:calib_size]
+    elif getattr(tokenizer, "requires_image",
+                 False) and os.path.isdir(dataset_name_or_dir):
+        # Local multimodal calibration dataset (ScienceQA-like: image + prompt
+        # columns) built for a VLM such as InternVL and saved to disk.
+        dataset = _load_local_multimodal_dataset(dataset_name_or_dir)
+        dataset = dataset.select(range(min(calib_size, len(dataset))))
+        logger.info(
+            f"Recognized local multimodal dataset {dataset_name_or_dir} for "
+            f"calibration ({len(dataset)} samples).")
     elif os.path.isdir(dataset_name_or_dir):
         logger.info(
             f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
@@ -563,10 +645,12 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
             f"Unsupported dataset name or local repo directory: {dataset_name_or_dir}."
         )
 
-    is_multimodal = False
-    for dataset_name in MULTIMODAL_DATASETS:
-        if dataset_name in dataset_name_or_dir:
-            is_multimodal = True
+    # A dataset is multimodal when it exposes an "image" column (local VLM
+    # datasets and ScienceQA) or its name matches a known multimodal dataset.
+    is_multimodal = ((hasattr(dataset, "column_names")
+                      and "image" in dataset.column_names)
+                     or any(name in dataset_name_or_dir
+                            for name in MULTIMODAL_DATASETS))
     if is_multimodal:
         # Apply the preprocessing function to the dataset
         processed_dataset = dataset.map(tokenizer.preprocess_function,
@@ -847,8 +931,32 @@ def quantize_and_export(*,
     dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
     model = get_model(model_dir, dtype, device=device, device_map=device_map)
-    model_type = get_model_type(model)
+
+    # InternVL is a vision-language model exposed through AutoModelForCausalLM.
+    # We only quantize/export its language model, but get_model() keeps the full
+    # model so multimodal calibration can run image features through it.
+    is_internvl = getattr(hf_config, "model_type", None) == "internvl_chat"
+    # InternVL calibration is multimodal when a VLM dataset is supplied: either a
+    # named multimodal dataset (ScienceQA) or a local dataset directory holding
+    # image + prompt columns. Text datasets (e.g. cnn_dailymail) stay text-only.
+    is_multimodal_calib = is_internvl and (any(name in calib_dataset
+                                               for name in MULTIMODAL_DATASETS)
+                                           or os.path.isdir(calib_dataset))
+
+    if is_internvl:
+        # Classify by the language model so the exported checkpoint carries the
+        # correct decoder type (matching the previous behavior where get_model()
+        # reduced InternVL to its language_model before this point).
+        model_type = get_model_type(model.language_model)
+    else:
+        model_type = get_model_type(model)
     is_enc_dec = model_type_is_enc_dec(model_type)
+
+    if is_internvl and not is_multimodal_calib:
+        # Text-only calibration exercises the language model directly, so reduce
+        # to it now (mirrors the historical get_model() behavior).
+        model = model.language_model
+
     if "vila" in model_dir:
         tokenizer = get_tokenizer(model_dir + "/llm",
                                   max_seq_length=tokenizer_max_seq_length,
@@ -858,6 +966,19 @@ def quantize_and_export(*,
                                   max_seq_length=tokenizer_max_seq_length,
                                   model_type=model_type,
                                   device=device)
+    elif is_internvl and is_multimodal_calib:
+        # InternVL has no combined processor; get_processor builds an
+        # InternVLImageProcessor (tokenizer + native dynamic tiling) from the HF
+        # config. The per-sample chat prompt comes from the calibration dataset.
+        tokenizer = get_processor(model_dir,
+                                  max_seq_length=tokenizer_max_seq_length,
+                                  model_type="internvl",
+                                  device=device,
+                                  hf_config=hf_config,
+                                  dtype=next(model.parameters()).dtype)
+        # The language model replaces <IMG_CONTEXT> placeholder tokens with
+        # image features during the forward; tell the model which id to look for.
+        model.img_context_token_id = tokenizer.img_context_token_id
     else:
         tokenizer = get_tokenizer(model_dir,
                                   max_seq_length=tokenizer_max_seq_length,
@@ -929,6 +1050,12 @@ def quantize_and_export(*,
 
         model = quantize_model(model, quant_cfg, calib_dataloader, batch_size,
                                qformat, auto_quantize_bits)
+
+    # InternVL multimodal calibration ran on the full VLM; export only the
+    # language model (same as mllama). Reduce before the export block so the
+    # computed architecture/model_type reflect the language model.
+    if is_internvl and is_multimodal_calib:
+        model = model.language_model
 
     with torch.inference_mode():
         if model_type is None:
