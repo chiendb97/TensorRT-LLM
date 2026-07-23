@@ -578,6 +578,22 @@ def _load_local_multimodal_dataset(dataset_dir):
     return dataset
 
 
+def _calib_dataset_is_multimodal(dataset_name_or_dir):
+    # Multimodal iff it is a known multimodal dataset name (ScienceQA) or a local
+    # dataset directory whose schema exposes an "image" column. A text-only local
+    # dataset (e.g. an instruct set with only id/text columns) is NOT multimodal
+    # even though it is also a directory.
+    if any(name in dataset_name_or_dir for name in MULTIMODAL_DATASETS):
+        return True
+    if not os.path.isdir(dataset_name_or_dir):
+        return False
+    try:
+        dataset = _load_local_multimodal_dataset(dataset_name_or_dir)
+    except Exception:
+        return False
+    return "image" in (getattr(dataset, "column_names", None) or [])
+
+
 def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                          tokenizer=None,
                          batch_size=1,
@@ -936,12 +952,13 @@ def quantize_and_export(*,
     # We only quantize/export its language model, but get_model() keeps the full
     # model so multimodal calibration can run image features through it.
     is_internvl = getattr(hf_config, "model_type", None) == "internvl_chat"
-    # InternVL calibration is multimodal when a VLM dataset is supplied: either a
-    # named multimodal dataset (ScienceQA) or a local dataset directory holding
-    # image + prompt columns. Text datasets (e.g. cnn_dailymail) stay text-only.
-    is_multimodal_calib = is_internvl and (any(name in calib_dataset
-                                               for name in MULTIMODAL_DATASETS)
-                                           or os.path.isdir(calib_dataset))
+    # InternVL calibration is multimodal only when the dataset actually carries
+    # images (ScienceQA, or a local dataset dir with an "image" column). A
+    # text-only dataset (cnn_dailymail, or a local instruct set) stays text-only:
+    # the model is reduced to its language model and calibrated with text, as
+    # before InternVL multimodal support was added.
+    is_multimodal_calib = is_internvl and _calib_dataset_is_multimodal(
+        calib_dataset)
 
     if is_internvl:
         # Classify by the language model so the exported checkpoint carries the
